@@ -1269,10 +1269,64 @@ void indexed_members()
     };
     auto const canonical = contents(name + "/fresh.gplot");
     require(contents(name + "/cached.gplot") == canonical, "cached digest changed canonical output bytes");
-    for (bool overlap : {false, true})
-        for (auto const* point : {"pending", "target-partial", "direct-target-partial", "direct-target", "direct-committed"})
+    auto compact_suffix = [&]
+    {
+        std::vector<Member> result;
+        for (size_t i = 2; i < members.size(); ++i)
         {
-            auto cfg = config; cfg.io_overlap = overlap;
+            CompactMemberBuilder builder(k, members[i].size());
+            builder.append(members[i]); result.push_back(builder.finish());
+        }
+        return result;
+    };
+    {
+        auto suffix = compact_suffix();
+        auto& first = suffix.front();
+        auto const before = first.storage_bytes();
+        first.release_before(chunks / 2);
+        require(first.storage_bytes() < before, "forward consumption retained completed payload pages");
+        rejects([&] { first.view().region(0); });
+        rejects([&] { first.release_before(0); });
+        Member moved(std::move(first));
+        for (uint64_t chunk = chunks / 2; chunk < chunks; ++chunk)
+        {
+            auto const view = moved.view(); auto const region = view.region(chunk);
+            require(std::equal(region.begin(), region.end(), members[2].begin() + view.boundary(size_t(chunk)),
+                members[2].begin() + view.boundary(size_t(chunk + 1))), "forward consumption changed retained fragments");
+            moved.release_before(chunk + 1);
+        }
+        require(moved.storage_bytes() == FragmentBoundaries::allocation_bytes(size_t(chunks), members[2].size()),
+            "forward consumption retained its final partial page");
+        rejects([&] { moved.view().region(chunks - 1); });
+    }
+    for (bool overlap : {false, true})
+    {
+        auto cfg = config; cfg.io_overlap = overlap; cfg.checkpoint_bytes = 256 * 1024;
+        auto const path = name + (overlap ? "/released-overlap" : "/released-serial");
+        auto suffix = compact_suffix();
+        uint64_t remaining = 0, calls = 0;
+        for (auto const& member : suffix) remaining += member.storage_bytes();
+        Engine engine(path, cfg, false, identity); engine.confirm_identity();
+        require(engine.append(Members(members).subspan(0, 2)).accepted, "releasing prefix rejected");
+        engine.consumed([&](uint64_t first)
+        {
+            uint64_t bytes = 0; ++calls;
+            for (auto& member : suffix) { member.release_after(first); bytes += member.storage_bytes(); }
+            require(bytes <= remaining, "consumed member allocation increased");
+            remaining = bytes;
+        });
+        require(engine.append(suffix).accepted && calls > 1 &&
+            remaining == suffix.size() * FragmentBoundaries::allocation_bytes(size_t(chunks), members[2].size()),
+            "backward construction retained consumed payload pages");
+        engine.consumed({});
+        rejects([&] { suffix.front().view().region(chunks - 1); });
+        rejects([&] { suffix.front().release_after(chunks); });
+        require(contents(path) == canonical, "releasing member pages changed canonical output");
+    }
+    for (bool overlap : {false, true})
+        for (auto const* point : {"pending", "target-partial", "direct-target-partial", "direct-target", "direct-committed:2", "committed"})
+        {
+            auto cfg = config; cfg.io_overlap = overlap; cfg.checkpoint_bytes = 256 * 1024;
             auto const path = name + "/window-recovery-" + point + (overlap ? "-overlap" : "-serial");
             auto const remaining = Members(members).subspan(2);
             pid_t const child = ::fork();
@@ -1283,8 +1337,11 @@ void indexed_members()
                 {
                     Engine engine(path, cfg, false, identity); engine.confirm_identity();
                     require(engine.append(Members(members).subspan(0, 2)).accepted, "initial source-window batch rejected");
+                    auto suffix = compact_suffix();
+                    engine.consumed([&](uint64_t first)
+                    { for (auto& member : suffix) member.release_after(first); });
                     ::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1);
-                    engine.append(remaining);
+                    engine.append(suffix);
                 }
                 catch (...) { std::_Exit(1); }
                 std::_Exit(0);

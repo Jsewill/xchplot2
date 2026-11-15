@@ -283,7 +283,7 @@ void command_help(std::string_view command, bool all)
             "  -f, --farmer-pk HEX        farmer public key (new fill)\n"
             "  -c, --pool-contract-address ADDRESS  pool contract address (new fill)\n"
             "  -d, --devices SPEC        select cpu, gpu, all, or named local devices\n"
-            "  -M, --max-host-ram SIZE   cap plotting RAM; replot uses available RAM when omitted\n"
+            "  -M, --max-host-ram SIZE   cap plotting RAM; uses available RAM when omitted\n"
             "  -t, --temp-dir DIR        temporary plotting storage\n"
             "  --temp-dirs DIR...        several temporary directories with one flag\n";
 #ifdef XCHPLOT2_GROUP_COMMANDS

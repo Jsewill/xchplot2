@@ -59,7 +59,8 @@ struct GroupOptions
     std::optional<std::string> seed_owner;
     std::optional<uint64_t> k, strength, meta;
     bool k_set = false, strength_set = false, meta_set = false;
-    uint64_t max_ram = 14000000000ull;
+    // Zero is resolved from available host memory before planning or plotting.
+    uint64_t max_ram = 0;
     // Preserve an explicit combined budget while migration re-observes its
     // effective allocation at stopped construction boundaries.
     bool max_ram_set = false, workers_set = false, device_set = false;

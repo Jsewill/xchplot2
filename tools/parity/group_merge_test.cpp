@@ -124,6 +124,14 @@ void test_producer_options()
     auto const defaults = parse({"grow", "group.gplot"});
     require(defaults.generation_overlap && defaults.generation_overlap_auto &&
         defaults.batch == defaults.max_members, "producer defaults do not allow admitted automatic work");
+    require(!defaults.max_ram_set && !defaults.max_ram_limit && defaults.max_ram >= 16 * mib &&
+        defaults.max_ram <= profile_detail::physical_memory(), "automatic RAM budget exceeds the host limit");
+    for (auto const* cap : {"67108864", "34359738368"})
+    {
+        auto const limited = parse({"grow", "group.gplot", "--max-ram", cap});
+        require(limited.max_ram_set && limited.max_ram == std::stoull(cap) &&
+            limited.max_ram_limit == limited.max_ram, "explicit RAM cap was replaced by automatic memory detection");
+    }
     auto const automatic = parse({"grow", "group.gplot", "--generation-overlap", "auto"});
     require(automatic.generation_overlap && automatic.generation_overlap_auto,
         "explicit automatic overlap differs from the default");
@@ -178,6 +186,12 @@ void test_producer_options()
     backend.generation_overlap = true; args.generation_overlap_auto = false;
     require(!backend.admit_gpu_generation(args, 2 * mib, 8 * mib, 6 * mib) && backend.generation_overlap,
         "increased workspace silently disabled explicit overlap");
+    args.generation_overlap_auto = true;
+    require(!backend.admit_gpu_generation(args, 0, 8 * mib, 6 * mib, uint64_t(0)),
+        "exhausted live RAM was treated as unknown headroom");
+    backend.generation_overlap = true;
+    require(backend.admit_gpu_generation(args, 0, 8 * mib, 6 * mib, uint64_t(0), 6 * mib) && !backend.generation_overlap,
+        "exhausted live RAM prevented reuse of an already resident borrowed output");
 }
 
 void test_destination_temporary()
@@ -945,6 +959,33 @@ void ordinary_prefix(fs::path const& root, Config cfg)
 }
 void balanced_traffic(fs::path const& root, Config cfg)
 {
+    // The final reader budget is independent of two-way compaction. With
+    // sufficient reader windows, unequal batches need no intermediate copy.
+    auto retained = members(14);
+    for (bool overlap : {false, true})
+    {
+        auto wide = cfg; wide.window_bytes = 16 * 1024 * 1024; wide.merge_inputs = 2;
+        wide.capacity_bytes = 512 * 1024 * 1024;
+        wide.io_overlap = overlap;
+        wide.memory_limit_bytes = std::max(Engine::memory_bytes(18, wide, uint16_t(retained.size())),
+            MergeEngine::memory_bytes(18, wide, uint16_t(retained.size())));
+        auto const path = root / (overlap ? "retained-overlap" : "retained-serial");
+        auto const reference = root / "retained-reference"; direct(reference, retained, wide);
+        {
+            MergeEngine output(path.string(), wide, false, identity()); output.confirm_identity();
+            size_t first = 0;
+            for (size_t count : {1, 3, 2, 1, 1, 1, 1, 2, 1, 1})
+            {
+                require(output.append(Members(retained).subspan(first, count)).accepted,
+                    "retained contribution did not fit"); first += count;
+            }
+            auto const result = output.finish();
+            require(!output.stats().merge_passes && output.stats().max_active_runs == 10 &&
+                result.peak_file_bytes <= wide.capacity_bytes && contents(path) == contents(reference),
+                "wide two-way construction copied retained runs or changed canonical bytes");
+        }
+        fs::remove(path); fs::remove(reference);
+    }
     // Borrow the same valid member payload for many contributions, keeping
     // resident memory small while exposing repeated unbalanced suffix copies.
     auto source = members(1, 96); std::vector<Member> input;
@@ -1428,6 +1469,40 @@ void packing_windows(fs::path const& root, Config cfg)
     fs::remove(reference);
 }
 
+void packing_reads(fs::path const& root, Config cfg)
+{
+    auto dense = members(8, 96); auto const reference = root / "packing-read-reference";
+    cfg.window_bytes = 32768; cfg.checkpoint_bytes = 65536;
+    cfg.memory_limit_bytes = 1024ull * 1024 * 1024;
+    direct(reference, dense, cfg); auto const expected = contents(reference);
+    for (bool overlap : {false, true})
+    {
+        auto const path = root / (overlap ? "packing-reads-overlap" : "packing-reads-serial");
+        cfg.workers = 2; cfg.io_overlap = overlap;
+        {
+            MergeEngine output(path.string(), cfg, false, identity()); output.confirm_identity();
+            for (size_t i = 0; i < dense.size(); ++i)
+                require(output.append(Members(dense).subspan(i, 1)).accepted, "packing read contribution did not fit");
+        }
+        uint64_t source_bytes = 0;
+        {
+            MergeState saved(path.string(), cfg, true, identity());
+            require(saved.state.run_count < dense.size(), "packing read fixture did not combine contribution packets");
+            for (size_t i = 0; i < saved.state.run_count; ++i) source_bytes += saved.state.runs[i].bytes;
+        }
+        {
+            MergeEngine output(path.string(), cfg, true, identity()); output.confirm_identity(); output.finish();
+            // A size lookahead may fetch each packet header separately, but
+            // its subsequent payload read must not reload the preread window.
+            uint64_t const headers = PlotGroupFile::getChunkCountForK(18) * dense.size() * sizeof(MergeState::Packet);
+            require(output.stats().phases[size_t(WorkPhase::pack)].read_bytes <= source_bytes + headers &&
+                contents(path) == expected, "packing reread payload windows while sizing chunks or changed canonical bytes");
+        }
+        fs::remove(path);
+    }
+    fs::remove(reference);
+}
+
 void placement_recovery(fs::path const& root, Config cfg)
 {
     auto dense = members(8, 96); auto reference = root / "placement-reference.gplot";
@@ -1625,6 +1700,66 @@ void single_pass(fs::path const& root, Members input, Config cfg)
     {
         interruption(root, compact, cfg, point);
         interruption(root, compact, cfg, point, true);
+    }
+}
+
+void contribution_consumption(fs::path const& root, Members input, Config cfg)
+{
+    using grow_controller_test::Construction;
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+    auto fresh = [&]
+    {
+        std::vector<Member> result;
+        for (size_t i = 0; i < input.size(); ++i)
+        {
+            result.emplace_back(std::vector<uint64_t>(input[i].raw().begin(), input[i].raw().end()));
+            result.back().compact(18);
+        }
+        return result;
+    };
+    for (auto const* mode : {"merged", "staged"}) for (bool overlap : {false, true})
+    {
+        cfg.io_overlap = overlap;
+        cfg.memory_limit_bytes = std::max({Engine::memory_bytes(18, cfg, uint16_t(input.size())),
+            MergeEngine::memory_bytes(18, cfg, uint16_t(input.size())), StagingEngine::memory_bytes(18, cfg, uint16_t(input.size()))});
+        auto const path = root / (std::string("consumed-") + mode + (overlap ? "-overlap" : "-serial"));
+        auto incoming = fresh(); uint64_t previous = 0, remaining = 0, calls = 0;
+        for (auto const& member : incoming) remaining += member.storage_bytes();
+        {
+            Construction engine(path.string(), cfg, false, identity(), mode); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                require(first >= previous && first <= chunks, "contribution consumption moved backwards");
+                previous = first; ++calls; uint64_t bytes = 0;
+                for (auto& member : incoming) { member.release_before(first); bytes += member.storage_bytes(); }
+                require(bytes <= remaining, "contribution consumption increased resident memory"); remaining = bytes;
+            });
+            require(engine.append(incoming).accepted && calls > 1 && previous == chunks &&
+                remaining == incoming.size() * FragmentBoundaries::allocation_bytes(size_t(chunks), input[0].size()),
+                "contribution encoding retained consumed input pages");
+            engine.consumed({}); engine.finish();
+        }
+        require(contents(path) == contents(root / "reference.gplot"), "consumed contribution changed canonical output");
+        fs::remove(path);
+        incoming = fresh(); calls = 0; bool interrupted = false;
+        try
+        {
+            Construction engine(path.string(), cfg, false, identity(), mode); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                for (auto& member : incoming) member.release_before(first);
+                if (++calls == 2) throw std::runtime_error("interrupt consumed contribution");
+            });
+            (void)engine.append(incoming);
+        }
+        catch (std::runtime_error const& error) { interrupted = std::string(error.what()) == "interrupt consumed contribution"; }
+        require(interrupted, "consumed contribution interruption was not exercised");
+        {
+            Construction engine(path.string(), cfg, true, identity(), mode); engine.confirm_identity();
+            require(engine.append(input).accepted, "interrupted contribution could not regenerate its input"); engine.finish();
+        }
+        require(contents(path) == contents(root / "reference.gplot"), "consumed contribution recovery changed canonical output");
+        fs::remove(path);
     }
 }
 
@@ -1909,6 +2044,39 @@ void group_prefetch(fs::path const& root, Members input)
         PlotData data; data.t3_proof_fragments.assign(input[index].raw().begin(), input[index].raw().end());
         fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
         fixture.paths.push_back(path);
+    }
+    // Compare controller scheduling with full-first rewrites of the same
+    // immutable input, both from empty and from a published ordinary prefix.
+    for (uint16_t prefix : {0, 1})
+    {
+        Arguments options; options.max_ram = 512 * mib; options.batch = prefix ? 2 : 3;
+        options.workers = 2; options.window = options.checkpoint_bytes = 65536;
+        options.window_set = options.checkpoint_set = true;
+        options.construction = "incremental"; options.generation_overlap = false;
+        auto cfg = grow_controller_test::configuration(options, 128 * mib, mib);
+        cfg.private_output = false;
+        auto const reference = root / ("full-first-" + std::to_string(prefix));
+        auto const reordered = root / ("short-first-" + std::to_string(prefix));
+        uint64_t read = 0, written = 0;
+        {
+            Engine full(reference.string(), cfg, false, identity()); full.confirm_identity();
+            if (prefix) require(full.append(input.subspan(0, prefix)).accepted, "reference prefix did not fit");
+            auto const before = full.stats();
+            for (uint16_t first = prefix; first < 4;)
+            {
+                auto const count = std::min<uint64_t>(options.batch, 4 - first);
+                require(full.append(input.subspan(first, count)).accepted, "full-first reference did not fit");
+                first += count;
+            }
+            read = full.stats().read_bytes - before.read_bytes;
+            written = full.stats().written_bytes - before.written_bytes;
+        }
+        if (prefix) { direct(reordered, input.subspan(0, prefix), cfg); options.resume = true; }
+        std::unique_ptr<Backend> backend;
+        auto const result = run_group(options, reordered, &fixture, requested, 4, cfg.capacity_bytes, 0, backend);
+        require(result.members == 4 && result.batches == 2 && result.max_batch_members == options.batch &&
+            result.read_bytes < read && result.written_bytes < written && contents(reordered) == contents(reference),
+            "continued or explicitly capped batches added prefix I/O or changed canonical bytes");
     }
     Arguments args; args.max_ram = 512 * mib; args.batch = args.max_members = 4;
     args.workers = 2; args.window = 65536; args.checkpoint_bytes = mib;
@@ -2863,6 +3031,17 @@ void cache_frontiers(fs::path const& root, Config cfg)
     MergeState::Reader input(arena, source, 2 * block);
     std::vector<uint8_t> actual(expected.size());
     input.read(std::span(actual).first(size_t(block + 17)));
+    uint64_t const read_before = arena.stats.read_bytes;
+    for (uint64_t offset : {block + 31, 2 * block - 4, 2 * block + 8})
+    {
+        uint64_t value = 0; std::memcpy(&value, expected.data() + offset, sizeof(value));
+        require(input.value_at<uint64_t>(offset) == value, "fragmented run lookahead changed packet bytes");
+    }
+    auto const cached = input.peek();
+    require(input.position() == block + 17 && cached.size() == block - 17 &&
+        arena.stats.read_bytes == read_before + 2 * sizeof(uint64_t) &&
+        std::equal(cached.begin(), cached.end(), expected.begin() + size_t(block + 17)),
+        "run lookahead moved its consumer or replaced its unconsumed cache");
     uint32_t const retired = source.head;
     arena.release(source, input.position()); arena.checkpoint("cache-consumed");
     // Cache advice must use the reader's saved physical map after retirement,
@@ -2968,7 +3147,34 @@ void construction_histories()
     require(continued.incremental.read == fixed.incremental.read && continued.incremental.write == fixed.incremental.write &&
         construction_initial_batch(UINT16_MAX, 9) == 9 && construction_initial_batch(10, 0) == 0 &&
         construction_initial_batch(9, 9) == 9,
-        "automatic batch forecasting reordered an existing prefix, unbounded group or complete batch");
+        "batch forecasting changed a complete batch or unbounded group");
+    auto const remainder = construction_forecast(18, fresh_config, 4, 4 * 654187, 9, 19, 0, true);
+    auto const full_remainder = construction_forecast(18, fresh_config, 4, 4 * 654187, 9, 19);
+    require(remainder.incremental_batches == 2 && full_remainder.incremental_batches == 2 &&
+        remainder.incremental.read == 28 * 654187 && full_remainder.incremental.read == 34 * 654187 &&
+        remainder.incremental.write < full_remainder.incremental.write &&
+        remainder.incremental.codec < full_remainder.incremental.codec &&
+        remainder.merged.read == full_remainder.merged.read && remainder.merged.write == full_remainder.merged.write,
+        "continued group forecast did not put the short batch before repeated prefix work");
+    // Independently minimize total written membership over every possible
+    // partition. This includes odd caps and nonempty starting groups.
+    for (uint16_t prefix : {0, 1, 7}) for (uint16_t cap = 1; cap <= 17; ++cap)
+    {
+        std::array<uint64_t, 65> best{};
+        for (uint16_t remaining = 1; remaining < best.size(); ++remaining)
+        {
+            best[remaining] = UINT64_MAX;
+            for (uint16_t count = 1; count <= std::min(remaining, cap); ++count)
+                best[remaining] = std::min(best[remaining], best[remaining - count] + prefix + remaining);
+            uint64_t written = 0, members = prefix;
+            for (uint16_t left = remaining; left;)
+            {
+                uint16_t const count = construction_initial_batch(left, std::min(left, cap));
+                members += count; written += members; left -= count;
+            }
+            require(written == best[remaining], "short-first batches did not minimize repeated prefix writes");
+        }
+    }
     auto clipped = fresh_config; clipped.capacity_bytes = 9 * 654187;
     auto const capacity = construction_forecast(18, clipped, 0, 0, 9, 10, 654187, true);
     require(capacity.members == 9 && capacity.batches == 1 && capacity.incremental_batches == 2,
@@ -3063,9 +3269,19 @@ void construction_selection()
         four_input_candidate(cfg, false, true, widest, 1),
         "rotating merge selection ignored completed timings");
     cfg.merge_inputs = 2;
-    auto const hdd_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
+    auto const retained_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
     cfg.merge_inputs = 4;
-    auto const hdd_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
+    auto const retained_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 64);
+    require(retained_two.merged.read == retained_four.merged.read &&
+        retained_two.merged.write == retained_four.merged.write,
+        "final reader retention still depended on compaction fan-in");
+    // A larger group still needs compaction. Price its copy savings against
+    // the smaller per-reader refill, independently of final reader retention.
+    cfg.capacity_bytes = 512ull * 1024 * 1024 * 1024;
+    cfg.merge_inputs = 2;
+    auto const hdd_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 256);
+    cfg.merge_inputs = 4;
+    auto const hdd_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 256);
     ConstructionSample streaming;
     streaming.elapsed_ns = 2000000000; streaming.read_ns = streaming.write_ns = 1000000000;
     streaming.read_bytes = streaming.written_bytes = 100 * widest;
@@ -7741,9 +7957,10 @@ int main(int argc, char** argv) try
         published_retired_external(external_cleanup.root, input, cfg);
     }
     test_construction_history(root, input, identity(), cfg); parity(root, input, cfg);
-    retuning(root, input, cfg); worker_grants(root, input, cfg); placement_costs(); placement(root, cfg); packing_windows(root, cfg);
+    retuning(root, input, cfg); worker_grants(root, input, cfg); placement_costs(); placement(root, cfg); packing_windows(root, cfg); packing_reads(root, cfg);
     placement_recovery(root, cfg); placement_bounds(root, cfg); layout(root, input, cfg); checkpoint_geometry(root, input, cfg);
     single_pass(root, input, cfg);
+    contribution_consumption(root, input, cfg);
     contribution_pipeline(root, cfg);
     ordinary_prefix(root, cfg); balanced_traffic(root, cfg);
     admission(root, input, cfg); recovery(root, input, cfg); construction_inspection_recovery(root, input, cfg); replot_bootstrap_inspection(root, input, cfg); replot_output_native_owners(root, input, cfg);

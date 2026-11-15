@@ -167,6 +167,20 @@ public:
         }
         template<class T> T value()
         { T result{}; read({reinterpret_cast<uint8_t*>(&result), sizeof(result)}); return result; }
+        template<class T> T value_at(uint64_t position) const
+        {
+            require(position >= run_.released && position <= run_.bytes && sizeof(T) <= run_.bytes - position,
+                    "invalid logical run lookahead");
+            T result{};
+            // Sizing may cross the end of the current preread before the
+            // payload consumer does. Fetch only the missing header; replacing
+            // this cache would make that consumer reread a whole window.
+            if (position >= cached_begin_ && position - cached_begin_ <= cached_size_ &&
+                sizeof(T) <= cached_size_ - size_t(position - cached_begin_))
+                std::memcpy(&result, buffer_.data() + size_t(position - cached_begin_), sizeof(T));
+            else copy(position, {reinterpret_cast<uint8_t*>(&result), sizeof(T)});
+            return result;
+        }
         void skip(uint64_t bytes)
         { require(bytes <= remaining(), "truncated logical run"); position_ += bytes; }
         void seek(uint64_t position)

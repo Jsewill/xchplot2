@@ -316,6 +316,27 @@ void test_layout_and_limits()
     c = {};
     auto empty = hdd(0);
     check(farming_plan(c, {empty}).feasible, "empty capacity is not harmless");
+
+    // A Rice boundary makes 92-member k18 groups exceed the modeled chunk
+    // code even though 93-member groups fit. Both sizes occur in a balanced
+    // fill; fixed layouts can encounter the same boundary in their last file.
+    c.k = 18; c.harvester_cores = c.lookup_workers = 1;
+    check(!farming_detail::shape(c, 92) && farming_detail::shape(c, 93),
+          "chunk-code boundary fixture changed");
+    auto large = hdd(uint64_t(farming_detail::member_bytes(c) * 20000));
+    auto legal = farming_plan(c, {large});
+    check(legal.feasible && legal.destinations[0].files &&
+              farming_assess(c, {large}, legal.destinations, extents(legal.destinations)).feasible,
+          "automatic layout failed to skip an unencodable balanced remainder");
+    c.group_members_override = 93; large.max_total_members = 185;
+    auto invalid_tail = farming_plan(c, {large});
+    check(!invalid_tail.feasible && !invalid_tail.destinations[0].files,
+          "fixed layout accepted an unencodable terminal remainder or silently truncated the fill");
+    large.max_total_members = 182;
+    auto valid_tail = farming_plan(c, {large});
+    check(valid_tail.feasible && valid_tail.destinations[0].total_members == 182 &&
+              farming_assess(c, {large}, valid_tail.destinations, extents(valid_tail.destinations)).feasible,
+          "fixed layout rejected a legal terminal remainder at the chunk-code boundary");
 }
 void test_adversarial_scheduler()
 {

@@ -298,6 +298,9 @@ public:
     Result resume(Members members, MemberBatchHash const* hash = nullptr);
     void confirm_identity();
     Stats const& stats() const { return stats_; }
+    // Set between operations. Backward rewriting reports the first durably
+    // consumed chunk after its codec readers have stopped borrowing that tail.
+    void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
     unsigned encoding_workers() const { return active_workers_; }
     // The owner calls between operations, after joining any borrowed windows.
     // Workers share codec_bytes; task descriptors retain their own small reserve.
@@ -416,6 +419,7 @@ private:
     bool overlap_ = false;
     unsigned active_workers_ = 0;
     mutable Stats stats_{};
+    std::function<void(uint64_t)> consumed_;
     // Only immutable, uniquely identified compact members may reuse this digest.
     // Public apply/resume compare the complete identity sequence every time.
     mutable std::unique_ptr<uint64_t[]> digest_ids_;
@@ -1920,6 +1924,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
         release_clean(record.old_frontier, durable.old_frontier);
         release_clean(record.new_frontier, durable.new_frontier);
         durable = record;
+        if (consumed_) consumed_(record.remaining);
         buffered = 0;
         grow_failpoint("direct-committed");
     };
@@ -2034,6 +2039,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
             release_clean(record.old_frontier, durable.old_frontier);
             release_clean(record.new_frontier, grow_add(record.new_frontier, bytes));
             durable = record;
+            if (consumed_) consumed_(record.remaining);
             grow_failpoint("committed");
             end = begin;
         }

@@ -591,11 +591,24 @@ int main(int argc, char** argv)
         last_group_options.excluded_destinations == last_group_options.temporary);
     assert(last_group_options.replot_confirmation == "directory" && last_group_options.reclaim_before_set && !last_group_options.reclaim_before_bytes);
     {
-        std::vector<std::string> arguments{"xchplot2", dir.string(), "--replot", "--compute", "off"};
-        std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data());
-        auto const automatic = pos2gpu::parse_group_options(int(argv.size()), argv.data(), "plan");
-        assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024 &&
-            automatic.max_ram != pos2gpu::GroupOptions{}.max_ram);
+        put(dir / "automatic.gplot", "existing group fixture");
+        for (auto const* command : {"plan", "fill", "grow", "plot"})
+        {
+            std::vector<std::string> arguments{"xchplot2", command == std::string_view("grow") ||
+                command == std::string_view("plot") ? (dir / "automatic.gplot").string() : dir.string(), "--compute", "off"};
+            std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data());
+            auto const automatic = pos2gpu::parse_group_options(int(argv.size()), argv.data(), command);
+            assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024);
+            if (command == std::string_view("plan"))
+            {
+                arguments.emplace_back("--replot"); argv.clear();
+                for (auto& argument : arguments) argv.push_back(argument.data());
+                auto const replot = pos2gpu::parse_group_options(int(argv.size()), argv.data(), command);
+                assert(!replot.max_ram_set && !replot.max_ram_limit && replot.max_ram >= 16ull * 1024 * 1024);
+            }
+        }
+        auto const automatic = pos2gpu::group_batch_options({}, {"--compute", "off"});
+        assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024);
     }
     assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
     assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());

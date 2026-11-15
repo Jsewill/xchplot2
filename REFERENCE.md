@@ -624,7 +624,10 @@ Use `plot` to create a new named job, or `fill` to manage a directory layout.
 ### Construction and recovery
 
 `-M`/`--max-host-ram SIZE` bounds modeled construction, producer, transport and
-codec buffers across the job. The default is 14,000,000,000 bytes.
+codec buffers across the job. When omitted, planning and plotting use the
+available host RAM, including process cgroup limits on Linux. This is a ceiling;
+small groups allocate only the buffers they need. Set an explicit cap to leave
+more memory for other applications.
 `-j`/`--workers N` sets the shared plotting CPU budget; zero or omission
 uses the available logical CPU count. The operating system, libraries and
 file cache are outside that buffer model. Separate plotting processes each
@@ -645,6 +648,10 @@ Destination directories are excluded from automatic scratch selection unless
 filters require known, uniformly matching drives. Explicit scratch directories
 remain available regardless of that policy. `--temp-capacity-bytes SIZE` caps
 scratch per filesystem. External construction needs permitted scratch.
+With compute sharing disabled (`--compute off`), external construction can
+stream local GPU output to scratch when a complete member cannot fit in RAM.
+The producer and codec workspaces must still fit, and scratch must hold both
+incoming data and contributions.
 
 Writers sharing a physical drive serialize their I/O. Independent drives can
 progress together within the shared RAM and CPU limits. `--io-overlap on|off`,

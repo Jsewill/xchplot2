@@ -335,12 +335,27 @@ void automatic_overlap()
     // path that was already using allocation-free matching.
     constexpr uint64_t margin = 128;
     constexpr uint64_t required = 1024;
-    for (int k = 18; k <= 28; k += 2) for (int strength : {2, k - 3})
+    for (int k = 18; k <= 28; k += 2) for (int strength = 2; strength <= k - 3; ++strength)
     {
         auto const section_bits = k < 28 ? 2 : k - 26;
         auto const capacity = pos2gpu::match_phase_capacity(k, section_bits);
         auto const buckets = uint64_t(1) << (section_bits + strength);
-        auto const scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets);
+        auto const match_keys = uint64_t(1) << strength;
+        auto const candidates = pos2gpu::twophase_candidate_capacity(capacity, buckets, match_keys);
+        // Increasing match keys does not reduce the candidates in each bucket.
+        // A buffer that cannot hold an ordinary section repeats the whole match.
+        require(candidates >= pos2gpu::max_pairs_per_section(k, section_bits),
+                "candidate scratch cannot hold an ordinary section at this strength");
+        for (uint64_t slices : {1, 4, 16})
+            require(pos2gpu::twophase_candidate_capacity(capacity / slices, buckets / slices, match_keys) == candidates,
+                    "sliced matching changed its per-bucket candidate allocation");
+        if (strength == 2)
+            require(candidates == (capacity / buckets) * 6 + 4096,
+                    "strength-two candidate allocation changed");
+        if (k == 28 && strength <= 17)
+            require(candidates == pos2gpu::twophase_candidate_capacity(capacity, 16, 4),
+                    "k28 candidate allocation shrank at higher strength");
+        auto const scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets, match_keys);
         auto const output = capacity * sizeof(uint64_t);
         auto const free = required + margin + output + scratch;
         auto const serial = pos2gpu::vram_scratch_budget(free, required, margin);
@@ -351,8 +366,8 @@ void automatic_overlap()
                 "automatic overlap evicted an admitted fast match allocation");
         require(group_grow::detail::preserves_match_scratch(scratch - 1, 0, scratch),
                 "automatic overlap rejected an already allocation-free match path");
-        require(pos2gpu::twophase_candidate_capacity(capacity, 0) ==
-                    pos2gpu::twophase_candidate_capacity(capacity, 1),
+        require(pos2gpu::twophase_candidate_capacity(capacity, 0, match_keys) ==
+                    pos2gpu::twophase_candidate_capacity(capacity, 1, match_keys),
                 "empty kernel bucket range changed candidate sizing");
     }
 }

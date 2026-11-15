@@ -9,6 +9,18 @@
 #include <iterator>
 #include <optional>
 #include <utility>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef interface
+#undef interface
+#endif
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace group_grow
 {
@@ -195,6 +207,122 @@ private:
     bool raw_ = false;
 };
 
+// Construction can return consumed whole pages without moving the remaining
+// input. The owner prepares views and releases pages; codec workers only read
+// those retained views. Concurrent admission reads the remaining allocation
+// after the native release has succeeded.
+class PackedMemberBuffer
+{
+public:
+    PackedMemberBuffer() = default;
+    ~PackedMemberBuffer() { reset(); }
+    PackedMemberBuffer(PackedMemberBuffer const&) = delete;
+    PackedMemberBuffer& operator=(PackedMemberBuffer const&) = delete;
+    PackedMemberBuffer(PackedMemberBuffer&& other) noexcept { *this = std::move(other); }
+    PackedMemberBuffer& operator=(PackedMemberBuffer&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            data_ = std::exchange(other.data_, nullptr);
+            begin_ = std::exchange(other.begin_, 0);
+            bytes_.store(other.bytes_.exchange(0));
+        }
+        return *this;
+    }
+    static size_t allocation_bytes(size_t words)
+    {
+        group_tools::require(words <= SIZE_MAX / sizeof(uint64_t), "packed member allocation overflow");
+        return aligned_bytes(words * sizeof(uint64_t));
+    }
+    void allocate(size_t words)
+    {
+        group_tools::require(!data_, "packed member buffer is already allocated");
+        size_t const bytes = allocation_bytes(words);
+        if (!bytes) return;
+#ifdef _WIN32
+        void* data = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!data) throw std::bad_alloc();
+#else
+        void* data = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (data == MAP_FAILED) throw std::bad_alloc();
+#endif
+        data_ = static_cast<uint64_t*>(data);
+        bytes_.store(bytes);
+    }
+    void retain_prefix(size_t bytes)
+    {
+        size_t const keep = aligned_bytes(bytes), current = bytes_.load();
+        group_tools::require(keep >= begin_ && keep - begin_ <= current, "cannot restore consumed member pages");
+        size_t const retained = keep - begin_;
+        if (retained == current) return;
+        auto* tail = reinterpret_cast<uint8_t*>(data_) + keep;
+#ifdef _WIN32
+        bool const released = ::VirtualFree(tail, current - retained, MEM_DECOMMIT) != 0;
+#else
+        bool const released = ::munmap(tail, current - retained) == 0;
+#endif
+        group_tools::require(released, "cannot release consumed member pages");
+        bytes_.store(retained);
+    }
+    void retain_suffix(size_t bytes)
+    {
+        size_t const first = bytes / page_bytes() * page_bytes(), current = bytes_.load();
+        group_tools::require(first >= begin_ && first - begin_ <= current, "cannot restore consumed member pages");
+        size_t const released_bytes = first - begin_;
+        if (!released_bytes) return;
+        auto* head = reinterpret_cast<uint8_t*>(data_) + begin_;
+#ifdef _WIN32
+        bool const released = ::VirtualFree(head, released_bytes, MEM_DECOMMIT) != 0;
+#else
+        bool const released = ::munmap(head, released_bytes) == 0;
+#endif
+        group_tools::require(released, "cannot release consumed member pages");
+        begin_ = first;
+        bytes_.store(current - released_bytes);
+    }
+    uint64_t* get() const { return data_; }
+    size_t bytes() const { return bytes_.load(); }
+    bool contains(size_t first, size_t end) const
+    { return first >= begin_ && end >= first && end - begin_ <= bytes_.load(); }
+private:
+    static size_t page_bytes()
+    {
+        static size_t const page = []
+        {
+#ifdef _WIN32
+            SYSTEM_INFO info{}; ::GetSystemInfo(&info);
+            auto const value = info.dwPageSize;
+#else
+            auto const value = ::sysconf(_SC_PAGESIZE);
+#endif
+            group_tools::require(value > 0, "cannot determine member allocation page size");
+            return size_t(value);
+        }();
+        return page;
+    }
+    static size_t aligned_bytes(size_t bytes)
+    {
+        size_t const page = page_bytes();
+        group_tools::require(bytes <= SIZE_MAX - (page - 1), "packed member allocation overflow");
+        return (bytes + page - 1) / page * page;
+    }
+    void reset() noexcept
+    {
+#ifdef _WIN32
+        if (data_) ::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+        if (bytes_.load()) ::munmap(reinterpret_cast<uint8_t*>(data_) + begin_, bytes_.load());
+#endif
+        data_ = nullptr;
+        begin_ = 0;
+        bytes_.store(0);
+    }
+    uint64_t* data_ = nullptr;
+    size_t begin_ = 0;
+    std::atomic<size_t> bytes_{0};
+};
+
 class Member;
 class MemberView
 {
@@ -218,6 +346,9 @@ public:
         FragmentRegion result;
         unsigned const width = k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
         size_t const bit = first * width;
+        size_t const end = (first + count) * width;
+        group_tools::require(retained_->contains((bit >> 6) * sizeof(uint64_t), end / 8 + (end % 8 != 0)),
+                             "member region crosses the consumed frontier");
         result.data_ = packed_ ? packed_ + (bit >> 6) : nullptr;
         result.count_ = count;
         result.packed_base_ = (chunk << width) | ((bit & 63) << 6) | width |
@@ -236,6 +367,7 @@ private:
     std::span<uint64_t const> raw_;
     uint64_t const* packed_ = nullptr;
     FragmentBoundaries const* boundaries_ = nullptr;
+    PackedMemberBuffer const* retained_ = nullptr;
     size_t count_ = 0;
     uint64_t id_ = 0;
     uint8_t k_ = 0;
@@ -361,6 +493,7 @@ public:
         if (!compact()) return borrowed_.empty() ? std::span<uint64_t const>(raw_) : borrowed_;
         MemberView result;
         result.packed_ = packed_.get();
+        result.retained_ = &packed_;
         result.boundaries_ = &boundaries_;
         result.count_ = count_;
         result.id_ = id_;
@@ -370,13 +503,13 @@ public:
     }
     uint64_t storage_bytes() const
     {
-        return uint64_t(raw_.capacity()) * sizeof(uint64_t) + uint64_t(packed_words_) * sizeof(uint64_t)
+        return uint64_t(raw_.capacity()) * sizeof(uint64_t) + packed_.bytes()
             + boundaries_.storage_bytes();
     }
     static uint64_t compact_bytes(uint8_t k, size_t count)
     {
         auto const words = packed_words(k, count);
-        uint64_t const payload = uint64_t(words) * sizeof(uint64_t);
+        uint64_t const payload = PackedMemberBuffer::allocation_bytes(words);
         uint64_t const boundaries = FragmentBoundaries::allocation_bytes(
             size_t(PlotGroupFile::getChunkCountForK(k)), count);
         group_tools::require(boundaries <= UINT64_MAX - payload, "packed member length overflow");
@@ -387,6 +520,29 @@ public:
     // An already compact member keeps its identity; hash is used only when a
     // new compact representation is constructed.
     void compact(uint8_t k, MemberBatchHash* hash = nullptr);
+    // The consumer has durably finished every chunk at or above this index.
+    // Keep a boundary's shared page until all of its lower chunks are consumed.
+    void release_after(uint64_t first_consumed)
+    {
+        group_tools::require(compact() && first_consumed <= PlotGroupFile::getChunkCountForK(k_),
+                             "invalid member consumption frontier");
+        size_t const bits = boundaries_[size_t(first_consumed)] * (k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+        packed_.retain_prefix(bits / 8 + (bits % 8 != 0));
+    }
+    // Forward contribution encoding no longer needs the chunks below this
+    // frontier. Keep the page shared with the first unconsumed packed word.
+    void release_before(uint64_t first_remaining)
+    {
+        group_tools::require(compact() && first_remaining <= PlotGroupFile::getChunkCountForK(k_),
+                             "invalid member consumption frontier");
+        if (first_remaining == PlotGroupFile::getChunkCountForK(k_))
+            packed_.retain_suffix(PackedMemberBuffer::allocation_bytes(packed_words_));
+        else
+        {
+            size_t const bits = boundaries_[size_t(first_remaining)] * (k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+            packed_.retain_suffix((bits >> 6) * sizeof(uint64_t));
+        }
+    }
 private:
     friend class CompactMemberBuilder;
     friend class CompactMemberReceiver;
@@ -414,7 +570,7 @@ private:
         return words;
     }
     std::vector<uint64_t> raw_;
-    std::unique_ptr<uint64_t[]> packed_;
+    PackedMemberBuffer packed_;
     size_t packed_words_ = 0;
     std::span<uint64_t const> borrowed_;
     FragmentBoundaries boundaries_;
@@ -437,7 +593,7 @@ public:
         member_.packed_words_ = Member::packed_words(k, count);
         // The accumulator writes complete words once and keeps the unwritten
         // tail zero-padded, so the payload needs no initial clearing pass.
-        if (member_.packed_words_) member_.packed_.reset(new uint64_t[member_.packed_words_]);
+        if (member_.packed_words_) member_.packed_.allocate(member_.packed_words_);
         next_word_ = member_.packed_.get();
         member_.boundaries_.reset(size_t(PlotGroupFile::getChunkCountForK(k)), count);
         member_.boundaries_.set(0, 0);
@@ -541,7 +697,7 @@ public:
         member_.k_ = k;
         member_.count_ = count;
         member_.packed_words_ = Member::packed_words(k, count);
-        if (member_.packed_words_) member_.packed_.reset(new uint64_t[member_.packed_words_]);
+        if (member_.packed_words_) member_.packed_.allocate(member_.packed_words_);
         member_.boundaries_.reset(size_t(PlotGroupFile::getChunkCountForK(k)), count);
         if (hash)
         {
@@ -600,7 +756,7 @@ public:
             (member_.k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS)) & 63);
         if (tail)
         {
-            failed_ = (member_.packed_[written_ - 1] >> tail) != 0;
+            failed_ = (member_.packed_.get()[written_ - 1] >> tail) != 0;
             group_tools::require(!failed_, "packed transfer tail is not zero padded");
         }
         // A network peer's validation declaration cannot substitute for local

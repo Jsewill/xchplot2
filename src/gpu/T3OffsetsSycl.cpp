@@ -23,20 +23,12 @@ namespace pos2gpu {
 
 namespace {
 
-// Candidate scratch is sized at 6 x the average per-bucket
-// output count. Candidates run ~4x outputs (the T3 test filter passes about
-// 1 in 4), so the multiplier is really "expected candidates x headroom". The
-// buffer itself is the ONE that T2 and T3 share — they are never live at the
-// same time, so the peak is the max of the two rather than their sum. See
+// T2 and T3 share one candidate buffer; they are never live at the same
+// time. The test accepts one in 2^strength candidates, so shared sizing
+// keeps 50% headroom above that candidate:output ratio. At strength two
+// the multiplier is 6; it grows with the match-key count to preserve
+// per-bucket capacity at higher strengths. See
 // sycl_backend::acquire_twophase_scratch in SyclBackend.hpp.
-//
-// Measured at k=28 on sm_89: the busiest bucket produced 67,137,219
-// candidates against an average per-bucket output of 17,039,360 — a ratio
-// of 3.94, and the spread across all 16 buckets was 0.09% (67,055,571 to
-// 67,137,219). The old multiplier of 8 was sized for an inter-bucket skew
-// that does not exist at production k, and cost 2x the memory it needed:
-// the buffer ran at 49% utilisation. 6 keeps 1.5x headroom over the
-// measured worst bucket while cutting the allocation by a quarter.
 //
 // Under-sizing is safe, not fatal: a bucket that overruns cand_cap sets the
 // sticky overflow flag, run_t3_match_twophase returns false, and the caller
@@ -105,14 +97,11 @@ namespace {
         return v && v[0] == '1';
     }();
 
-    // Per-bucket candidate scratch: {u32 l, u32 r} per pair. The T3 test
-    // filter passes ~1/4, so total candidates ≈ 4× outputs. The shared
-    // multiplier retains headroom over the expected candidate count and
-    // inter-bucket variance. Allocated once, reused across the bucket range,
-    // and reused across calls on the same queue via the per-queue cache in
-    // sycl_backend::acquire_twophase_scratch — which T2 shares — so the
-    // per-plot ~500 MB device malloc/free is gone.
-    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
+    // Per-bucket candidate scratch: {u32 l, u32 r} per pair. The test filter
+    // passes one in num_match_keys candidates. Shared sizing keeps headroom
+    // above that ratio at every strength. T2 and T3 reuse the same per-queue
+    // allocation; overflow still selects the allocation-free fallback.
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range, num_match_keys);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;
@@ -148,9 +137,8 @@ namespace {
     // Phase B is launched with a cand_cap-sized grid; each thread reads
     // the bucket's actual cand_n from the device counter and early-
     // returns if idx >= cand_n. That removes the need for a host
-    // readback of cand_n to size Phase B's launch. Cost: ~2× over-
-    // launching (cand_cap is ~2× the expected per-bucket candidate
-    // count). The wasted threads do one comparison + return — cheap.
+    // readback of cand_n to size Phase B's launch. Headroom in cand_cap
+    // over-launches some threads, which do one comparison + return.
     size_t const b_blocks_max = static_cast<size_t>(
         (cand_cap + threads - 1) / threads);
 
@@ -359,7 +347,7 @@ namespace {
         return v && v[0] == '1';
     }();
 
-    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range, num_match_keys);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;

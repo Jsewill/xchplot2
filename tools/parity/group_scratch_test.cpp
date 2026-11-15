@@ -365,10 +365,20 @@ void automatic_storage(fs::path const& directory)
     auto rotating = slower.grant(0, 20 * unit, unit, unit, 2, false, 8);
     require(rotating && rotating->packing_inputs == rotating->fan_in,
         "explicit rotating scratch ignored the storage choice or expanded its reader set");
+    auto rotating_target = target; rotating_target.device.nonrotating = false;
+    for (auto const [buffers, readers] : {std::pair{16ull, 2u}, {64ull, 4u}, {128ull, 8u}, {1024ull, 8u}})
+    {
+        ScratchPool buffered({hdd}, 0);
+        require(buffered.try_reserve_output(0, rotating_target, unit), "buffered HDD output reservation failed");
+        buffered.seal_recovery();
+        auto retained = buffered.grant(0, 20 * unit, unit, unit, 2, true, 8, buffers * 1024 * 1024);
+        require(retained && retained->fan_in == 2 && retained->packing_inputs == readers,
+            "HDD run retention ignored its reader buffer or changed compaction arity");
+    }
     auto unknown = ssd; unknown.device.drives.clear();
     ScratchPool unclassified({unknown}, 0);
     require(unclassified.try_reserve_output(0, target, unit), "unknown scratch output reservation failed");
-    unclassified.seal_recovery(); auto conservative = unclassified.grant(0, 20 * unit, unit, unit, 2, true, 8);
+    unclassified.seal_recovery(); auto conservative = unclassified.grant(0, 20 * unit, unit, unit, 2, true, 8, 128ull * 1024 * 1024);
     require(conservative && conservative->packing_inputs == conservative->fan_in,
         "unknown scratch expanded its reader set");
 }

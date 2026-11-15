@@ -633,12 +633,12 @@ inline long double construction_codec_work(uint64_t before, uint64_t after, bool
         2 * static_cast<long double>(before) + 2 * static_cast<long double>(after);
 }
 
-// Only automatic fresh incremental work can reorder its first batch. A fixed
-// limit or an existing prefix keeps its established transaction boundaries.
-inline uint16_t construction_initial_batch(uint16_t maximum, uint16_t admitted)
+// Put the short batch before full batches to minimize repeated prefix work.
+// The caller preserves pending transactions and already generated members.
+inline uint16_t construction_initial_batch(uint16_t remaining, uint16_t admitted)
 {
-    if (maximum == UINT16_MAX || !admitted || admitted >= maximum) return admitted;
-    return uint16_t(1 + (maximum - 1) % admitted);
+    if (remaining == UINT16_MAX || !admitted || admitted >= remaining) return admitted;
+    return uint16_t(1 + (remaining - 1) % admitted);
 }
 
 inline ConstructionForecast construction_forecast(uint8_t k, Config const& config,
@@ -707,7 +707,8 @@ inline ConstructionForecast construction_forecast(uint8_t k, Config const& confi
     long double old_bytes = bytes;
     for (uint32_t first = current; first < result.members;)
     {
-        uint32_t const limit = !first && short_first ? construction_initial_batch(maximum, batch) : batch;
+        uint32_t const limit = first == current && short_first && maximum != UINT16_MAX ?
+            construction_initial_batch(uint16_t(maximum - current), batch) : batch;
         uint32_t const added = std::min<uint32_t>(limit, result.members - first);
         long double const growth = added * member_bytes, next_bytes = old_bytes + growth;
         auto& ordinary = result.incremental;

@@ -97,20 +97,13 @@ void launch_t2_compute_fine_bucket_offsets(
 
 namespace {
 
-// Candidate scratch is sized at 6 x the average per-bucket
-// output count, and comes from the ONE buffer that T2 and T3 share (see
+// Candidate scratch comes from the ONE buffer that T2 and T3 share (see
 // sycl_backend::acquire_twophase_scratch in SyclBackend.hpp — they are never
 // live at the same time, so the peak is the max of the two, not their sum).
-//
-// Measured at k=28 on sm_89, T2's busiest bucket produced 67,158,023
-// candidates against an average per-bucket output of 17,039,360 — a ratio of
-// 3.94, with a 0.09% spread across all 16 buckets. The old multiplier of 16
-// was sized for an inter-bucket skew that does not exist at production k: it
-// ran the buffer at 24.6% utilisation and, because the tier's slicing factor
-// cancels out of (out_capacity / num_buckets_in_range), it allocated a full
-// plot-capacity 2080 MiB buffer in *every* tier — including the ones whose
-// entire purpose is to slice T2 staging down to 570 MiB. 6 keeps 1.5x headroom
-// over the measured worst bucket at a third of the memory.
+// The test accepts one in 2^strength candidates, so the shared sizing rule
+// keeps 50% headroom above that candidate:output ratio. At strength two this
+// is 6 x the average per-bucket output; higher strengths need a proportionally
+// larger multiplier because they divide the same output among more buckets.
 
 // ---- Phase 2 prototype: two-phase T2 match ----------------------------
 //
@@ -165,15 +158,11 @@ namespace {
         return v && v[0] == '1';
     }();
 
-    // Per-bucket candidate scratch: {u32 l, u32 r}. Sized at the shared multiplier
-    // (6) × the average per-bucket output count — headroom over the measured
-    // candidate:output ratio (~4× for the T3 test filter) for bucket skew. It
-    // was 16×, which is where ~3 GB of this buffer came from; overflow is safe
-    // anyway (sticky flag → caller rewinds and re-runs the single-kernel path),
-    // so the multiplier buys speed, not correctness. Allocated once, reused per
-    // bucket, and reused across calls on the same queue via the per-queue cache
-    // in sycl_backend::acquire_twophase_scratch — which T3 shares.
-    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range);
+    // Per-bucket candidate scratch: {u32 l, u32 r}. The test filter passes
+    // one in num_match_keys candidates. Shared sizing keeps headroom above
+    // that ratio at every strength; overflow still rewinds and retries the
+    // allocation-free path. T2 and T3 reuse the same per-queue allocation.
+    uint64_t const cand_cap = twophase_candidate_capacity(out_capacity, num_buckets_in_range, num_match_keys);
     auto* scratch_p = sycl_backend::acquire_twophase_scratch(q, cand_cap);
     if (!scratch_p) return false;   // over budget or OOM → single-kernel path
     auto& scratch = *scratch_p;

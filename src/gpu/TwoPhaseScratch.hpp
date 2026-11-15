@@ -14,12 +14,13 @@ namespace pos2gpu::sycl_backend {
 // over them. That buffer is sized from the plot's capacity, not from the
 // tier's memory budget — in
 //
-//     cand_cap = (out_capacity / num_buckets_in_range) * M
+//     cand_cap = (out_capacity / num_buckets_in_range) * (1.5 * num_match_keys) + guard
 //
-// both terms scale with the tier's slicing factor N, so N cancels and the
-// scratch lands at the same size in every tier. It was allocated with a
-// raw sycl::malloc_device, so it never appeared in the streaming-stats
-// trace that the tier peak models were calibrated against (see the anchor
+// out_capacity and num_buckets_in_range scale with the tier's slicing
+// factor N, so N cancels and the scratch lands at the same size in every
+// tier. It was allocated with a raw sycl::malloc_device, so it never appeared
+// in the streaming-stats trace that the tier peak models were calibrated
+// against (see the anchor
 // comments in GpuBufferPool.cpp, which say so outright). The models
 // therefore under-predicted the true peak by ~3.1 GB at k=28, and the tier
 // picker handed memory-constrained cards a tier that could not fit: a

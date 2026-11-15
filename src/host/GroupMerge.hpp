@@ -41,6 +41,7 @@ class MergeEngine
     uint64_t contribution_bytes_ = 0;
     std::optional<file_io::Stat> trusted_;
     uint64_t minimum_final_bytes_ = 0;
+    std::function<void(uint64_t)> consumed_;
     struct ReadOnly {};
     MergeEngine(std::string path, Config cfg, ReadOnly, ConstructionInspectionLimits const& limits, std::optional<Identity> const& initial, ConstructionStamp& target,
                 std::array<uint8_t, 32>& authority)
@@ -119,7 +120,7 @@ class MergeEngine
         size_t size() const { return readers_.size(); }
         Run const& run(size_t i) const { return runs_[i]; }
         MergeState::Reader& reader(size_t i) { return *readers_[i]; }
-        Packet packet(size_t i, uint64_t chunk, uint16_t member)
+        Packet packet(size_t i, uint64_t chunk, uint16_t member, std::optional<uint64_t> lookahead = {})
         {
             auto const& run = runs_[i];
             Packet packet{};
@@ -129,9 +130,11 @@ class MergeEngine
                         "invalid ordinary merge record");
                 packet = {run.first, run.count, uint32_t(sizes_[size_t(chunk)])};
             }
-            else packet = reader(i).value<Packet>();
+            else packet = lookahead ? reader(i).value_at<Packet>(*lookahead) : reader(i).value<Packet>();
+            uint64_t const position = lookahead ? grow_add(*lookahead, run.ordinary ? 0 : sizeof(Packet)) : reader(i).position();
             require(packet.first == member && packet.count && packet.count <= uint32_t(run.first) + run.count - member &&
-                packet.bytes > 1 && packet.bytes <= reader(i).remaining(), "invalid merged packet coverage or size");
+                position <= run.bytes && packet.bytes > 1 && packet.bytes <= run.bytes - position,
+                "invalid merged packet coverage or size");
             return packet;
         }
         void end_chunk(size_t i, uint64_t chunk)
@@ -143,14 +146,13 @@ class MergeEngine
             uint64_t bytes = 0;
             for (size_t i = 0; i < size(); ++i)
             {
-                auto const& source = run(i); uint64_t const position = reader(i).position();
+                auto const& source = run(i); uint64_t position = reader(i).position();
                 for (uint32_t member = source.first; member < uint32_t(source.first) + source.count;)
                 {
-                    auto const entry = packet(i, chunk, uint16_t(member));
+                    auto const entry = packet(i, chunk, uint16_t(member), position);
                     bytes = grow_add(bytes, grow_add(sizeof(Packet), entry.bytes));
-                    reader(i).skip(entry.bytes); member += entry.count;
+                    position += (source.ordinary ? 0 : sizeof(Packet)) + entry.bytes; member += entry.count;
                 }
-                reader(i).seek(position);
             }
             return bytes;
         }
@@ -310,6 +312,9 @@ class MergeEngine
     { uint64_t result = 0; for (size_t i = 0; i < regions.size(); ++i) result = grow_add(result, regions[i].size()); return result; }
 
 public:
+    // A completed contribution window will never read its input again.
+    // Admission and sizing do not release input; failed writes unwind.
+    void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
     static uint64_t block_bytes(Config const& cfg)
     {
         // Keep recycling and placement granular when a longer transaction is
@@ -320,9 +325,12 @@ public:
     }
     static size_t packing_inputs(Config const& cfg)
     {
-        // The four-input policy's eight-window preread budget can retain
-        // eight full-window readers. The two-input policy keeps two readers.
-        return cfg.merge_inputs == 4 ? 8 : 2;
+        // Final packing already reserves eight reader windows. Retain more
+        // runs without a preliminary copy, independently of compaction fan-in.
+        // Additional readers retain at least 8 MiB each from that shared
+        // budget. Keep the established small-window two/four-input gates.
+        return size_t(std::clamp<uint64_t>(cfg.window_bytes / (1024 * 1024),
+            cfg.merge_inputs == 4 ? 8 : 2, MergeState::max_runs));
     }
     static uint64_t memory_bytes(uint8_t k, Config const& cfg, uint16_t batch_members = 1)
     {
@@ -826,6 +834,7 @@ inline uint64_t MergeEngine::contribution(Members members, std::span<uint64_t> s
             // provisional recovery at window boundaries without per-chunk
             // failpoint overhead or changing the writer's I/O grouping.
             if (output->position() >= config().window_bytes) grow_failpoint("merge-contribution-partial");
+            if (consumed_) consumed_(current->next);
         }
         if (current->next == chunks()) break;
         if (next) { pending.get(); current.swap(next); }

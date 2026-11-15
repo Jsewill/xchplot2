@@ -35,17 +35,21 @@ inline std::uint64_t match_phase_capacity(int k, int num_section_bits) noexcept
 
 // T2 and T3 share one per-bucket candidate allocation. Keep admission and
 // kernel wrappers on the same sizing rule; overflow still falls back to the
-// allocation-free match path. Callers supply admitted match capacities.
+// allocation-free match path. The filter accepts one in match_keys candidates;
+// keep 50% headroom above that ratio, including at strengths above two.
+// Callers supply admitted match capacities and the table's match-key count.
 inline std::uint64_t twophase_candidate_capacity(std::uint64_t output_capacity,
-                                               std::uint64_t buckets) noexcept
+                                               std::uint64_t buckets,
+                                               std::uint64_t match_keys) noexcept
 {
-    return (output_capacity / (buckets ? buckets : 1)) * 6 + 4096;
+    return (output_capacity / (buckets ? buckets : 1)) * (match_keys + match_keys / 2) + 4096;
 }
 
 inline std::uint64_t twophase_scratch_bytes(std::uint64_t output_capacity,
-                                          std::uint64_t buckets) noexcept
+                                          std::uint64_t buckets,
+                                          std::uint64_t match_keys) noexcept
 {
-    return twophase_candidate_capacity(output_capacity, buckets) * (2 * sizeof(std::uint32_t)) +
+    return twophase_candidate_capacity(output_capacity, buckets, match_keys) * (2 * sizeof(std::uint32_t)) +
         sizeof(std::uint64_t) + sizeof(std::uint32_t);
 }
 

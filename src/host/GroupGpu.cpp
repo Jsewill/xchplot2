@@ -194,7 +194,7 @@ struct GpuProducer::Impl
                 auto const overlap_budget = pos2gpu::vram_scratch_budget(
                     memory_before_pool.free_bytes, required + capacity * sizeof(uint64_t), margin);
                 auto const buckets = uint64_t(1) << ((k < 28 ? 2 : k - 26) + strength);
-                auto const match_scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets);
+                auto const match_scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets, uint64_t(1) << strength);
                 if (options.member_overlap && pos2gpu::vram_fits(memory_before_pool.free_bytes,
                         required + capacity * sizeof(uint64_t), margin) &&
                     (!options.preserve_match_scratch || detail::preserves_match_scratch(

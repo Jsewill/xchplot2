@@ -860,6 +860,60 @@ void summary_planning(fs::path const& root, Members input, Members compact, Exte
                       std::vector<uint8_t> const& reference)
 {
     auto const directory = root / "summary-planning"; fs::create_directory(directory);
+    auto fresh = [&]
+    {
+        std::vector<Member> result;
+        for (size_t i = 0; i < input.size(); ++i)
+        {
+            result.emplace_back(std::vector<uint64_t>(input[i].raw().begin(), input[i].raw().end()));
+            result.back().compact(18);
+        }
+        return result;
+    };
+    for (unsigned workers : {1u, 3u})
+    {
+        auto cfg = config(); cfg.workers = workers; cfg.io_overlap = workers > 1; cfg.window_bytes = 4096;
+        cfg.memory_limit_bytes = ExternalEngine::memory_bytes(18, cfg, ext, uint16_t(input.size()));
+        auto const path = directory / ("consumed-" + std::to_string(workers));
+        auto incoming = fresh(); uint64_t previous = 0, remaining = 0, calls = 0;
+        uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+        for (auto const& member : incoming) remaining += member.storage_bytes();
+        {
+            ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                require(first >= previous && first <= chunks, "external consumption moved backwards");
+                previous = first; ++calls; uint64_t bytes = 0;
+                for (auto& member : incoming) { member.release_before(first); bytes += member.storage_bytes(); }
+                require(bytes <= remaining, "external consumption increased resident memory"); remaining = bytes;
+            });
+            require(engine.append(incoming).accepted && calls > 1 && previous == chunks &&
+                remaining == incoming.size() * FragmentBoundaries::allocation_bytes(size_t(chunks), input[0].size()),
+                "external encoding retained consumed input pages");
+            engine.consumed({}); engine.finish();
+            require(engine.release_completed() && contents(path) == reference, "consumed external input changed canonical output");
+        }
+        fs::remove(path); incoming = fresh(); calls = 0; bool interrupted = false;
+        try
+        {
+            ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+            engine.consumed([&](uint64_t first)
+            {
+                for (auto& member : incoming) member.release_before(first);
+                if (++calls == 2) throw std::runtime_error("interrupt consumed contribution");
+            });
+            (void)engine.append(incoming);
+        }
+        catch (std::runtime_error const& error) { interrupted = std::string(error.what()) == "interrupt consumed contribution"; }
+        require(interrupted, "external consumption interruption was not exercised");
+        {
+            ExternalEngine engine(path.string(), cfg, ext, true); engine.confirm_identity();
+            require(engine.append(input).accepted, "interrupted external contribution could not regenerate its input"); engine.finish();
+            require(engine.release_completed() && contents(path) == reference,
+                "consumed external recovery changed canonical output");
+        }
+        fs::remove(path);
+    }
     std::optional<std::pair<uint64_t, uint64_t>> admission;
     for (unsigned workers : {1u, 3u})
     {
@@ -1613,6 +1667,45 @@ void retirement(fs::path const& root, Members input, ExternalConfig const& ext, 
             "retired metadata was credited as reclaimed or charged as future construction workspace");
     }
 #endif
+}
+void reader_buffers(fs::path const& root, Members input, ExternalConfig ext,
+                    std::vector<uint8_t> const& reference)
+{
+    ext.packing_inputs = 8; ext.segment_bytes = 1024 * 1024;
+    for (bool overlap : {false, true})
+    {
+        auto cfg = config(); cfg.io_overlap = overlap;
+        auto original = ext; original.packing_inputs = original.fan_in;
+        auto limited = cfg;
+        limited.memory_limit_bytes = ExternalEngine::memory_bytes(18, cfg, original, uint16_t(input.size()));
+        require(ExternalEngine::read_buffer_bytes(18, cfg, ext) == cfg.window_bytes * 8 &&
+            ExternalEngine::read_buffer_bytes(18, limited, ext) == cfg.window_bytes &&
+            ExternalEngine::memory_bytes(18, limited, ext, uint16_t(input.size())) == limited.memory_limit_bytes,
+            "retained reader caches changed the minimum recovery memory requirement");
+        std::array<uint64_t, 2> reads{};
+        for (bool wide : {false, true})
+        {
+            auto const path = root / (std::string("reader-buffers-") + (overlap ? "overlap-" : "serial-") + (wide ? "wide" : "limited"));
+            // Cache size may change in either direction across recovery;
+            // only the existing retained-run setting belongs to the record.
+            {
+                ExternalEngine engine(path.string(), wide ? limited : cfg, ext, false, initial_identity()); engine.confirm_identity();
+                for (size_t i = 0; i < input.size() / 2; ++i)
+                    require(engine.append(input.subspan(i, 1)).accepted, "reader buffer prefix rejected");
+            }
+            auto const selected = wide ? cfg : limited;
+            ExternalEngine engine(path.string(), selected, ext, true); engine.confirm_identity();
+            require(engine.batch_resources().read_buffer_bytes == ExternalEngine::read_buffer_bytes(18, selected, ext) &&
+                engine.required_memory(uint16_t(input.size())) <= selected.memory_limit_bytes,
+                "reader cache was not included in the live admission or batch estimate");
+            for (size_t i = input.size() / 2; i < input.size(); ++i)
+                require(engine.append(input.subspan(i, 1)).accepted, "reader buffer contribution rejected");
+            engine.finish(); reads[size_t(wide)] = engine.stats().phases[size_t(WorkPhase::pack)].read_calls;
+            require(!engine.stats().merge_passes && contents(path) == reference && engine.release_completed(),
+                "reader buffer recovery copied retained runs, changed output or retained scratch");
+        }
+        require(reads[1] < reads[0], "larger retained reader buffers did not reduce packing reads");
+    }
 }
 void retained_runs(fs::path const& root, Members input, ExternalConfig ext,
                    std::vector<uint8_t> const& reference)
@@ -2511,7 +2604,11 @@ try
         retirement(root, input, ext, reference); fs::remove_all(root); std::cout << "external retirement tests passed\n"; return 0;
     }
     std::vector<Member> compact; for (auto const& member : raw) { compact.emplace_back(std::vector<uint64_t>(member)); compact.back().compact(18); }
-    if (!windows_only && !checkpoints_only) summary_planning(root, input, Members(compact), ext, reference);
+    if (!windows_only && !checkpoints_only)
+    {
+        summary_planning(root, input, Members(compact), ext, reference);
+        reader_buffers(root, input, ext, reference);
+    }
     if (!windows_only && !planning_only) packing_checkpoints(root, Members(compact), ext, reference);
     if (planning_only)
     {

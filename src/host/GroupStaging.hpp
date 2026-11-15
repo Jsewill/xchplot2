@@ -148,6 +148,7 @@ class StagingEngine
     std::vector<uint64_t> old_sizes_;
     mutable Stats stats_{};
     unsigned packing_workers_ = 0;
+    std::function<void(uint64_t)> consumed_;
     // Self-written committed sources need no repeated decode. Resume and an
     // observed source change rebuild this trust during read-only admission.
     std::optional<file_io::Stat> validated_source_;
@@ -568,6 +569,9 @@ public:
     Stats const& stats() const { return stats_; }
     uint64_t read_calls() const { return stats_.read_calls; }
     unsigned packing_workers() const { return packing_workers_; }
+    // Only final contribution emission consumes input; sizing and rejected
+    // admission keep the full batch available to the caller.
+    void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
     void confirm_identity()
     {
         check_path(); require(size() <= config_.capacity_bytes && identity_.bytes <= config_.capacity_bytes &&
@@ -1007,8 +1011,10 @@ inline AppendResult StagingEngine::append(Members members)
         {
             output.flush(); sync(); grow_failpoint("stage-run-partial-flushed");
             evict(flushed, output.position() - flushed); flushed = output.position();
+            if (consumed_) consumed_(chunk + 1);
         }
     }
+    if (consumed_) consumed_(chunks);
     output.flush(); require(output.position() == end, "staged run length mismatch");
     write_value(begin, RunHeader{run_bytes, before, uint16_t(members.size()), 0}); sync(); grow_failpoint("stage-run-flushed");
     record_.staged_end = end; record_.staged = after; record_.target.group_size = after;

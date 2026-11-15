@@ -205,7 +205,7 @@ void reference_help()
         "  -r, --resume              continue/recover an existing destination\n"
         "  --capacity-bytes N        logical destination cap; default filesystem capacity\n"
         "  --headroom-bytes N        filesystem bytes left free, default 67108864\n"
-        "  -M, --max-ram N           modeled app buffer budget in bytes, default 14000000000\n"
+        "  -M, --max-ram N           modeled app buffer budget in bytes, default available RAM\n"
         "  --window-bytes N          fixed I/O window; default auto up to 16777216\n"
         "  -j, --workers N           compression workers, default available CPU count\n"
         "  --batch-members N         maximum additions per rewrite, default fits available RAM\n"
@@ -668,6 +668,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             destination(key);
         }
     }
+    if (!result.max_ram_set)
+    {
+        result.max_ram = group_grow::profile_detail::available_memory();
+        require(result.max_ram >= 16 * mib,
+            "cannot determine an available RAM budget; retry when memory is available or set --max-host-ram");
+    }
     bool const farm_command = command == "fill" || command == "plan";
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(!result.status_live || result.replot_status, "--live requires status");
@@ -802,14 +808,6 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         require(result.from_plan.empty() && result.destinations.empty(),
             "supply a saved plan on its own, without destination directories");
         result.from_plan = std::move(result.target); result.target.clear();
-    }
-    bool const migration_resources = result.replot || !result.replot_inventory.empty() ||
-        (!result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
-    if (migration_resources && !result.max_ram_set)
-    {
-        auto const available = group_grow::profile_detail::available_memory();
-        require(available >= 16 * mib, "cannot determine an available migration RAM budget; retry when memory is available or set --max-host-ram");
-        result.max_ram = available;
     }
     bool const verification_options = result.replot_verification || result.replot_proof_first_groups || result.replot_proof_every_groups;
     require(!result.replot_confirmation || (result.replot &&

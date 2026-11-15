@@ -817,6 +817,11 @@ inline FarmingDrivePlan candidate(FarmingConfig const& config, FarmingDestinatio
     if (total < files) return plan;
     uint64_t const members = config.group_members_override ? config.group_members_override : ceiling(total, files);
     if (members > 65535 || !shape(config, unsigned(members))) return plan;
+    // The chunk-size code changes at Rice parameter boundaries, so a smaller
+    // balanced group or fixed terminal remainder need not be encodable merely
+    // because the largest group is. Assess only candidates whose actual sizes fit.
+    uint64_t const smaller = config.group_members_override ? total % members : total / files;
+    if (smaller && smaller != members && !shape(config, unsigned(smaller))) return plan;
     plan.group_bytes = size(members * bytes + overhead);
     if (plan.group_bytes > destination.max_file_bytes) return FarmingDrivePlan{.meta_slots = slots, .meta_bits = plan.meta_bits,
         .meta_base = plan.meta_base, .resource_rank = rank, .resource_lanes = lanes};

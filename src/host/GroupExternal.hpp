@@ -181,6 +181,7 @@ public:
     enum class MemoryPhase { staging, packing, publication };
     static uint64_t phase_memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
                                        MemoryPhase phase, uint16_t batch_members = 1);
+    static uint64_t read_buffer_bytes(uint8_t k, Config const& config, ExternalConfig const& external);
     static uint64_t metadata_bytes(uint8_t k, ExternalConfig const& external);
     uint64_t required_memory(uint16_t batch_members = 1, unsigned workers = 0) const
     {
@@ -192,6 +193,9 @@ public:
     Identity const& identity() const { return identity_; }
     uint16_t committed_member_count() const { return members_; }
     bool can_append() const { return phase_ == Phase::stage; }
+    // Called only after admitted contribution encoding has finished these
+    // input chunks. Provisional-write failures unwind; they do not retry input.
+    void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
     Stats const& stats() const { return stats_; }
     using RunShape = ConstructionRun;
     void run_shapes(std::vector<RunShape>& result) const
@@ -232,6 +236,7 @@ public:
         uint16_t members = 0;
         uint64_t runs = 0, packets = 0, bytes = 0, source_bytes = 0, packet_bytes = 0;
         unsigned readers = 0;
+        uint64_t read_buffer_bytes = 0;
     };
     BatchResources batch_resources() const;
     std::vector<uint64_t> scratch_reserved_bytes() const;
@@ -324,6 +329,7 @@ private:
     CpuTime contribution_owner_cpu_, packing_owner_cpu_, contribution_driver_cpu_, packing_driver_cpu_;
     ExecutionIO execution_scratch_, execution_destination_;
     uint64_t packing_body_ns_ = 0;
+    std::function<void(uint64_t)> consumed_;
     struct Orphan { uint32_t root; std::string name; Stamp stamp; uint64_t reserved = 0; file_io::DurableIdentity identity; };
     std::vector<Orphan> orphans_;
 
@@ -353,6 +359,8 @@ private:
     }
     static uint64_t descriptor_limit(ExternalConfig const& external);
     static uint64_t checkpoint_buffer_bytes(ExternalConfig const& external);
+    static uint64_t phase_base_memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
+                                            MemoryPhase phase, uint16_t batch_members);
     static uint64_t packing_index_bytes(Config const& config)
     { return std::clamp<uint64_t>(config.window_bytes, 65536, 1024 * 1024); }
     static Inspection inspect_at(std::string const& path, std::string const& work, uint64_t memory_limit_bytes, bool retired,
@@ -876,7 +884,8 @@ inline ExternalEngine::BatchResources ExternalEngine::batch_resources() const
     uint64_t bytes = 0;
     for (auto const& run : runs_) bytes = grow_add(bytes, run.bytes);
     return {members_, runs_.size(), packet_count_, bytes, packing_source_bytes_, sizeof(Packet),
-        external_.packing_inputs ? external_.packing_inputs : external_.fan_in};
+        external_.packing_inputs ? external_.packing_inputs : external_.fan_in,
+        read_buffer_bytes(identity_.header.k, config_, external_)};
 }
 inline uint64_t ExternalEngine::metadata_bytes(uint8_t k, ExternalConfig const& external)
 {
@@ -899,6 +908,30 @@ inline uint64_t ExternalEngine::checkpoint_buffer_bytes(ExternalConfig const& ex
     return grow_add(1024 * 1024, grow_add(paths, multiply(descriptor_limit(external), 768)));
 }
 inline uint64_t ExternalEngine::phase_memory_bytes(uint8_t k, Config const& config,
+    ExternalConfig const& external, MemoryPhase phase, uint16_t batch_members)
+{
+    uint64_t const base = phase_base_memory_bytes(k, config, external, phase, batch_members);
+    if (phase == MemoryPhase::publication) return base;
+    return grow_add(base, std::max(read_buffer_bytes(k, config, external), uint64_t(max_runs * sizeof(Packet))) -
+        std::max(config.window_bytes, uint64_t(max_runs * sizeof(Packet))));
+}
+inline uint64_t ExternalEngine::read_buffer_bytes(uint8_t k, Config const& config, ExternalConfig const& external)
+{
+    uint64_t const original = config.window_bytes;
+    if (external.packing_inputs <= external.fan_in) return original;
+    // A larger retained reader set must not turn sequential HDD reads into
+    // small refills. Like the merged engine, share up to eight I/O windows.
+    // Cache size is runtime workspace, not a checkpoint setting. Preserve
+    // the original memory requirement when recovering a tightly budgeted job.
+    // Use the largest staging descriptor window so the same cache bound is
+    // valid for every admitted batch and for final packing.
+    uint64_t const base = std::max(
+        phase_base_memory_bytes(k, config, external, MemoryPhase::staging, UINT16_MAX),
+        phase_base_memory_bytes(k, config, external, MemoryPhase::packing, 1));
+    uint64_t const spare = config.memory_limit_bytes - std::min(config.memory_limit_bytes, base);
+    return grow_add(original, std::min(multiply(config.window_bytes, 7), spare));
+}
+inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const& config,
     ExternalConfig const& external, MemoryPhase phase, uint16_t batch_members)
 {
     require(k >= 18 && k <= 28 && !(k & 1) && config.window_bytes && external.fan_in >= 2 &&
@@ -1748,9 +1781,10 @@ class ExternalEngine::Reader
 {
 public:
     Reader(ExternalEngine& engine, Run const& run, size_t active = 0, uint64_t start = UINT64_MAX,
-           char const* role = "contribution", uint64_t* activity = nullptr)
+           char const* role = "contribution", uint64_t* activity = nullptr, uint64_t buffer_bytes = 0)
         : engine_(engine), run_(run), position_(start == UINT64_MAX ? run.consumed : start), read_position_(position_), role_(role), activity_(activity),
-          buffer_(size_t(std::max<uint64_t>(sizeof(Packet), engine.config_.window_bytes / (active ? active : std::max<size_t>(1, engine.runs_.size())))))
+          buffer_(size_t(std::max<uint64_t>(sizeof(Packet), (buffer_bytes ? buffer_bytes : read_buffer_bytes(engine.identity_.header.k,
+              engine.config_, engine.external_)) / (active ? active : std::max<size_t>(1, engine.runs_.size())))))
     {
         uint64_t skip = position_;
         while (segment_ < run_.segments.size() && skip >= run_.segments[segment_].bytes)
@@ -2271,11 +2305,14 @@ inline std::unique_ptr<ExternalEngine::PreparedInput> ExternalEngine::prepare_in
     require(grow_add(required_memory(members), input_memory_bytes(config_, members)) <= config_.memory_limit_bytes,
         "prepared input exceeds memory budget");
     if (!fragment_bound || fragment_bound > UINT32_MAX || !staging_slot()) return {};
+    uint64_t const total = input_scratch_bytes(identity_.header.k, members, fragment_bound);
+    uint64_t available = 0;
+    for (auto const& root : roots_) available = grow_add(available, root.capacity - root.used);
+    if (total > available) return {};
     auto input = std::unique_ptr<PreparedInput>(new PreparedInput(*this, members, fragment_bound)); prepared_ = input.get();
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
     uint64_t const boundary_bytes = multiply(members, multiply(chunks + 1, sizeof(uint32_t)));
     uint64_t const payload_bytes = multiply(members, multiply(input->word_count(fragment_bound), sizeof(uint64_t)));
-    uint64_t const total = input_scratch_bytes(identity_.header.k, members, fragment_bound);
     uint64_t const summary_bytes = multiply(chunks, sizeof(Summary));
     auto allocate = [&](Run& run, uint64_t bytes, char const* role)
     {
@@ -2302,8 +2339,10 @@ public:
         for (uint16_t member = 0; member < count; ++member)
         {
             Cursor cursor;
-            cursor.boundaries = std::make_unique<Reader>(engine, input.boundaries_, size_t(count) * 2, multiply(member, bytes), "compact_member", &input.read_bytes_);
-            cursor.payload = std::make_unique<Reader>(engine, input.payload_, size_t(count) * 2, input.members_[member].word_offset, "compact_member", &input.read_bytes_);
+            // Prepared input has a separate, fixed receive-window reservation;
+            // it can coexist with the retained-contribution readers in sizing.
+            cursor.boundaries = std::make_unique<Reader>(engine, input.boundaries_, size_t(count) * 2, multiply(member, bytes), "compact_member", &input.read_bytes_, engine.config_.window_bytes);
+            cursor.payload = std::make_unique<Reader>(engine, input.payload_, size_t(count) * 2, input.members_[member].word_offset, "compact_member", &input.read_bytes_, engine.config_.window_bytes);
             read(*cursor.boundaries, cursor.first); require(!cursor.first, "prepared boundaries do not start at zero");
             cursors_.push_back(std::move(cursor));
         }
@@ -2850,6 +2889,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
                 }
                 require(offset == block.bytes.size(), "external encoded block has trailing data");
             }
+            if (!input && consumed_) consumed_(current->next);
             if (current->next == chunks) break;
             if (next)
             {

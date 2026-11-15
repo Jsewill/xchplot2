@@ -200,7 +200,7 @@ public:
 
     std::optional<ExternalConfig> grant(uint64_t owner, uint64_t desired, uint64_t minimum,
                                         uint64_t segment_bytes, unsigned fan_in, bool automatic = false,
-                                        unsigned packing_inputs = 0)
+                                        unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0)
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -274,11 +274,16 @@ public:
         }
         if (desired - remaining < minimum) return {};
         // Retaining more readers avoids copying packets that the final packer
-        // can already join. Only known SSD scratch gets the larger reader set;
-        // the merge arity and the aggregate reader buffer remain unchanged.
+        // can already join. Known HDDs can also retain more when the requested
+        // aggregate cache leaves large refills; unknown storage keeps the
+        // original gate. Compaction arity and saved admission stay independent.
         bool const nonrotating = std::all_of(selected.begin(), selected.end(), [&](size_t i)
             { auto const& device = roots_[i].value.device; return device.nonrotating && !device.drives.empty(); });
-        external.packing_inputs = nonrotating && packing_inputs ? packing_inputs : fan_in;
+        bool const known = std::all_of(selected.begin(), selected.end(), [&](size_t i)
+            { return !roots_[i].value.device.drives.empty(); });
+        uint64_t const readers = nonrotating ? packing_inputs : known ?
+            std::min<uint64_t>(packing_inputs, read_buffer_bytes / (16ull * 1024 * 1024)) : 0;
+        external.packing_inputs = unsigned(std::max<uint64_t>(fan_in, readers));
         for (size_t i = 0; i < selected.size(); ++i)
         {
             auto& filesystem = fs_for(selected[i]); uint64_t const quota = external.scratch[i].capacity_bytes;
