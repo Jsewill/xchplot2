@@ -550,6 +550,17 @@ int main(int argc, char** argv)
     assert(cli({"fill", dir.string(), "--config", config.string(), "--devices", "cpu"}) == 0);
     assert(last_group_options.plan_only && last_group_options.json && last_group_options.backend == "cpu");
     assert(last_group_options.max_ram == 512ull * 1024 * 1024);
+    assert(last_group_options.destination_temp == "on" && !last_group_options.destination_temp_set);
+    put(config, "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ndestination-temp=\"off\"\n");
+    assert(cli({"fill", dir.string(), "--config", config.string()}) == 0);
+    assert(last_group_options.destination_temp == "off" && last_group_options.destination_temp_set);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--destination-temp", "on"}) == 0);
+    assert(last_group_options.destination_temp == "on" && last_group_options.destination_temp_set);
+    put(config, "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=\"" + dir.string() + "\"\n");
+    assert(cli({"fill", dir.string(), "--config", config.string()}) == 0);
+    assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set &&
+        last_group_options.temporary == std::vector<std::filesystem::path>{dir});
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     assert(cli({"plan", dir.string(), "--config", config.string(), "--progress"}) == 0);
     assert(last_group_options.progress && !last_group_options.verbose);
     assert(cli({"plan", dir.string(), "--config", config.string(), "-v", "--no-progress"}) == 0);
@@ -581,6 +592,7 @@ int main(int argc, char** argv)
         last_group_options.workers_set && last_group_options.device_set);
     assert((last_group_options.destinations == std::vector<std::filesystem::path>{other, third}));
     assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
+    assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--replot", "--no-plan-only",
                 "--temp-dirs", other.string(), third.string(), "--exclude-destination", other.string(), third.string(),
                 "--farm-config", other.string(), third.string(), "--replot-confirmation", "directory",
@@ -589,6 +601,7 @@ int main(int argc, char** argv)
     assert((last_group_options.temporary == std::vector<std::filesystem::path>{other, third}));
     assert(last_group_options.farm_configs == last_group_options.temporary &&
         last_group_options.excluded_destinations == last_group_options.temporary);
+    assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set);
     assert(last_group_options.replot_confirmation == "directory" && last_group_options.reclaim_before_set && !last_group_options.reclaim_before_bytes);
     {
         put(dir / "automatic.gplot", "existing group fixture");
@@ -599,6 +612,7 @@ int main(int argc, char** argv)
             std::vector<char*> argv; for (auto& argument : arguments) argv.push_back(argument.data());
             auto const automatic = pos2gpu::parse_group_options(int(argv.size()), argv.data(), command);
             assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024);
+            assert(automatic.destination_temp == "on" && !automatic.destination_temp_set);
             if (command == std::string_view("plan"))
             {
                 arguments.emplace_back("--replot"); argv.clear();
@@ -609,6 +623,9 @@ int main(int argc, char** argv)
         }
         auto const automatic = pos2gpu::group_batch_options({}, {"--compute", "off"});
         assert(!automatic.max_ram_set && !automatic.max_ram_limit && automatic.max_ram >= 16ull * 1024 * 1024);
+        assert(automatic.destination_temp == "on" && !automatic.destination_temp_set);
+        auto const separate = pos2gpu::group_batch_options({}, {"--compute", "off", "--temp-dir", other.string()});
+        assert(separate.destination_temp == "off" && separate.temporary == std::vector<std::filesystem::path>{other});
     }
     assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
     assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());

@@ -643,11 +643,15 @@ fragments; compact is the default.
 Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems, or use
 `--temp-dirs /scratch-a /scratch-b`. End a multi-directory list with another
 option or `--`; destinations after `--` are positional arguments.
-Destination directories are excluded from automatic scratch selection unless
-`--destination-temp on|ssd|hdd` permits them; the default is `off`. The media
-filters require known, uniformly matching drives. Explicit scratch directories
-remain available regardless of that policy. `--temp-capacity-bytes SIZE` caps
-scratch per filesystem. External construction needs permitted scratch.
+For new jobs, destination directories are available for temporary files by
+default when no explicit temporary directories are supplied. With `--temp-dir`
+or `--temp-dirs`, only those directories are offered by default.
+`--destination-temp off|on|ssd|hdd` overrides this choice; `off` excludes
+destinations, `on` permits any destination, and the media filters require known,
+uniformly matching drives. Explicit scratch directories remain available
+regardless of that policy. Saved jobs and previews retain their scratch
+restrictions. `--temp-capacity-bytes SIZE` caps scratch per filesystem.
+External construction needs permitted scratch.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both

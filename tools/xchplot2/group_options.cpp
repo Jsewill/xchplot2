@@ -174,7 +174,8 @@ void reference_help()
         "Usage: pos2_pr118_grow TARGET [OPTIONS]\n"
         "      --destination FILE|DIR  additional key-derived destination; repeat for more drives\n"
         "  -t, --temp-dir DIR        temporary plotting storage; repeat for more devices\n"
-        "  --destination-temp off|on|ssd|hdd  allow temporary files on destinations; default off\n"
+        "  --destination-temp off|on|ssd|hdd  allow temporary files on destinations\n"
+        "                            default on without --temp-dir; otherwise off\n"
         "                            on: any destination; ssd/hdd: only known drives of that type\n"
         "  --temp-capacity-bytes N    aggregate scratch cap per filesystem; default available space\n"
         "  --group-id HEX --memo HEX  identity for a new group (memo may be empty)\n"
@@ -913,6 +914,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.construction == "auto" || result.construction == "incremental" ||
             result.construction == "staged" || result.construction == "merged" || result.construction == "external",
             "--construction requires auto, incremental, staged, merged or external");
+    if (!result.destination_temp_set) result.destination_temp = result.temporary.empty() ? "on" : "off";
     require(result.destination_temp == "off" || result.destination_temp == "on" ||
         result.destination_temp == "ssd" || result.destination_temp == "hdd",
         "--destination-temp requires off, on, ssd or hdd");

@@ -6694,6 +6694,13 @@ FarmingJob farming_arguments(Arguments& args)
     }
     args.target = job.directories.front();
     args.destinations.assign(job.directories.begin() + 1, job.directories.end());
+    if (!args.destination_temp_set && args.temporary.empty())
+    {
+        // A new CLI default must not enable scratch that a saved job or preview
+        // did not authorize. Explicit storage changes use the existing update checks.
+        auto const* policy = job.preview ? &job.preview->preview.state : job.saved ? &*job.saved : nullptr;
+        if (policy && (policy->version < 9 || !policy->shared_scratch_possible)) args.destination_temp = "off";
+    }
     return job;
 }
 uint64_t farming_manifest_reservation(group_grow::FarmingState& state, uint64_t text_bytes, uint64_t alignment)
@@ -10290,13 +10297,11 @@ Arguments replot_review_options(Arguments const& supplied, group_grow::ReplotRev
     same_limit(args.max_total_members_set, args.max_total_members, review.farm.max_total_members, "--max-total-members");
     args.k = review.farm.config.k; args.strength = review.farm.config.strength; args.headroom = review.farm.headroom;
     if (review.farm.config.fixed_meta) args.meta = review.farm.config.meta_group_override;
-    if (!review.owned_roots.empty())
+    if (args.temporary.empty() && !args.destination_temp_set)
     {
-        if (args.temporary.empty() && !args.destination_temp_set)
-        {
+        if (!review.owned_roots.empty())
             for (auto const& path : review.scratch_directories) args.temporary.push_back(file_io::native_path(path));
-            args.destination_temp = "off";
-        }
+        args.destination_temp = "off";
     }
     return args;
 }

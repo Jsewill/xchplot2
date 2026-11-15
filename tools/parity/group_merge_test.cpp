@@ -204,7 +204,21 @@ void test_destination_temporary()
         return pos2gpu::parse_group_options(int(command.size()), command.data());
     };
     auto const defaults = parse({"grow", "group.gplot"});
-    require(defaults.destination_temp == "off", "destination scratch was enabled by default");
+    require(defaults.destination_temp == "on" && !defaults.destination_temp_set,
+        "destination scratch was not enabled by default without explicit temporary directories");
+    auto const separate = parse({"grow", "group.gplot", "--temp-dir", "scratch"});
+    require(separate.destination_temp == "off" && !separate.destination_temp_set,
+        "explicit temporary storage also enabled destination scratch by default");
+    for (auto const& options : {std::initializer_list<char const*>{"grow", "group.gplot", "--temp-dir", "scratch", "--destination-temp", "on"},
+        {"grow", "group.gplot", "--destination-temp", "on", "--temp-dir", "scratch"}})
+    {
+        auto const selected = parse(options);
+        require(selected.destination_temp == "on" && selected.destination_temp_set && selected.temporary.size() == 1,
+            "explicit destination scratch depended on temporary-directory argument order");
+    }
+    auto const capped = parse({"grow", "group.gplot", "--construction", "external", "--temp-capacity-bytes", "1048576"});
+    require(capped.destination_temp == "on" && capped.temporary_capacity == mib,
+        "default destination scratch did not support external construction or a temporary cap");
     auto const ssd = parse({"grow", "group.gplot", "--destination-temp", "ssd"});
     auto const hdd = parse({"grow", "group.gplot", "--destination-temp", "hdd"});
     auto const on = parse({"grow", "group.gplot", "--destination-temp", "on",
@@ -221,7 +235,7 @@ void test_destination_temporary()
     catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "obsolete destination temporary policy spelling was accepted");
     rejected = false;
-    try { (void)parse({"grow", "group.gplot", "--temp-capacity-bytes", "1048576"}); }
+    try { (void)parse({"grow", "group.gplot", "--destination-temp", "off", "--temp-capacity-bytes", "1048576"}); }
     catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "temporary cap without enabled storage was accepted");
 
@@ -229,7 +243,9 @@ void test_destination_temporary()
     StorageDevice const fast{"fast-fs", {"nvme"}, true}, slow{"slow-fs", {"hdd"}, false, true},
         unknown{"unknown-fs", {}, false, false}, mixed{"mixed-fs", {"nvme", "hdd"}, false, false};
     add_destination_temporary(roots, defaults.destination_temp, "fast", fast);
-    require(roots.empty(), "default policy promoted a known SSD destination");
+    add_destination_temporary(roots, defaults.destination_temp, "slow", slow);
+    require(roots == std::vector<fs::path>{"fast", "slow"}, "default policy omitted destination scratch");
+    roots.clear();
     roots.emplace_back("explicit");
     for (auto const& [path, device] : std::array<std::pair<fs::path, StorageDevice>, 4>{
             std::pair{fs::path("fast"), fast}, {fs::path("slow"), slow}, {fs::path("unknown"), unknown},
@@ -3275,13 +3291,13 @@ void construction_selection()
     require(retained_two.merged.read == retained_four.merged.read &&
         retained_two.merged.write == retained_four.merged.write,
         "final reader retention still depended on compaction fan-in");
-    // A larger group still needs compaction. Price its copy savings against
-    // the smaller per-reader refill, independently of final reader retention.
+    // With sixteen retained readers, this larger group saves enough compaction
+    // to clear the switching margin. Price that against smaller reader refills.
     cfg.capacity_bytes = 512ull * 1024 * 1024 * 1024;
     cfg.merge_inputs = 2;
-    auto const hdd_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 256);
+    auto const hdd_two = construction_forecast(28, cfg, 10, 10000000000ull, 9, 384);
     cfg.merge_inputs = 4;
-    auto const hdd_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 256);
+    auto const hdd_four = construction_forecast(28, cfg, 10, 10000000000ull, 9, 384);
     ConstructionSample streaming;
     streaming.elapsed_ns = 2000000000; streaming.read_ns = streaming.write_ns = 1000000000;
     streaming.read_bytes = streaming.written_bytes = 100 * widest;
@@ -4861,6 +4877,21 @@ void replot_review_options(fs::path const& directory)
     reject("plan", {"--from-plan", ordinary.string(), "--harvester", profile.string()});
     auto const saved = parse("plan", {"--from-plan", origin.string(), "--harvester", profile.string(), "--compute", "off"});
     require(!saved.farming_profile, "saved migration did not reuse resource-only profile semantics");
+    {
+        ReplotReview review; review.memory_limit_bytes = saved.max_ram;
+        auto restored = grow_controller_test::replot_review_options(saved, review);
+        require(restored.destination_temp == "off" && restored.temporary.empty(),
+            "new scratch default widened a legacy migration review");
+        review.owned_roots.push_back({directory.string()});
+        review.scratch_directories.push_back((directory / "reviewed-scratch").string());
+        restored = grow_controller_test::replot_review_options(saved, review);
+        require(restored.destination_temp == "off" && restored.temporary == std::vector<fs::path>{directory / "reviewed-scratch"},
+            "new scratch default replaced the migration's reviewed temporary directories");
+        auto explicit_policy = saved; explicit_policy.destination_temp = "on"; explicit_policy.destination_temp_set = true;
+        restored = grow_controller_test::replot_review_options(explicit_policy, review);
+        require(restored.destination_temp == "on" && restored.temporary.empty(),
+            "saved migration option restoration discarded an explicit scratch policy");
+    }
     for (auto const* resource_input : {"{\"schema\":1,\"resources\":[],\"workloads\":[]}",
         "{\"schema_version\":1,\"kind\":\"farm-inventory\",\"farm_resources\":{}}"})
     {
@@ -4957,10 +4988,10 @@ void replot_destination_namespace(fs::path const& root)
         state.directories[0].identity_resources = 1;
         auto const body = farming_state_text(state), bytes = body + stream_state::digest(body) + '\n';
         stream_state::atomic_save(path / "grow-farm.plan", bytes, false);
-        auto legacy = args; legacy.target = path; legacy.plan_only = true;
+        auto legacy = args; legacy.target = path; legacy.plan_only = true; legacy.destination_temp = "on";
         auto saved = farming_arguments(legacy);
         require(saved.saved && saved.legacy_metadata.value_or(false) && saved.directories.front() == path &&
-            contents(path / "grow-farm.plan") == std::vector<uint8_t>(bytes.begin(), bytes.end()),
+            legacy.destination_temp == "off" && contents(path / "grow-farm.plan") == std::vector<uint8_t>(bytes.begin(), bytes.end()),
             "legacy saved job under a reserved-name ancestor could not be inspected unchanged");
         reject([&] { require_unmanaged_group_directory(path); }, "standalone writer inherited a legacy job's namespace exception");
         if (!nested)
@@ -6048,6 +6079,18 @@ void farming_preview_handoff(fs::path const& root)
     auto planned = farming_run(options, nullptr, job);
     require(planned->feasible() && fs::is_empty(a) && fs::is_empty(b), "saving preparation wrote destination files");
     {
+        auto shared = options; shared.destination_temp = "on"; shared.save_plan = directory / "scratch-review.plan";
+        auto source = farming_arguments(shared);
+        auto with_scratch = farming_run(shared, nullptr, source);
+        require(with_scratch->state.shared_scratch_possible, "new job did not retain its destination scratch authorization");
+        save_farming_review(shared, source, *with_scratch);
+        Arguments restored; restored.from_plan = shared.save_plan; restored.command = "plan";
+        restored.directory_farm = restored.plan_only = true; restored.max_ram = options.max_ram; restored.destination_temp = "on";
+        auto preview = farming_arguments(restored);
+        require(restored.destination_temp == "on" && farming_run(restored, nullptr, preview)->feasible(),
+            "saved preview lost its authorized destination scratch default");
+    }
+    {
         // An independent maximum-identity serialization places the metadata
         // exactly at an allocation boundary, then crosses it with one byte.
         // Key form and escaped owner/parent fields must never move that edge.
@@ -6096,8 +6139,9 @@ void farming_preview_handoff(fs::path const& root)
     auto inspect = [&]
     {
         Arguments args; args.command = "fill"; args.directory_farm = args.plan_only = true;
-        args.from_plan = path; args.max_ram = options.max_ram;
+        args.from_plan = path; args.max_ram = options.max_ram; args.destination_temp = "on";
         auto source = farming_arguments(args);
+        require(args.destination_temp == "off", "new scratch default widened a saved preview");
         return farming_run(args, nullptr, source);
     };
     auto reviewed = inspect();
@@ -6187,8 +6231,20 @@ void farming_preview_handoff(fs::path const& root)
     { refused = std::string(error.what()).find("conflicts with the current job policy") != std::string::npos; }
     require(refused, "fresh-job preview accepted a subsequently published job");
 
-    auto source_options = options; source_options.save_plan = directory / "saved-job-review.plan";
+    auto source_options = options; source_options.save_plan = directory / "saved-job-review.plan"; source_options.destination_temp = "on";
     auto source_job = farming_arguments(source_options);
+    require(source_options.destination_temp == "off", "new scratch default widened a saved job");
+    {
+        auto explicit_policy = options; explicit_policy.destination_temp = "on"; explicit_policy.destination_temp_set = true;
+        explicit_policy.save_plan.clear();
+        auto source = farming_arguments(explicit_policy);
+        require(explicit_policy.destination_temp == "on", "saved job discarded an explicit scratch policy");
+        bool rejected = false;
+        try { (void)farming_run(explicit_policy, nullptr, source); }
+        catch (std::runtime_error const& error)
+        { rejected = std::string(error.what()).find("temporary scratch was not authorized") != std::string::npos; }
+        require(rejected, "explicit scratch bypassed the saved job's existing update requirement");
+    }
     auto source_run = farming_run(source_options, nullptr, source_job);
     save_farming_review(source_options, source_job, *source_run);
     Arguments source_inspection; source_inspection.command = "fill";

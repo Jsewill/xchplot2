@@ -76,6 +76,7 @@ struct GroupOptions
     std::string tier = "auto";
     std::string member_storage = "compact";
     std::string construction = "auto";
+    // The CLI resolves its default after reading explicit temporary directories.
     std::string destination_temp = "off";
     bool destination_temp_set = false;
     bool io_overlap = true, generation_overlap = true, cache_release = true;
