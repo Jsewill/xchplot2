@@ -945,7 +945,7 @@ void batch_hashing()
         std::vector<uint64_t>{0, 0, 1, 31, range - 1, range + 5},
         std::vector<uint64_t>{2, 3, 3, range + 7, range + 9},
         std::vector<uint64_t>{4, 4, range + 1, range + 2}};
-    MemberBatchHash hash(raw.size());
+    MemberBatchHash hash(1);
     auto build = [&](size_t member, MemberBatchHash* cache)
     {
         CompactMemberBuilder builder(k, raw[member].size(), cache);
@@ -959,6 +959,9 @@ void batch_hashing()
     auto const first_digest = hash.digest_for(members);
     require(first_digest && *first_digest == framed_digest(std::span(raw).first(1)),
             "fused member hash changed the native logical framing");
+    hash.reserve(raw.size());
+    require(hash.size() == 1 && hash.digest_for(members) == first_digest,
+            "enlarging a hash cache changed its committed prefix");
     members.push_back(build(1, &hash));
     require(hash.digest_for(members) == std::optional(framed_digest(std::span(raw).first(2))) &&
             hash.digest_for(Members(members).subspan(0, 1)) == first_digest,
@@ -982,6 +985,7 @@ void batch_hashing()
         rejects([&] { failed.append(invalid); });
         rejects([&] { failed.finish(); });
         rejects([&] { hash.reset(); });
+        rejects([&] { hash.reserve(raw.size() + 1); });
         require(hash.size() == moved.size() && hash.digest_for(moved) == first_digest,
                 "failed construction committed a partial batch hash");
     }
@@ -996,6 +1000,7 @@ void batch_hashing()
     require(hash.digest_for(empty_member) == std::optional(framed_digest(empty_member)),
             "empty member size prefix was omitted from the fused hash");
     rejects([&] { MemberBatchHash::memory_bytes(size_t(UINT16_MAX) + 1); });
+    rejects([&] { hash.reserve(size_t(UINT16_MAX) + 1); });
     MemberBatchHash no_capacity(0);
     rejects([&] { CompactMemberBuilder builder(k, 0, &no_capacity); });
 }

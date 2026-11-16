@@ -422,6 +422,15 @@ public:
             uint64_t(capacity + 3) * pos2_sha256_state_bytes();
     }
     size_t size() const { return size_; }
+    void reserve(size_t capacity)
+    {
+        group_tools::require(!active_, "cannot resize an active group hash cache");
+        (void)memory_bytes(capacity);
+        if (capacity <= capacity_) return;
+        auto prefixes = std::make_unique<Prefix[]>(capacity);
+        for (size_t i = 0; i < size_; ++i) prefixes[i] = std::move(prefixes_[i]);
+        prefixes_ = std::move(prefixes); capacity_ = capacity;
+    }
     void reset() { truncate(0); }
     void truncate(size_t count)
     {

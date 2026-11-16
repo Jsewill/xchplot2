@@ -1824,9 +1824,9 @@ struct Producer
         peak = std::max(peak, actual);
         return values;
     }
-    void admit_engine(std::span<group_grow::Member const> values)
+    void admit_engine(std::span<group_grow::Member const> values, uint64_t other_retained = 0)
     {
-        uint64_t const planned = sum(sum(fixed, resident(values)), backend.retained());
+        uint64_t const planned = sum(sum(sum(fixed, resident(values)), other_retained), backend.retained());
         require(planned <= budget, "engine and retained producer buffers exceed --max-ram");
         peak = std::max(peak, planned);
     }
@@ -1839,6 +1839,7 @@ struct GroupPrefetch
     std::optional<Identity> identity;
     uint16_t capacity = 0;
     uint16_t first = 0;
+    uint16_t hash_first = 0;
     std::vector<group_grow::Member> members;
     std::unique_ptr<group_grow::MemberBatchHash> hash;
     uint64_t metadata_bytes = 0;
@@ -1849,13 +1850,25 @@ struct GroupPrefetch
               std::unique_ptr<group_grow::MemberBatchHash>& incoming_hash, size_t wanted, uint16_t cap)
     {
         size_t const count = std::min({members.size(), wanted, size_t(cap)});
+        if (capacity <= cap && count < members.size())
+        {
+            incoming.reserve(count);
+            for (size_t i = 0; i < count; ++i) incoming.push_back(std::move(members[i]));
+            members.erase(members.begin(), members.begin() + count);
+            first = uint16_t(first + count);
+            // A short staging prefix leaves the next batch and its hash owned
+            // here. A different split uses the engine's ordinary hash fallback.
+            if (count <= hash_first) hash_first = uint16_t(hash_first - count);
+            else { hash.reset(); hash_first = 0; }
+            return;
+        }
         if (capacity <= cap)
         {
             incoming = std::move(members); incoming.resize(count);
-            // A smaller cache cannot grow with the receiver's admitted batch.
-            // Hash uncached members through the engine's existing fallback.
-            if (capacity == cap) incoming_hash = std::move(hash);
-            if (incoming_hash) incoming_hash->truncate(count);
+            // The receiver's two-cache reservation covers the old and new
+            // prefix arrays while enlarging a smaller producer's hash cache.
+            if (!hash_first) incoming_hash = std::move(hash);
+            if (incoming_hash) { incoming_hash->reserve(cap); incoming_hash->truncate(count); }
         }
         else
         {
@@ -1878,19 +1891,33 @@ bool group_prefetch_enabled(Arguments const& args, Backend const& backend)
 
 size_t prefetch_group(GroupPrefetch& batch, Producer& producer, Identity const& identity,
     size_t owner, uint16_t capacity, uint64_t retained, std::string const& progress,
-    std::function<bool()> const& stop)
+    std::function<bool()> const& stop, uint16_t hash_first = 0)
 {
     producer.fill_stop = Producer::FillStop::requested;
-    if (!capacity || !batch.members.empty() || !group_prefetch_enabled(producer.args, producer.backend)) return 0;
-    if (!producer.fits(0, retained)) { producer.fill_stop = Producer::FillStop::memory; return 0; }
+    if (!capacity || !group_prefetch_enabled(producer.args, producer.backend)) return 0;
+    if (!batch.members.empty() && (batch.owner != owner || !batch.identity || batch.first || batch.capacity != capacity)) return 0;
+    if (batch.members.size() >= capacity) { producer.fill_stop = Producer::FillStop::full; return 0; }
+    if (!producer.fits(uint16_t(batch.members.size()), sum(retained, batch.resident_bytes())))
+    { producer.fill_stop = Producer::FillStop::memory; return 0; }
     if (!group_prefetch_enabled(producer.args, producer.backend)) return 0;
-    batch.owner = owner; batch.identity = identity; batch.capacity = capacity;
-    if (!has_compute(producer.args)) batch.hash = std::make_unique<group_grow::MemberBatchHash>(capacity);
-    batch.members.reserve(capacity);
-    require(batch.members.capacity() <= capacity, "next group batch exceeds admitted metadata capacity");
-    auto const added = producer.fill(batch.members, 0, capacity, retained, batch.hash.get(), nullptr,
-        progress, stop);
-    if (!added) batch.clear();
+    if (batch.members.empty())
+    {
+        batch.owner = owner; batch.identity = identity; batch.capacity = capacity;
+        batch.hash_first = hash_first < capacity ? hash_first : 0;
+        if (!has_compute(producer.args)) batch.hash = std::make_unique<group_grow::MemberBatchHash>(capacity);
+        batch.members.reserve(capacity);
+        require(batch.members.capacity() <= capacity, "next group batch exceeds admitted metadata capacity");
+    }
+    else
+    {
+        same_identity(*batch.identity, identity);
+    }
+    size_t added = 0;
+    if (batch.members.size() < batch.hash_first)
+        added = producer.fill(batch.members, 0, batch.hash_first, retained, nullptr, nullptr, progress, stop);
+    if (batch.members.size() >= batch.hash_first)
+        added += producer.fill(batch.members, 0, capacity, retained, batch.hash.get(), nullptr, progress, stop);
+    if (batch.members.empty()) batch.clear();
     return added;
 }
 
@@ -3644,7 +3671,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                   uint64_t external_bytes, std::unique_ptr<Backend>& backend, group_grow::ConstructionHistories* histories = nullptr,
                   std::optional<group_grow::ExternalEngine::Inspection> recovery = {}, Output const& auxiliary = {},
                   GroupPrefetch* inherited = nullptr,
-                  std::function<uint32_t(uint64_t, uint16_t, std::future<group_grow::Result>&)> const& prefetch_next = {},
+                  std::function<uint32_t(uint64_t, uint16_t, uint64_t, std::function<bool()> const&)> const& prefetch_next = {},
                   GroupSuccessor* successor = nullptr,
                   std::shared_ptr<std::recursive_mutex> const& target_gate = {},
                   PublishedRetirements const& published_retirements = {})
@@ -3981,22 +4008,29 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     uint64_t observed_member_bytes = metrics.members ?
         std::max(uint64_t(1), metrics.final_bytes / metrics.members) : 0;
     uint64_t observed_member_storage = 0;
-    std::vector<group_grow::Member> prefetched;
-    std::unique_ptr<group_grow::MemberBatchHash> prefetched_hash;
+    GroupPrefetch prefetched;
     group_grow::ControllerWake consumed;
     if (inherited && !inherited->members.empty())
-        inherited->take(prefetched, prefetched_hash, maximum, batch_cap);
+    {
+        if (inherited->capacity <= batch_cap)
+        {
+            prefetched = std::move(*inherited); inherited->clear();
+            if (prefetched.hash) prefetched.hash->reserve(batch_cap);
+        }
+        else inherited->take(prefetched.members, prefetched.hash, maximum, batch_cap);
+        prefetched.capacity = batch_cap;
+    }
     while (metrics.members < maximum)
     {
         check_cancel(args);
         engine.refresh_history();
         if (auto selected = automatic_selection(engine, producer, maximum, batch_cap, engine_bytes,
-                0, observed_member_storage, true, resident(prefetched)))
+                0, observed_member_storage, true, prefetched.resident_bytes()))
         {
             engine_bytes = selected->engine_bytes; producer.fixed = fixed = selected->fixed;
             engine.retune(selected->config); engine.selected_batch = selected->batch;
             if (selected->merged) engine.select_merged(detailed_output(args));
-            producer.admit_engine(prefetched);
+            producer.admit_engine(prefetched.members);
             metrics.engine_reserved_bytes = std::max(metrics.engine_reserved_bytes, fixed);
         }
         uint64_t selected_batch = engine.selected_batch;
@@ -4006,7 +4040,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         uint64_t wanted = std::min({args.batch, uint64_t(batch_cap), uint64_t(maximum - metrics.members)});
         if (selected_batch) wanted = std::min(wanted, selected_batch);
         // Prefetched external members still obey the final-batch boundary.
-        if (prefetched.empty() || engine.external)
+        if (prefetched.members.empty() || engine.external)
             wanted = construction_batch_members(engine, maximum, uint16_t(wanted), !input_required && !has_compute(args));
         if (!engine.is_staging() && observed_member_bytes && metrics.final_bytes < capacity)
         {
@@ -4014,8 +4048,9 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             // The extra candidate makes the boundary exact after a fit estimate.
             wanted = std::min(wanted, remaining / observed_member_bytes + 1);
         }
-        auto incoming = std::move(prefetched);
-        auto hash = std::move(prefetched_hash);
+        std::vector<group_grow::Member> incoming;
+        std::unique_ptr<group_grow::MemberBatchHash> hash;
+        prefetched.take(incoming, hash, size_t(wanted), batch_cap);
         if (compact && !has_compute(args) && (!engine.is_staging() || metrics.members + wanted == maximum) && !hash && incoming.empty())
             hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
         MemberLease borrowed;
@@ -4023,9 +4058,6 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         std::unique_ptr<group_grow::ExternalEngine::PreparedInput> prepared_input;
         uint16_t contribution_members = 0;
         uint16_t prepared_members = 0;
-        prefetched = std::vector<group_grow::Member>{};
-        if (incoming.size() > wanted) incoming.resize(size_t(wanted));
-        if (hash) hash->truncate(incoming.size());
         (void)producer.can_borrow(); // Initialize the backend before reporting it.
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (backend->mode == "pool" && engine.external && engine.can_append() && incoming.empty())
@@ -4066,10 +4098,10 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         {
             incoming.reserve(wanted);
             require(incoming.capacity() <= batch_cap, "member container exceeds admitted capacity");
-            metrics.generated_members += producer.fill(incoming, uint16_t(metrics.members), size_t(wanted), 0,
+            metrics.generated_members += producer.fill(incoming, uint16_t(metrics.members), size_t(wanted), prefetched.resident_bytes(),
                 hash.get(), &borrowed, fixture ? "loading fixture member " : "generating " + backend->mode + " member ");
         }
-        producer.admit_engine(incoming);
+        producer.admit_engine(incoming, prefetched.resident_bytes());
         std::optional<group_grow::AppendResult> appended;
         uint64_t accepted_member_storage = 0;
         while (!incoming.empty() || contribution_members || prepared_members)
@@ -4095,14 +4127,16 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             bool const recycle = !incoming.empty() && (terminal ||
                 (next < maximum && producer.overlap_enabled() && backend->mode == "gpu")) &&
                 std::all_of(incoming.begin(), incoming.end(), [](auto const& member) { return member.compact(); });
+            std::atomic<bool> packing_started{false};
             engine.consumed(recycle ? std::function<void(uint64_t)>([&, forward](uint64_t first)
                 {
                     for (auto& member : incoming)
                         if (forward) member.release_before(first); else member.release_after(first);
+                    if (terminal) packing_started.store(true, std::memory_order_release);
                     consumed.notify();
                 }) : std::function<void(uint64_t)>{});
             if (!prepared_input && producer.overlap_enabled() && backend->mode != "cpu" && next < maximum &&
-                (recycle || producer.fits(uint16_t(next), received)) && producer.overlap_enabled())
+                (recycle || producer.fits(uint16_t(next), sum(received, prefetched.resident_bytes()))) && producer.overlap_enabled())
             {
                 // Keep GPU use on its constructing thread. The CPU consumer
                 // borrows immutable members until get (also drained on unwind).
@@ -4111,9 +4145,13 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                     return contribution_input ? engine.append(*contribution_input, contribution_members) :
                         engine.append(incoming, hash.get());
                 });
-                if (need_prefetch_hash) prefetched_hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
-                prefetched.reserve(prefetch_count);
-                require(prefetched.capacity() <= batch_cap, "member container exceeds admitted capacity");
+                if (prefetched.members.empty())
+                {
+                    prefetched.capacity = batch_cap; prefetched.first = uint16_t(next);
+                    if (need_prefetch_hash) prefetched.hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
+                }
+                prefetched.members.reserve(prefetch_count);
+                require(prefetched.members.capacity() <= batch_cap, "member container exceeds admitted capacity");
                 // Stop prefetching as soon as assembly finishes. The producer
                 // also drains its final pending member before either hash or
                 // destination batch can be read on this thread.
@@ -4122,10 +4160,10 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 do
                 {
                     auto const wake = consumed.generation();
-                    generated += producer.fill(prefetched, uint16_t(next), prefetch_count,
-                        recycle ? resident(incoming) : received, prefetched_hash.get(), nullptr,
+                    generated += producer.fill(prefetched.members, uint16_t(next), prefetch_count,
+                        recycle ? resident(incoming) : received, prefetched.hash.get(), nullptr,
                         "prefetching " + backend->mode + " member ", done);
-                    if (!recycle || prefetched.size() == prefetch_count || done()) break;
+                    if (!recycle || prefetched.members.size() >= prefetch_count || done()) break;
                     check_cancel(args);
                     auto const begin = std::chrono::steady_clock::now();
                     consumed.wait_for(wake, std::chrono::milliseconds(50));
@@ -4134,6 +4172,25 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 metrics.generated_members += generated;
                 if (generated) ++metrics.generation_overlap_batches;
                 appended = join_consumer(pending, fill_wait_reason(producer.fill_stop));
+            }
+            else if (terminal && recycle && prefetch_next && group_prefetch_enabled(args, *backend))
+            {
+                auto pending = std::async(std::launch::async, [&]
+                { return engine.append(incoming, hash.get(), false, true); });
+                auto done = [&] { return pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready; };
+                uint32_t reason = 0;
+                while (!done())
+                {
+                    auto const wake = consumed.generation();
+                    if (packing_started.load(std::memory_order_acquire))
+                        reason = prefetch_next(producer.fixed, batch_cap, resident(incoming), done);
+                    if (done() || (reason & wait_bit(ControllerWait::batch_full))) break;
+                    check_cancel(args);
+                    auto const begin = std::chrono::steady_clock::now();
+                    consumed.wait_for(wake, std::chrono::milliseconds(50));
+                    metrics.controller_waits.add(reason, group_grow::elapsed_ns(begin));
+                }
+                appended = join_consumer(pending, reason);
             }
             else appended = prepared_input ? engine.append(*prepared_input, prepared_members) :
                 contribution_input ? engine.append(*contribution_input, contribution_members) : engine.append(incoming, hash.get(), false, next == maximum);
@@ -4147,7 +4204,6 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             metrics.attempted_peak_bytes = appended->attempted_peak_bytes;
             if (appended->accepted) break;
             prefetched.clear(); // Rejected candidates change the next member index.
-            prefetched_hash.reset();
             if (detailed_output(args)) std::cerr << "candidate batch rejected: " << appended->reason << '\n';
             if (prepared_input)
             {
@@ -4228,7 +4284,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             {
                 unsigned const spare = engine.staging_workers(engine.config.workers);
                 successor_ready = prepare_successor(*successor, args, *backend, *scratch_pool, 1,
-                    producer.fixed, resident(prefetched), spare, target_gate, fixture, histories, engine.demand_history, released_bytes, cpu_scheduler);
+                    producer.fixed, prefetched.resident_bytes(), spare, target_gate, fixture, histories, engine.demand_history, released_bytes, cpu_scheduler);
                 producer.fixed = sum(producer.fixed, successor->pool_growth);
                 if (successor_ready) engine.admit_staging_workers(engine.config.workers, spare);
             }
@@ -4237,7 +4293,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     if (successor_ready)
     {
         auto pending = std::async(std::launch::async, finish);
-        uint32_t const reason = stage_successor(*successor, args, *backend, resident(prefetched), [&]
+        uint32_t const reason = stage_successor(*successor, args, *backend, prefetched.resident_bytes(), [&]
             { return pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }, fixture);
         successor->close();
         finished = join_consumer(pending, reason);
@@ -4249,7 +4305,8 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         auto pending = std::async(std::launch::async, finish);
         // Device generation stays on the constructing thread; get also joins
         // final packing before engine ownership or scratch reservations change.
-        uint32_t const reason = prefetch_next(producer.fixed, batch_cap, pending);
+        uint32_t const reason = prefetch_next(producer.fixed, batch_cap, 0, [&]
+            { return pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
         finished = join_consumer(pending, reason);
     }
     else finished = finish();
@@ -4751,9 +4808,9 @@ int rollover(Arguments const& args, Keys const& keys)
         current_args.resume = existing;
         auto const next_members = args.max_total_members - sum(prior_members, maximum);
         auto const next_maximum = uint16_t(std::min(args.group_members, next_members));
-        std::function<uint32_t(uint64_t, uint16_t, std::future<group_grow::Result>&)> prefetch_next;
+        std::function<uint32_t(uint64_t, uint16_t, uint64_t, std::function<bool()> const&)> prefetch_next;
         if (ordinal + 1 < args.max_groups && next_maximum && maximum == args.group_members)
-            prefetch_next = [&](uint64_t current_fixed, uint16_t cap, std::future<group_grow::Result>& pending)
+            prefetch_next = [&](uint64_t current_fixed, uint16_t cap, uint64_t retained, std::function<bool()> const& done)
             {
                 auto const identity = keys.derive(ordinal + 1);
                 auto const next_config = configuration(args, active_capacity, sum(metadata, histories.memory_bytes()));
@@ -4761,16 +4818,19 @@ int rollover(Arguments const& args, Keys const& keys)
                 auto memory = [&](uint16_t count) { return prefetch_memory(args, identity, next_config, count, nonrotating); };
                 Producer producer{identity, nullptr, *backend, args, args.max_ram,
                     sum(current_fixed, memory(1)), current_fixed};
-                if (!producer.fits(0, 0)) return wait_bit(ControllerWait::producer_memory);
+                if (!producer.fits(uint16_t(prefetched.members.size()), sum(retained, prefetched.resident_bytes())))
+                    return wait_bit(ControllerWait::producer_memory);
                 uint64_t const generation = std::max(producer.next_peak(0), backend->retained());
-                uint16_t const wanted = admitted_batch_cap(uint16_t(std::min({args.batch, uint64_t(cap), uint64_t(next_maximum)})),
+                uint16_t const ceiling = uint16_t(std::min({args.batch, uint64_t(cap), uint64_t(next_maximum)}));
+                uint16_t const wanted = prefetched.members.empty() ? admitted_batch_cap(ceiling,
                     1, args.max_ram - std::min(args.max_ram, sum(current_fixed, generation)),
-                    member_storage_bound(args, identity), memory);
+                    member_storage_bound(args, identity), memory) : prefetched.capacity;
                 if (!wanted) return wait_bit(ControllerWait::engine_memory);
                 producer.fixed = sum(current_fixed, memory(wanted));
-                auto const generated = prefetch_group(prefetched, producer, identity, ordinal + 1, wanted, 0,
-                    "prefetching next group " + backend->mode + " member ", [&]
-                    { return pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+                uint16_t const first_batch = args.construction == "auto" || args.construction == "external" ?
+                    group_grow::construction_initial_batch(next_maximum, ceiling) : 0;
+                auto const generated = prefetch_group(prefetched, producer, identity, ordinal + 1, wanted, retained,
+                    "prefetching next group " + backend->mode + " member ", done, first_batch);
                 if (generated)
                     prefetched.metadata_bytes = sum(product(wanted, 2 * sizeof(group_grow::Member)),
                         batch_hash_bytes(args, wanted));
@@ -12586,6 +12646,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         Work work = Work::append;
         bool select_merged = false;
         bool recycle_members = false;
+        bool finish_with_members = false;
+        std::atomic<bool> resident_packing{false};
+        bool packing() const
+        { return work == Work::finish || resident_packing.load(std::memory_order_acquire); }
         Producer::FillStop fill_stop = Producer::FillStop::requested;
         std::vector<group_grow::Member> members;
         std::unique_ptr<group_grow::ExternalEngine::PreparedInput> prepared_input;
@@ -13752,20 +13816,26 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         d.workers = count;
         task->original_member_bytes = resident(task->members);
+        task->finish_with_members = d.engine->external && d.engine->external->can_finish_with_members();
         bool const terminal = d.engine->external &&
             ((task->work == Work::recover && d.engine->needs_regeneration()) ||
                 (task->work == Work::append && (!farm || !farm->state.capacity_fill) &&
-                    d.metrics.members + task->members.size() == d.maximum && d.engine->external->can_finish_with_members()));
+                    d.metrics.members + task->members.size() == d.maximum && task->finish_with_members));
         task->recycle_members = !task->select_merged &&
             !task->members.empty() && (terminal || (task->work == Work::append &&
                 d.metrics.members + task->members.size() < d.maximum &&
                 group_prefetch_enabled(args, *backend) && backend->mode == "gpu")) &&
             std::all_of(task->members.begin(), task->members.end(), [](auto const& member) { return member.compact(); });
         bool const forward = d.engine->is_staging();
-        d.engine->consumed(task->recycle_members ? std::function<void(uint64_t)>([task, &wake, forward](uint64_t first)
+        bool const complete_batch = terminal && d.metrics.members + task->members.size() == d.maximum;
+        d.engine->consumed(task->recycle_members ? std::function<void(uint64_t)>([task, &wake, forward, complete_batch](uint64_t first)
             {
                 for (auto& member : task->members)
                     if (forward) member.release_before(first); else member.release_after(first);
+                // The initial packing checkpoint is durable before consumed
+                // input is released. Publish that phase without sharing the
+                // worker's mutable engine state with the controller.
+                if (complete_batch) task->resident_packing.store(true, std::memory_order_release);
                 wake.notify();
             }) : std::function<void(uint64_t)>{});
         d.ready = writers[d.writer]->submit([&, task]
@@ -13827,17 +13897,20 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #endif
         if (stream_cohort.calibrating()) return false;
         if (d.successor || d.staging_successor) return false;
+        if (!prefetched.members.empty() && (backend->mode != "gpu" || prefetched.members.size() == prefetched.capacity)) return false;
         bool const rollover = farm && d.engine && d.ready.valid() && d.pending &&
-            d.pending->work == Work::finish && d.metrics.members == d.maximum &&
+            d.pending->packing() && d.metrics.members +
+                (d.pending->resident_packing.load(std::memory_order_acquire) ? d.pending->members.size() : 0) == d.maximum &&
             d.metrics.stop_reason.empty();
-        if (!prefetched.members.empty() || (!rollover && (d.guard || d.engine || d.pending)) ||
+        if ((!prefetched.members.empty() && (prefetched.owner != d.owner || prefetched.first)) ||
+            (!rollover && (d.guard || d.engine || d.pending)) ||
             !group_prefetch_enabled(args, *backend)) return false;
         auto identity = d.requested;
         uint16_t maximum = d.maximum;
         if (rollover)
         {
             auto const& lane = farm->lanes[d.owner];
-            uint64_t const members = sum(lane.completed_members, d.metrics.members);
+            uint64_t const members = sum(lane.completed_members, d.maximum);
             if (lane.ordinal + 1 >= args.max_groups || members >= args.max_total_members) return false;
             maximum = uint16_t(std::min<uint64_t>(farm->file_maximum(d.owner, lane.ordinal + 1),
                 args.max_total_members - members));
@@ -13847,7 +13920,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto const packing = std::find_if(destinations.begin(), destinations.end(), [&](auto const& other)
         {
             return other->writer == d.writer && other->ready.valid() && other->pending &&
-                other->pending->work == Work::finish;
+                other->pending->packing();
         });
         if (packing == destinations.end()) return false;
         if (std::any_of(destinations.begin(), destinations.end(), [](auto const& other)
@@ -13857,20 +13930,27 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (done()) return false;
         check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
-        uint64_t const held = retained();
+        uint64_t const held = retained() - prefetched.resident_bytes();
+        uint64_t const base = fixed - prefetched.metadata_bytes;
         auto options = args; options.workers = (*packing)->workers;
-        auto cfg = configuration(options, d.metrics.capacity_bytes, fixed, cpu_scheduler, backend->remote_encoder());
+        auto cfg = configuration(options, d.metrics.capacity_bytes, base, cpu_scheduler, backend->remote_encoder());
         cfg.path_bindings = path_bindings;
         auto future_memory = [&](uint16_t count)
         { return prefetch_memory(args, identity, cfg, count, devices[d.owner].nonrotating); };
         Producer producer{identity, nullptr, *backend, args, args.max_ram,
-            sum(fixed, future_memory(1)), fixed};
-        if (!producer.fits(0, held)) return false;
+            sum(base, future_memory(1)), base};
+        if (!producer.fits(uint16_t(prefetched.members.size()), sum(held, prefetched.resident_bytes()))) return false;
         uint64_t const generation = std::max(producer.next_peak(0), backend->retained());
-        uint64_t const occupied = sum(sum(fixed, held), generation);
+        bool const resident_pack = backend->mode == "gpu" &&
+            (*packing)->pending->resident_packing.load(std::memory_order_acquire);
+        uint16_t wanted = uint16_t(std::min<uint64_t>(args.batch, maximum));
+        uint64_t const released = resident_pack ? resident((*packing)->pending->members) : 0;
+        if (resident_pack)
+            wanted = std::min(wanted, (*packing)->batch_cap);
+        uint64_t const occupied = sum(sum(base, held - released), generation);
         if (occupied >= args.max_ram) return false;
-        uint16_t cap = admitted_batch_cap(uint16_t(std::min<uint64_t>(args.batch, maximum)), 1,
-            args.max_ram - occupied, member_storage_bound(args, identity), future_memory);
+        uint16_t cap = prefetched.members.empty() ? admitted_batch_cap(wanted, 1,
+            args.max_ram - occupied, member_storage_bound(args, identity), future_memory) : prefetched.capacity;
         if (!cap) return false;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         uint64_t pool_receive = 0;
@@ -13882,7 +13962,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             pool_receive = producer.pool_receive_bytes(0, cap);
         }
 #endif
-        producer.fixed = sum(fixed, future_memory(cap));
+        producer.fixed = sum(base, future_memory(cap));
         uint16_t previous_reservation = 0;
         if (farm)
         {
@@ -13919,8 +13999,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return true;
         }
 #endif
+        bool const initial = prefetched.members.empty();
+        uint16_t const first_batch = args.construction == "auto" || args.construction == "external" ?
+            group_grow::construction_initial_batch(maximum, wanted) : 0;
         auto const generated = prefetch_group(prefetched, producer, identity, d.owner, cap, held,
-            file_io::path_text(d.path) + ": prefetching " + backend->mode + " member ", done);
+            file_io::path_text(d.path) + ": prefetching " + backend->mode + " member ", done, first_batch);
         if (!generated)
         {
             if (farm)
@@ -13930,9 +14013,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             return false;
         }
-        prefetched.metadata_bytes = batch_metadata(cap);
+        if (initial) { prefetched.metadata_bytes = batch_metadata(cap); fixed = sum(fixed, prefetched.metadata_bytes); }
         (*packing)->prefetch_wait_reason = fill_wait_reason(producer.fill_stop);
-        fixed = sum(fixed, prefetched.metadata_bytes);
         d.metrics.generated_members = sum(d.metrics.generated_members, generated);
         ++total.drive_overlap_batches; ++total.generation_overlap_batches;
         total.generation_overlap_members = sum(total.generation_overlap_members, producer.overlap_members);
@@ -13961,7 +14043,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         for (auto const& other : destinations) check_guard(*other);
         uint16_t const maximum = farm ? std::min(d.maximum, farm->maximum(args, d.owner)) : d.maximum;
         if (first >= maximum) return false;
-        uint64_t const extra = prefetched.members.empty() ? batch_metadata(d.batch_cap) : 0;
+        uint64_t const metadata = batch_metadata(d.batch_cap);
+        uint64_t const extra = metadata - std::min(metadata, prefetched.metadata_bytes);
         Producer producer{d.requested, nullptr, *backend, args, args.max_ram, sum(fixed, extra), fixed};
         uint64_t const generation = std::max(producer.next_peak(first), backend->retained());
         uint64_t const occupied = sum(producer.fixed, generation);
@@ -13969,8 +14052,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const slots = std::max(size_t(1), active);
         size_t wanted = size_t(std::min({args.batch, uint64_t(d.batch_cap), uint64_t(maximum - first),
             std::max<uint64_t>(1, sum((args.max_ram - occupied) / member_storage_bound(args, d.requested), 1) / slots)}));
-        if ((!farm || !farm->state.capacity_fill) && d.engine->external &&
-            d.engine->external->can_finish_with_members() && maximum != UINT16_MAX)
+        if ((!farm || !farm->state.capacity_fill) && d.pending->finish_with_members && maximum != UINT16_MAX)
             wanted = group_grow::construction_initial_batch(uint16_t(maximum - first), uint16_t(wanted));
         if (prefetched.members.size() >= wanted) return false;
         uint64_t const held = retained() - prefetched.resident_bytes();
@@ -13978,12 +14060,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (prefetched.members.empty())
         {
             prefetched.owner = d.owner; prefetched.identity = d.requested; prefetched.first = first;
-            prefetched.capacity = d.batch_cap; prefetched.metadata_bytes = extra;
             if (!has_compute(args)) prefetched.hash = std::make_unique<group_grow::MemberBatchHash>(d.batch_cap);
-            prefetched.members.reserve(wanted);
-            require(prefetched.members.capacity() <= d.batch_cap, "prefetched batch exceeds admitted metadata capacity");
-            fixed = sum(fixed, extra);
         }
+        else if (prefetched.hash) prefetched.hash->reserve(d.batch_cap);
+        prefetched.members.reserve(wanted);
+        require(prefetched.members.capacity() <= d.batch_cap, "prefetched batch exceeds admitted metadata capacity");
+        prefetched.capacity = d.batch_cap; prefetched.metadata_bytes = metadata;
+        fixed = sum(fixed, extra);
         auto const generated = producer.fill(prefetched.members, first, wanted, held,
             prefetched.hash.get(), nullptr, file_io::path_text(d.path) + ": prefetching " + backend->mode + " member ", done);
         if (prefetched.members.empty()) { fixed -= prefetched.metadata_bytes; prefetched.clear(); }
@@ -14513,8 +14596,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 require(first == prefetched.first && prefetched.identity, "prefetched destination batch lost its member index");
                 same_identity(d.requested, *prefetched.identity);
-                fixed -= prefetched.metadata_bytes;
+                uint64_t const metadata = prefetched.metadata_bytes;
                 prefetched.take(task.members, task.hash, wanted, d.batch_cap);
+                fixed -= metadata - prefetched.metadata_bytes;
                 producer.fixed = fixed;
             }
             uint64_t const other_held = retained() - resident(task.members);

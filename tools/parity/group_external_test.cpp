@@ -516,7 +516,21 @@ void bulk_checkpoints(fs::path const& root, Members input, ExternalConfig ext)
         try { (void)ExternalEngine::inspect(path.string(), fs::file_size(checkpoint) * 8); }
         catch (std::exception const&) { rejected = true; }
         require(rejected, "small manifest inspection omitted its summary hashing buffer admission");
+#ifdef GROW_TEST_WRAP_PWRITE
+        {
+            std::lock_guard lock(summary_read_observer.mutex); auto& state = summary_read_observer;
+            state.prefix = ".xchplot2-external-" + ownership_token(path) + "/run-1-";
+            state.bytes = state.maximum = 0; state.armed = true;
+        }
+#endif
         require(engine.append(input.subspan(1, 1)).accepted, "bulk summary replacement rejected");
+#ifdef GROW_TEST_WRAP_PWRITE
+        {
+            std::lock_guard lock(summary_read_observer.mutex); auto& state = summary_read_observer;
+            state.armed = false;
+            require(!state.bytes, "live staging reread its retained summary");
+        }
+#endif
         require(std::ranges::none_of(old, [](fs::path const& part) { return fs::exists(part); }) &&
             !summary_segments(path, ext, 3).empty(), "durable manifest did not replace and reclaim its prior summary generation");
     }
@@ -559,6 +573,24 @@ void bulk_checkpoints(fs::path const& root, Members input, ExternalConfig ext)
         Engine reference(expected.string(), config(), false, initial_identity()); reference.confirm_identity();
         require(reference.append(input.subspan(0, 1)).accepted && contents(tight_path) == contents(expected),
             "summary-pair capacity rejection changed its acknowledged ordinary prefix");
+    }
+    {
+        auto const cached = root / "bulk-cached-retry";
+        ExternalEngine engine(cached.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        require(engine.append(input.subspan(0, 1)).accepted, "cached retry prefix rejected");
+        auto const record_path = fs::path(cached.string() + ".external") / "checkpoint";
+        auto const record = contents(record_path);
+        auto const raw = input[1].raw(); std::vector<uint64_t> damaged(raw.begin(), raw.end());
+        uint64_t const last = (chunks - 1) << (18 + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+        damaged.erase(std::lower_bound(damaged.begin(), damaged.end(), last), damaged.end());
+        std::vector<Member> invalid; invalid.emplace_back(std::move(damaged)); invalid.back().compact(18);
+        bool rejected = false;
+        try { (void)engine.append(invalid); } catch (std::runtime_error const&) { rejected = true; }
+        require(rejected && engine.committed_member_count() == 1 && contents(record_path) == record,
+            "failed cached planning changed the durable summary");
+        require(engine.append(input.subspan(1, 1)).accepted, "cached planning retry rejected valid input");
+        engine.finish(); require(engine.release_completed() && contents(cached) == contents(path),
+            "cached planning retry reused a partially changed summary");
     }
     // Planning changes only an operation-local candidate. A read or late
     // summary failure must preserve the saved prefix and allow the same

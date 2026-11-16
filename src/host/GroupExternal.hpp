@@ -332,6 +332,7 @@ private:
     std::vector<Run> runs_;
     Run summary_run_, pending_summary_;
     std::array<uint8_t, 32> summary_digest_{};
+    std::vector<Summary> summary_cache_;
     uint64_t remaining_metadata_bytes_ = 0;
     uint64_t index_bytes_ = 0, packing_source_bytes_ = 0, packing_work_ = 0, packet_count_ = 0;
     uint32_t index_carry_bits_ = 0, index_carry_value_ = 0;
@@ -463,6 +464,7 @@ private:
                              external_detail::IOContext context = {}, CodecScheduler* scheduler = nullptr,
                              ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
     void write_summary(std::span<Summary const> summaries);
+    std::vector<Summary> take_summary();
     bool reserve(Run& run, uint64_t bytes, char const* role = "contribution");
     void discard(Run const& run);
     void incoming_regions(Members members, uint64_t chunk, std::vector<size_t>& cursors,
@@ -967,8 +969,8 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     // input record while rebuilding persistent metadata. Keep
     // the existing recovery/inspection admission of a record within one eighth
     // of the grant, including descriptor-vector capacity and parser temporaries.
-    // Staging additionally owns one candidate summary. Exact sizing retains
-    // one canonical size field; committed summaries remain in scratch.
+    // Staging owns one cached or operation-local candidate summary. Exact sizing retains
+    // one canonical size field; durable summaries remain in scratch.
     uint64_t const metadata = multiply(checkpoint_buffer_bytes(external), 8);
     if (phase == MemoryPhase::publication) return metadata;
     uint64_t const digest_memory = member_digest_words * sizeof(uint64_t) + 4096;
@@ -1099,6 +1101,26 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
     }
     std::array<uint8_t, 32> actual{}; sha256_sum(&context, actual.data());
     require(position == run.bytes && actual == checksum, "external summary checksum or coverage changed");
+}
+inline std::vector<ExternalEngine::Summary> ExternalEngine::take_summary()
+{
+    if (!summary_cache_.empty())
+    {
+        for (auto const& segment : summary_run_.segments)
+        {
+            auto const path = segment_path(summary_run_, segment);
+            require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp,
+                "external cached summary changed");
+        }
+        // The candidate owns this allocation until its checkpoint commits.
+        // Rejection or failure discards it; a retry reloads the durable table.
+        return std::exchange(summary_cache_, {});
+    }
+    std::vector<Summary> summaries(size_t(PlotGroupFile::getChunkCountForK(identity_.header.k)), Summary{});
+    if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
+        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_,
+        io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
+    return summaries;
 }
 inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
 {
@@ -2521,10 +2543,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
-    std::vector<Summary> summaries(size_t(chunks), Summary{});
-    if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
-        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_,
-        io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
+    auto summaries = take_summary();
     auto codec = std::make_unique<ChunkCodec>(identity_.header.k, config_.codec_bytes, config_.cpu_scheduler);
     std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
     std::vector<EncodedChunk> parts; parts.reserve(UINT16_MAX);
@@ -2630,7 +2649,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     for (auto const& summary : summaries) packing_source_bytes_ = std::max(packing_source_bytes_, summary.bytes);
     packing_work_ = ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, 0);
     identity_.pending = true; identity_.target_members = members_; identity_.pending_peak_bytes = peak;
-    save("external-run", summaries); std::vector<Summary>().swap(summaries);
+    save("external-run", summaries); summary_cache_ = std::move(summaries);
     release_contributions(); encoding.finish(); balance();
     config_.check_running();
     return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
@@ -2656,9 +2675,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
-    std::vector<Summary> summaries(size_t(chunks), Summary{});
-    if (members_) read_summary(roots_, token_, summary_run_, summary_digest_,
-        {reinterpret_cast<uint8_t*>(summaries.data()), summaries.size() * sizeof(Summary)}, &stats_, io_context("checkpoint_summary", &execution_scratch_), config_.cpu_scheduler.get(), nullptr, &config_);
+    auto summaries = take_summary();
     std::vector<size_t> cursors(count, 0);
     std::vector<FragmentRegion> regions(count);
     std::unique_ptr<InputReader> input_reader;
@@ -2986,7 +3003,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     ++packet_count_; for (auto const& summary : summaries) packing_source_bytes_ = std::max(packing_source_bytes_, summary.bytes);
     packing_work_ = ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, 0);
     identity_.pending = true; identity_.target_members = members_; identity_.pending_peak_bytes = peak;
-    save("external-run", summaries); std::vector<Summary>().swap(summaries);
+    save("external-run", summaries); summary_cache_ = std::move(summaries);
     if (input) release_prepared();
     encoding.finish(); balance();
     config_.check_running();
@@ -3051,6 +3068,7 @@ inline void ExternalEngine::start_packing()
     require(confirmed_, "external packing requires confirmed identity"); check_paths(); validate_runs();
     if (phase_ == Phase::stage && members_)
     {
+        std::vector<Summary>().swap(summary_cache_);
         PhaseTimer packing(stats_, WorkPhase::pack, config_.progress);
         require(required_memory() <= config_.memory_limit_bytes, "external packing transition exceeds memory budget");
         {

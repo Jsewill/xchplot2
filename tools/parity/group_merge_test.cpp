@@ -780,12 +780,20 @@ void construction_cancellation(fs::path const& root, Members input, Config cfg)
                 return requested.load();
             };
             bool stopped = false;
+            if (summary)
             {
-                Construction output(path.string(), bounded, false, identity(), mode,
+                // Live staging retains its summary in RAM. Reopen the saved
+                // prefix to exercise cancellation during the authenticated read.
+                Construction prefix(path.string(), bounded, false, identity(), mode, external, 0, false);
+                prefix.confirm_identity();
+                require(prefix.append(input.subspan(0, 1)).accepted, "cancellation summary prefix did not fit");
+            }
+            {
+                Construction output(path.string(), bounded, summary, identity(), mode,
                     std::string_view(mode) == "external" ? std::optional(external) : std::nullopt, 0, false);
                 output.confirm_identity(); live = &output;
                 bool const prefix = std::string_view(phase) == "append" || summary;
-                if (packing || prefix)
+                if (packing || (prefix && !summary))
                     require(output.append(packing ? input : input.subspan(0, 1)).accepted, "cancellation prefix did not fit");
                 auto const before = output.stats().encode_chunks;
                 auto const target = grow_controller_test::Construction::snapshot(path.string());
@@ -2106,10 +2114,46 @@ void group_prefetch(fs::path const& root, Members input)
         "next group producer did not stop at a completed packing boundary");
     require(!prefetch_group(partial, producer, requested, 2, 4, 0, "unexpected prefetch ", [] { return false; }) &&
         partial.owner == 1 && partial.members.size() == 2, "next group queue retained more than one batch");
+    auto const generated = model.generated_members;
+    auto const retained = partial.resident_bytes();
+    producer.budget = sum(sum(producer.fixed, retained), producer.next_peak(2)) - 1;
+    require(!prefetch_group(partial, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        producer.fill_stop == Producer::FillStop::memory && partial.members.size() == 2 &&
+        partial.resident_bytes() == retained && partial.hash->size() == 2 && model.generated_members == generated,
+        "blocked prefetch refill changed its retained prefix or exceeded RAM admission");
+    producer.budget = args.max_ram;
+    require(prefetch_group(partial, producer, requested, 1, 4, 0, "test prefetch refill ", [] { return false; }) == 2 &&
+        partial.members.size() == 4 && partial.hash->size() == 4 && model.generated_members == generated + 2 &&
+        producer.peak <= args.max_ram, "prefetch refill regenerated its prefix or lost its owning hash");
+    require(!prefetch_group(partial, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
+        producer.fill_stop == Producer::FillStop::full && model.generated_members == generated + 2,
+        "complete prefetch did not stop without generating more members");
     std::vector<Member> transferred; std::unique_ptr<MemberBatchHash> transferred_hash;
     partial.take(transferred, transferred_hash, 1, 1);
     require(transferred.size() == 1 && transferred[0].compact() && partial.members.empty() && !partial.identity,
         "smaller next engine admission lost owning members or retained the old batch");
+    GroupPrefetch suffix;
+    require(prefetch_group(suffix, producer, requested, 1, 3, 0, "test suffix prefetch ", [] { return false; }, 1) == 3 &&
+        suffix.hash_first == 1 && suffix.hash && suffix.hash->size() == 2,
+        "next group prefetch did not retain a hash for its post-staging suffix");
+    suffix.metadata_bytes = batch_hash_bytes(args, 3);
+    uint64_t const metadata = suffix.metadata_bytes;
+    auto const count_before = model.generated_members;
+    auto const suffix_digest = members_digest(requested.params.get_k(), Members(suffix.members).subspan(1, 2), nullptr, [] {});
+    transferred.clear(); transferred_hash.reset();
+    suffix.take(transferred, transferred_hash, 1, 3);
+    require(transferred.size() == 1 && !transferred_hash && suffix.members.size() == 2 && suffix.first == 1 &&
+        !suffix.hash_first && suffix.metadata_bytes == metadata && suffix.hash &&
+        suffix.hash->digest_for(suffix.members) == suffix_digest,
+        "short staging handoff discarded the suffix, its cached digest or its memory charge");
+    require(producer.fill(suffix.members, 1, 3, resident(transferred), suffix.hash.get(), nullptr,
+        "test suffix prefetch refill ") == 1 && model.generated_members == count_before + 1,
+        "post-staging prefetch regenerated a retained member");
+    transferred.clear(); suffix.take(transferred, transferred_hash, 3, 4);
+    require(suffix.members.empty() && !suffix.identity && !suffix.metadata_bytes && transferred.size() == 3 &&
+        transferred_hash && transferred_hash->digest_for(transferred) ==
+            members_digest(requested.params.get_k(), input.subspan(1, 3), nullptr, [] {}),
+        "larger receiver admission lost its suffix hash or changed member order");
     GroupPrefetch denied;
     producer.budget = sum(producer.fixed, producer.next_peak(0)) - 1;
     require(!prefetch_group(denied, producer, requested, 1, 4, 0, "unexpected prefetch ", [] { return false; }) &&
@@ -2147,7 +2191,7 @@ void group_prefetch(fs::path const& root, Members input)
         {
             auto const result = run_group(args, current, &fixture, requested, 4, 128 * mib, 0, backend,
                 nullptr, {}, {}, nullptr,
-                [&](uint64_t fixed, uint16_t cap, std::future<Result>& pending)
+                [&](uint64_t fixed, uint16_t cap, uint64_t retained, std::function<bool()> const& done)
                 {
                     started_signal.get();
                     struct Release { std::promise<void>& signal; ~Release() { signal.set_value(); } } unblock{release};
@@ -2155,9 +2199,8 @@ void group_prefetch(fs::path const& root, Members input)
                     auto const next_config = grow_controller_test::configuration(args, 128 * mib, mib);
                     Producer next_producer{requested, &fixture, *backend, args, args.max_ram,
                         sum(fixed, prefetch_memory(args, requested, next_config, wanted, storage_device(root).nonrotating)), fixed};
-                    auto const generated = prefetch_group(next, next_producer, requested, 1, wanted, 0,
-                        "test next group member ", [&]
-                        { return pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+                    auto const generated = prefetch_group(next, next_producer, requested, 1, wanted, retained,
+                        "test next group member ", done);
                     require(generated == wanted && generated > 1 && background_write_active.load(std::memory_order_acquire) &&
                         !fs::exists(following), "next owning batch did not advance during blocked final packing");
                     next.metadata_bytes = sum(product(wanted, 2 * sizeof(Member)), batch_hash_bytes(args, wanted));
@@ -3648,6 +3691,39 @@ void external_batch_observations(fs::path const& root, Members members, Config c
     require(!engine.external && !engine.external_batches.ceiling && !engine.external_batches.sizes[0].planning.count &&
         !source->snapshot().count && !source->snapshot().contributions.count,
         "external timing evidence survived ordinary handoff");
+
+    auto const requested = identity_from(identity());
+    Fixtures fixture{requested, {}, 0};
+    for (uint16_t index = 0; index < 4; ++index)
+    {
+        auto const path = root / ("external-prefetch-member-" + std::to_string(index));
+        PlotData data; data.t3_proof_fragments.assign(members[index].raw().begin(), members[index].raw().end());
+        fixture.bytes = sum(fixture.bytes, PlotFile::writeData(path.string(), data, requested.params, index, requested.memo));
+        fixture.paths.push_back(path);
+    }
+    Arguments args; args.max_ram = 512 * mib; args.batch = 3; args.max_members = 4;
+    args.workers = 2; args.window = args.checkpoint_bytes = 65536;
+    args.window_set = args.checkpoint_set = true;
+    args.construction = "external"; args.member_storage = "compact";
+    args.temporary.push_back(directory);
+    auto const reference = root / "external-prefetch-reference";
+    direct(reference, members.subspan(0, 4), cfg);
+    for (uint16_t cap : {2, 3})
+    {
+        auto backend = std::make_unique<Backend>(); backend->mode = "fixture"; backend->generation_overlap = true;
+        Producer producer{requested, &fixture, *backend, args, args.max_ram, mib, mib};
+        GroupPrefetch prefetched;
+        require(prefetch_group(prefetched, producer, requested, 0, cap, 0, "test external prefetch ", [] { return false; }, 1) == cap,
+            "external prefetch fixture did not fill its admitted batch");
+        prefetched.metadata_bytes = sum(product(cap, 2 * sizeof(Member)), batch_hash_bytes(args, cap));
+        auto const path = root / ("external-prefetch-handoff-" + std::to_string(cap));
+        auto const result = run_group(args, path, &fixture, requested, 4, cfg.capacity_bytes, 0, backend,
+            nullptr, {}, {}, &prefetched);
+        require(result.members == 4 && result.generated_members == 4 - cap && backend->generated_members == 4 &&
+            result.batches == 2 && result.max_batch_members == 3 && result.peak_modeled_bytes <= args.max_ram &&
+            prefetched.members.empty() && contents(path) == contents(reference),
+            "external short-first handoff regenerated members, exceeded RAM admission or changed canonical bytes");
+    }
 }
 
 void bounded_saved_reads(fs::path const& root)
