@@ -14,8 +14,106 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Select checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      shell: ${{ steps.filter.outputs.shell }}
+      actions: ${{ steps.filter.outputs.actions }}
+      rust: ${{ steps.filter.outputs.rust }}
+      host: ${{ steps.filter.outputs.host }}
+      python: ${{ steps.filter.outputs.python }}
+      group: ${{ steps.filter.outputs.group }}
+      container: ${{ steps.filter.outputs.container }}
+      compose: ${{ steps.filter.outputs.compose }}
+      docs: ${{ steps.filter.outputs.docs }}
+      installer: ${{ steps.filter.outputs.installer }}
+      installer-smoke: ${{ steps.filter.outputs.installer-smoke }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          base: ${{ github.ref }}
+          filters: |
+            shell:
+              - '.github/workflows/ci.yml'
+              - '.shellcheckrc'
+              - 'scripts/**/*.sh'
+            actions:
+              - '.github/workflows/**'
+              - '.github/actionlint.{yaml,yml}'
+            rust:
+              - '.github/workflows/ci.yml'
+              - 'keygen-rs/Cargo.{toml,lock}'
+              - 'keygen-rs/src/**'
+            host:
+              - '.github/workflows/ci.yml'
+              - 'CMakeLists.txt'
+              - 'cmake/{BuildVersion,HostTests,RegisterTests}.cmake'
+              - 'scripts/test/host-tests.sh'
+              - 'src/host/{Batch*,BenchStats,BoundedProofSampling,Cancel,ConfigFile,GpuBufferPool,GpuPipeline,GpuPlotter}.hpp'
+              - 'src/host/{ComputeNetwork,ComputePool,ComputeSession,ComputeWorker}.hpp'
+              - 'src/host/{GroupCalibrationProcess,GroupComputeSettings,GroupFarmComputeResources,GroupFarmFile,GroupFarmMetadata,GroupFarmResources}.hpp'
+              - 'src/host/{GroupFarming,GroupFile,GroupHarvesterProfile,GroupNativeIdentity,GroupOptions,GroupPacked,GroupPlotter,GroupPublication}.hpp'
+              - 'src/host/{HostGuard,HostRamPolicy,Json,MultiGpuPipelineParallel,NumaTopology,PlotFileWriterParallel,PoolSizing,Random,Spill*,TempFile,Utf8,Vram*}.hpp'
+              - 'src/host/{BatchManifest,Cancel,ConfigFile,HostRamPolicy,MultiGpuPipelineParallel,NumaTopology,TempFile}.cpp'
+              - 'src/gpu/{DeviceIds,SpillTileReader,SyclDeviceList}.hpp'
+              - 'keygen-rs/include/**'
+              - 'tools/xchplot2/{cli,group_commands,group_options}.cpp'
+              - 'tools/xchplot2/{cli,device_options,group_commands}.hpp'
+              - 'tools/parity/{bench_stats,bounded_proof_sampling,cli_host,group_calibration_process,group_compute_resources,group_farm_metadata,group_farm_resources,group_file,group_harvester_profile,host_guard,host_spill_policy,numa_topology,pipeline_control,spill_coverage,spill_engine,temp_file,vram_budget,vram_probe}_test.cpp'
+              - 'tools/parity/pipeline_control_test/**'
+            python:
+              - '.github/workflows/ci.yml'
+              - 'cmake/{TargetSelection,CudaArchitectures,AdaptiveCppDependencies}.cmake'
+              - 'scripts/test/{build-selection,gpu-ci,gpu-ci-test,group-benchmark-test,compute-network,compute-network-test}.py'
+              - 'contrib/pos2-pr118/group-benchmark.py'
+            group:
+              - '.github/workflows/ci.yml'
+              - 'cmake/{GroupPlotter,GroupTests,ComputePool,ComputeWorker,RegisterTests}.cmake'
+              - 'contrib/pos2-pr118/{CMakeLists.txt,*.cpp,plot-index-base.patch}'
+              - 'contrib/pos2-{plotter-output-move,solver-*,worker-thread-limit}.patch'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock,src/**,include/**}'
+              - 'src/host/{Group*,Compute*,BatchPlotter,BenchStats,GpuPipeline,GpuPlotter,Json,MultiGpuPipelineParallel,NumaTopology,PoolSizing,Random,Utf8,VramBudget,WindowsFile}.hpp'
+              - 'src/host/{Compute*,GroupPlotter,NumaTopology}.cpp'
+              - 'src/gpu/DeviceIds.hpp'
+              - 'tools/xchplot2/{compute_broker,compute_worker,group_options,group_commands,group_reference}.cpp'
+              - 'tools/xchplot2/{compute_output,device_options,group_commands}.hpp'
+              - 'tools/parity/compute_*'
+              - 'tools/parity/group_{checkpoint_compatibility,codec,external,farming,gpu_output,inventory,merge,replot_resources,retirement,scratch,staging}_test.cpp'
+              - 'tools/parity/group_farm_{control,membership,progress}_test.hpp'
+            container:
+              - '.github/workflows/ci.yml'
+              - '.hadolint.yaml'
+              - Containerfile
+            compose:
+              - '.github/workflows/ci.yml'
+              - compose.yaml
+            docs:
+              - '.github/workflows/ci.yml'
+              - '**/*.md'
+              - '.markdownlint*'
+              - 'scripts/test/docs.py'
+              # Renames include the removed name. Any tracked file can be linked.
+              - deleted: '**'
+            installer:
+              - '.github/workflows/ci.yml'
+              - 'scripts/install-container-deps.sh'
+              - 'scripts/test/install-container-deps/**'
+            installer-smoke:
+              - '.github/workflows/ci.yml'
+              - 'scripts/install-container-deps.sh'
+
   shell:
     name: ShellCheck
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.shell == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,6 +125,8 @@ jobs:
 
   actions:
     name: actionlint
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.actions == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -37,6 +137,8 @@ jobs:
 
   rust:
     name: Rust (keygen-rs)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -62,6 +164,8 @@ jobs:
 
   host-tests:
     name: C++ host tests (${{ matrix.mode }})
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.host == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Shared host targets need no GPU toolchain; sanitizers cover host memory
@@ -82,6 +186,8 @@ jobs:
 
   python:
     name: Python harness checks
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -99,6 +205,8 @@ jobs:
 
   group-tests:
     name: C++ construction and compute tests
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.group == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -120,6 +228,8 @@ jobs:
 
   hadolint:
     name: hadolint Containerfile
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.container == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -132,6 +242,8 @@ jobs:
 
   compose-config:
     name: docker compose config validate
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.compose == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -149,6 +261,8 @@ jobs:
 
   markdownlint:
     name: Markdown documentation
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -171,6 +285,8 @@ jobs:
 
   install-container-deps-dryrun:
     name: install-container-deps.sh — dry-run fixtures
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.installer == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -180,6 +296,8 @@ jobs:
 
   install-container-deps-smoke:
     name: install-container-deps.sh smoke (${{ matrix.engine }} ${{ matrix.gpu }})
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.installer-smoke == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

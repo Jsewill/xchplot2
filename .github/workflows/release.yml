@@ -5,16 +5,17 @@ on:
     paths:
       - .github/workflows/release.yml
       - CMakeLists.txt
-      - Cargo.toml
-      - Cargo.lock
       - LICENSE
       - NOTICE
       - cmake/**
       - ci/release/**
       - keygen-rs/**
-      - src/**
+      - src/host/**
+      - src/gpu/**
       - tools/**
-      - contrib/**
+      - contrib/pos2-*.patch
+      - contrib/cccl-*.patch
+      - contrib/adaptivecpp-windows-*.patch
       - scripts/build-release.sh
       - scripts/build-release.ps1
       - scripts/test/recovery.py
@@ -45,8 +46,59 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: Select release checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      linux: ${{ steps.filter.outputs.linux }}
+      windows: ${{ steps.filter.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '.github/workflows/release.yml'
+              - '{CMakeLists.txt,LICENSE,NOTICE}'
+              - 'cmake/**'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock,about.toml,src/**,include/**}'
+              - 'src/{host,gpu}/**'
+              - 'tools/**'
+              - '!tools/xchplot2/*.{rc,manifest}'
+              - '!tools/xchplot2/compute_service_windows.cpp'
+              - '!tools/xchplot2/compute_service.cpp'
+              - 'contrib/pos2-*.patch'
+              - 'contrib/cccl-arch-list.patch'
+              - 'ci/release/adaptivecpp-*.patch'
+              - 'ci/release/{adaptivecpp-third-party.txt,llvm-third-party.txt,licenses.hbs,check-cuda-ptx.py}'
+              - 'scripts/test/{recovery,release,group-cli,compute-cli,group-pool-test}.py'
+            linux:
+              - 'ci/release/{Containerfile,README.txt}'
+              - 'scripts/build-release.sh'
+              - 'tools/xchplot2/compute_service.cpp'
+            windows:
+              - 'ci/release/*.ps1'
+              - 'ci/release/{README.windows.txt,amd-runtime.txt,microsoft-runtime.txt}'
+              - 'scripts/build-release.ps1'
+              - 'tools/xchplot2/*.{rc,manifest}'
+              - 'tools/xchplot2/compute_service_windows.cpp'
+              - 'contrib/adaptivecpp-windows-*.patch'
+              - 'contrib/cccl-windows-ptx.patch'
+
   linux-sycl:
-    if: inputs.platform != 'windows'
+    needs: changes
+    if: >-
+      inputs.platform != 'windows' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.linux == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +138,11 @@ jobs:
           if-no-files-found: error
 
   windows-sycl:
-    if: inputs.platform != 'linux'
+    needs: changes
+    if: >-
+      inputs.platform != 'linux' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.windows == 'true')
     strategy:
       fail-fast: false
       matrix:

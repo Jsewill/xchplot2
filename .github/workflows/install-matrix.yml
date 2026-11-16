@@ -14,17 +14,30 @@ on:
       - Cargo.lock
       - build.rs
       - cmake/**
-      - keygen-rs/**
+      - keygen-rs/Cargo.*
+      - keygen-rs/src/**
+      - keygen-rs/include/**
       - src/**
-      - tools/**
-      - contrib/**
-      - ci/release/adaptivecpp-*.patch
+      - tools/xchplot2/**
+      - tools/parity/plot_file_parity.cpp
+      - tools/parity/solver_filter_parity.cpp
+      - tools/parity/sycl_twophase_budget_test.cpp
+      - tools/parity/sycl_sort_parity.cpp
+      - tools/parity/sycl_bucket_offsets_parity.cpp
+      - tools/parity/sycl_g_x_parity.cpp
+      - contrib/pos2-plotter-output-move.patch
+      - contrib/pos2-solver-*.patch
+      - contrib/pos2-worker-thread-limit.patch
+      - contrib/cccl-arch-list.patch
+      - ci/release/adaptivecpp-level-zero-*.patch
       - scripts/install-deps.sh
       - scripts/test/native-install.sh
       - scripts/test/recovery.py
       - scripts/test/group-cli.py
       - scripts/test/compute-cli.py
       - scripts/test/group-pool-test.py
+      - '!tools/xchplot2/windows.manifest'
+      - '!tools/xchplot2/compute_service_windows.cpp'
   push:
     branches: [main]
     paths:
@@ -36,17 +49,30 @@ on:
       - Cargo.lock
       - build.rs
       - cmake/**
-      - keygen-rs/**
+      - keygen-rs/Cargo.*
+      - keygen-rs/src/**
+      - keygen-rs/include/**
       - src/**
-      - tools/**
-      - contrib/**
-      - ci/release/adaptivecpp-*.patch
+      - tools/xchplot2/**
+      - tools/parity/plot_file_parity.cpp
+      - tools/parity/solver_filter_parity.cpp
+      - tools/parity/sycl_twophase_budget_test.cpp
+      - tools/parity/sycl_sort_parity.cpp
+      - tools/parity/sycl_bucket_offsets_parity.cpp
+      - tools/parity/sycl_g_x_parity.cpp
+      - contrib/pos2-plotter-output-move.patch
+      - contrib/pos2-solver-*.patch
+      - contrib/pos2-worker-thread-limit.patch
+      - contrib/cccl-arch-list.patch
+      - ci/release/adaptivecpp-level-zero-*.patch
       - scripts/install-deps.sh
       - scripts/test/native-install.sh
       - scripts/test/recovery.py
       - scripts/test/group-cli.py
       - scripts/test/compute-cli.py
       - scripts/test/group-pool-test.py
+      - '!tools/xchplot2/windows.manifest'
+      - '!tools/xchplot2/compute_service_windows.cpp'
   workflow_dispatch:
   schedule:
     # Package repositories can break a fresh install without source changes.
@@ -60,8 +86,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Select installation checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      native: ${{ steps.filter.outputs.native }}
+      container: ${{ steps.filter.outputs.container }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        with:
+          base: ${{ github.ref }}
+          predicate-quantifier: some-with-excludes
+          filters: |
+            shared:
+              - '.github/workflows/install-matrix.yml'
+              - '{CMakeLists.txt,Cargo.toml,Cargo.lock,build.rs}'
+              - 'cmake/**'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock,src/**,include/**}'
+              - 'src/**'
+              - 'tools/xchplot2/*.{cpp,h,hpp,cu}'
+              - '!tools/xchplot2/compute_service_windows.cpp'
+              - 'tools/parity/plot_file_parity.cpp'
+              - 'contrib/pos2-{plotter-output-move,solver-*,worker-thread-limit}.patch'
+              - 'contrib/cccl-arch-list.patch'
+              - 'ci/release/adaptivecpp-level-zero-*.patch'
+            native:
+              - 'scripts/install-deps.sh'
+              - 'scripts/test/native-install.sh'
+              - 'scripts/test/{recovery,group-cli,compute-cli,group-pool-test}.py'
+              - 'tools/parity/{solver_filter_parity,sycl_twophase_budget_test}.cpp'
+            container:
+              - '{Containerfile,.dockerignore}'
+              - 'tools/parity/{sycl_sort_parity,sycl_bucket_offsets_parity,sycl_g_x_parity}.cpp'
+
   native:
     name: native / ${{ matrix.os.name }} / ${{ matrix.gpu }}
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+      needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
@@ -131,6 +202,10 @@ jobs:
 
   wsl:
     name: WSL2 / ubuntu-24.04 / ${{ matrix.gpu }}
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+      needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
@@ -166,6 +241,10 @@ jobs:
 
   build:
     name: build / ${{ matrix.target.name }}
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
+      needs.changes.outputs.shared == 'true' || needs.changes.outputs.container == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
