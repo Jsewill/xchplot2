@@ -215,6 +215,13 @@ inline uint64_t multiply(uint64_t a, uint64_t b)
 { require(!a || b <= UINT64_MAX / a, "mixed farm resource product overflow"); return a * b; }
 inline bool memory(ResourceKind kind)
 { return kind == ResourceKind::host_memory || kind == ResourceKind::gpu_memory; }
+inline bool adaptive_cpu_sharing(Profile const& profile, uint64_t lanes)
+{
+    // Small hosts share the controller, capped producer and health probe.
+    // Enrolled compute adds a broker and a separately capped executor; keep
+    // that minimum service set runnable under the same live pressure gate.
+    return profile.adaptive && lanes <= (profile.native.compute_owner_identity.empty() ? 3u : 5u);
+}
 inline char const* name(ResourceKind kind)
 {
     switch (kind)
@@ -923,10 +930,7 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
             result.conditional_shared_service = result.conditional_shared_service || m.required_units > m.request_units;
         }
         uint64_t occupied = memory(m.kind) ? add(m.resident_units, m.transient_units) : add(m.reserved_units, required);
-        // Small hosts cannot dedicate separate cores to the controller,
-        // capped producer and health probe. The automatic policy time-shares
-        // that inherited set and relies on its live farming/pressure gate.
-        if (profile.adaptive && m.kind == ResourceKind::cpu && m.capacity <= 3)
+        if (m.kind == ResourceKind::cpu && adaptive_cpu_sharing(profile, m.capacity))
             occupied = std::min(occupied, m.capacity);
         m.occupied_units = occupied;
         if (occupied > m.capacity && (!profile.adaptive || r.capacity_known)) fail(result, "capacity-exceeded:" + m.resource);

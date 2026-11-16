@@ -163,7 +163,7 @@ inline ReplotLocalResources replot_local_resources(Profile const& profile, Nativ
             }
             if (resource.kind == ResourceKind::cpu)
             {
-                if (profile.adaptive && inherited_cpu_lanes <= 3)
+                if (adaptive_cpu_sharing(profile, inherited_cpu_lanes))
                 { result.cpu_threads = std::min(result.cpu_threads, uint64_t(1)); continue; }
                 // Shared modeled queues keep their complete serialized timing
                 // bound. Only the available physical partition determines the

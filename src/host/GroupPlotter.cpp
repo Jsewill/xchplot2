@@ -18950,11 +18950,19 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         for (auto const& replica : journal.replicas)
         { replica.metadata->check(); auto const path = replica.metadata->path / "grow-farm.plan", pending = replica.metadata->path / "grow-farm.plan.next";
           if (fs::exists(pending)) publish_farming_state(pending, path, fs::exists(path)); grow_failpoint("replot-handoff-one-published"); }
+        // Runtime services and retained memory can change after the final
+        // construction. Refit this new allocation before auditing the farm.
+        for (;;)
+        {
+            try { refresh_native_request(); break; }
+            catch (ReplotResourcesUnavailable const&)
+            { publish_activity("waiting-host-resources"); check_cancel(args); refresh_controls(); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+        }
+        admit(true, false, service_members());
         auto audit_args = effective; audit_args.command = "plan"; audit_args.plan_only = audit_args.resume = audit_args.directory_farm = true;
         audit_args.target.clear(); audit_args.destinations.clear(); audit_args.from_plan.clear(); audit_args.manifest = journal.replicas.front().metadata->path / "grow-farm.plan";
         audit_args.save_plan.clear(); audit_args.seed = args.seed; audit_args.farmer = args.farmer; audit_args.pool_pk = args.pool_pk;
         audit_args.pool_ph = args.pool_ph; audit_args.pool_address = args.pool_address;
-        admit(true, false, service_members());
         auto job = farming_arguments(audit_args); auto audited = farming_run(audit_args, &keys, job);
         require(audited->feasible(), "completed migration failed ordinary farming handoff audit");
         persist([](auto& state) { state.phase = ReplotPhase::complete; }); grow_failpoint("replot-handoff-complete");

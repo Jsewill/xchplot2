@@ -70,6 +70,53 @@ int main() try
         require(held == pos2gpu::ComputeSession::memory_bytes + resolved.pool_codec_ram,
             "automatic setup re-estimated an already resolved codec partition from the remaining owner budget");
     }
+    for (bool compute : {false, true}) for (uint64_t lanes : {1, 2, 3, 4, 5, 6, 8})
+    {
+        auto automatic = profile; automatic.adaptive = true; automatic.workloads.clear();
+        automatic.resources[0].capacity = lanes; automatic.resources[0].conditional_shared = false;
+        automatic.resources[1].capacity = 2 * 1024 * mib;
+        auto& native = automatic.native; native.max_cpu_threads = std::max(uint64_t(1), lanes / 2);
+        Demand farming; farming.resource = "cpu"; farming.reserved_units = std::max(uint64_t(1), lanes / 4); farming.bounded = true;
+        native.cohorts.front().new_farming = {farming, memory(256 * mib)};
+        native.cohorts.front().proof_reserve.clear();
+        auto maximum = request; maximum.cpu_affinity_lanes = lanes; maximum.cpu_threads = native.max_cpu_threads;
+        maximum.adaptive_resources = true; maximum.verification_cpu_threads = 1;
+        if (compute)
+        {
+            native.compute_owner_identity = native.compute_broker_identity = std::string(64, 'a');
+            native.compute_broker_host = host;
+            auto broker = farming; broker.reserved_units = 1;
+            native.compute_services = {broker, memory(pos2gpu::ComputeSession::memory_bytes)};
+            ComputeWorkerEnvelope worker; worker.tls_identity = std::string(64, 'b'); worker.host = host;
+            worker.cpu_threads = lanes; worker.slots = 1; worker.host_bytes = 1024 * mib;
+            worker.standing_host_bytes = 128 * mib; worker.allowed_kinds = compute_generate_cpu;
+            auto executor = broker; executor.reserved_units = lanes;
+            auto resident = memory(worker.host_bytes - worker.standing_host_bytes); resident.resident_units = worker.standing_host_bytes;
+            worker.reservation = {executor, resident}; native.compute_workers = {worker};
+            maximum.compute_enabled = maximum.compute_offer_owned = true;
+            maximum.compute_offer_identity = worker.tls_identity; maximum.compute_offer_backend = "cpu";
+            maximum.compute_offer_ram_bytes = 256 * mib; maximum.compute_offer_cpu_threads = 1;
+            maximum.compute_session_ram_bytes = pos2gpu::ComputeSession::memory_bytes;
+        }
+        auto const room = replot_local_resources(automatic, maximum, 2 * 1024 * mib, lanes);
+        require(room.ram_bytes == maximum.ram_bytes && room.cpu_threads && room.cpu_threads <= native.max_cpu_threads,
+            "small-host automatic allocation lost its native owner beside the local compute services");
+        if (compute && lanes <= 5) require(room.cpu_threads == 1, "small-host compute sharing enabled producer fanout");
+        if (!compute && lanes == 5) require(room.cpu_threads == 2, "compute sharing reduced an ordinary native CPU partition");
+        auto selected = maximum; selected.ram_bytes = room.ram_bytes; selected.cpu_threads = room.cpu_threads;
+        for (auto phase : {std::pair{true, false}, {false, true}, {false, false}})
+        {
+            auto const stage = replot_stage(automatic, selected, {}, 0, phase.first, phase.second, false);
+            auto const assessed = assess_stage(automatic, stage);
+            require(assessed.feasible, "small-host allocation and phase assessment disagree about compute service sharing");
+            auto const held = std::find_if(assessed.margins.begin(), assessed.margins.end(),
+                [](auto const& margin) { return margin.resource == "ram"; });
+            require(held != assessed.margins.end() && held->occupied_units >= farming_health_memory_bytes + 256 * mib,
+                "CPU sharing released health or farming memory");
+            auto shortage = automatic; shortage.resources[1].capacity = held->occupied_units - 1;
+            require(!assess_stage(shortage, stage).feasible, "CPU sharing admitted a physical RAM shortage");
+        }
+    }
     {
         ReplotVerification sampled{ReplotVerificationMode::sampled, 1, 3};
         require(replot_requires_proof(sampled, 0) && !replot_requires_proof(sampled, 1) && replot_requires_proof(sampled, 2) &&
