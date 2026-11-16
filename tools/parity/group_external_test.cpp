@@ -2804,7 +2804,8 @@ try
     {
         ExternalEngine engine((root / "buffered").string(), config(), ext, false, initial_identity()); engine.confirm_identity();
         require(engine.append(input).accepted, "buffered fixture rejected"); uint64_t segments = 0;
-        for (auto const& grant : ext.scratch) for (auto const& entry : fs::recursive_directory_iterator(grant.directory))
+        auto const directory = ".xchplot2-external-" + ownership_token(root / "buffered");
+        for (auto const& grant : ext.scratch) for (auto const& entry : fs::directory_iterator(fs::path(grant.directory) / directory))
             if (entry.is_regular_file() && entry.path().filename().string().starts_with("run-")) ++segments;
         engine.finish(); auto const& stats = engine.stats(); uint64_t const window = config().window_bytes;
         require(stats.read_calls <= (stats.read_bytes + window - 1) / window + segments + 2,
@@ -2930,7 +2931,8 @@ try
         auto const path = root / "missing";
         { ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); require(engine.append(input.subspan(0, 1)).accepted, "missing-input fixture rejected"); }
         fs::path segment;
-        for (auto const& grant : ext.scratch) for (auto const& entry : fs::recursive_directory_iterator(grant.directory))
+        auto const directory = ".xchplot2-external-" + ownership_token(path);
+        for (auto const& grant : ext.scratch) for (auto const& entry : fs::directory_iterator(fs::path(grant.directory) / directory))
             if (entry.is_regular_file() && entry.path().filename().string().starts_with("run-")) segment = entry.path();
         require(!segment.empty(), "missing-input fixture has no segment"); fs::rename(segment, segment.string() + ".held");
         { std::ofstream tail(path, std::ios::binary | std::ios::app); tail << "uncommitted tail"; }

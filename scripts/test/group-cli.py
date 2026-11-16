@@ -2541,15 +2541,27 @@ def check_replot(binary, root, reference=None):
     queue_log = directory / "queue waiting.log"
 
     def queue_status():
-        return json.loads(run("status", queue_review, "--json", code=0 if queue_dirs[0].exists() else 2).stdout)
+        result = run("status", queue_review, "--json", code=0 if queue_dirs[0].exists() else 2)
+        assert result.stdout, ("migration queue status returned no JSON", result.returncode, result.stderr)
+        return json.loads(result.stdout)
 
     def await_queue(process, predicate, timeout=120):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             assert process.poll() is None, queue_log.read_text(encoding="utf-8")
-            value = queue_status()
-            if predicate(value):
-                return value
+            try:
+                value = queue_status()
+            except AssertionError as error:
+                # A running coordinator can invalidate all bounded snapshot
+                # attempts. Keep polling only for that explicit retry result.
+                if not any(message in str(error) for message in (
+                        "cannot obtain a stable migration status snapshot; retry --status",
+                        "migration progress changed during the bounded read-only status snapshot; retry --status")):
+                    raise
+                value = str(error)
+            else:
+                if predicate(value):
+                    return value
             time.sleep(0.2)
         raise AssertionError(("migration state did not converge", value, queue_log.read_text(encoding="utf-8")))
 
