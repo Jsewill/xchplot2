@@ -622,16 +622,22 @@ if(XCHPLOT2_HIP_RUNTIME_H)
     # without this explicit link, ROCm silently fails to initialise
     # and AdaptiveCpp's default selector falls through to its OpenMP
     # host device. The fall-through makes hellosycl / sycl_t1_parity
-    # report "ALL OK" while having executed entirely on CPU. Mirrors
-    # build.rs:631 (cargo:rustc-link-lib=amdhip64) for the cargo
-    # build path.
+    # report "ALL OK" while having executed entirely on CPU. Mirrors the
+    # HIP runtime link in build.rs for the cargo build path.
     # It is also what puts the HIP runtime on the link line for targets that
     # merely consume libpos2_gpu.a rather than compiling SYCL themselves: with
     # a hip:gfx* AOT target those objects carry hipLaunchKernel /
     # __hipRegisterFatBinary, and tools/xchplot2 failed to link outright when
     # this was skipped.
     if(XCHPLOT2_AMDHIP64)
-        link_libraries("${XCHPLOT2_AMDHIP64}")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # SSCP has no host-side HIP references, so --as-needed can drop
+            # even a full library path. Keep the runtime in DT_NEEDED, as
+            # Cargo does, before AdaptiveCpp loads its backend plugins.
+            link_libraries("-Wl,--no-as-needed" "${XCHPLOT2_AMDHIP64}" "-Wl,--as-needed")
+        else()
+            link_libraries("${XCHPLOT2_AMDHIP64}")
+        endif()
         message(STATUS "xchplot2: link_libraries(${XCHPLOT2_AMDHIP64}) — "
                        "AdaptiveCpp HIP backend will find ROCm at runtime")
     else()

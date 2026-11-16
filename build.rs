@@ -844,12 +844,9 @@ fn main() {
     // gfx1013 spoof) fails at first queue construction with
     // "No matching device" because HIP can't initialise.
     //
-    // We pass the full .so path (rather than `cargo:rustc-link-lib=amdhip64`
-    // which becomes `-lamdhip64`) because the SSCP path emits no host-
-    // side HIP symbol references, and the linker's default --as-needed
-    // would drop a name-only -l flag from NEEDED. A positional path
-    // argument bypasses --as-needed and keeps the library in the link.
-    // Same approach as CMakeLists.txt's `link_libraries(.../libamdhip64.so)`.
+    // The SSCP path emits no host-side HIP symbol references. Wrap the
+    // resolved runtime path with --no-as-needed/--as-needed below so it
+    // stays in DT_NEEDED, matching CMakeLists.txt's HIP runtime link.
     let rocm_root = env::var("ROCM_PATH")
         .unwrap_or_else(|_| "/opt/rocm".to_string());
     // <root>/lib is AMD's own installer layout. Multilib distros package the
