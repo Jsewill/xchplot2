@@ -1424,6 +1424,14 @@ inline ReplotJournalSet load_replot_journals(std::span<std::filesystem::path con
     require(!result.authority_missing || allow_missing, "migration controller authority is unavailable; restore its saved native state directory before recovery");
     return result;
 }
+inline bool replot_authority_matches(ReplotJournalSet const& saved, ReplotJournalSet const& current)
+{
+    if (!saved.authority || !current.authority) return false;
+    // The controller's current/next record advances before the whole replica
+    // set commits. A returning drive must match that exact owned publication.
+    auto const& authority = *saved.authority;
+    return current.digest == (authority.pending ? authority.pending_digest : authority.digest);
+}
 inline bool replot_journals_unchanged(ReplotJournalSet const& saved)
 {
     try

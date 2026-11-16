@@ -366,11 +366,26 @@ int main() try
             fs::rename(drives.back(), hidden); replicas.replicas.back().available = false;
             save([](auto& state) { state.retirements[0] = {ReplotRetirement::claim_intent, true}; });
             save([](auto& state) { state.retirements[0].state = ReplotRetirement::claimed; });
-            save([](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
             auto missing = load_replot_journals(drives, initial.review_digest, 64 * mib);
             require(missing.authority && missing.digest == replicas.digest && !missing.replicas.back().available,
                 "unavailable drive concealed newer durable controller progress");
-            fs::rename(hidden, drives.back());
+            // Return the drive after staging the next controller revision,
+            // while the complete replica set still retains its older digest.
+            auto next = next_replot_revision(replicas.state, replicas.digest,
+                [](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
+            bool staged = false, published = false;
+            publish_replot_journals(replicas, next, 64 * mib, [&]
+            {
+                if (!replicas.authority->pending && replicas.authority->digest == replicas.digest) return;
+                if (!staged) fs::rename(hidden, drives.back());
+                auto current = load_replot_journals(drives, initial.review_digest, 64 * mib);
+                require(replot_authority_matches(replicas, current),
+                    "returning drive rejected the controller's own in-progress publication");
+                if (replicas.authority->pending) staged = true; else published = true;
+                replicas.replicas.back() = std::move(current.replicas.back());
+            });
+            require(staged && published && !replot_authority_matches(replicas, missing),
+                "controller publication skipped a returning-drive fence or accepted its old revision");
             auto returning = load_replot_journals(drives, initial.review_digest, 64 * mib);
             publish_replot_journals(returning, returning.state, 64 * mib, [] {});
             require(returning.replicas.back().digest == returning.digest && replot_journals_unchanged(returning),
@@ -378,10 +393,14 @@ int main() try
             auto fork = next_replot_revision(returning.state, returning.digest, [](auto& state)
             { stream_state::Stamp stamp; stamp.bytes = 1; state.verified_stage = stamp; });
             auto const fork_body = replot_journal_text(fork);
+            auto const body = replot_journal_text(returning.state);
+            stream_state::atomic_save(returning.authority->path, fork_body + stream_state::digest(fork_body) + '\n');
+            require(!replot_authority_matches(returning, load_replot_journals(drives, initial.review_digest, 64 * mib)),
+                "returning drive accepted a controller revision outside its owned publication");
+            stream_state::atomic_save(returning.authority->path, body + stream_state::digest(body) + '\n');
             stream_state::atomic_save(returning.replicas.back().path, fork_body + stream_state::digest(fork_body) + '\n');
             rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },
                 "destination newer than controller authority was silently overwritten");
-            auto const body = replot_journal_text(returning.state);
             stream_state::atomic_save(returning.replicas.back().path, body + stream_state::digest(body) + '\n');
             fs::rename(authority_root, directory / "lost-controller");
             rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },

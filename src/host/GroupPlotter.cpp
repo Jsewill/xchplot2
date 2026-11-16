@@ -16908,7 +16908,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             if (!replica.available)
             {
                 auto current = load_replot_journals(destinations, inputs.digest, args.max_ram - inputs.memory_bytes, true);
-                require(current.authority && current.digest == journal.digest, "returning migration drive changed controller authority");
+                require(replot_authority_matches(journal, current), "returning migration drive changed controller authority");
                 replica = std::move(current.replicas[lane]);
                 if (lane < bookkeeping.size() && !bookkeeping[lane]) bookkeeping[lane] = std::make_unique<FarmingReplotDirectory>(destinations[lane], review.farm.job_id, true, legacy_metadata);
             }
