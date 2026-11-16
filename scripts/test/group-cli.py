@@ -647,6 +647,8 @@ def check_farm_membership_lifecycle(run, command, verify, root):
             run("fill", survivor, *runtime, "--quiet")
             current = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
             assert current["revision"] > previous_revision and current["required_destinations"] == 1
+            for field in ("manifest_reserved_bytes", "update_reserved_bytes", "progress_reserved_bytes", "owner_reserved_bytes"):
+                assert current[field] == metadata[field], "independent continuation changed a saved metadata grant"
             previous_revision = current["revision"]
             retained = next(item for item in current["destinations"] if item["directory"] == str(member))
             assert retained["membership"] == "detached" and retained["retained_obligation"]

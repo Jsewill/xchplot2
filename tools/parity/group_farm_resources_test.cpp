@@ -123,7 +123,7 @@ void guided_resource_settings()
     std::ostringstream text; write_profile_json(text, completed); std::istringstream input(text.str());
     auto reused = read_profile(input); stage = initial(); bind_native_stage(reused, request(), 0, stage, true, true);
     check(assess_stage(reused, stage).feasible, "saved guided declarations did not survive profile reuse");
-    for (auto const* invalid : {"resources[invented].capacity=99,capacity_known=true", "resources[cpu].capacity=1,capcity_known=true",
+    for (auto const* invalid : {"resources[invented].capacity=99,capacity_known=true", "resources[cpu].capacity=1,capacity_known_extra=true",
         "resources[cpu].capacity_known=yes", "resources[cpu].capacity=-1", "resources[cpu].capacity=18446744073709551616",
         "workloads[original-pos1].plot_count=0", "workloads[invented].cost=reservation", "native.executable=/tmp/reader",
         "native.construction[invented].bounded=true", "native.cohorts[0].proof_reserve[cpu].bounded=true", "resources[0].capacity=16"})

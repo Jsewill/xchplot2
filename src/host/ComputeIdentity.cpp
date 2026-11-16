@@ -1,7 +1,4 @@
 #include "host/ComputeIdentity.hpp"
-#include <openssl/pem.h>
-#include <openssl/rand.h>
-#include <openssl/x509v3.h>
 #ifdef _WIN32
 #include "host/WindowsFile.hpp"
 #else
@@ -12,6 +9,9 @@
 #include <sys/file.h>
 #include <unistd.h>
 #endif
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/x509v3.h>
 #include <array>
 #include <algorithm>
 #include <cerrno>
@@ -198,9 +198,10 @@ Identity issue(std::string const& node, Identity const* authority = nullptr, EVP
         X509_set_pubkey(result.cert.get(), public_key ? public_key : result.key.get()) == 1, "cannot prepare pool identity");
     if (authority && ASN1_TIME_compare(X509_get0_notAfter(result.cert.get()), X509_get0_notAfter(authority->cert.get())) > 0)
         require(X509_set1_notAfter(result.cert.get(), X509_get0_notAfter(authority->cert.get())) == 1, "cannot bound node certificate by pool authority validity");
-    auto subject = X509_get_subject_name(result.cert.get());
-    require(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-        reinterpret_cast<unsigned char const*>(node.c_str()), -1, -1, 0) == 1, "cannot name pool certificate");
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject(X509_NAME_new(), X509_NAME_free);
+    require(subject && X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC,
+        reinterpret_cast<unsigned char const*>(node.c_str()), -1, -1, 0) == 1 &&
+        X509_set_subject_name(result.cert.get(), subject.get()) == 1, "cannot name pool certificate");
     auto issuer = authority ? authority->cert.get() : result.cert.get();
     auto signing_key = authority ? authority->key.get() : result.key.get();
     require(X509_set_issuer_name(result.cert.get(), X509_get_subject_name(issuer)) == 1, "cannot set pool issuer");

@@ -6164,6 +6164,42 @@ void farming_preview_handoff(fs::path const& root)
     auto planned = farming_run(options, nullptr, job);
     require(planned->feasible() && fs::is_empty(a) && fs::is_empty(b), "saving preparation wrote destination files");
     {
+        // A saved partition can have a smaller request mailbox than the
+        // current planner would choose. Continuing within that grant must
+        // neither resize it nor consume its space for the next policy copy.
+        uint64_t const alignment = 4096;
+        auto before = planned->state;
+        before.revision = before.policy_revision = 2;
+        before.parent_digest.assign(64, 'a');
+        farming_record_parent(before, 1, before.parent_digest);
+        detach_farming_member(before, 1);
+        before.update_reserved_bytes = sum(farming_control_reservation(before, alignment),
+            farming_update_reservation(alignment, alignment));
+        auto const auxiliary = sum(sum(before.update_reserved_bytes, before.progress_reserved_bytes), before.owner_reserved_bytes);
+        before.manifest_reserved_bytes = sum(auxiliary, product(farming_update_aligned(
+            sum(farming_state_text(before).size(), 65 + 1024), alignment), 2));
+        FarmingJob saved = job; saved.saved = before; saved.digest = stream_state::digest(farming_state_text(before));
+        FarmingRun continued; continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.available = {1, 0}; continued.lanes.resize(2); continued.metadata = planned->metadata;
+        revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {});
+        require(continued.state.manifest_reserved_bytes == before.manifest_reserved_bytes &&
+            continued.state.update_reserved_bytes == before.update_reserved_bytes &&
+            continued.state.progress_reserved_bytes == before.progress_reserved_bytes &&
+            continued.state.owner_reserved_bytes == before.owner_reserved_bytes &&
+            farming_revision_fits(continued.state, sum(farming_state_text(continued.state).size(), 65)),
+            "independent policy continuation changed a saved metadata grant");
+
+        // Keep the refusal when the policy itself consumes the saved margin.
+        continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.state.manifest_reserved_bytes = auxiliary;
+        bool refused = false;
+        try { revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {}); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("detached writer's saved grant") != std::string::npos; }
+        require(refused && fs::is_empty(a) && fs::is_empty(b), "oversized independent policy reached publication");
+    }
+    {
         auto shared = options; shared.destination_temp = "on"; shared.save_plan = directory / "scratch-review.plan";
         auto source = farming_arguments(shared);
         auto with_scratch = farming_run(shared, nullptr, source);

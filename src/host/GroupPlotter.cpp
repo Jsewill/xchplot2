@@ -6889,9 +6889,10 @@ void revise_farming_policy(Arguments const& args, FarmingJob const& job, Farming
         static_cast<FarmingAssessment&>(state.estimate) = farming_assess_state(state, grants, args.max_ram - run.metadata);
         run.planning_peak = std::max(run.planning_peak, sum(run.metadata, state.estimate.planning_memory_bytes));
         auto const text = farming_state_text(state);
-        auto needed = farming_manifest_reservation(state, text.size(), alignment);
-        if (!job.legacy_metadata.value_or(false)) needed = sum(needed, product(alignment, 2));
-        require(needed <= state.manifest_reserved_bytes,
+        // Preserve the independently granted mailbox and progress allowances.
+        // A new-job reservation estimate must not enlarge those saved grants
+        // merely because the current policy text crossed an allocation boundary.
+        require(farming_revision_fits(state, sum(text.size(), 65)),
             "the revised policy needs more metadata than the detached writer's saved grant; acknowledge its retirement before resizing");
         require(valid_farming_policy_revision(before, state) && valid_farming_independent_policy_revision(before, state),
             farming_independent_policy_reason());
