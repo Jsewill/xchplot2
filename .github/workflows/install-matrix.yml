@@ -134,7 +134,8 @@ jobs:
       github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
       needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Clean toolchain builds plus both installed-binary suites can exceed 90 minutes.
+    timeout-minutes: 150
     container:
       image: ${{ matrix.os.image }}
     strategy:
@@ -207,7 +208,8 @@ jobs:
       github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
       needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
     runs-on: windows-2025
-    timeout-minutes: 90
+    # Run the same complete Cargo and CMake checks as the native installs.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
