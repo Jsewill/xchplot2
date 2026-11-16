@@ -61,6 +61,16 @@ int main() try
     ReplotSupervision supervision{mib, 8 * mib, 1, 100000}; supervision.source_roots = {directory}; native.source_resources = {disk};
     auto request = replot_native_request(args, profile, state, {}, 0, 16 * mib, supervision);
     {
+        auto automatic = profile; automatic.native.compute_owner_identity = "enrolled-owner";
+        auto resolved = args; resolved.pool_codec_auto = true; resolved.pool_codec_ram = 96 * mib;
+        configure_adaptive_resources(automatic, resolved, state.config);
+        uint64_t held = 0;
+        for (auto const& demand : automatic.native.compute_services) if (demand.resource == "ram")
+            held += demand.resident_units + demand.transient_units;
+        require(held == pos2gpu::ComputeSession::memory_bytes + resolved.pool_codec_ram,
+            "automatic setup re-estimated an already resolved codec partition from the remaining owner budget");
+    }
+    {
         ReplotVerification sampled{ReplotVerificationMode::sampled, 1, 3};
         require(replot_requires_proof(sampled, 0) && !replot_requires_proof(sampled, 1) && replot_requires_proof(sampled, 2) &&
             !replot_requires_proof(sampled, 3) && replot_requires_proof(sampled, 5), "saved proof schedule changed its global group ordinals");
@@ -639,6 +649,18 @@ int main() try
             [&](auto const&) { paused = true; });
         require(admitted.allowed && paused && Clock::now() - began > std::chrono::milliseconds(1),
             "resource wait expired instead of recovering after its old aggregate deadline");
+        bool healthy = false;
+        gate.farming_health([&] { return healthy ? std::string{} : "unavailable-farming-health"; });
+        auto const lost = Clock::now();
+        auto unavailable = gate.poll(stage);
+        require(!unavailable.allowed && unavailable.paused && std::find(unavailable.assessment.reasons.begin(),
+            unavailable.assessment.reasons.end(), "unavailable-farming-health") != unavailable.assessment.reasons.end(),
+            "unavailable farming health admitted another native phase");
+        healthy = true;
+        auto const recovered = Clock::now();
+        require(gate.wait(stage, 1, [&] { return Clock::now() - recovered > std::chrono::seconds(5); }).allowed &&
+            Clock::now() - lost >= std::chrono::milliseconds(waiting.gate.recovery_hold_ms),
+            "farming health recovery bypassed the resource gate's cooldown");
         auto blocked = stage; blocked.supervision[1].transient_units = profile_detail::physical_memory();
         waiting.resources[1].capacity = UINT64_MAX;
         ReplotGate cancellation(waiting, host); auto const stopped = Clock::now(); bool cancelled = false;

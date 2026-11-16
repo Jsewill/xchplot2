@@ -4453,7 +4453,13 @@ void replot_status_protocol(fs::path const& root)
 
     ReplotLocalBindings local{inputs.digest, private_farm.job_id, "local-host", "local-user", "chia", "/config", "/executable", "/profile"};
     auto const local_text = replot_local_bindings_text(local);
-    require(replot_local_bindings_text(parse_replot_local_bindings(local_text)) == local_text, "private binding roundtrip changed bytes");
+    require(local_text.starts_with("ordinary-group-replot-local-v1\n") &&
+        replot_local_bindings_text(parse_replot_local_bindings(local_text)) == local_text, "legacy private binding roundtrip changed bytes");
+    local.compute_settings = "{\"compute_settings\":{\"schema\":1,\"options\":{\"--compute-local\":\"off\"}}}";
+    auto const with_compute = replot_local_bindings_text(local);
+    require(with_compute.starts_with("ordinary-group-replot-local-v2\n") &&
+        replot_local_bindings_text(parse_replot_local_bindings(with_compute)) == with_compute,
+        "private compute selection roundtrip changed bytes");
     auto const tight_allowance = replot_journal_allocation(4096, 4096, 4096);
     require(!replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance) &&
         replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance + 65536),
@@ -4486,6 +4492,7 @@ void replot_status_protocol(fs::path const& root)
         "next reviewed successor classification differs from exact activation authorization");
     auto rejects = [&](auto operation)
     { bool refused = false; try { operation(); } catch (std::exception const&) { refused = true; } require(refused, "invalid successor or provenance was accepted"); };
+    rejects([&] { (void)parse_replot_local_bindings(with_compute.substr(0, with_compute.rfind('\n', with_compute.size() - 2) + 1)); });
     auto construction_review = successor;
     construction_review.construction = ReplotConstructionEvidence{0, "incremental", GROW_IDENTITY, std::string(64, 'b'), {1, 2, 4096, 3, 4, 5, 6}};
     auto const construction_text = replot_revalidation_text(construction_review);

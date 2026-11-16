@@ -18,6 +18,8 @@ namespace group_grow::farm
 {
 using Clock = std::chrono::steady_clock;
 inline constexpr uint64_t resource_schema = 1;
+inline constexpr uint64_t adaptive_resource_schema = 2;
+inline constexpr uint64_t farming_health_memory_bytes = 512 * 1024 * 1024;
 inline constexpr size_t max_resources = 128, max_workloads = 256, max_stages = 4096;
 inline constexpr uint64_t profile_byte_limit = 4 * 1024 * 1024;
 inline constexpr uint64_t compute_generate_cpu = uint64_t(1) << 1, compute_generate_gpu = uint64_t(1) << 2,
@@ -150,6 +152,9 @@ struct NativeRequest
 };
 struct Profile
 {
+    // Monitored allocation policy. Unknown foreign service costs stay unknown;
+    // this policy makes no worst-case response or future-filter guarantee.
+    bool adaptive = false;
     std::string source, captured_at, producer;
     std::vector<Resource> resources;
     std::vector<Workload> workloads;
@@ -196,6 +201,7 @@ struct Margin
 struct Assessment
 {
     bool feasible = true, conditional_shared_gpu = false, conditional_shared_service = false, per_dimension_worst = false;
+    bool adaptive = false;
     std::vector<std::string> reasons;
     std::vector<Margin> margins;
 };
@@ -458,8 +464,8 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
 {
     using namespace resource_detail;
     auto const& profile = preparation.profile(); auto const& graph = preparation.graph(); auto const& n = profile.native;
-    require(n.bounded && n.scope_complete, "missing complete bounded native resource envelope");
-    require(n.covers_future_filter && n.phase_totals_include_controller && request.controller_ram_bytes,
+    require(profile.adaptive || (n.bounded && n.scope_complete), "missing complete bounded native resource envelope");
+    require((profile.adaptive || (n.covers_future_filter && n.phase_totals_include_controller)) && request.controller_ram_bytes,
             "native envelope must explicitly cover future filters and phase-total controller residency");
     require(!n.output_resources.empty(), "native resource envelope omits physical output mapping");
     require(!request.host.empty() && request.host == n.host && request.k == n.k && request.strength == n.strength && request.reader == n.reader && request.backend == n.backend && request.engine == n.engine,
@@ -474,7 +480,7 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     require(request.cpu_affinity_lanes && request.cpu_threads <= request.cpu_affinity_lanes,
             "native request has no valid inherited CPU affinity scope");
     require(request.standing_gpu_bytes == (request.backend == "gpu" && !request.compute_enabled ? n.standing_gpu_bytes : 0) &&
-            (request.backend != "gpu" || request.compute_enabled || request.standing_gpu_bytes),
+            (profile.adaptive || request.backend != "gpu" || request.compute_enabled || request.standing_gpu_bytes),
             "GPU migration requires a reviewed standing native GPU residency bound");
     auto mappings = [&](std::vector<std::string> const& actual, std::vector<std::string> const& saved)
     {
@@ -498,6 +504,19 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     }
     stage.new_farming.clear(); stage.proof_reserve.clear(); stage.construction.clear(); stage.verification.clear(); stage.supervision.clear();
     stage.background = n.compute_services;
+    if (profile.adaptive)
+    {
+        // One independently capped RPC child and its parser remain reserved
+        // while construction runs. No resident credit is taken for the child.
+        for (auto const& resource : graph.resources) if (resource.host == request.host)
+        {
+            Demand demand; demand.resource = resource.id; demand.bounded = true;
+            if (resource.kind == ResourceKind::host_memory) demand.transient_units = farming_health_memory_bytes;
+            else if (resource.kind == ResourceKind::cpu) demand.reserved_units = 1;
+            else continue;
+            stage.background.push_back(std::move(demand));
+        }
+    }
     for (auto const& worker : n.compute_workers)
     {
         auto const first = stage.background.size();
@@ -534,15 +553,34 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     // standing residency and queues without guessing a smaller idle footprint.
     auto const at = std::find_if(n.cohorts.begin(), n.cohorts.end(), [&](NativeCohort const& c) { return c.max_members >= ready_members; });
     require(at != n.cohorts.end(), "native farming count exceeds reviewed cohort envelope");
-    require(!at->new_farming.empty() && !at->proof_reserve.empty(), "native cohort omits qualities or full-proof solver reserve");
+    require(!at->new_farming.empty() && (profile.adaptive || !at->proof_reserve.empty()), "native cohort omits qualities or full-proof solver reserve");
     stage.new_farming = at->new_farming; stage.proof_reserve = at->proof_reserve;
-    if (building) { require(!n.construction.empty(), "missing native construction demands"); stage.construction = n.construction; }
-    if (verifying) { require(!n.verification.empty(), "missing native verification demands"); stage.verification = n.verification; }
+    if (building) { require(profile.adaptive || !n.construction.empty(), "missing native construction demands"); stage.construction = n.construction; }
+    if (verifying) { require(profile.adaptive || !n.verification.empty(), "missing native verification demands"); stage.verification = n.verification; }
     if (!building && !verifying)
     {
-        require(!n.supervision.empty() && request.adapter_ram_bytes && request.adapter_cpu_threads && request.adapter_timeout_us,
+        require((profile.adaptive || !n.supervision.empty()) && request.adapter_ram_bytes && request.adapter_cpu_threads && request.adapter_timeout_us,
                 "missing complete bounded controller/RPC phase envelope");
         stage.supervision = n.supervision;
+    }
+    if (profile.adaptive)
+    {
+        auto& phase = building ? stage.construction : verifying ? stage.verification : stage.supervision;
+        phase.clear();
+        auto const child_cpu = building ? request.cpu_threads : verifying ? request.verification_cpu_threads : request.adapter_cpu_threads;
+        auto const child_ram = building ? request.ram_bytes : verifying ? request.verification_ram_bytes : request.adapter_ram_bytes;
+        for (auto const& resource : graph.resources) if (resource.host == request.host)
+        {
+            Demand demand; demand.resource = resource.id; demand.bounded = true;
+            if (resource.kind == ResourceKind::cpu) demand.reserved_units = std::min(request.cpu_affinity_lanes, add(child_cpu, 1));
+            else if (resource.kind == ResourceKind::host_memory)
+            { demand.resident_units = request.controller_ram_bytes; demand.transient_units = child_ram; }
+            else if (selected_vram && graph.find(resource.id) == *selected_vram)
+            { demand.resident_units = request.standing_gpu_bytes; demand.transient_units = building ? request.gpu_bytes : request.verification_gpu_bytes; }
+            else if (building && selected_gpu && graph.find(resource.id) == *selected_gpu) demand.reserved_units = 1;
+            else continue;
+            if (demand.resident_units || demand.transient_units || demand.reserved_units) phase.push_back(std::move(demand));
+        }
     }
     auto coverage = [&](std::vector<Demand> const& values, uint64_t cpu_required, uint64_t ram_required,
                         uint64_t gpu_required, bool scratch, bool local, bool sources = false)
@@ -587,9 +625,12 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
             require(selected_vram && resident[*selected_vram] >= request.standing_gpu_bytes &&
                     units[*selected_vram] >= add(gpu_required, request.standing_gpu_bytes),
                     "native demand omits standing selected GPU residency or allocation footprint");
-        for (auto const& id : request.output_resources) require(used.contains(graph.find(id)), "native demand omits a physical output resource");
-        if (scratch) for (auto const& id : request.scratch_resources) require(used.contains(graph.find(id)), "native demand omits a physical scratch resource");
-        if (sources) for (auto const& id : request.source_resources) require(used.contains(graph.find(id)), "supervision demand omits a physical source resource");
+        if (!profile.adaptive)
+        {
+            for (auto const& id : request.output_resources) require(used.contains(graph.find(id)), "native demand omits a physical output resource");
+            if (scratch) for (auto const& id : request.scratch_resources) require(used.contains(graph.find(id)), "native demand omits a physical scratch resource");
+            if (sources) for (auto const& id : request.source_resources) require(used.contains(graph.find(id)), "supervision demand omits a physical source resource");
+        }
     };
     // Worker/child and controller may run concurrently, but their inherited
     // affinity union cannot use more physical CPU lanes than that whole set.
@@ -597,7 +638,7 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     // scoped generation cap. host_threads does not cap those existing threads,
     // so every GPU-session phase retains the whole inherited CPU-set envelope.
     auto concurrent_cpu = [&](uint64_t child)
-    { return request.backend == "gpu" && !request.compute_enabled ? request.cpu_affinity_lanes : std::min(request.cpu_affinity_lanes, add(child, 1)); };
+    { return !profile.adaptive && request.backend == "gpu" && !request.compute_enabled ? request.cpu_affinity_lanes : std::min(request.cpu_affinity_lanes, add(child, 1)); };
     if (building) coverage(stage.construction, concurrent_cpu(request.cpu_threads), add(request.ram_bytes, request.controller_ram_bytes), request.gpu_bytes, true, true);
     if (verifying)
     {
@@ -613,7 +654,7 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
     // These declarations cover their complete cohort. Native reader mean
     // work statistics and a memory-only 'proof reserve' cannot supply them.
     coverage(stage.new_farming, 1, 1, 0, false, false);
-    coverage(stage.proof_reserve, 1, 1, 0, false, false);
+    if (!profile.adaptive) coverage(stage.proof_reserve, 1, 1, 0, false, false);
     if (request.compute_enabled)
     {
         require(!n.compute_workers.empty() && !n.compute_owner_identity.empty() && !n.compute_broker_identity.empty() && !n.compute_broker_host.empty(),
@@ -639,12 +680,12 @@ inline void bind_native_stage(AssessmentPreparation const& preparation, NativeRe
             if (resource.kind == ResourceKind::host_memory) ram = add(ram, add(demand.resident_units, demand.transient_units));
         }
         require(!service_ram || (cpu && ram >= service_ram), "reviewed compute services omit the local broker/codec memory and CPU partitions");
-        require(broker_cpu && broker_ram && network, "reviewed compute services omit the physical broker host or its remote network scope");
+        require(profile.adaptive || (broker_cpu && broker_ram && network), "reviewed compute services omit the physical broker host or its remote network scope");
     }
     for (auto const& worker : n.compute_workers)
     {
         uint64_t cpu = 0, ram = 0, resident_ram = 0, vram = 0, resident_vram = 0;
-        bool gpu = false, network = worker.host == request.host;
+        bool gpu = false, network = profile.adaptive || worker.host == request.host;
         std::optional<size_t> selected;
         if (worker.gpu_bytes) selected = graph.find(worker.gpu_identity + "/memory");
         for (auto const& demand : worker.reservation)
@@ -737,6 +778,11 @@ inline void bind_native_stage(Profile const& profile, NativeRequest const& reque
 
 inline void require_target_pool_difficulty(Profile const& profile, uint64_t current, uint64_t protocol = 0)
 {
+    if (profile.adaptive)
+    {
+        resource_detail::require(current ? protocol == 1 || protocol == 2 : !protocol, "unsupported target pool protocol");
+        return;
+    }
     resource_detail::require(((!current && !profile.native.min_pool_difficulty) || (current && profile.native.min_pool_difficulty && current >= profile.native.min_pool_difficulty)) &&
         profile.native.pool_protocol_version == protocol,
         "current target pool difficulty is below the reviewed full-solver floor or its protocol differs");
@@ -747,7 +793,7 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
     using namespace resource_detail;
     auto const& profile = preparation.profile(); auto const& graph = preparation.graph(); text(stage.name, true);
     require(stage.remaining.size() <= max_workloads, "too many stage workload partitions");
-    Assessment result;
+    Assessment result; result.adaptive = profile.adaptive;
     if (!stage.scope_complete) fail(result, "incomplete-stage-resource-scope:" + stage.name);
     std::vector<bool> external_gpu(graph.resources.size()), own_gpu(graph.resources.size());
     std::vector<std::vector<size_t>> paths;
@@ -756,7 +802,7 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
     {
         Margin margin; margin.resource = r.id; margin.kind = r.kind; margin.capacity = r.capacity;
         result.margins.push_back(std::move(margin));
-        if (!r.capacity_known) fail(result, "unknown-capacity:" + r.id);
+        if (!profile.adaptive && !r.capacity_known) fail(result, "unknown-capacity:" + r.id);
     }
     std::map<std::string, uint64_t> remaining;
     for (auto const& item : stage.remaining)
@@ -770,6 +816,10 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
             "migration cannot reduce an unscanned external service reservation");
         require(count <= w.plot_count, "stage increases an existing workload inventory");
         if (at != remaining.end()) remaining.erase(at);
+        // The automatic policy protects a combined farming headroom budget.
+        // Inventory and identities remain checked, but no foreign decoder or
+        // proof service-time claim is inferred from discovery or measurements.
+        if (profile.adaptive) continue;
         bool const active = count != 0;
         bool const pending = std::any_of(w.uses.begin(), w.uses.end(), [](Use const& u) { return u.blocking_us != 0; });
         if (w.cost == CostKind::unknown || !w.bounded || !w.scope_complete || w.uses.empty())
@@ -819,7 +869,7 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
     bool proof_service = false;
     for (auto const& d : stage.proof_reserve)
         proof_service = proof_service || (!memory(graph.resources[graph.find(d.resource)].kind) && d.bounded && (d.work_us || d.reserved_units));
-    if (!stage.new_farming.empty() && !proof_service) fail(result, "missing-native-full-proof-reserve");
+    if (!profile.adaptive && !stage.new_farming.empty() && !proof_service) fail(result, "missing-native-full-proof-reserve");
     auto demands = [&](std::vector<Demand> const& values, char const* label, bool own)
     {
         require(values.size() <= max_resources * 4, "too many native stage resource demands");
@@ -872,9 +922,14 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
             required = m.request_units;
             result.conditional_shared_service = result.conditional_shared_service || m.required_units > m.request_units;
         }
-        uint64_t const occupied = memory(m.kind) ? add(m.resident_units, m.transient_units) : add(m.reserved_units, required);
+        uint64_t occupied = memory(m.kind) ? add(m.resident_units, m.transient_units) : add(m.reserved_units, required);
+        // Small hosts cannot dedicate separate cores to the controller,
+        // capped producer and health probe. The automatic policy time-shares
+        // that inherited set and relies on its live farming/pressure gate.
+        if (profile.adaptive && m.kind == ResourceKind::cpu && m.capacity <= 3)
+            occupied = std::min(occupied, m.capacity);
         m.occupied_units = occupied;
-        if (occupied > m.capacity) fail(result, "capacity-exceeded:" + m.resource);
+        if (occupied > m.capacity && (!profile.adaptive || r.capacity_known)) fail(result, "capacity-exceeded:" + m.resource);
         if (m.request_units > m.capacity) fail(result, "request-shape-exceeds-capacity:" + m.resource);
         m.remaining_units = occupied <= m.capacity ? m.capacity - occupied : 0;
         // Deliberately serialize the whole finite burst. Parallel lanes only
@@ -908,6 +963,7 @@ inline void merge_stage_assessment(Assessment& result, Assessment next, std::str
     resource_detail::text(stage_name, true);
     resource_detail::require(result.margins.empty() || result.margins.size() == next.margins.size(), "migration resource aggregation scope changed");
     result.per_dimension_worst = true; result.feasible = result.feasible && next.feasible;
+    result.adaptive = result.adaptive || next.adaptive;
     result.conditional_shared_gpu = result.conditional_shared_gpu || next.conditional_shared_gpu;
     result.conditional_shared_service = result.conditional_shared_service || next.conditional_shared_service;
     for (auto const& reason : next.reasons)
@@ -1129,6 +1185,7 @@ inline ResourcePreparation prepare_resource_declarations(Profile const& profile)
 {
     using namespace resource_detail;
     validate(profile); Graph graph(profile); ResourcePreparation result;
+    if (profile.adaptive) return result;
     auto need = [&](bool absent, std::string group, std::string path, std::string action)
     { if (absent) { require(result.missing.size() < max_preparation_entries, "too many missing resource declarations");
         result.missing.push_back({std::move(group), std::move(path), std::move(action)}); } };
@@ -1447,7 +1504,9 @@ inline Profile parse_profile(profile_detail::Json const& supplied)
     auto const* nested = field(supplied, "farm_resources"); auto const& object = nested ? *nested : supplied;
     auto required = [&](Json const& value, char const* name) -> Json const&
     { auto const* result = field(value, name); resource_detail::require(result, "missing mixed farm profile field"); return *result; };
-    resource_detail::require(integer(required(object, "schema")) == resource_schema, "unsupported mixed farm resource schema");
+    auto const schema = integer(required(object, "schema"));
+    resource_detail::require(schema == resource_schema || (schema == adaptive_resource_schema &&
+        text(required(object, "policy")) == "adaptive"), "unsupported mixed farm resource schema");
     auto string = [&](Json const& value, char const* name) { auto const* item = field(value, name); return item ? text(*item) : std::string{}; };
     auto number = [&](Json const& value, char const* name) { auto const* item = field(value, name); return item ? integer(*item) : uint64_t(0); };
     auto flag = [&](Json const& value, char const* name) { auto const* item = field(value, name); return item && boolean(*item); };
@@ -1457,7 +1516,8 @@ inline Profile parse_profile(profile_detail::Json const& supplied)
         resource_detail::require(result.kind == Json::array && result.items.size() <= bound, "invalid mixed farm profile array");
         return result.items;
     };
-    Profile profile; profile.source = string(object, "source"); profile.captured_at = string(object, "captured_at"); profile.producer = string(object, "producer");
+    Profile profile; profile.adaptive = schema == adaptive_resource_schema;
+    profile.source = string(object, "source"); profile.captured_at = string(object, "captured_at"); profile.producer = string(object, "producer");
     if (auto const* policy = field(object, "gate"))
     {
         if (auto const* item = field(*policy, "max_age_ms")) profile.gate.max_age_ms = integer(*item);
@@ -1800,7 +1860,9 @@ inline void write_profile_json(std::ostream& out, Profile const& profile)
 {
     resource_detail::validate(profile);
     auto quote = [&](std::string const& s) { pos2gpu::write_json_string(out, s); };
-    out << "{\"schema\":" << resource_schema << ",\"source\":"; quote(profile.source);
+    out << "{\"schema\":" << (profile.adaptive ? adaptive_resource_schema : resource_schema);
+    if (profile.adaptive) out << ",\"policy\":\"adaptive\"";
+    out << ",\"source\":"; quote(profile.source);
     out << ",\"captured_at\":"; quote(profile.captured_at); out << ",\"producer\":"; quote(profile.producer);
     out << ",\"gate\":{\"max_age_ms\":" << profile.gate.max_age_ms << ",\"recovery_hold_ms\":" << profile.gate.recovery_hold_ms
         << ",\"recovery_samples\":" << profile.gate.recovery_samples << ",\"max_cpu_busy_permille\":" << profile.gate.max_cpu_busy_permille << "},\"resources\":[";
@@ -1850,7 +1912,8 @@ inline void write_assessment_json(std::ostream& out, Assessment const& result)
 {
     auto quote = [&](std::string const& s) { pos2gpu::write_json_string(out, s); };
     out << "{\"feasible\":" << (result.feasible ? "true" : "false")
-        << ",\"assessment\":\"conditional-declared-envelopes\",\"foreign_queues_controlled\":false,\"gpu_preemption_guaranteed\":false"
+        << ",\"assessment\":\"" << (result.adaptive ? "adaptive-allocation-limits" : "conditional-declared-envelopes")
+        << "\",\"foreign_queues_controlled\":false,\"gpu_preemption_guaranteed\":false"
         << ",\"conditional_shared_gpu\":" << (result.conditional_shared_gpu ? "true" : "false")
         << ",\"conditional_shared_service\":" << (result.conditional_shared_service ? "true" : "false")
         << ",\"per_dimension_worst_across_stages\":" << (result.per_dimension_worst ? "true" : "false") << ",\"reasons\":[";

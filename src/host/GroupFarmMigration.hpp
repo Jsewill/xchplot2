@@ -1223,7 +1223,9 @@ struct ReplotLocalBindings
     std::string review_digest, job_id, host, user;
     std::string adapter, root, executable, profile;
     std::string policy_digest;
+    std::string compute_settings;
 };
+inline constexpr uint64_t replot_local_bindings_byte_limit = 128 * 1024;
 inline std::string replot_local_bindings_text(ReplotLocalBindings const& local)
 {
     require(replot_digest(local.review_digest) && replot_digest(local.job_id) && !local.host.empty() && !local.user.empty() &&
@@ -1231,19 +1233,21 @@ inline std::string replot_local_bindings_text(ReplotLocalBindings const& local)
         (local.policy_digest.empty() || replot_digest(local.policy_digest)), "invalid private replot bindings");
     for (auto const* path : {&local.root, &local.executable, &local.profile})
         require(path->empty() || file_io::native_path(*path).is_absolute(), "private replot binding paths must be absolute");
-    std::ostringstream out; out << "ordinary-group-replot-local-v1\n" << std::quoted(local.review_digest) << ' '
+    std::ostringstream out; out << (local.compute_settings.empty() ? "ordinary-group-replot-local-v1\n" : "ordinary-group-replot-local-v2\n") << std::quoted(local.review_digest) << ' '
         << std::quoted(local.job_id) << ' ' << std::quoted(local.host) << ' ' << std::quoted(local.user) << '\n'
         << std::quoted(local.adapter) << ' ' << std::quoted(local.root) << ' ' << std::quoted(local.executable) << ' ' << std::quoted(local.profile)
         << ' ' << std::quoted(local.policy_digest) << '\n';
-    auto result = out.str(); require(result.size() <= 8192, "private replot bindings exceed their allocation allowance"); return result;
+    if (!local.compute_settings.empty()) out << std::quoted(local.compute_settings) << '\n';
+    auto result = out.str(); require(result.size() <= replot_local_bindings_byte_limit, "private replot bindings exceed their allocation allowance"); return result;
 }
 inline ReplotLocalBindings parse_replot_local_bindings(std::string const& body)
 {
-    require(body.size() <= 8192, "private replot bindings exceed their allocation allowance");
+    require(body.size() <= replot_local_bindings_byte_limit, "private replot bindings exceed their allocation allowance");
     std::istringstream in(body); std::string version; std::getline(in, version);
-    require(version == "ordinary-group-replot-local-v1", "unsupported private replot bindings version");
+    require(version == "ordinary-group-replot-local-v1" || version == "ordinary-group-replot-local-v2", "unsupported private replot bindings version");
     ReplotLocalBindings result; in >> std::quoted(result.review_digest) >> std::quoted(result.job_id) >> std::quoted(result.host) >> std::quoted(result.user)
         >> std::quoted(result.adapter) >> std::quoted(result.root) >> std::quoted(result.executable) >> std::quoted(result.profile) >> std::quoted(result.policy_digest);
+    if (version == "ordinary-group-replot-local-v2") in >> std::quoted(result.compute_settings);
     require(bool(in), "incomplete private replot bindings"); in >> std::ws; require(in.eof(), "unexpected private replot binding data");
     (void)replot_local_bindings_text(result); return result;
 }

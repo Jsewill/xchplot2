@@ -33,6 +33,65 @@ struct ReplotLocalResources
     uint64_t ram_bytes = 0, cpu_threads = 0;
 };
 struct ReplotMemoryObservation { uint64_t available_bytes = 0, owned_resident_bytes = 0; };
+// Build allocation limits from observed hardware and the plotter's enforced
+// caps. Foreign decoder/solver costs are deliberately left unqualified.
+inline void configure_adaptive_resources(Profile& profile, pos2gpu::GroupOptions const& args, FarmingConfig const& config)
+{
+    using namespace resource_detail;
+    profile.adaptive = true; profile.source = "automatic-conservative-limits";
+    auto& native = profile.native;
+    uint64_t cpus = 0, ram = 0;
+    for (auto& resource : profile.resources) if (resource.host == native.host)
+    {
+        if (resource.kind == ResourceKind::cpu)
+        { resource.capacity = profile_detail::logical_cpus(); cpus = resource.capacity; resource.capacity_known = true; resource.telemetry_required = true; }
+        if (resource.kind == ResourceKind::host_memory)
+        { resource.capacity = profile_detail::physical_memory(); ram = resource.capacity; resource.capacity_known = true; resource.telemetry_required = true; }
+    }
+    require(cpus && ram, "cannot observe local CPU and RAM limits for automatic migration");
+    native.k = config.k; native.strength = config.strength;
+    native.reader = config.reader == FarmingReader::cached ? "cached" : "stateless";
+    native.backend = args.backend == "auto" ? "cpu" : args.backend;
+    native.engine = args.construction;
+    native.max_ram_bytes = std::min(args.max_ram, ram / 2);
+    native.max_cpu_threads = std::min(args.workers ? args.workers : cpus, std::max(uint64_t(1), cpus / 2));
+    native.max_group_members = args.group_members ? args.group_members : UINT16_MAX;
+    native.max_batch_members = std::min(args.batch, native.max_group_members);
+    native.verification_cpu_threads = 1;
+    // Watchdogs bound an attempted operation, not a farming response. Paused
+    // time is excluded by the existing checkpoint/retry machinery.
+    native.max_construction_us = native.max_verification_us = 24ULL * 60 * 60 * 1000000;
+    native.bounded = native.scope_complete = native.covers_future_filter = false;
+    native.phase_totals_include_controller = true;
+    native.construction.clear(); native.verification.clear(); native.supervision.clear(); native.cohorts.clear();
+    NativeCohort cohort; cohort.max_members = UINT64_MAX;
+    for (auto const& resource : profile.resources) if (resource.host == native.host)
+    {
+        Demand demand; demand.resource = resource.id; demand.bounded = true;
+        if (resource.kind == ResourceKind::cpu) demand.reserved_units = std::max(uint64_t(1), cpus / 4);
+        else if (resource.kind == ResourceKind::host_memory)
+            demand.transient_units = std::min(ram / 4,
+                std::max(uint64_t(256 * 1024 * 1024), profile_detail::available_memory() / 4));
+        else continue;
+        cohort.new_farming.push_back(std::move(demand));
+    }
+    native.cohorts.push_back(std::move(cohort));
+    native.compute_services.clear();
+    if (!native.compute_owner_identity.empty())
+    {
+        for (auto const& resource : profile.resources) if (resource.host == native.host)
+        {
+            Demand demand; demand.resource = resource.id; demand.bounded = true;
+            if (resource.kind == ResourceKind::cpu) demand.reserved_units = 1;
+            else if (resource.kind == ResourceKind::host_memory)
+                demand.transient_units = add(pos2gpu::ComputeSession::memory_bytes, args.pool_codec_ram);
+            else continue;
+            native.compute_services.push_back(std::move(demand));
+        }
+    }
+    profile.gate.max_cpu_busy_permille = 850;
+    validate(profile);
+}
 inline ReplotMemoryObservation replot_memory_observation()
 {
     auto owned = []() -> std::optional<uint64_t>
@@ -104,6 +163,8 @@ inline ReplotLocalResources replot_local_resources(Profile const& profile, Nativ
             }
             if (resource.kind == ResourceKind::cpu)
             {
+                if (profile.adaptive && inherited_cpu_lanes <= 3)
+                { result.cpu_threads = std::min(result.cpu_threads, uint64_t(1)); continue; }
                 // Shared modeled queues keep their complete serialized timing
                 // bound. Only the available physical partition determines the
                 // capped producer fanout; an idle sample does not grant lanes.
@@ -136,6 +197,9 @@ inline void require_target_service_scope(Profile const& profile,
     };
     auto const& harvester = host("harvester"); auto const& farmer = host("farmer");
     auto const& full_node = host("full_node"); auto const& solver = host("solver");
+    // Authenticated physical bindings still apply. Shared remote services are
+    // observed live by the adaptive policy, not assigned invented cost bounds.
+    if (profile.adaptive) return;
     auto covered = [&](auto const& uses, std::string const& physical, bool proof)
     {
         bool cpu = false, ram = false, full = false;
@@ -566,6 +630,7 @@ class ReplotGate
     // The caller reports only live/identity-reserved services it owns, never
     // all reviewed workers on this host. Phase totals still reserve all of them.
     std::function<uint64_t(bool)> owned_background_ram_;
+    std::function<std::string()> farming_health_;
     Admission poll_impl(Stage const& stage, bool active, SupervisedProcess const* proof = nullptr, uint64_t proof_ram_bytes = 0)
     {
         using namespace resource_detail;
@@ -613,6 +678,7 @@ class ReplotGate
         catch (std::exception const&) { failure = "unavailable-current-local-pressure"; }
         if (credit.parent_limit_bytes && !accepted_own_anon_) failure = "unavailable-current-own-anonymous-memory";
         if (proof && !accepted_child_anon_) failure = "unavailable-current-proof-anonymous-memory";
+        if (failure.empty() && farming_health_) failure = farming_health_();
         if (!failure.empty()) gate_.pause();
         credit.parent_resident_bytes = accepted_own_anon_.value_or(0);
         credit.child_resident_bytes = proof ? accepted_child_anon_.value_or(0) : 0;
@@ -629,6 +695,7 @@ public:
         resource_detail::require(!actual_host.empty() && actual_host == profile_detail::host_name() && actual_host == profile_.native.host,
                                  "migration runtime gate host differs from the reviewed execution host");
     }
+    void farming_health(std::function<std::string()> check) { farming_health_ = std::move(check); }
     Admission poll(Stage const& stage)
     { return poll_impl(stage, false); }
     // Sole monitor caller, while the declared construction reservation is held.

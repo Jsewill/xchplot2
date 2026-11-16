@@ -919,24 +919,48 @@ Ordinary `fill` uses available space without deleting existing plots. Add
 selected farm, checks the replacement schedule and saves a private resumable
 job before retiring any source. `plan` and `fill --plan-only` preview the same
 operation without changing the farm; neither is a prerequisite for execution.
-For example, with a complete mixed-farm resource profile:
+For example:
 
 ```bash
 xchplot2 fill /disk-a/plots /disk-b/plots --replot \
-  --harvester mixed-farm.json --destination-temp on -M 60G \
   --chia-root /home/farmer/.chia/mainnet --chia-executable /opt/chia/bin/chia \
   -f "$FARMER_PK" -c "$POOL_ADDRESS"
 ```
 
 Resume an interrupted job with `xchplot2 fill /disk-a/plots`. Its private
 `.xchplot2/grow-replot.review` retains the selection, keys, profile and local
-reader bindings. All roots must be present when durable coordination is first
+reader and compute selections. All roots must be present when durable coordination is first
 established. Later, a missing drive waits while independent work can continue;
 resume through an available destination or the saved review.
 After migration completes, `fill DIR` uses ordinary farming recovery without
 requiring migration service checks again.
 Construction and compute overrides follow the same rules as saved reviews
 described below.
+
+New jobs without a declared `farm_resources` profile use automatic conservative
+limits. The plotter caps construction at half the local CPU/RAM ceiling, leaves
+additional farming headroom, and reduces allocations when live memory is tight.
+`--workers` and `-M` can lower those limits. The default producer is CPU; an
+explicit GPU selection retains physical-device checks and leaves VRAM headroom.
+Enrolled helpers are discovered through the existing shared-compute setup.
+
+During execution, an independently capped health probe checks the synced full
+node, connected farmer/harvester and started solver. Unavailable or stale health
+observations pause work at a recoverable boundary. Local CPU/RAM pressure also
+pauses work. When the selected reader's existing log supplies fresh lookup
+times, slow responses throttle I/O and pause construction; no logging change is
+required. Healthy observations allow recovery. These controls do not establish
+a worst-case proof deadline, GPU preemption or future-filter guarantee. RPC
+health remains available when lookup timing is not exposed.
+
+`plan DIR --replot --save-profile FILE` optionally saves this automatic setup
+and prints continuation commands. It does not require service-cost or queue
+declarations. Saved local profiles and private job bindings retain explicit
+compute choices, including membership directory, broker, local participation
+and offer limits. Explicit command-line choices override saved preferences.
+Portable reviews contain the resource policy, not local credentials or
+executable authority. Automatic resource profiles use schema 2; older binaries
+reject them. Existing schema 1 profiles retain their reviewed-envelope behavior.
 
 A fresh replot scan includes directories from the selected reader configurations
 and adds explicit destinations, path-list files and `--discover-drives` results.
@@ -956,8 +980,7 @@ Like `--temp-dirs`, these lists end at another option or `--`; prefix names
 starting with `-` with `./`.
 
 Execution needs a compatible Chia harvester, farmer,
-started PoS2 solver and synced, activated full node, with complete resource
-bounds for the selected construction backend. Linux and native Windows use
+started PoS2 solver and synced, activated full node. Linux and native Windows use
 native file claims and bounded worker processes. A platform without the required
 telemetry or process controls refuses admission. See the
 [compatibility guide](contrib/pos2-pr118/README.md) for PoS2 reader support.
@@ -965,8 +988,9 @@ telemetry or process controls refuses admission. See the
 Replacement routes include solo pool contracts, external pooling and OG pool
 public keys. For an external pool, the farmer must report the configured public
 route, supported pooling protocol, initialized authentication parameters and
-current difficulty. The review must cover that protocol and a conservative
-minimum difficulty. These RPC observations do not prove pool registration, a
+current difficulty. Manually reviewed resource envelopes must cover that
+protocol and a conservative minimum difficulty; automatic policies monitor the
+live services. These RPC observations do not prove pool registration, a
 current authentication token, possession of an OG signing key or acceptance of
 a future proof. By default the first replacement in each destination establishes
 its exact public-key route after publication; migration does not wait for a
@@ -1082,6 +1106,12 @@ inode attestation. A matching pathname on an unrelated remote filesystem does
 not establish the controller's exact replacement. Configure the actual shared
 file namespace and physical storage/resource mappings before review.
 
+The following declaration workflow is for manually reviewed resource envelopes.
+It is optional for new migrations using automatic limits. A supplied schema 1
+resource profile keeps this mode. Explicit `--resource-setting` declarations
+also select it when starting without an automatic profile; incomplete
+declarations are not silently promoted to guarantees.
+
 The inventory contains an editable `farm_resources` template and a separate
 `resource_preparation` checklist. Preparation generates local source filesystem
 and drive aliases, CPU/RAM resources for selected physical service hosts, and
@@ -1151,8 +1181,9 @@ can remain incomplete and are not executable migration reviews. Once complete,
 use the profile with `fill --replot`, or preview and optionally save a review
 with `plan --replot --save-plan`. `fill --replot` also accepts the same
 `--resource-setting` declarations. An ordinary
-harvester profile can also seed setup; missing migration declarations remain
-explicit. Keep profiles containing `farm_adapters` private and local to the
+harvester profile can also seed automatic setup; adding explicit resource
+declarations selects the reviewed workflow above. Keep profiles containing
+`farm_adapters` or `compute_settings` private and local to the
 machine where their executable and configuration paths are authorized.
 
 You can also edit the existing `farm_resources` object in a copy of the inventory

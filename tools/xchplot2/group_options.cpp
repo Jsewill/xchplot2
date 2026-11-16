@@ -1,6 +1,7 @@
 #include "group_commands.hpp"
 #include "device_options.hpp"
 #include "host/GroupHarvesterProfile.hpp"
+#include "host/GroupComputeSettings.hpp"
 #include "host/GroupFarmFile.hpp"
 #include "host/GroupFarmMetadata.hpp"
 #include "host/GroupPublication.hpp"
@@ -140,6 +141,13 @@ void load_harvester_profile(pos2gpu::GroupOptions& result)
             group_grow::farm::inventory_detail::is_replot_review(result.from_plan));
         if (migration)
         {
+            {
+                using namespace group_grow::profile_detail;
+                auto const memory = std::min(result.max_ram / 8, parsing_memory_bytes);
+                auto const document = JsonReader(read_text(input, std::min<uint64_t>(profile_bytes, memory / 4)), memory).read();
+                (void)apply_group_compute_settings(result, document);
+            }
+            input.clear(); input.seekg(0);
             auto profile = group_grow::read_replot_farming_profile(input, std::min(result.max_ram / 8, uint64_t(256 * mib)));
             if (profile) result.farming_profile = std::make_shared<group_grow::FarmingProfile>(std::move(*profile));
             return;
@@ -249,6 +257,73 @@ void reference_help()
         "The RAM budget models app buffers; physical memory qualification is separate.\n";
 }
 } // namespace
+
+void pos2gpu::configure_group_compute(GroupOptions& result)
+{
+    if (result.compute_requested) return;
+    auto const& command = result.command;
+    bool const farm_command = command == "fill" || command == "plan";
+    auto const combined_ram = result.max_ram;
+    result.compute_requested = static_cast<GroupComputeOptions const&>(result);
+    result.compute_requested_backend = result.backend;
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    if (result.save_profile.empty() || !result.local_devices.empty() || result.replot) prepare_group_compute(result);
+#endif
+    bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
+        !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||
+        result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram || !result.pool_codec_auto;
+    require(!pool_options || !result.pool_broker.empty() || result.local_compute, command.empty() ? "network compute options require --pool-broker" : "network compute options require --compute-broker");
+    if (!result.pool_broker.empty() || result.local_compute)
+    {
+        if (!result.backend_set) result.backend = "auto";
+#if !defined(GROW_POOL_NETWORK) || !GROW_POOL_NETWORK
+        require(false, "network compute is unavailable in this build");
+#endif
+        require(result.local_compute || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
+            !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty()),
+            command.empty() ? "network compute requires a stable --pool-owner-id and mutual TLS credentials" : "network compute requires a stable --compute-owner-id and mutual TLS credentials");
+        require(result.fixtures.empty(), "network compute cannot use fixture inputs");
+        require(result.pool_inflight && result.pool_inflight <= 1024 && result.pool_timeout_ms &&
+            result.pool_timeout_ms <= UINT_MAX && result.pool_socket_timeout_ms && result.pool_socket_timeout_ms <= UINT_MAX &&
+            result.pool_frame_bytes >= 4096 && result.pool_frame_bytes <= 16 * mib,
+            "invalid network compute concurrency, deadline or transport window");
+        require(result.window <= UINT32_MAX - result.pool_frame_bytes,
+            "network codec source window exceeds the portable task bound");
+        bool const offer = !result.pool_listen.empty() || !result.pool_advertise.empty() ||
+            result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram;
+        require(!offer || ((result.local_compute || result.automatic_compute || (!result.pool_listen.empty() && !result.pool_advertise.empty())) &&
+            result.pool_offer_ram && result.pool_offer_cpus),
+            "offering local compute requires listen, advertise, RAM and CPU grants");
+        unsigned const workers = result.workers ? unsigned(result.workers) : std::max(1u, std::thread::hardware_concurrency());
+        require(!offer || (result.pool_offer_cpus && result.pool_offer_cpus <= 1024 && result.pool_offer_slots && result.pool_offer_slots <= 1024),
+            "local compute offer exceeds CPU or slot bounds");
+        bool const shared = workers == 1 ? result.pool_offer_cpus == 1 : result.pool_offer_cpus < workers;
+        bool const migration = offer && !shared && (result.replot || (farm_command && !result.from_plan.empty() &&
+            group_grow::farm::inventory_detail::is_replot_review(result.from_plan)));
+        require(!offer || shared || migration,
+            "local compute offer must leave CPU capacity for receiving and storage");
+        require(result.pool_offer_backend == "cpu" || result.pool_offer_backend == "gpu" || result.pool_offer_backend == "auto",
+            command.empty() ? "--pool-offer-backend requires cpu, gpu or auto" : "--compute-offer-backend requires cpu, gpu or auto");
+        require(!offer || result.local_compute || result.automatic_compute || result.pool_offer_backend == "cpu" || result.pool_offer_vram,
+            command.empty() ? "a local GPU offer requires --pool-offer-vram" : "a local GPU offer requires --compute-offer-vram");
+        require(result.pool_offer_ram < result.max_ram && result.max_ram - result.pool_offer_ram >= 16 * mib,
+            "local compute offer must leave at least 16 MiB for receiving and assembling plots; reduce the offered RAM or raise -M");
+        // Reserve the complete service partition before owner construction
+        // admission. Its own gate covers sessions, transport and retained GPU
+        // state; it cannot consume construction's remaining headroom.
+        result.max_ram -= result.pool_offer_ram;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (result.pool_codec_auto)
+            result.pool_codec_ram = std::min({sum(product(result.window, 12),
+                product(group_grow::pool::Channel::memory_bytes(uint32_t(result.pool_frame_bytes)), 2)),
+                result.max_ram / 16, uint64_t(256 * mib), result.max_ram - 16 * mib});
+#endif
+        require(result.pool_codec_ram < result.max_ram && result.max_ram - result.pool_codec_ram >= 16 * mib,
+            "remote codec partition leaves insufficient owner RAM");
+        result.max_ram -= result.pool_codec_ram;
+    }
+    result.compute_reserved_ram = combined_ram - result.max_ram;
+}
 
 pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::string_view command)
 {
@@ -540,13 +615,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 require(!value.empty() && result.mounts_under.size() < 1024, "invalid mount discovery root");
                 result.mounts_under.push_back(path(value));
             }
-            else if (key == "--compute") result.compute_mode = value;
-            else if (key == "--pool-directory") result.pool_directory = value;
-            else if (key == "--pool-local")
-            {
-                require(value == "on" || value == "off", "--compute-local requires on or off");
-                result.automatic_local_compute = value == "on";
-            }
+            else if ((key == "--compute" || key.starts_with("--pool-")) && set_group_compute_setting(result, key, value)) {}
             else if (key == "--memo") result.memo = value;
             else if (key == "--farmer-pk" || key == "-f") result.farmer = value;
             else if (key == "--pool-pk" || key == "-p") result.pool_pk = value;
@@ -554,24 +623,6 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--pool-contract-address" || key == "-c") result.pool_address = value;
             else if (key == "--seed" || key == "-S") result.seed = value;
             else if (key == "--fixture-inputs") result.fixtures = fs::path(reinterpret_cast<char8_t const*>(value.c_str()));
-            else if (key == "--pool-broker") result.pool_broker = value;
-            else if (key == "--pool-owner-id") { result.pool_owner = value; result.pool_owner_explicit = true; }
-            else if (key == "--pool-ca") result.pool_ca = value;
-            else if (key == "--pool-cert") result.pool_cert = value;
-            else if (key == "--pool-key") result.pool_key = value;
-            else if (key == "--pool-listen") result.pool_listen = value;
-            else if (key == "--pool-advertise") result.pool_advertise = value;
-            else if (key == "--pool-offer-backend") { result.pool_offer_backend = value; result.pool_offer_backend_set = true; }
-            else if (key == "--pool-offer-ram") result.pool_offer_ram = result.pool_offer_ram_limit = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-offer-cpus") result.pool_offer_cpus = result.pool_offer_cpu_limit = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-offer-vram") result.pool_offer_vram = result.pool_offer_vram_limit = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-offer-slots") result.pool_offer_slots = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-inflight") result.pool_inflight = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-timeout-ms") result.pool_timeout_ms = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-socket-timeout-ms") result.pool_socket_timeout_ms = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-frame-bytes") result.pool_frame_bytes = number(value.c_str(), argv[i - 1]);
-            else if (key == "--pool-codec-ram")
-            { result.pool_codec_auto = value == "auto"; if (!result.pool_codec_auto) result.pool_codec_ram = number(value.c_str(), argv[i - 1]); }
             else if (key == "--temp-dir" || key == "-t")
             {
                 require(result.temporary.size() < 1024, "too many temporary directories");
@@ -934,62 +985,8 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(result.local_devices.empty() || (!result.replot &&
         (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
         "migration uses its reviewed single-producer resources; select --backend cpu or --devices gpuN for migration");
-#ifdef XCHPLOT2_GROUP_COMMANDS
-    if (result.save_profile.empty() || !result.local_devices.empty()) prepare_group_compute(result);
-#endif
-    bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
-        !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||
-        result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram || !result.pool_codec_auto;
-    require(!pool_options || !result.pool_broker.empty() || result.local_compute, command.empty() ? "network compute options require --pool-broker" : "network compute options require --compute-broker");
-    if (!result.pool_broker.empty() || result.local_compute)
-    {
-        if (!result.backend_set) result.backend = "auto";
-#if !defined(GROW_POOL_NETWORK) || !GROW_POOL_NETWORK
-        require(false, "network compute is unavailable in this build");
-#endif
-        require(result.local_compute || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
-            !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty()),
-            command.empty() ? "network compute requires a stable --pool-owner-id and mutual TLS credentials" : "network compute requires a stable --compute-owner-id and mutual TLS credentials");
-        require(result.fixtures.empty(), "network compute cannot use fixture inputs");
-        require(result.pool_inflight && result.pool_inflight <= 1024 && result.pool_timeout_ms &&
-            result.pool_timeout_ms <= UINT_MAX && result.pool_socket_timeout_ms && result.pool_socket_timeout_ms <= UINT_MAX &&
-            result.pool_frame_bytes >= 4096 && result.pool_frame_bytes <= 16 * mib,
-            "invalid network compute concurrency, deadline or transport window");
-        require(result.window <= UINT32_MAX - result.pool_frame_bytes,
-            "network codec source window exceeds the portable task bound");
-        bool const offer = !result.pool_listen.empty() || !result.pool_advertise.empty() ||
-            result.pool_offer_ram || result.pool_offer_cpus || result.pool_offer_vram;
-        require(!offer || ((result.local_compute || result.automatic_compute || (!result.pool_listen.empty() && !result.pool_advertise.empty())) &&
-            result.pool_offer_ram && result.pool_offer_cpus),
-            "offering local compute requires listen, advertise, RAM and CPU grants");
-        unsigned const workers = result.workers ? unsigned(result.workers) : std::max(1u, std::thread::hardware_concurrency());
-        require(!offer || (result.pool_offer_cpus && result.pool_offer_cpus <= 1024 && result.pool_offer_slots && result.pool_offer_slots <= 1024),
-            "local compute offer exceeds CPU or slot bounds");
-        bool const shared = workers == 1 ? result.pool_offer_cpus == 1 : result.pool_offer_cpus < workers;
-        bool const migration = offer && !shared && (result.replot || (farm_command && !result.from_plan.empty() &&
-            group_grow::farm::inventory_detail::is_replot_review(result.from_plan)));
-        require(!offer || shared || migration,
-            "local compute offer must leave CPU capacity for receiving and storage");
-        require(result.pool_offer_backend == "cpu" || result.pool_offer_backend == "gpu" || result.pool_offer_backend == "auto",
-            command.empty() ? "--pool-offer-backend requires cpu, gpu or auto" : "--compute-offer-backend requires cpu, gpu or auto");
-        require(!offer || result.local_compute || result.automatic_compute || result.pool_offer_backend == "cpu" || result.pool_offer_vram,
-            command.empty() ? "a local GPU offer requires --pool-offer-vram" : "a local GPU offer requires --compute-offer-vram");
-        require(result.pool_offer_ram < result.max_ram && result.max_ram - result.pool_offer_ram >= 16 * mib,
-            "local compute offer must leave at least 16 MiB for receiving and assembling plots; reduce the offered RAM or raise -M");
-        // Reserve the complete service partition before owner construction
-        // admission. Its own gate covers sessions, transport and retained GPU
-        // state; it cannot consume construction's remaining headroom.
-        result.max_ram -= result.pool_offer_ram;
-#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        if (result.pool_codec_auto)
-            result.pool_codec_ram = std::min({sum(product(result.window, 12),
-                product(group_grow::pool::Channel::memory_bytes(uint32_t(result.pool_frame_bytes)), 2)),
-                result.max_ram / 16, uint64_t(256 * mib), result.max_ram - 16 * mib});
-#endif
-        require(result.pool_codec_ram < result.max_ram && result.max_ram - result.pool_codec_ram >= 16 * mib,
-            "remote codec partition leaves insufficient owner RAM");
-        result.max_ram -= result.pool_codec_ram;
-    }
+    if (result.save_profile.empty() || !result.local_devices.empty()) configure_group_compute(result);
+    else { auto checked = result; configure_group_compute(checked); }
     if (result.directory_farm && !farm_command)
     {
         result.target = fs::canonical(result.target);

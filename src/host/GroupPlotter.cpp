@@ -8,6 +8,7 @@
 #include "host/GroupPolicy.hpp"
 #include "host/GroupFarming.hpp"
 #include "host/GroupHarvesterProfile.hpp"
+#include "host/GroupComputeSettings.hpp"
 #include "host/GroupFarmState.hpp"
 #include "host/GroupFarmMembership.hpp"
 #include "host/GroupFarmPreview.hpp"
@@ -8472,6 +8473,7 @@ void save_replot_setup_profile(Arguments const& args, group_grow::farm::FarmInve
     out << ",\"farm_resources\":"; write_profile_json(out, *inventory.resource_template);
     out << ",\"resource_preparation\":"; write_resource_preparation_json(out, *inventory.resource_preparation);
     if (!adapters.routes.empty()) { out << ",\"farm_adapters\":"; write_farm_adapters_json(out, adapters); }
+    if (!args.compute_settings.empty()) { out << ",\"compute_settings\":"; pos2gpu::write_group_compute_settings(out, args); }
     out << "}\n"; auto const text = out.str();
     require(sum(retained, product(text.capacity(), 4)) < args.max_ram, "reusable migration profile export exceeds --max-ram");
     check_cancel(args); stream_state::atomic_save(args.save_profile, text, false);
@@ -8583,7 +8585,44 @@ int print_farm_inventory(Arguments const& args)
     }
     return 0;
 }
-int print_replot_setup(Arguments const& args)
+void append_replot_arguments(std::vector<std::string>& command, Arguments const& args,
+    group_grow::FarmingConfig const& config, fs::path const& profile, bool fresh)
+{
+    if (!profile.empty()) command.insert(command.end(), {"--harvester", file_io::path_text(profile)});
+    command.insert(command.end(), {"--k", std::to_string(config.k), "--strength", std::to_string(config.strength),
+        "--headroom-bytes", std::to_string(args.headroom), "--batch-members", std::to_string(args.batch), "--destination-temp", args.destination_temp,
+        "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", std::to_string(args.checkpoint_bytes), "--member-storage", args.member_storage,
+        "--io-overlap", args.io_overlap ? "on" : "off", "--generation-overlap", args.generation_overlap_auto ? "auto" : args.generation_overlap ? "on" : "off",
+        "--cache-release", args.cache_release ? "on" : "off"});
+    auto limit = [&](char const* option, uint64_t value, uint64_t omitted)
+    { if (value != omitted) command.insert(command.end(), {option, std::to_string(value)}); };
+    if (args.max_ram_set) command.insert(command.end(), {"--max-ram", std::to_string(args.max_ram_limit ? args.max_ram_limit : args.max_ram)});
+    limit("--workers", args.workers, 0); limit("--capacity-bytes", args.capacity, 0);
+    limit("--temp-capacity-bytes", args.temporary_capacity, 0);
+    limit("--max-groups", args.max_groups, UINT64_MAX); limit("--max-total-members", args.max_total_members, UINT64_MAX);
+    limit("--group-members", args.group_members, 0);
+    if (args.backend != "auto") command.insert(command.end(), {"--backend", args.backend});
+    if (!args.devices.empty()) command.insert(command.end(), {"--devices", args.devices});
+    else if (args.backend != "cpu") command.insert(command.end(), {"--device", std::to_string(args.device)});
+    if (args.tier != "auto") command.insert(command.end(), {"--tier", args.tier});
+    if (args.meta) command.insert(command.end(), {"--meta-group", std::to_string(*args.meta)});
+    if (args.construction != "auto") command.insert(command.end(), {"--construction", args.construction});
+    for (auto const& [key, value] : args.compute_settings) command.insert(command.end(), {key, value});
+    for (auto const& path : args.temporary) command.insert(command.end(), {"--temp-dir", file_io::path_text(path)});
+    if (fresh)
+    {
+        if (args.reclaim_before_set) command.insert(command.end(), {"--reclaim-before-bytes", std::to_string(args.reclaim_before_bytes)});
+        limit("--replot-max-source-files", args.replot_max_source_files, 0); limit("--replot-max-source-bytes", args.replot_max_source_bytes, 0);
+        for (auto const& value : args.farming_resource_settings) command.insert(command.end(), {"--resource-setting", value});
+        for (auto const& path : args.replot_source_roots) command.insert(command.end(), {"--replot-source-root", file_io::path_text(path)});
+        for (auto const& path : args.replot_exclude_roots) command.insert(command.end(), {"--replot-exclude-root", file_io::path_text(path)});
+        if (args.replot_verification) command.insert(command.end(), {"--replot-verification", *args.replot_verification});
+        if (args.replot_confirmation) command.insert(command.end(), {"--replot-confirmation", *args.replot_confirmation});
+        if (args.replot_proof_first_groups) command.insert(command.end(), {"--replot-proof-first-groups", std::to_string(*args.replot_proof_first_groups)});
+        if (args.replot_proof_every_groups) command.insert(command.end(), {"--replot-proof-every-groups", std::to_string(*args.replot_proof_every_groups)});
+    }
+}
+group_grow::farm::FarmInventory prepare_replot_setup(Arguments const& args)
 {
     using namespace group_grow; using namespace group_grow::farm;
     auto const limits = replot_inventory_limits(args);
@@ -8755,10 +8794,49 @@ int print_replot_setup(Arguments const& args)
             std::make_move_iterator(prepared.missing.begin()), std::make_move_iterator(prepared.missing.end()));
     }
 #endif
+    if ((!imported && args.farming_resource_settings.empty()) || profile.adaptive)
+    {
+        auto selected = args; pos2gpu::configure_group_compute(selected);
+        configure_adaptive_resources(profile, selected, config);
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+        if (profile.native.backend == "gpu" && profile.native.compute_owner_identity.empty())
+        {
+            auto const devices = pos2gpu::list_gpu_devices();
+            auto const selected = std::find_if(devices.begin(), devices.end(), [&](auto const& device) { return device.id == args.device; });
+            if (selected != devices.end() && !selected->physical_identity.empty() && selected->vram_bytes)
+            {
+                auto const identity = "host:" + inventory.host + '/' + selected->physical_identity;
+                auto resource = [&](std::string id, ResourceKind kind, uint64_t capacity)
+                {
+                    resource_detail::Graph graph(profile);
+                    if (!graph.names.contains(id)) profile.resources.push_back({id, inventory.host, {}, kind, capacity, true});
+                    return id;
+                };
+                native.gpu_compute_resource = resource(identity + "/compute", ResourceKind::gpu_compute, 1);
+                native.gpu_memory_resource = resource(identity + "/memory", ResourceKind::gpu_memory, selected->vram_bytes);
+                native.max_gpu_bytes = selected->vram_bytes - selected->vram_bytes / 4;
+                native.standing_gpu_bytes = 0;
+                Demand headroom; headroom.resource = native.gpu_memory_resource;
+                headroom.transient_units = selected->vram_bytes / 4; headroom.bounded = true;
+                native.cohorts.front().new_farming.push_back(std::move(headroom));
+            }
+            else compute_preparation.missing.push_back({"gpu", "native.gpu_compute_resource",
+                "The selected GPU is unavailable or has no stable physical identity; reconnect it or select an available device."});
+        }
+#else
+        if (profile.native.backend == "gpu" && profile.native.compute_owner_identity.empty())
+            compute_preparation.missing.push_back({"gpu", "native.backend", "GPU construction requires a GPU-enabled build or enrolled GPU helper."});
+#endif
+    }
     if (!args.farming_resource_settings.empty()) profile = apply_resource_settings(std::move(profile), args.farming_resource_settings);
     validate_inventory_coverage(profile, replot_inventory_counts(inventory));
     inventory.resource_preparation = prepare_farm_inventory_resources(inventory, bindings, imported);
     auto& preparation = *inventory.resource_preparation;
+    if (profile.adaptive)
+    {
+        preparation.facts.push_back({"farm_resources.policy", "adaptive", "declared", "automatic-conservative-limits",
+            "Reserve farming headroom, cap owned work and pause on unhealthy or unavailable live farming observations. Foreign service costs remain unknown; no deadline or future-filter guarantee is inferred."});
+    }
     preparation.facts.push_back({"local.total_memory_bytes", std::to_string(profile_detail::physical_memory()), "observed", "local-os",
         "Effective physical/container memory ceiling; live allocations still use current availability and protected farming reservations."});
     preparation.facts.insert(preparation.facts.end(), std::make_move_iterator(compute_preparation.facts.begin()), std::make_move_iterator(compute_preparation.facts.end()));
@@ -8777,6 +8855,15 @@ int print_replot_setup(Arguments const& args)
     if (!inventory.complete) preparation.missing.push_back({"inventory", "inventory.complete", "Repeat inventory until the complete active farm scope is observed before saving an executable migration review."});
     require(!inventory_stamp || stream_state::stamp(args.replot_inventory) == *inventory_stamp, "migration setup inventory changed while gathering its selections");
     if (profile_stamp) require(stream_state::stamp(args.farming_profile_path) == *profile_stamp, "migration setup local profile changed while gathering its selections");
+    return inventory;
+}
+int print_replot_setup(Arguments const& args)
+{
+    using namespace group_grow; using namespace group_grow::farm;
+    auto const inventory = prepare_replot_setup(args);
+    auto const& profile = *inventory.resource_template; auto const& preparation = *inventory.resource_preparation;
+    auto const config = farming_configuration(args); auto const adapters = replot_adapter_table(args);
+    std::vector<fs::path> directories{args.target}; directories.insert(directories.end(), args.destinations.begin(), args.destinations.end());
     save_replot_setup_profile(args, inventory, adapters);
     std::vector<std::string> command{"xchplot2", "plan"};
     for (auto const& path : directories) command.push_back(file_io::path_text(path));
@@ -8785,35 +8872,7 @@ int print_replot_setup(Arguments const& args)
     if (args.discover_farm_set) command.push_back(args.discover_farm ? "--discover-farm" : "--no-discover-farm");
     for (auto const& path : args.farm_configs) command.insert(command.end(), {"--farm-config", file_io::path_text(path)});
     for (auto const& path : args.excluded_destinations) command.insert(command.end(), {"--exclude-destination", file_io::path_text(path)});
-    command.insert(command.end(), {"--harvester", file_io::path_text(args.save_profile),
-        "--k", std::to_string(config.k), "--strength", std::to_string(config.strength),
-        "--headroom-bytes", std::to_string(args.headroom), "--batch-members", std::to_string(args.batch), "--destination-temp", args.destination_temp,
-        "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", std::to_string(args.checkpoint_bytes), "--member-storage", args.member_storage,
-        "--io-overlap", args.io_overlap ? "on" : "off", "--generation-overlap", args.generation_overlap_auto ? "auto" : args.generation_overlap ? "on" : "off",
-        "--cache-release", args.cache_release ? "on" : "off"});
-    auto limit = [&](char const* option, uint64_t value, uint64_t omitted)
-    { if (value != omitted) command.insert(command.end(), {option, std::to_string(value)}); };
-    if (args.max_ram_set) command.insert(command.end(), {"--max-ram", std::to_string(args.max_ram_limit ? args.max_ram_limit : args.max_ram)});
-    limit("--workers", args.workers, 0); limit("--capacity-bytes", args.capacity, 0);
-    limit("--temp-capacity-bytes", args.temporary_capacity, 0);
-    limit("--max-groups", args.max_groups, UINT64_MAX); limit("--max-total-members", args.max_total_members, UINT64_MAX);
-    limit("--group-members", args.group_members, 0);
-    if (args.reclaim_before_set) command.insert(command.end(), {"--reclaim-before-bytes", std::to_string(args.reclaim_before_bytes)});
-    limit("--replot-max-source-files", args.replot_max_source_files, 0); limit("--replot-max-source-bytes", args.replot_max_source_bytes, 0);
-    if (args.backend != "auto") command.insert(command.end(), {"--backend", args.backend});
-    if (!args.devices.empty()) command.insert(command.end(), {"--devices", args.devices});
-    else if (args.backend != "cpu") command.insert(command.end(), {"--device", std::to_string(args.device)});
-    if (args.tier != "auto") command.insert(command.end(), {"--tier", args.tier});
-    if (args.meta) command.insert(command.end(), {"--meta-group", std::to_string(*args.meta)});
-    if (args.construction != "auto") command.insert(command.end(), {"--construction", args.construction});
-    if (args.compute_mode == "off") command.insert(command.end(), {"--compute", "off"});
-    for (auto const& path : args.temporary) command.insert(command.end(), {"--temp-dir", file_io::path_text(path)});
-    for (auto const& path : args.replot_source_roots) command.insert(command.end(), {"--replot-source-root", file_io::path_text(path)});
-    for (auto const& path : args.replot_exclude_roots) command.insert(command.end(), {"--replot-exclude-root", file_io::path_text(path)});
-    if (args.replot_verification) command.insert(command.end(), {"--replot-verification", *args.replot_verification});
-    if (args.replot_confirmation) command.insert(command.end(), {"--replot-confirmation", *args.replot_confirmation});
-    if (args.replot_proof_first_groups) command.insert(command.end(), {"--replot-proof-first-groups", std::to_string(*args.replot_proof_first_groups)});
-    if (args.replot_proof_every_groups) command.insert(command.end(), {"--replot-proof-every-groups", std::to_string(*args.replot_proof_every_groups)});
+    append_replot_arguments(command, args, config, args.save_profile, true);
     auto setup_command = command; setup_command.insert(setup_command.end(), {"--save-profile", "UPDATED_PROFILE"});
     command.insert(command.end(), {"--save-plan", "MIGRATION_PLAN"});
     auto const next = farming_next_command(command), continue_setup = farming_next_command(setup_command);
@@ -8827,10 +8886,10 @@ int print_replot_setup(Arguments const& args)
     else if (!args.quiet)
     {
         std::cout << "Saved reusable local migration profile: " << file_io::path_text(args.save_profile)
-            << ". Complete its remaining resource declarations before execution.\n";
+            << (profile.adaptive ? ". Automatic limits and live farming monitoring are selected.\n" : ". Complete its remaining resource declarations before execution.\n");
         print_replot_setup_decisions(preparation);
         if (!preparation.missing.empty()) std::cout << "Keep completed declarations and apply the remaining settings with:\n  " << continue_setup << " [--resource-setting ...]\n";
-        std::cout << "After completing the declarations, use fill --replot with this profile and your farmer/pool keys.\n"
+        std::cout << (profile.adaptive ? "Use fill --replot with this profile and your farmer/pool keys.\n" : "After completing the declarations, use fill --replot with this profile and your farmer/pool keys.\n")
             << "Optionally preview and save the migration first with:\n  " << next << '\n';
     }
     return 0;
@@ -8859,6 +8918,7 @@ struct ReplotInputs
     std::optional<group_grow::ReplotRevalidation> revalidation;
     std::optional<stream_state::Stamp> stamp;
     std::optional<group_grow::ReplotJob> job;
+    std::optional<ReplotMetadataFile> preparation_binding;
     uint64_t memory_bytes = 0;
     bool mapping_search_exhausted = false;
 };
@@ -9122,7 +9182,7 @@ void replot_input_memory(ReplotInputs& inputs, Arguments const& args)
             inputs.inventory, value.readers, inputs.review.sources));
     }
     if (inputs.job) inputs.memory_bytes = sum(inputs.memory_bytes,
-        product(sum(sum(inputs.job->review.capacity(), inputs.job->profile.capacity()), 8192), 4));
+        product(sum(sum(inputs.job->review.capacity(), inputs.job->profile.capacity()), sum(8192, inputs.job->bindings.compute_settings.capacity())), 4));
     require(inputs.memory_bytes < args.max_ram / 2, "retained migration review and planner inputs exceed --max-ram");
 }
 ReplotInputs load_replot_review(Arguments const& args)
@@ -9558,7 +9618,9 @@ ReplotInputs make_replot_review(Arguments const& args)
     std::vector<ReplotMetadataFile> metadata;
     if (!args.replot_inventory.empty()) metadata.emplace_back(args.replot_inventory, stream_state::stamp(args.replot_inventory));
     if (!args.farming_profile_path.empty()) metadata.emplace_back(args.farming_profile_path, stream_state::stamp(args.farming_profile_path));
-    if (args.replot_inventory.empty()) result.inventory = inspect_farm_inventory(args);
+    auto supplied_resources = replot_setup_resources(args);
+    if (!supplied_resources && args.farming_resource_settings.empty()) result.inventory = prepare_replot_setup(args);
+    else if (args.replot_inventory.empty()) result.inventory = inspect_farm_inventory(args);
     else { auto file = replot_text_file(args.replot_inventory); result.inventory = read_farm_inventory(file, limits); }
     require(result.inventory.complete, "replot requires a complete inventory of the selected farm");
     auto const adapters = replot_adapter_table(args);
@@ -9573,8 +9635,7 @@ ReplotInputs make_replot_review(Arguments const& args)
         result.inventory.network = observe_network_projection(replot_adapter(args), &result.inventory);
     }
     require(result.inventory.network.available, "replot review requires a genuine network projection; select --chia-root and --chia-executable");
-    if (!args.farming_profile_path.empty())
-    { auto file = replot_text_file(args.farming_profile_path); result.resources = read_profile(file, args.max_ram / 8); }
+    if (supplied_resources) result.resources = std::move(*supplied_resources);
     else
     {
         require(result.inventory.resource_template.has_value(), "replot review requires a completed farming_profile/farm_resources profile");
@@ -10135,13 +10196,19 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
             if (resource.kind == ResourceKind::cpu) phase_cpus = sum(phase_cpus, sum(demand.required_units, demand.reserved_units));
         }
     }
+    if (replot_resources(inputs).adaptive)
+    {
+        phase_ram = sum(native.max_ram_bytes, controller);
+        phase_cpus = std::min(uint64_t(group_grow::profile_detail::logical_cpus()), sum(native.max_cpu_threads, 1));
+    }
     require(phase_ram > controller, "reviewed construction phase cannot hold its current controller ledger");
     auto const phase_app_ram = std::min(native.max_ram_bytes, phase_ram - controller);
     auto owner_cap = [&](uint64_t offer_ram)
     {
         if (!args.max_ram_set) return phase_app_ram;
-        uint64_t const fixed = sum(controller, sum(offer_ram, sum(effective.pool_codec_ram,
-            effective.automatic_compute ? pos2gpu::ComputeSession::memory_bytes : 0)));
+        uint64_t const fixed = sum(replot_resources(inputs).adaptive ? farming_health_memory_bytes : 0,
+            sum(controller, sum(offer_ram, sum(effective.pool_codec_ram,
+            effective.automatic_compute ? pos2gpu::ComputeSession::memory_bytes : 0))));
         auto const limit = args.max_ram_limit ? args.max_ram_limit : sum(args.max_ram, fixed);
         require(limit > fixed && limit - fixed >= 16 * mib, "explicit combined RAM cap cannot hold the reviewed compute services and native owner");
         return std::min(phase_app_ram, limit - fixed);
@@ -10258,6 +10325,21 @@ ReplotStorageCapacity replot_storage_capacity(Arguments const& args, ReplotInput
             project(ScratchRoot::inspect(file_io::native_path(directory.directory))), generation_peak, true);
     };
 }
+void require_fresh_replot_metadata(fs::path const& root, ReplotInputs const& inputs)
+{
+    group_grow::FarmingReplotDirectory prepared(root, inputs.review.farm.job_id, false, false);
+    auto const& metadata = prepared.metadata;
+    if (metadata.recorded || !prepared.pin) { metadata.require_fresh(); return; }
+    // A stopped first start may have created its directory or saved local
+    // choices before any journal. Only that exact private preparation is ours.
+    for (auto const& entry : fs::directory_iterator(metadata.path))
+        require(entry.path() == prepared.path, "unrelated bookkeeping appeared before migration preparation");
+    for (auto const& entry : fs::directory_iterator(prepared.path))
+        require(inputs.preparation_binding && entry.path() == inputs.preparation_binding->first &&
+            stream_state::stamp(entry.path()) == inputs.preparation_binding->second,
+            "unrelated migration data appeared before its initial journal");
+    prepared.check();
+}
 ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& inputs)
 {
     using namespace group_grow::farm;
@@ -10296,7 +10378,7 @@ ReplotAssessment assess_replot_review(Arguments const& args, ReplotInputs& input
         if (result.request.engine == "external" && !recovering)
         {
             for (auto const& directory : inputs.review.farm.directories)
-                group_grow::FarmingMetadataDirectory(file_io::native_path(directory.directory), false).require_fresh();
+                require_fresh_replot_metadata(file_io::native_path(directory.directory), inputs);
             auto const bounded = replot_execution_options(args, result.request);
             for (auto const& directory : inputs.review.farm.directories)
                 construction_filesystems.insert(replot_filesystem(inputs, directory.filesystem));
@@ -10444,6 +10526,18 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
         if (assessment.feasible)
         { stream_state::atomic_save(args.save_plan, body, false); plan_saved = true; }
     }
+    std::string next;
+    auto const plan = plan_saved ? args.save_plan : args.from_plan;
+    if (!plan.empty() && (metadata || assessment.feasible))
+    {
+        std::vector<std::string> command{"xchplot2", "fill", "--from-plan", file_io::path_text(plan)};
+        append_replot_arguments(command, args, inputs.review.farm.config, args.farming_profile_path, false);
+        if (args.farm_adapter_set) command.insert(command.end(), {"--farm-adapter", args.farm_adapter});
+        if (!args.chia_root.empty()) command.insert(command.end(), {"--chia-root", file_io::path_text(args.chia_root)});
+        if (!args.chia_executable.empty()) command.insert(command.end(), {"--chia-executable", file_io::path_text(args.chia_executable)});
+        if (args.farm_adapter_timeout_set) command.insert(command.end(), {"--farm-adapter-timeout-ms", std::to_string(args.farm_adapter_timeout_ms)});
+        next = farming_next_command(command);
+    }
     auto const& review = inputs.review; auto const& state = review.farm;
     uint64_t selected_bytes = 0, inventory_bytes = 0;
     for (auto index : review.sources)
@@ -10456,6 +10550,7 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
     if (args.json)
     {
         std::cout << "{\"replot_review\":true,\"metadata_only\":" << (metadata ? "true" : "false")
+            << ",\"resource_policy\":" << json_string(replot_resources(inputs).adaptive ? "adaptive" : "reviewed")
             << ",\"saved_successor\":" << (successor ? "true" : "false")
             << ",\"live_readiness_checked\":false,\"feasible\":" << (metadata ? "null" : assessment.feasible ? "true" : "false")
             << ",\"physical_release_conditional\":true,\"farming_value_preserved\":null,\"old_effective_value\":\"unknown\",\"new_effective_value\":\"unknown\""
@@ -10512,7 +10607,7 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
         if (successor) std::cout << ",\"origin_review_digest\":" << json_string(inputs.digest) << ",\"selected_policy_digest\":" << json_string(inputs.policy_digest)
             << ",\"parent_policy_digest\":" << json_string(inputs.revalidation->parent_policy_digest) << ",\"reviewed_journal_digest\":" << json_string(inputs.revalidation->journal_digest)
             << ",\"next_safe_action\":\"Use --status for durable progress; activate the unchanged reviewed boundary with fill --from-plan, or use --revalidate for a fresh suffix review.\"";
-        std::cout << ",\"saved_plan\":" << json_string(file_io::path_text(plan_saved ? args.save_plan : args.from_plan)) << "}\n";
+        std::cout << ",\"saved_plan\":" << json_string(file_io::path_text(plan)) << ",\"next_command\":" << json_string(next) << "}\n";
     }
     else if (!args.quiet)
     {
@@ -10522,6 +10617,9 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
             << protected_entries << " entries, " << protected_bytes << " allocated bytes (aliases counted once).\n"
             << "Early-deletion limit: " << review.reclaim_before_bytes << " allocated bytes awaiting ready replacements. Farming/reward value change: unknown.\n"
             << "No live farming readiness is implied. Physical release requires fresh free-space probes.\n";
+        if (replot_resources(inputs).adaptive)
+            std::cout << "Automatic limits: reserve farming headroom and pause on unavailable farming health or resource pressure. "
+                "Observed slow lookups throttle I/O and pause construction; no farming deadline guarantee is inferred.\n";
         auto const verification = replot_verification(inputs);
         std::cout << "Verification policy: " << replot_verification_name(verification.mode)
             << ". Headers, chunk index and durable publication are checked for every replacement.\n"
@@ -10560,6 +10658,7 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
             for (auto const& [dimension, stage] : margin.worst_stages) std::cout << "; " << dimension << " at " << stage;
             std::cout << '\n';
         }
+        if (!next.empty()) std::cout << "Continue with:\n  " << next << "\nAdd your farmer/pool keys when starting a new job.\n";
         if (args.verbose) for (auto index : review.sources)
         { auto const& plot = inputs.inventory.plots.at(size_t(index)); std::cout << "  retire " << inputs.inventory.roots.at(plot.root).path << '/' << plot.relative_path
             << " (k" << unsigned(plot.k) << ", " << plot.compression_family << ", " << plot.identity.allocated_bytes << " allocated bytes)\n"; }
@@ -15570,7 +15669,8 @@ std::optional<ReplotLocalBindingFile> load_replot_local_bindings(ReplotInputs co
 #else
     require(info.st_uid == ::geteuid() && !(info.st_mode & 0077), "private migration bindings must be owned by this user with owner-only permissions");
 #endif
-    require(info.st_nlink == 1 && info.st_size >= 65 && info.st_size <= 8192 + 65, "invalid private migration bindings file");
+    require(info.st_nlink == 1 && info.st_size >= 65 && uint64_t(info.st_size) <= std::min(replot_local_bindings_byte_limit, memory_limit / 8) + 65,
+        "invalid private migration bindings file");
     std::string body(size_t(info.st_size), '\0'); size_t position = 0;
     while (position < body.size())
     {
@@ -15600,6 +15700,16 @@ void apply_replot_local_bindings(Arguments& args, group_grow::ReplotLocalBinding
     if (!args.chia_executable_set && args.chia_executable.empty()) args.chia_executable = file_io::native_path(local.executable);
     if (!args.farming_profile_set && args.farming_profile_path.empty() && local.policy_digest == policy_digest)
         args.farming_profile_path = file_io::native_path(local.profile);
+    if (!local.compute_settings.empty())
+    {
+        auto const document = group_grow::profile_detail::JsonReader(local.compute_settings, args.max_ram / 8).read();
+        if (pos2gpu::apply_group_compute_settings(args, document)) pos2gpu::configure_group_compute(args);
+    }
+}
+std::string replot_local_compute_settings(Arguments const& args)
+{
+    if (args.compute_settings.empty()) return {};
+    std::ostringstream out; out << "{\"compute_settings\":"; pos2gpu::write_group_compute_settings(out, args); out << '}'; return out.str();
 }
 void apply_replot_job(Arguments& args, ReplotInputs const& inputs)
 {
@@ -16480,6 +16590,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         (args.farming_profile_set && !args.farming_profile_path.empty() && !replot_adapter_table(args).routes.empty());
     auto local_bindings = load_replot_local_bindings(inputs, args.max_ram - inputs.memory_bytes, explicit_connections);
     if (local_bindings && local_bindings->usable) apply_replot_local_bindings(args, local_bindings->bindings, inputs.policy_digest);
+    if (local_bindings) inputs.preparation_binding = ReplotMetadataFile{local_bindings->path, local_bindings->stamp};
     std::optional<stream_state::Stamp> local_profile_stamp;
     if (!args.farming_profile_path.empty()) local_profile_stamp = stream_state::stamp(args.farming_profile_path);
     if (args.farming_profile_path != supplied.farming_profile_path)
@@ -16497,7 +16608,8 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     }
     auto local_path = [&](fs::path const& path) { return path.empty() ? std::string{} : file_io::path_text(fs::absolute(path).lexically_normal()); };
     ReplotLocalBindings selected_local{inputs.digest, inputs.review.farm.job_id, profile_detail::host_name(), replot_local_user(),
-        args.farm_adapter, local_path(args.chia_root), local_path(args.chia_executable), local_path(args.farming_profile_path), inputs.policy_digest};
+        args.farm_adapter, local_path(args.chia_root), local_path(args.chia_executable), local_path(args.farming_profile_path), inputs.policy_digest,
+        replot_local_compute_settings(args)};
     auto const local_body = replot_local_bindings_text(selected_local);
     require(inputs.stamp && !args.from_plan.empty(), "execution requires the original saved migration review");
     std::vector<fs::path> reviewed_destinations;
@@ -16517,7 +16629,8 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         for (;;)
         {
             try { auto const assessment = assess_replot_review(args, inputs);
-                require(assessment.feasible, "migration review is infeasible under the current execution binding"); break; }
+                require(assessment.feasible, "migration review is infeasible under the current execution binding" +
+                    (assessment.reasons.empty() ? std::string{} : ": " + assessment.reasons.front())); break; }
             catch (ReplotResourcesUnavailable const& error) { startup_wait(error.what()); }
         }
     }
@@ -16913,6 +17026,13 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     TargetServiceExpectation service; service.farmer_public_key = group_tools::hex(keys.farmer);
     if (keys.pool_kind == POS2_POOL_PK) service.pool_public_key = group_tools::hex(keys.pool);
     else service.pool_contract_puzzle_hash = group_tools::hex(keys.pool);
+    std::unique_ptr<FarmingHealthMonitor> farming_health;
+    if (replot_resources(inputs).adaptive)
+    {
+        farming_health = std::make_unique<FarmingHealthMonitor>(target_options, inventory.network, keys.k, keys.strength, service);
+        gate.farming_health([&] { return farming_health->reason(); });
+        farming_deadline_ns = uint64_t(review.farm.config.deadline_seconds * 1000000000);
+    }
     auto final_path = [&](uint64_t batch)
     { auto const& plan = review.batches.at(size_t(batch)); return group_path(destinations.at(size_t(plan.lane)), plan.ordinal, review.farm.job_id); };
     auto stage_path = [&](uint64_t batch)
@@ -16985,6 +17105,49 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
             if (!lane) local_bindings_fit = replot_local_bindings_fit(body.size(), ordinary.size(), local_body.size(), unit,
                 review.space[lane].metadata_allowance_bytes - sum(directories, auxiliary));
         }
+    };
+    auto cache_authority_bindings = [&](FarmingMetadataDirectory const& metadata)
+    {
+        std::ostringstream cached_profile;
+        cached_profile << "{\"farming_profile\":"; write_farming_profile_json(cached_profile, farming_profile(args, review.farm.config));
+        cached_profile << ",\"farm_resources\":"; write_profile_json(cached_profile, inputs.resources);
+        if (!routes.routes.empty()) { cached_profile << ",\"farm_adapters\":"; write_farm_adapters_json(cached_profile, routes); }
+        if (!args.compute_settings.empty()) { cached_profile << ",\"compute_settings\":"; pos2gpu::write_group_compute_settings(cached_profile, args); }
+        cached_profile << "}\n";
+        auto mirror = selected_local; auto const profile_path = metadata.path / "local-profile.json";
+        mirror.profile = file_io::path_text(profile_path);
+        auto const mirror_body = replot_local_bindings_text(mirror);
+        auto const profile_body = cached_profile.str();
+        bool replace_profile = fs::exists(profile_path);
+        bool write_profile = true;
+        if (replace_profile) { auto file = replot_text_file(profile_path); write_profile = profile_detail::read_text(file, args.max_ram / 8) != profile_body; }
+        if (write_profile) stream_state::atomic_save(profile_path, profile_body, replace_profile);
+        if (args.farming_profile_path == profile_path && local_profile_stamp) local_profile_stamp = stream_state::stamp(profile_path);
+        auto const binding_path = metadata.path / "local-bindings";
+        bool const replace_bindings = fs::exists(binding_path);
+        if (!replace_bindings || read_farming_state(binding_path, args.max_ram / 8).body != mirror_body)
+            stream_state::atomic_save(binding_path, mirror_body + stream_state::digest(mirror_body) + '\n', replace_bindings);
+        if (local_bindings && local_bindings->path == binding_path)
+        { local_bindings->stamp = stream_state::stamp(binding_path); local_bindings->bindings = std::move(mirror); }
+        return sum(profile_body.size(), sum(mirror_body.size(), 65));
+    };
+    auto save_local_bindings = [&]
+    {
+        if (journal.authority)
+        {
+            cache_authority_bindings(*journal.authority->metadata);
+            local_bindings = load_replot_local_bindings(inputs, args.max_ram - inputs.memory_bytes);
+        }
+        if (!local_bindings_fit || (local_bindings && replot_local_bindings_text(local_bindings->bindings) == local_body)) return;
+        if (!bookkeeping.front() || !journal.replicas.front().available) return;
+        check(); bookkeeping.front()->check();
+        auto const path = bookkeeping.front()->path / "local-bindings";
+        if (fs::exists(path))
+        { auto const previous = parse_replot_local_bindings(read_farming_state(path, args.max_ram / 8).body);
+          require(previous.review_digest == inputs.digest && previous.job_id == review.farm.job_id, "private local bindings belong to another migration job"); }
+        stream_state::atomic_save(path, local_body + stream_state::digest(local_body) + '\n', fs::exists(path));
+        local_bindings = load_replot_local_bindings(inputs, args.max_ram - inputs.memory_bytes);
+        require(local_bindings.has_value(), "private migration bindings disappeared after publication");
     };
     auto metadata_remaining = [&](std::string const& filesystem)
     {
@@ -17064,10 +17227,11 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         std::vector<ReplotMetadataFile> metadata{{args.from_plan, *inputs.stamp}};
         metadata.insert(metadata.end(), private_reviews.begin(), private_reviews.end());
         if (local_profile_stamp) metadata.emplace_back(args.farming_profile_path, *local_profile_stamp);
+        if (local_bindings) metadata.emplace_back(local_bindings->path, local_bindings->stamp);
         std::set<std::string> checked_space;
         for (size_t lane = 0; lane < destinations.size(); ++lane)
         {
-            journal.replicas[lane].metadata->require_fresh();
+            require_fresh_replot_metadata(destinations[lane], inputs);
             replot_destination_coverage(args, inventory, destinations[lane], metadata);
             for (auto const* name : {"grow-farm.plan", "grow-farm.plan.next"})
             {
@@ -17098,12 +17262,22 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         initial.farm.pool_public_key = keys.pool_kind == POS2_POOL_PK; initial.farm.fingerprint = farming_fingerprint(keys);
         initial.retirements.resize(size_t(review.batches.front().sources));
         journal_allocation(initial);
+        require(local_bindings_fit, "private migration settings exceed the reviewed metadata allowance; save a new review before starting");
+        journal.replicas.front().metadata->create();
+        bookkeeping.resize(destinations.size());
+        bookkeeping.front() = std::make_unique<FarmingReplotDirectory>(destinations.front(), review.farm.job_id, true, legacy_metadata);
+        journal_allocation(initial);
+        require(local_bindings_fit, "private migration directory allocation exceeds the reviewed metadata allowance");
+        save_local_bindings();
+        grow_failpoint("replot-local-bindings-durable");
         publish_replot_journals(journal, initial, args.max_ram - inputs.memory_bytes, check);
     }
     require(journal.state.farm.fingerprint == farming_fingerprint(keys), "migration farmer, pool or seed differs from its private saved identity");
 
+    bookkeeping.resize(destinations.size());
     for (size_t lane = 0; lane < destinations.size(); ++lane)
-        bookkeeping.push_back(journal.replicas[lane].available ? std::make_unique<FarmingReplotDirectory>(destinations[lane], review.farm.job_id, true, legacy_metadata) : nullptr);
+        if (!bookkeeping[lane] && journal.replicas[lane].available)
+            bookkeeping[lane] = std::make_unique<FarmingReplotDirectory>(destinations[lane], review.farm.job_id, true, legacy_metadata);
     auto control_policy = replot_control_policy(journal.state.farm);
     refresh_controls = [&]
     {
@@ -17132,48 +17306,6 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     if (activate_policy) journal_allocation(next_replot_revision(journal.state, journal.digest,
         [&](auto& state) { state.policy_digest = inputs.policy_digest; }));
     publish_replot_journals(journal, journal.state, args.max_ram - inputs.memory_bytes, check);
-    auto cache_authority_bindings = [&](FarmingMetadataDirectory const& metadata)
-    {
-        std::ostringstream cached_profile;
-        cached_profile << "{\"farming_profile\":"; write_farming_profile_json(cached_profile, farming_profile(args, review.farm.config));
-        cached_profile << ",\"farm_resources\":"; write_profile_json(cached_profile, inputs.resources);
-        if (!routes.routes.empty()) { cached_profile << ",\"farm_adapters\":"; write_farm_adapters_json(cached_profile, routes); }
-        cached_profile << "}\n";
-        auto mirror = selected_local; auto const profile_path = metadata.path / "local-profile.json";
-        mirror.profile = file_io::path_text(profile_path);
-        auto const mirror_body = replot_local_bindings_text(mirror);
-        auto const profile_body = cached_profile.str();
-        bool replace_profile = fs::exists(profile_path);
-        bool write_profile = true;
-        if (replace_profile) { auto file = replot_text_file(profile_path); write_profile = profile_detail::read_text(file, args.max_ram / 8) != profile_body; }
-        if (write_profile) stream_state::atomic_save(profile_path, profile_body, replace_profile);
-        if (args.farming_profile_path == profile_path && local_profile_stamp) local_profile_stamp = stream_state::stamp(profile_path);
-        auto const binding_path = metadata.path / "local-bindings";
-        bool const replace_bindings = fs::exists(binding_path);
-        if (!replace_bindings || read_farming_state(binding_path, args.max_ram / 8).body != mirror_body)
-            stream_state::atomic_save(binding_path, mirror_body + stream_state::digest(mirror_body) + '\n', replace_bindings);
-        if (local_bindings && local_bindings->path == binding_path)
-        { local_bindings->stamp = stream_state::stamp(binding_path); local_bindings->bindings = std::move(mirror); }
-        return sum(profile_body.size(), sum(mirror_body.size(), 65));
-    };
-    auto save_local_bindings = [&]
-    {
-        if (journal.authority)
-        {
-            cache_authority_bindings(*journal.authority->metadata);
-            local_bindings = load_replot_local_bindings(inputs, args.max_ram - inputs.memory_bytes);
-        }
-        if (!local_bindings_fit || (local_bindings && replot_local_bindings_text(local_bindings->bindings) == local_body)) return;
-        if (!bookkeeping.front() || !journal.replicas.front().available) return;
-        check(); bookkeeping.front()->check();
-        auto const path = bookkeeping.front()->path / "local-bindings";
-        if (fs::exists(path))
-        { auto const previous = parse_replot_local_bindings(read_farming_state(path, args.max_ram / 8).body);
-          require(previous.review_digest == inputs.digest && previous.job_id == review.farm.job_id, "private local bindings belong to another migration job"); }
-        stream_state::atomic_save(path, local_body + stream_state::digest(local_body) + '\n', fs::exists(path));
-        local_bindings = load_replot_local_bindings(inputs, args.max_ram - inputs.memory_bytes);
-        require(local_bindings.has_value(), "private migration bindings disappeared after publication");
-    };
     std::function<void()> checkpoint_gate;
     auto persist = [&](auto change)
     {
@@ -18014,7 +18146,11 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                         refresh_controls();
                         if (controls.effective(size_t(plan.lane)) == "paused")
                         { pause_reason = "ordinary-pause"; resource_pause.store(true, std::memory_order_release); return; }
-                        for (auto& sampler : farming_samples) if (auto const elapsed = sampler.sample()) effective.disk_io->observe_farming(*elapsed, farming_deadline_ns);
+                        for (auto& sampler : farming_samples) if (auto const elapsed = sampler.sample())
+                        {
+                            effective.disk_io->observe_farming(*elapsed, farming_deadline_ns);
+                            if (farming_health) farming_health->observe_latency(*elapsed, farming_deadline_ns);
+                        }
                         auto admission = gate.poll_active(current);
                         if (admission.allowed) admission = gate.poll_active(future);
                         effective.disk_io->observe_pressure(!admission.allowed);
@@ -19623,11 +19759,12 @@ int start_replot(Arguments args, ReplotInputs inputs)
     profile << ",\"farm_resources\":"; write_profile_json(profile, inputs.resources);
     auto const adapters = replot_adapter_table(args);
     if (!adapters.routes.empty()) { profile << ",\"farm_adapters\":"; write_farm_adapters_json(profile, adapters); }
+    if (!args.compute_settings.empty()) { profile << ",\"compute_settings\":"; pos2gpu::write_group_compute_settings(profile, args); }
     profile << "}\n"; job.profile = profile.str();
     auto const options = replot_adapter(args);
     job.review = replot_review_text(inputs.review);
     job.bindings = {stream_state::digest(job.review), inputs.review.farm.job_id, profile_detail::host_name(), replot_local_user(),
-        args.farm_adapter, file_io::path_text(options.root), file_io::path_text(options.executable), {}, {}};
+        args.farm_adapter, file_io::path_text(options.root), file_io::path_text(options.executable), {}, {}, replot_local_compute_settings(args)};
     auto const initial_bytes = sum(replot_job_text(job).size(), 65536 + 65);
     std::map<std::string, uint64_t> reserves;
     for (auto const& directory : inputs.review.farm.directories)

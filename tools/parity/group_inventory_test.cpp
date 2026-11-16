@@ -269,6 +269,7 @@ int fake_adapter(int argc, char** argv)
     }
     else if (endpoint == "get_harvesters" || endpoint == "get_harvesters_summary")
     {
+        if (endpoint == "get_harvesters" && flag("summary-only")) return 1;
         std::ifstream in(root / (flag("farmer-override") ? "farmer-plots.json" : "plots.json"));
         std::string raw = in ? std::string(std::istreambuf_iterator<char>(in), {}) : "{\"plots\":[]}";
         auto parsed = profile_detail::JsonReader(raw, 16 * 1024 * 1024).read(); auto const count = inventory_detail::required_field(parsed, "plots").items.size();
@@ -595,6 +596,28 @@ void adapters(fs::path const& directory)
     TargetServiceExpectation service{expected.farmer_public_key, expected.pool_public_key, expected.pool_contract_puzzle_hash};
     require(observe_target_prerequisites(options, projection, 28, 2, service).ready,
         "empty target registry incorrectly required a fabricated new-plot/key acknowledgement");
+    { std::ofstream flag(root / "summary-only"); flag << '1'; }
+    observe_farming_health(options, projection, 28, 2, service);
+    {
+        FarmingHealthMonitor monitor(options, projection, 28, 2, service);
+        auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!monitor.reason().empty() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason().empty(), "live health monitor did not recover after a fresh healthy observation");
+        { std::ofstream flag(root / "farmer-unavailable"); flag << '1'; }
+        auto changed = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (monitor.reason().empty() && std::chrono::steady_clock::now() < changed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason() == "unavailable-farming-health", "live health monitor retained a healthy observation after service loss");
+        fs::remove(root / "farmer-unavailable");
+        changed = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (!monitor.reason().empty() && std::chrono::steady_clock::now() < changed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(monitor.reason().empty(), "live health monitor did not recover after service return");
+        monitor.observe_latency(6000000, 10000000);
+        require(monitor.reason() == "degraded-farming-response", "slow farming observation did not pause the automatic policy");
+    }
+    fs::remove(root / "summary-only");
     { std::ofstream flag(root / "harvester-advertised"); flag << '1'; }
     require(observe_target_prerequisites(options, projection, 28, 2, service).ready,
         "matching advertised harvester ports were refused");
@@ -605,6 +628,8 @@ void adapters(fs::path const& directory)
     {
         { std::ofstream flag(root / failure); flag << '1'; }
         require(!observe_target_prerequisites(options, projection, 28, 2, service).ready, "missing genuine target service prerequisite was accepted");
+        rejects([&] { observe_farming_health(options, projection, 28, 2, service); },
+            "automatic health check accepted an unavailable or changed farming service");
         fs::remove(root / failure);
     }
     auto og = service; og.pool_public_key = std::string(96, '4'); og.pool_contract_puzzle_hash.clear();

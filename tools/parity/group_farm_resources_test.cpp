@@ -476,6 +476,42 @@ int main()
         std::istringstream input("{\"farming_profile\":{},\"farm_resources\":" + encoded.str() + "}");
         auto roundtrip = read_profile(input); std::ostringstream again; write_profile_json(again, roundtrip);
         check(encoded.str() == again.str(), "mixed profile JSON changed on round trip");
+        {
+            auto automatic = fixture(); automatic.adaptive = true;
+            automatic.resources[1].capacity = farming_health_memory_bytes + 100000;
+            automatic.resources[4].capacity_known = false;
+            automatic.workloads[0].cost = CostKind::unknown;
+            automatic.workloads[0].bounded = automatic.workloads[0].scope_complete = false;
+            automatic.workloads[0].uses.clear();
+            auto& native = automatic.native;
+            native.bounded = native.scope_complete = native.covers_future_filter = false;
+            native.construction.clear(); native.verification.clear(); native.supervision.clear();
+            native.cohorts[0].proof_reserve.clear();
+            Demand headroom; headroom.resource = "cpu"; headroom.reserved_units = 2; headroom.bounded = true;
+            native.cohorts[0].new_farming = {headroom, memory("ram", 10000)};
+            auto selected = request(); selected.verification_ram_bytes = 500; selected.verification_cpu_threads = 1;
+            for (auto phase : {std::pair{true, false}, {false, true}, {false, false}})
+            {
+                auto stage = initial(); bind_native_stage(automatic, selected, 0, stage, phase.first, phase.second);
+                auto assessed = assess_stage(automatic, stage);
+                check(assessed.feasible, "automatic policy required invented foreign service bounds");
+                auto const ram = std::find_if(assessed.margins.begin(), assessed.margins.end(), [](auto const& value) { return value.resource == "ram"; });
+                check(ram != assessed.margins.end() && ram->occupied_units >= farming_health_memory_bytes + 10000 + selected.controller_ram_bytes,
+                    "concurrent health probe or farming headroom escaped phase accounting");
+                auto shortage = automatic; shortage.resources[1].capacity = ram->occupied_units - 1;
+                check(!assess_stage(shortage, stage).feasible, "automatic allocation exceeded physical RAM");
+            }
+            auto excess = selected; excess.cpu_threads = native.max_cpu_threads + 1;
+            rejects([&] { auto stage = initial(); bind_native_stage(automatic, excess, 0, stage, true, false); },
+                "automatic execution ignored its CPU cap");
+            std::ostringstream saved; write_profile_json(saved, automatic);
+            std::istringstream reload(saved.str()); auto restored = read_profile(reload);
+            std::ostringstream repeated; write_profile_json(repeated, restored);
+            check(restored.adaptive && saved.str() == repeated.str() && saved.str().find("\"schema\":2") != std::string::npos,
+                "automatic policy lost its distinct compatibility identity");
+            restored.adaptive = false;
+            check(!assess_stage(restored, initial()).feasible, "reviewed policy silently adopted adaptive semantics");
+        }
         rejects([&] { std::istringstream bad("{\"schema\":2}"); read_profile(bad); }, "unknown schema accepted");
         rejects([&] { std::istringstream bad(encoded.str()); read_profile(bad, 4096); }, "profile parsing memory bound ignored");
         auto generated = make_profile_template(fixture().resources, {{"original-pos1", 10}}, "scan", "xchplot2");

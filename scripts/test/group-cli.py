@@ -2350,6 +2350,66 @@ def check_replot(binary, root, reference=None):
                "--workers", 1, "--batch-members", 1, "--construction", "incremental", "--destination-temp", "off",
                "--devices", "cpu", "--compute", "off", "-M", ram, "--headroom-bytes", 0,
                "--capacity-bytes", ram + 256 * mib, "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+    # A fresh job needs no hand-written resource graph. Public preview remains
+    # read-only; automatic limits do not promote foreign costs to known bounds.
+    automatic = directory / "automatic fill"
+    automatic.mkdir()
+    (automatic / "legacy.plot").write_bytes(legacy)
+    automatic_reader = directory / "automatic reader"
+    (automatic_reader / "config").mkdir(parents=True)
+    (automatic_reader / "config/config.yaml").write_text(
+        "self_hostname: localhost\nharvester:\n  num_threads: 1\n  plot_directories:\n  - " +
+        json.dumps(str(automatic)) + "\n  logging:\n    log_filename: log/debug.log\n", encoding="utf-8")
+    (automatic_reader / "fixture.json").write_text(json.dumps({"roots": [str(automatic)]}), encoding="utf-8")
+    (automatic_reader / "log").mkdir()
+    reader_log = automatic_reader / "log/debug.log"
+    reader_log.touch()
+    automatic_args = [automatic, "--replot", "--chia-root", automatic_reader, "--chia-executable", executable,
+                      *options, "--group-members", 8, "--max-total-members", 8]
+    before = snapshot(farm), snapshot(automatic)
+    automatic_preview = json.loads(run("plan", *automatic_args, "--json").stdout)
+    assert automatic_preview["feasible"] and automatic_preview["resource_policy"] == "adaptive", automatic_preview
+    assert (snapshot(farm), snapshot(automatic)) == before
+    automatic_profile_file = directory / "automatic profile.json"
+    automatic_setup = json.loads(run("plan", *automatic_args, "--save-profile", automatic_profile_file, "--json").stdout)
+    automatic_profile = json.loads(automatic_profile_file.read_text(encoding="utf-8"))
+    assert automatic_profile["farm_resources"]["schema"] == 2
+    assert automatic_profile["farm_resources"]["policy"] == "adaptive"
+    assert all(not workload["bounded"] and workload["cost"] == "unknown"
+               for workload in automatic_profile["farm_resources"]["workloads"])
+    assert not automatic_setup["resource_preparation"]["missing"], automatic_setup["resource_preparation"]
+    run("fill", *automatic_args, "-f", FARMER, "--pool-ph", POOL, "-S", SEED,
+        point="replot-job-prepared", code=86)
+    prepared_automatic = private_record(automatic, "grow-replot.review").read_bytes()
+    health_log = directory / "automatic-health.log"
+    with health_log.open("w", encoding="utf-8") as output:
+        process = subprocess.Popen(command("fill", automatic), stdout=output, stderr=output)
+        try:
+            until = time.monotonic() + 120
+            while time.monotonic() < until:
+                text = health_log.read_text(encoding="utf-8")
+                assert process.poll() is None, text
+                with reader_log.open("a", encoding="utf-8") as native_log:
+                    native_log.write(time.strftime("%Y-%m-%dT%H:%M:%S") +
+                                     ".000 harvester harvester.harvester: INFO 1 plots were eligible for farming. Time: 120.0 s.\n")
+                if "protected construction drained" in text and "degraded-farming-response" in text:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(("slow farming observations did not pause construction", text))
+            assert process.wait(timeout=180) == 0, health_log.read_text(encoding="utf-8")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+    health = health_log.read_text(encoding="utf-8")
+    assert "migration resource admission resumed" in health and SEED not in health, health
+    assert private_record(automatic, "grow-replot.review").read_bytes() == prepared_automatic
+    assert not (automatic / "legacy.plot").exists() and digest(source) == source_hash
+    automatic_output, = automatic.glob("*.plot2")
+    run("verify", automatic_output, "--full", "--trials", 100)
+    flags()
+    print("PASS automatic migration limits, live farming pause/recovery, private resume and full proofs", flush=True)
     # The normal fill command owns inventory, private preparation and resume.
     # Configuration discovery is additive; exclusions still count as active
     # farm scope but never receive output, temporary files or source deletion.
@@ -2875,11 +2935,14 @@ def check_replot(binary, root, reference=None):
         assert "service version changed since review" in drift.stdout + drift.stderr and snapshot(farm) == before
     flags()
     run(*execute, *keys, point="replot-journal-all-staged", code=86)
-    staged_private = snapshot(farm)
-    # A durable preparing journal can precede its per-job directory. Reviewing
-    # an unchanged successor must not create that directory or activate policy.
+    # Reproduce an older preparing journal that preceded its local bindings.
+    # Reviewing a successor must not create its directory or activate policy.
     assert private_record(farm, "grow-replot.plan.next").is_file()
     preparing_artifacts = replot_artifacts(farm, review["job_id"])
+    assert [path.name for path in preparing_artifacts.iterdir()] == ["local-bindings"]
+    (preparing_artifacts / "local-bindings").unlink()
+    preparing_artifacts.rmdir()
+    staged_private = snapshot(farm)
     assert not preparing_artifacts.exists()
     preparing_before = staged_private, snapshot(external_scratch), review_file.read_bytes(), review_file.stat().st_mtime_ns
     preparing_successor = directory / "preparing journal successor.plan"
@@ -3778,7 +3841,7 @@ def check_replot(binary, root, reference=None):
     compute_inventory = directory / "compute inventory.plan"
     compute_catalog = json.loads(run("plan", "--inventory", compute_farm, *compute_adapter,
                                      "--save-plan", compute_inventory, "--json").stdout)
-    membership = directory / "migration compute membership"
+    membership = directory / "migration ' compute é membership"
     run("compute", "init", "--directory", membership, "--name", "protected migration fixture")
     # Leave saved caps unset so command limits can exercise the reviewed
     # physical envelope without additional membership limits.
@@ -3822,6 +3885,22 @@ def check_replot(binary, root, reference=None):
                         "--compute-offer-ram", "1G", "--compute-offer-cpus", 2, "--compute-offer-slots", 1,
                         "--compute-offer-backend", "cpu", "--compute-codec-ram", "64M", "--compute-inflight", 1,
                         "--compute-timeout-ms", 120000]
+    remote_setup_file = directory / "remote selection.json"
+    remote_setup = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", compute_file,
+                                  *compute_adapter, *options, "--compute", "auto", "--compute-directory", membership,
+                                  "--compute-local", "off", "--compute-broker", "127.0.0.1:1",
+                                  "--save-profile", remote_setup_file, "--json").stdout)
+    for field in ("continue_setup_command", "next_command"):
+        selected = shlex.split(remote_setup[field])
+        for key, value in (("--compute-directory", str(membership)), ("--compute-local", "off"),
+                           ("--compute-broker", "127.0.0.1:1")):
+            assert selected[selected.index(key) + 1] == value
+    continued = shlex.split(remote_setup["continue_setup_command"])[1:]
+    continued[continued.index("--save-profile") + 1] = str(directory / "remote continued.json")
+    remote_continued = json.loads(run(*continued, "--json").stdout)
+    continued_options = shlex.split(remote_continued["next_command"])
+    assert continued_options[continued_options.index("--compute-local") + 1] == "off"
+    assert json.loads(remote_setup_file.read_text())["compute_settings"]["options"]["--compute-directory"] == str(membership)
     ordinary = directory / "ordinary shared scheduler"
     ordinary.mkdir()
     refused_ordinary = run("plan", ordinary, *compute_options, "--json", code=2)
@@ -3840,10 +3919,15 @@ def check_replot(binary, root, reference=None):
                                             for reason in uncovered["infeasibility_reasons"])
     assert snapshot(compute_farm) == before
     compute_credit = compute_catalog["plots"][0]["identity"]["allocated_bytes"]
-    reviewed_compute = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", compute_file,
-                                     *compute_adapter, *compute_options, "--reclaim-before-bytes", compute_credit,
-                                     "--save-plan", compute_review, "--json").stdout)
+    saved_compute_file = directory / "saved compute selection.json"
+    compute_setup = json.loads(run("plan", compute_farm, "--replot", compute_inventory, "--harvester", compute_file,
+                                  *compute_adapter, *compute_options, "--reclaim-before-bytes", compute_credit,
+                                  "--save-profile", saved_compute_file, "--json").stdout)
+    continued = shlex.split(compute_setup["next_command"])[1:]
+    continued[continued.index("--save-plan") + 1] = str(compute_review)
+    reviewed_compute = json.loads(run(*continued, "--json").stdout)
     assert reviewed_compute["feasible"] and reviewed_compute["native_request"]["compute_enabled"] and snapshot(compute_farm) == before
+    assert str(membership) not in compute_review.read_text(), "portable review contains private compute connection settings"
     raised_offer = list(compute_options)
     raised_offer[raised_offer.index("--compute-offer-ram") + 1] = "2G"
     capped = json.loads(run("plan", "--from-plan", compute_review, "--harvester", compute_file,
@@ -3860,11 +3944,23 @@ def check_replot(binary, root, reference=None):
     refusal = run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *bad_offer, *keys, code=2)
     assert "infeasible under the current execution binding" in refusal.stdout + refusal.stderr
     assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
-    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options, *keys,
-        point="replot-journal-all-staged", code=86)
-    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options,
-        point="replot-replacement-verified", code=86)
-    run("fill", compute_review, "--harvester", compute_file, *compute_adapter, *compute_options)
+    execute = shlex.split(reviewed_compute["next_command"])[1:]
+    assert "--reclaim-before-bytes" not in execute, "execution command repeated a saved review selection"
+    run(*execute, *keys, point="replot-local-bindings-durable", code=86)
+    assert not private_record(compute_farm, "grow-replot.plan").exists()
+    replot_artifacts(compute_farm, reviewed_compute["job_id"]).joinpath("local-bindings").unlink()
+    run(*execute, *keys, point="replot-local-bindings-durable", code=86)
+    unrelated = private_record(compute_farm, "unrelated")
+    unrelated.write_text("preserve unrelated bookkeeping", encoding="utf-8")
+    stopped = snapshot(compute_farm)
+    refusal = run("fill", compute_review, *keys, code=2)
+    assert "unrelated bookkeeping" in refusal.stdout + refusal.stderr and snapshot(compute_farm) == stopped
+    unrelated.unlink()
+    run("fill", compute_review, *keys, point="replot-journal-all-staged", code=86)
+    # Resume from the private local binding with neither the reusable profile
+    # nor any compute flags, even though enrollment is outside the default path.
+    run("fill", compute_review, point="replot-replacement-verified", code=86)
+    run("fill", compute_review)
     compute_final = Path(reviewed_compute["batches"][0]["path"])
     assert not compute_source.exists() and header(compute_final)[3] == 2
     proof = run("verify", compute_final, "--full", "--trials", 100)
@@ -3888,6 +3984,31 @@ def check_replot(binary, root, reference=None):
         assert comparison.returncode == 0, (comparison.stdout, comparison.stderr)
         assert digest(canonical) == digest(compute_final), "protected compute migration differs from the independent assembler"
     print("PASS saved-pool protected migration, adaptive offer caps, complete worker reservations, preclaim refusal, owner-key recovery, real multi-member contributions and full proofs", flush=True)
+    # The same enrolled service also needs no manual graph or codec estimate
+    # when starting an automatic job with the default execution limits.
+    automatic_compute = directory / "automatic compute migration"
+    automatic_compute.mkdir()
+    (automatic_compute / "legacy.plot").write_bytes(legacy)
+    (compute_reader / "fixture.json").write_text(json.dumps({"roots": [str(automatic_compute)],
+                                                            "plot_public_key": COMPUTE_FARMING_PLOT_KEY}), encoding="utf-8")
+    (compute_reader / "config/config.yaml").write_text(
+        "self_hostname: localhost\nharvester:\n  num_threads: 1\n  plot_directories:\n  - " +
+        json.dumps(str(automatic_compute)) + "\n", encoding="utf-8")
+    automatic_options = [automatic_compute, "--replot", *compute_adapter, "-k", 18,
+                         "--group-members", 1, "--max-total-members", 1, "--max-groups", 1, "--headroom-bytes", 0,
+                         "--compute-directory", membership, "--compute-offer-backend", "cpu",
+                         "--compute-owner-id", "protected-migration-owner"]
+    automatic_preview = json.loads(run("plan", *automatic_options, "--json").stdout)
+    assert automatic_preview["resource_policy"] == "adaptive" and automatic_preview["feasible"], automatic_preview
+    automatic_file = directory / "automatic compute profile.json"
+    automatic_setup = json.loads(run("plan", *automatic_options, "--save-profile", automatic_file, "--json").stdout)
+    assert not automatic_setup["resource_preparation"]["missing"], automatic_setup["resource_preparation"]
+    run("fill", *automatic_options, *keys, point="replot-job-prepared", code=86)
+    run("fill", automatic_compute)
+    automatic_output, = automatic_compute.glob("*.plot2")
+    assert not (automatic_compute / "legacy.plot").exists()
+    run("verify", automatic_output, "--full", "--trials", 100)
+    print("PASS automatic enrolled-compute setup, default limits, saved selections and full proofs", flush=True)
 
 
 def check_compute(binary, root):

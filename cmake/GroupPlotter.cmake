@@ -51,7 +51,7 @@ function(pos2_grow_identity target upstream_dir)
         string(APPEND identity "upstream/${name}:${digest}\n")
     endforeach()
     set(local_sources)
-    foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
+    foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupComputeSettings.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
                  GroupFarmPreview.hpp GroupFarmUpdate.hpp GroupFarmProgress.hpp GroupFarmControlState.hpp GroupFarmControl.hpp GroupFarmOwner.hpp GroupFarmMembership.hpp GroupFarmMetadata.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp

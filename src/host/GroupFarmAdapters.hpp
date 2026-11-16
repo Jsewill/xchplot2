@@ -5,6 +5,7 @@
 #include "host/GroupFarmAdapterProcess.hpp"
 #include <cctype>
 #include <ctime>
+#include <mutex>
 
 namespace group_grow::farm
 {
@@ -970,7 +971,7 @@ public:
     TargetPoolState pool;
     std::vector<OtherHarvesterObservation> other_harvesters;
     TargetServices(Session& session, HarvesterAdapterOptions const& options, NetworkProjection const& reviewed,
-        NetworkProjection& observed, TargetServiceExpectation const& expected) : session_(session)
+        NetworkProjection& observed, TargetServiceExpectation const& expected, bool summary_only = false) : session_(session)
     {
         pool_hash_ = expected.pool_contract_puzzle_hash; pool_key_ = expected.pool_public_key; reviewed_network_ = reviewed.network;
         farmer_version_ = reviewed.farmer_version; solver_version_ = reviewed.solver_version;
@@ -1006,22 +1007,26 @@ public:
             require_service_available(profile_detail::boolean(inventory_detail::required_field(state, "started")), "target PoS2 solver has not completed startup");
         }
         pool_route();
-        harvesters_ = session.rpc(AdapterOperation::farmer_harvesters); receiver_ = &receiver(harvesters_);
+        harvesters_ = session.rpc(summary_only ? AdapterOperation::farmer_harvesters_summary : AdapterOperation::farmer_harvesters);
+        receiver_ = &receiver(harvesters_);
         generation_ = service_time(*receiver_, "last_sync_time", true);
         auto const& rows = inventory_detail::required_field(harvesters_, "harvesters");
         for (auto const& row : rows.items)
         {
             auto const& plots = inventory_detail::required_field(row, "plots");
-            require(plots.kind == Json::array && plots.items.size() <= options.limits.max_files, "target farmer plot view exceeds its bound");
+            uint64_t files = 0;
+            if (summary_only) files = profile_detail::integer(plots);
+            else
+            { require(plots.kind == Json::array && plots.items.size() <= options.limits.max_files, "target farmer plot view exceeds its bound"); files = plots.items.size(); }
             if (&row == receiver_) continue;
             require_service_available(inventory_detail::required_field(row, "syncing").kind == Json::null,
                 "another harvester synchronization is incomplete; even an empty partial view has unknown workload");
             (void)service_time(row, "last_sync_time", true);
-            if (plots.items.empty()) continue;
+            if (!files) continue;
             auto const& connection = inventory_detail::required_field(row, "connection");
             OtherHarvesterObservation other;
             other.node_id = hex_string(inventory_detail::required_field(connection, "node_id"), 32);
-            other.peer_host = inventory_detail::string(connection, "host"); other.files = plots.items.size();
+            other.peer_host = inventory_detail::string(connection, "host"); other.files = files;
             for (auto const& plot : plots.items)
             {
                 auto const size = inventory_detail::integer(plot, "size");
@@ -1578,6 +1583,65 @@ inline TargetPrerequisites observe_target_prerequisites(HarvesterAdapterOptions 
     { if (options.limits.cancelled && options.limits.cancelled()) throw; result.reason = error.what(); }
     return result;
 }
+// Bounded live health uses the farmer's summary RPC, independent of farm size.
+// It does not acknowledge a replacement, authorize retirement, or establish a
+// proof deadline. Those actions retain the complete native readiness checks.
+inline void observe_farming_health(HarvesterAdapterOptions const& options, NetworkProjection const& reviewed,
+    uint8_t k, uint8_t strength, TargetServiceExpectation const& expected)
+{
+    adapter_detail::Session session(options); auto observed = adapter_detail::projection(session);
+    inventory_detail::require(observed.reader_version == reviewed.reader_version && observed.version == reviewed.version,
+        "farming service version changed");
+    ReplacementExpectation target; target.k = k; target.strength = strength;
+    target.network = reviewed.network; target.genesis_challenge = reviewed.genesis_challenge;
+    (void)adapter_detail::active_network(session, options, target, observed);
+    adapter_detail::TargetServices services(session, options, reviewed, observed, expected, true);
+    services.finish(); session.unchanged();
+}
+class FarmingHealthMonitor
+{
+    using Clock = std::chrono::steady_clock;
+    mutable std::mutex mutex_;
+    bool healthy_ = false;
+    Clock::time_point observed_{}, slow_until_{};
+    std::jthread thread_;
+public:
+    FarmingHealthMonitor(HarvesterAdapterOptions options, NetworkProjection reviewed, uint8_t k, uint8_t strength,
+        TargetServiceExpectation expected)
+    {
+        options.retirement = nullptr; options.revalidation = nullptr;
+        options.limits.memory_bytes = farming_health_memory_bytes;
+        options.limits.max_output_bytes = options.limits.memory_bytes / 64;
+        options.limits.timeout_ms = std::min(uint64_t(30000), options.limits.timeout_ms);
+        thread_ = std::jthread([this, options = std::move(options), reviewed = std::move(reviewed), k, strength,
+            expected = std::move(expected)](std::stop_token stop) mutable
+        {
+            auto const cancelled = options.limits.cancelled;
+            options.limits.cancelled = [stop, cancelled] { return stop.stop_requested() || (cancelled && cancelled()); };
+            while (!options.limits.cancelled())
+            {
+                bool healthy = false;
+                try { observe_farming_health(options, reviewed, k, strength, expected); healthy = true; }
+                catch (std::exception const&) {}
+                { std::lock_guard lock(mutex_); healthy_ = healthy; observed_ = Clock::now(); }
+                auto const next = Clock::now() + std::chrono::seconds(5);
+                while (!options.limits.cancelled() && Clock::now() < next) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+    void observe_latency(uint64_t elapsed_ns, uint64_t deadline_ns)
+    {
+        if (!deadline_ns || elapsed_ns < deadline_ns / 2) return;
+        std::lock_guard lock(mutex_); slow_until_ = Clock::now() + std::chrono::seconds(30);
+    }
+    std::string reason() const
+    {
+        std::lock_guard lock(mutex_); auto const now = Clock::now();
+        if (!healthy_ || now < observed_ || now - observed_ > std::chrono::seconds(40)) return "unavailable-farming-health";
+        if (now < slow_until_) return "degraded-farming-response";
+        return {};
+    }
+};
 namespace adapter_detail
 {
 inline void observe_inventory(FarmInventory& inventory, HarvesterAdapterOptions const& options, Session& session,

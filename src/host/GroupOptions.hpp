@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,7 +21,25 @@ struct GroupLocalDevice
     std::vector<int> cpu_affinity;
 };
 
-struct GroupOptions
+struct GroupComputeOptions
+{
+    std::string pool_broker, pool_owner, pool_ca, pool_cert, pool_key, pool_listen, pool_advertise;
+    std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
+    bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;
+    std::shared_ptr<ComputeSession> compute_session;
+    std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
+    std::function<void()> compute_admit_session;
+    std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
+    std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
+    std::string pool_offer_backend = "cpu";
+    uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
+    uint64_t pool_offer_ram_limit = 0, pool_offer_cpu_limit = 0, pool_offer_vram_limit = 0;
+    uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;
+    uint64_t pool_codec_ram = 0;
+    bool pool_codec_auto = true, pool_offer_backend_set = false;
+};
+
+struct GroupOptions : GroupComputeOptions
 {
     std::string command;
     bool json = false, quiet = false, verbose = false, progress = false, report_metrics = true;
@@ -100,20 +119,14 @@ struct GroupOptions
     bool farming_detect_local = false;
     std::shared_ptr<group_grow::FarmingProfile const> farming_profile;
     std::shared_ptr<std::string const> replot_local_profile;
-    std::string pool_broker, pool_owner, pool_ca, pool_cert, pool_key, pool_listen, pool_advertise;
-    std::string compute_mode = "auto", pool_directory, pool_server_name, pool_session_owner;
-    bool automatic_compute = false, automatic_local_compute = true, pool_owner_explicit = false;
-    std::shared_ptr<ComputeSession> compute_session;
-    std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
-    std::function<void()> compute_admit_session;
-    std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
-    std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
-    std::string pool_offer_backend = "cpu";
-    uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
-    uint64_t pool_offer_ram_limit = 0, pool_offer_cpu_limit = 0, pool_offer_vram_limit = 0;
-    uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;
-    uint64_t pool_codec_ram = 0;
-    bool pool_codec_auto = true, pool_offer_backend_set = false;
+    // Explicit connection choices survive local profile/job continuation.
+    // The snapshot precedes enrollment/default resolution and RAM partitioning.
+    std::map<std::string, std::string> compute_settings;
+    std::optional<GroupComputeOptions> compute_requested;
+    uint64_t compute_reserved_ram = 0;
+    std::string compute_requested_backend;
 };
+
+void configure_group_compute(GroupOptions&);
 
 } // namespace pos2gpu

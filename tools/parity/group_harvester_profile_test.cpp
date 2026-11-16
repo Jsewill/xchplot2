@@ -5,6 +5,7 @@
 namespace group_tools { inline void require(bool condition, std::string const& message) { if (!condition) throw std::runtime_error(message); } }
 namespace group_grow { using group_tools::require; }
 #include "host/GroupHarvesterProfile.hpp"
+#include "host/GroupComputeSettings.hpp"
 #include <iostream>
 #ifdef _WIN32
 #include <shellapi.h>
@@ -129,6 +130,42 @@ void json_tests()
     rejects([&] { std::istringstream input(out.str()); read_farming_profile(input, 16); }, "profile parsing memory budget was ignored");
     rejects([&] { profile_detail::JsonReader("[0,0,0,0]", 1024).read(); }, "JSON structure allocation budget was ignored");
 }
+void compute_settings_tests()
+{
+    using namespace pos2gpu;
+    GroupOptions original;
+    auto const directory = fs::absolute(utf8_path("compute \xc3\xa9 ' pool")).u8string();
+    std::string const path(reinterpret_cast<char const*>(directory.data()), directory.size());
+    for (auto const& [key, value] : std::vector<std::pair<std::string, std::string>>{
+        {"--compute-directory", path}, {"--compute-local", "off"}, {"--compute-broker", "[::1]:18444"},
+        {"--compute-owner-id", "farm owner"}, {"--compute-codec-ram", "0"}, {"--compute-inflight", "2"},
+        {"--compute-timeout-ms", "120000"}, {"--compute-socket-timeout-ms", "2000"}, {"--compute-frame-bytes", "65536"}})
+        check(set_group_compute_setting(original, key, value), "compute option was not captured");
+    std::ostringstream saved; saved << "{\"compute_settings\":"; write_group_compute_settings(saved, original); saved << '}';
+    auto const document = profile_detail::JsonReader(saved.str()).read();
+    GroupOptions resumed;
+    check(apply_group_compute_settings(resumed, document) && resumed.pool_directory == path && !resumed.automatic_local_compute &&
+        resumed.pool_broker == "[::1]:18444" && resumed.pool_owner == "farm owner" && resumed.pool_owner_explicit &&
+        !resumed.pool_codec_auto && !resumed.pool_codec_ram && resumed.pool_inflight == 2 && resumed.pool_frame_bytes == 65536 &&
+        resumed.pool_timeout_ms == 120000 && resumed.pool_socket_timeout_ms == 2000,
+        "local profile continuation lost compute selection");
+    check(!apply_group_compute_settings(resumed, document), "unchanged local settings were reapplied");
+    GroupOptions override;
+    set_group_compute_setting(override, "--compute-local", "on"); set_group_compute_setting(override, "--compute-codec-ram", "auto");
+    apply_group_compute_settings(override, document);
+    check(override.automatic_local_compute && override.pool_codec_auto && override.pool_directory == path,
+        "explicit on/auto did not override saved preferences");
+    GroupOptions disabled; set_group_compute_setting(disabled, "--compute", "off");
+    apply_group_compute_settings(disabled, document);
+    check(disabled.compute_mode == "off" && disabled.pool_broker.empty() && disabled.pool_owner.empty() && disabled.pool_codec_auto,
+        "explicit compute off retained incompatible inherited connections");
+    rejects([&] { GroupOptions invalid; apply_group_compute_settings(invalid,
+        profile_detail::JsonReader("{\"compute_settings\":{\"schema\":1,\"options\":{\"--seed\":\"secret\"}}}").read()); },
+        "compute settings accepted unrelated private-key options");
+    rejects([&] { GroupOptions invalid; apply_group_compute_settings(invalid,
+        profile_detail::JsonReader("{\"compute_settings\":{\"schema\":2,\"options\":{}}}").read()); },
+        "unknown compute settings version was accepted");
+}
 void calibration_scope_tests()
 {
     FarmingProfile scoped; scoped.config.k = 18; scoped.config.strength = 3; scoped.config.reader = FarmingReader::cached;
@@ -251,7 +288,7 @@ int main(int argc, char** argv) try
 #else
     auto executable = fs::absolute(utf8_path(argv[0]));
 #endif
-    json_tests(); calibration_scope_tests(); config_tests(); memory_bound_tests(); process_tests(executable);
+    json_tests(); compute_settings_tests(); calibration_scope_tests(); config_tests(); memory_bound_tests(); process_tests(executable);
     std::cout << "Harvester profile parsing and local Chia detection passed\n"; return 0;
 }
 catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
