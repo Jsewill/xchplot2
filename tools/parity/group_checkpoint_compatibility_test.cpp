@@ -99,7 +99,8 @@ void complete(std::string const& engine, fs::path const& path, bool resume, bool
     {
         auto ext = resume ? ExternalEngine::inspect(path.string(), cfg.memory_limit_bytes, cfg.path_bindings).external : external(path);
         ExternalEngine output(path.string(), cfg, ext, resume, identity()); output.confirm_identity();
-        if (!output.committed_member_count()) require(output.append(input).accepted, "external fixture rejected input");
+        if (output.pending_members()) output.resume(input);
+        else if (!output.committed_member_count()) require(output.append(input).accepted, "external fixture rejected input");
         output.finish();
     }
 }
@@ -214,6 +215,29 @@ void refuses_unchanged(std::string const& engine, fs::path const& path, fs::path
     try { complete(engine, path, true); }
     catch (std::exception const& error) { refused = true; require(std::string(error.what()).find(expected) != std::string::npos, error.what()); }
     require(refused && snapshot(root) == before, "incompatible checkpoint recovery changed saved bytes");
+}
+void terminal_compatibility(fs::path const& root, fs::path const& producer, std::vector<uint8_t> const& expected)
+{
+    for (auto const* boundary : {"external-pack-initialized-after-checkpoint", "external-pack-after-checkpoint", "external-ready-after-checkpoint"})
+    {
+        auto const path = root / (std::string("resident-") + boundary + ".gplot");
+        require(child(producer, {"--external-terminal", "external", path.string()}, boundary) == 86,
+            "source build did not reach resident batch checkpoint");
+        auto const before = snapshot(root); auto const inspected = inspect("external", path);
+        require(inspected.checkpoint && inspected.checkpoint_identity.producer_build == "checkpoint-source-a" &&
+            inspected.checkpoint_identity.algorithm == std::string(construction_algorithm_identity) + "/terminal-1" &&
+            snapshot(root) == before, "resident cross-build inspection lost its compatibility contract or changed bytes");
+        auto const checkpoint = checkpoint_path("external", path); auto const original = contents(checkpoint);
+        for (auto const* change : {"format", "algorithm", "representation", "corrupt"})
+        {
+            replace(checkpoint, alter("external", original, change));
+            refuses_unchanged("external", path, root, std::string(change) == "corrupt" ? "checksum" : change);
+            replace(checkpoint, original);
+        }
+        complete("external", path, true, true);
+        require(contents(path) == expected && inspect("external", path).checkpoint_identity.producer_build == "checkpoint-source-a",
+            "resident cross-build recovery changed canonical output or producer provenance");
+    }
 }
 void stream_compatibility(fs::path const& root, fs::path const& producer, std::vector<uint8_t> const& expected)
 {
@@ -415,6 +439,12 @@ try
     }
     if (argc >= 4)
     {
+        if (std::string(argv[1]) == "--external-terminal")
+        {
+            fs::path const path(argv[3]);
+            ExternalEngine output(path.string(), config(), external(path), false, identity()); output.confirm_identity();
+            require(output.append_and_finish(members()).accepted, "resident source rejected input"); return 0;
+        }
         if (std::string(argv[1]) == "--external-scratch")
         {
             fs::path const path(argv[3]); auto ext = external(path); ext.scratch.front().directory = argv[4];
@@ -492,6 +522,7 @@ try
         if (std::string(engine) == "external") refuses_unchanged(engine, corrupt, root, "checksum");
         else { complete(engine, corrupt, true); require(contents(corrupt) == expected, "corrupt checkpoint generation bypassed checksum recovery"); }
     }
+    terminal_compatibility(root, producer, expected);
     stream_compatibility(root, producer, expected);
     retired_compatibility(root, producer, expected);
     external_rebinding(root, producer, expected);

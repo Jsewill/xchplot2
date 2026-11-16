@@ -330,7 +330,7 @@ private:
     static constexpr uint8_t construction_version = 0xf0, finalizing_version = 0xf1;
     static constexpr size_t record_bytes = 1024;
     static constexpr size_t max_tasks = 65536;
-    static constexpr size_t digest_words = 1024;
+    static constexpr size_t digest_words = member_digest_words;
     struct Record;
     static ConstructionCompatibility checkpoint_compatibility();
     struct Window
@@ -1177,77 +1177,7 @@ inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBat
         }
         return digest;
     };
-    if (hash)
-        if (auto digest = hash->digest_for(members)) return remember(*digest);
-    // Keep the native uint64 size prefix and logical fragment bytes exactly.
-    // Raw inputs hash in place; packed inputs reuse one bounded decode buffer.
-    // The accelerated Rust shim owns the SHA state and consumes each segment
-    // before asking for the next one.
-    struct Reader
-    {
-        Members members;
-        uint8_t k;
-        size_t member = 0, chunk = 0, offset = 0;
-        bool prefix = true;
-        uint64_t count = 0;
-        std::array<uint64_t, digest_words> decoded;
-        std::exception_ptr error;
-        Config const* config = nullptr;
-    } reader{members, identity_.header.k};
-    reader.config = &config_;
-    auto next = [](void* context, pos2_sha256_segment* segment) noexcept -> int
-    {
-        auto& reader = *static_cast<Reader*>(context);
-        try
-        {
-            reader.config->check_running();
-            if (reader.member == reader.members.size()) return 0;
-            auto const view = reader.members[reader.member];
-            if (reader.prefix)
-            {
-                reader.count = view.size();
-                *segment = {reinterpret_cast<uint8_t const*>(&reader.count), sizeof(reader.count)};
-                reader.prefix = false;
-                return 1;
-            }
-            if (!view.compact())
-            {
-                auto const raw = view.raw();
-                require(raw.size() <= SIZE_MAX / sizeof(uint64_t), "member hash length overflow");
-                auto const part = raw.subspan(reader.offset, std::min(raw.size() - reader.offset, reader.decoded.size()));
-                *segment = {reinterpret_cast<uint8_t const*>(part.data()), part.size_bytes()};
-                reader.offset += part.size();
-                if (reader.offset == raw.size())
-                { ++reader.member; reader.offset = 0; reader.prefix = true; }
-                return 1;
-            }
-            size_t const chunks = size_t(PlotGroupFile::getChunkCountForK(reader.k));
-            size_t filled = 0;
-            while (reader.chunk < chunks && filled < reader.decoded.size())
-            {
-                auto const region = view.region(reader.chunk);
-                size_t const count = std::min(region.size() - reader.offset, reader.decoded.size() - filled);
-                for (size_t i = 0; i < count; ++i) reader.decoded[filled + i] = region[reader.offset + i];
-                reader.offset += count;
-                filled += count;
-                if (reader.offset == region.size()) { ++reader.chunk; reader.offset = 0; }
-            }
-            *segment = {reinterpret_cast<uint8_t const*>(reader.decoded.data()), filled * sizeof(uint64_t)};
-            if (reader.chunk == chunks)
-            {
-                ++reader.member;
-                reader.chunk = 0;
-                reader.prefix = true;
-            }
-            return 1;
-        }
-        catch (...) { reader.error = std::current_exception(); return -1; }
-    };
-    std::array<uint8_t, 32> result{};
-    int const status = pos2_sha256_stream(next, &reader, result.data());
-    if (reader.error) std::rethrow_exception(reader.error);
-    require(status == POS2_OK, "cannot hash incoming group members");
-    return remember(result);
+    return remember(members_digest(identity_.header.k, members, hash, [&] { config_.check_running(); }));
 }
 
 inline std::span<EncodedBlock const> Engine::encode_window(uint64_t first, uint64_t count, uint64_t source_begin,

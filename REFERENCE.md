@@ -656,6 +656,13 @@ With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both
 incoming data and contributions.
+When the final member count is fixed and the last batch fits in RAM, external
+construction packs it directly with the saved contributions, avoiding its
+temporary write and read. An interruption
+during packing regenerates that batch and checks it against the checkpoint
+before continuing. Recovery must have enough RAM for the saved batch. These
+checkpoints require a build that supports resident final batches; completed
+plots retain the ordinary v2 format.
 
 Writers sharing a physical drive serialize their I/O. Independent drives can
 progress together within the shared RAM and CPU limits. `--io-overlap on|off`,

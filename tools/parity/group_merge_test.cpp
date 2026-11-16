@@ -3183,12 +3183,14 @@ void construction_histories()
             for (uint16_t count = 1; count <= std::min(remaining, cap); ++count)
                 best[remaining] = std::min(best[remaining], best[remaining - count] + prefix + remaining);
             uint64_t written = 0, members = prefix;
+            uint16_t last = 0;
             for (uint16_t left = remaining; left;)
             {
                 uint16_t const count = construction_initial_batch(left, std::min(left, cap));
-                members += count; written += members; left -= count;
+                members += count; written += members; left -= count; last = count;
             }
             require(written == best[remaining], "short-first batches did not minimize repeated prefix writes");
+            require(last == std::min(remaining, cap), "short-first batches did not retain the largest final batch");
         }
     }
     auto clipped = fresh_config; clipped.capacity_bytes = 9 * 654187;

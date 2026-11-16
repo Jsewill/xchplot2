@@ -164,6 +164,8 @@ public:
         uint64_t target_bytes = 0, target_allocated_bytes = 0, metadata_reserved_bytes = 0, metadata_allocated_bytes = 0, metadata_occupied_bytes = 0, peak_bytes = 0;
         uint64_t packing_source_bytes = 0, packing_work_bytes = 0, packet_count = 0;
         uint16_t members = 0;
+        uint16_t terminal_members = 0, pending_members = 0;
+        uint64_t terminal_symbols = 0;
         bool finishing = false, complete = false;
     };
     static bool pending(std::string const& path);
@@ -186,13 +188,17 @@ public:
     uint64_t required_memory(uint16_t batch_members = 1, unsigned workers = 0) const
     {
         auto cfg = config_; if (workers) cfg.workers = workers;
-        return phase_memory_bytes(identity_.header.k, cfg, external_, memory_phase(), batch_members);
+        return phase_memory_bytes(identity_.header.k, cfg, external_, memory_phase(),
+            phase_ == Phase::stage ? batch_members : std::max(uint16_t(1), terminal_members_));
     }
     MemoryPhase memory_phase() const
     { return phase_ == Phase::stage ? MemoryPhase::staging : phase_ == Phase::pack ? MemoryPhase::packing : MemoryPhase::publication; }
     Identity const& identity() const { return identity_; }
-    uint16_t committed_member_count() const { return members_; }
+    uint16_t pending_members() const
+    { return phase_ == Phase::pack && packed_chunks_ < PlotGroupFile::getChunkCountForK(identity_.header.k) ? terminal_members_ : 0; }
+    uint16_t committed_member_count() const { return members_ - pending_members(); }
     bool can_append() const { return phase_ == Phase::stage; }
+    bool can_finish_with_members() const { return can_append() && !legacy_checkpoint_; }
     // Called only after admitted contribution encoding has finished these
     // input chunks. Provisional-write failures unwind; they do not retry input.
     void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
@@ -260,6 +266,10 @@ public:
     std::unique_ptr<ContributionInput> prepare_contributions(uint16_t members, uint64_t fragment_bound);
     AppendResult append(ContributionInput& input, uint16_t prefix = 0);
     AppendResult append(Members members);
+    // The caller retains the last batch through packing. Its digest and the
+    // emitted frontier are durable; recovery regenerates only this batch.
+    AppendResult append_and_finish(Members members, MemberBatchHash const* hash = nullptr);
+    Result resume(Members members, MemberBatchHash const* hash = nullptr);
     // Exclusive engine ownership is required, as for append/finish. A queued
     // owner may run this boundary; its caller can lower the grant only after
     // joining it. The staging summary and checkpoint buffer are then gone.
@@ -313,6 +323,9 @@ private:
     bool input_cleanup_failed_ = false;
     Phase phase_ = Phase::stage;
     uint16_t members_ = 0;
+    uint16_t terminal_members_ = 0;
+    uint64_t terminal_symbols_ = 0;
+    std::array<uint8_t, 32> terminal_digest_{};
     uint64_t next_id_ = 0, final_bound_ = 0, output_bytes_ = 0, packed_chunks_ = 0, contribution_bytes_ = 0;
     uint64_t checkpoint_ceiling_ = 0, packing_checkpoint_bytes_ = 0, checkpoint_tuning_changes_ = 0;
     std::vector<Root> roots_;
@@ -340,7 +353,8 @@ private:
     { InputWindowExceeded() : std::runtime_error("prepared chunk exceeds its input window") {} };
     PreparedInput* prepared_ = nullptr;
     ContributionInput* contributions_ = nullptr;
-    AppendResult append_source(Members members, PreparedInput* input, uint16_t count);
+    AppendResult append_source(Members members, PreparedInput* input, uint16_t count,
+                               bool terminal = false, MemberBatchHash const* hash = nullptr);
     void discard_input(Run& run, bool refresh = false);
     bool staging_slot();
     uint64_t prepared_segments() const;
@@ -383,11 +397,11 @@ private:
     static bool checkpoint_scope(std::istream& in, bool durable, std::string const& target, std::string const& work, std::string const& checkpoint);
     struct CheckpointHeader
     {
-        bool durable = false, legacy = false;
+        bool durable = false, legacy = false, terminal = false;
         ConstructionCheckpointIdentity identity;
         ConstructionCompatibility compatibility;
     };
-    static ConstructionCompatibility checkpoint_compatibility();
+    static ConstructionCompatibility checkpoint_compatibility(bool terminal = false);
     static CheckpointHeader read_checkpoint_header(std::istream& in, bool retired = false, bool candidate = false);
     static void check_checkpoint_header(CheckpointHeader const& header, bool retired = false);
     template<class Output> void write_checkpoint_header(Output& out, bool durable, bool retired = false) const;
@@ -412,9 +426,12 @@ private:
         if (phase == Phase::stage) require(!packed_chunks && !index_bytes && !index.inode && output_bytes == sizeof(Header) + memo_bytes,
             "invalid external staging progress");
     }
-    static void validate_packing_shape(uint8_t k, uint16_t members, uint64_t packets, uint64_t source, uint64_t work)
+    static void validate_packing_shape(uint8_t k, uint16_t members, uint64_t packets, uint64_t source, uint64_t work,
+                                       uint16_t terminal = 0, uint64_t symbols = 0)
     {
-        require(!members || (packets && packets <= members && source && work == ChunkCodec::estimate_work(k, source, 0)),
+        require(terminal <= members && bool(terminal) == bool(symbols) &&
+            (!members || (packets <= members - terminal && bool(packets) == bool(members - terminal) &&
+                bool(source) == bool(packets) && work == ChunkCodec::estimate_work(k, source, symbols))),
             "invalid external packing admission record");
     }
     void capture_owned_identities();
@@ -452,7 +469,7 @@ private:
                           std::vector<FragmentRegion>& regions) const;
     void balance();
     bool merge_range(size_t first, size_t count);
-    void pack();
+    void pack(Members members = {});
 };
 }
 
@@ -636,9 +653,9 @@ inline file_io::DurableIdentity get_native_identity(std::istream& in)
 }
 }
 
-inline ConstructionCompatibility ExternalEngine::checkpoint_compatibility()
+inline ConstructionCompatibility ExternalEngine::checkpoint_compatibility(bool terminal)
 {
-    return construction_compatibility({sizeof(Phase), sizeof(FileIdentity), alignof(FileIdentity), offsetof(FileIdentity, inode),
+    auto result = construction_compatibility({sizeof(Phase), sizeof(FileIdentity), alignof(FileIdentity), offsetof(FileIdentity, inode),
         sizeof(Stamp), alignof(Stamp), offsetof(Stamp, bytes), offsetof(Stamp, modified), offsetof(Stamp, changed),
         offsetof(Stamp, modified_ns), offsetof(Stamp, changed_ns), sizeof(LegacySegment), alignof(LegacySegment),
         offsetof(LegacySegment, ordinal), offsetof(LegacySegment, capacity), offsetof(LegacySegment, bytes), offsetof(LegacySegment, stamp),
@@ -655,12 +672,14 @@ inline ConstructionCompatibility ExternalEngine::checkpoint_compatibility()
         offsetof(Stats, phases), sizeof(PhaseStats), alignof(PhaseStats), offsetof(PhaseStats, read_ns), offsetof(PhaseStats, write_ns),
         offsetof(PhaseStats, sync_ns), offsetof(PhaseStats, codec_ns), offsetof(PhaseStats, decode_ns), offsetof(PhaseStats, read_bytes),
         offsetof(PhaseStats, written_bytes), offsetof(PhaseStats, read_calls), offsetof(PhaseStats, write_calls), offsetof(PhaseStats, syncs)});
+    if (terminal) result.algorithm = construction_build(std::string(construction_algorithm_identity) + "/terminal-1");
+    return result;
 }
 inline void ExternalEngine::check_checkpoint_header(CheckpointHeader const& header, bool retired)
 {
     auto const engine = retired ? "retired external" : "external";
     if (header.legacy) check_construction_build(header.identity.producer_build, GROW_IDENTITY, engine);
-    else check_construction_compatibility(header.compatibility, checkpoint_compatibility(), engine);
+    else check_construction_compatibility(header.compatibility, checkpoint_compatibility(header.terminal), engine);
 }
 inline ExternalEngine::CheckpointHeader ExternalEngine::read_checkpoint_header(std::istream& in, bool retired, bool candidate)
 {
@@ -669,14 +688,16 @@ inline ExternalEngine::CheckpointHeader ExternalEngine::read_checkpoint_header(s
     bool const legacy = retired ? version == "xchplot2-external-retired-1" || version == "xchplot2-external-retired-2" :
         version == "xchplot2-external-3" || version == "xchplot2-external-4";
     bool const stable = retired ? version == "xchplot2-external-retired-3" || version == "xchplot2-external-retired-4" :
-        version == "xchplot2-external-5" || version == "xchplot2-external-6";
+        version == "xchplot2-external-5" || version == "xchplot2-external-6" ||
+        version == "xchplot2-external-7" || version == "xchplot2-external-8";
     if (candidate && !legacy && !stable) return {};
     check_construction_format(legacy || stable, retired ? "retired external" : "external");
     auto const producer = get_string(in);
     auto const compatibility = legacy ? ConstructionCompatibility{} : get<ConstructionCompatibility>(in);
     bool const durable = retired ? version == "xchplot2-external-retired-2" || version == "xchplot2-external-retired-4" :
-        version == "xchplot2-external-4" || version == "xchplot2-external-6";
-    CheckpointHeader result{durable, legacy, construction_checkpoint_identity(version, producer, legacy, compatibility), compatibility};
+        version == "xchplot2-external-4" || version == "xchplot2-external-6" || version == "xchplot2-external-8";
+    bool const terminal = !retired && (version == "xchplot2-external-7" || version == "xchplot2-external-8");
+    CheckpointHeader result{durable, legacy, terminal, construction_checkpoint_identity(version, producer, legacy, compatibility), compatibility};
     if (!candidate) check_checkpoint_header(result, retired);
     return result;
 }
@@ -686,9 +707,10 @@ template<class Output> inline void ExternalEngine::write_checkpoint_header(Outpu
     put_string(out, retired ? (legacy_checkpoint_ ? (durable ? "xchplot2-external-retired-2" : "xchplot2-external-retired-1") :
         (durable ? "xchplot2-external-retired-4" : "xchplot2-external-retired-3")) :
         (legacy_checkpoint_ ? (durable ? "xchplot2-external-4" : "xchplot2-external-3") :
+        terminal_members_ ? (durable ? "xchplot2-external-8" : "xchplot2-external-7") :
         (durable ? "xchplot2-external-6" : "xchplot2-external-5")));
     put_string(out, producer_build_);
-    if (!legacy_checkpoint_) put(out, checkpoint_compatibility());
+    if (!legacy_checkpoint_) put(out, checkpoint_compatibility(terminal_members_ && !retired));
 }
 
 template<class Output> inline void ExternalEngine::put_segment(Output& out, Segment const& segment, bool durable)
@@ -949,6 +971,7 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     // one canonical size field; committed summaries remain in scratch.
     uint64_t const metadata = multiply(checkpoint_buffer_bytes(external), 8);
     if (phase == MemoryPhase::publication) return metadata;
+    uint64_t const digest_memory = member_digest_words * sizeof(uint64_t) + 4096;
     // Aggregate reader buffers, gathered payload, codec and canonical index
     // words coexist with bounded tasks. An overlapping target writer owns
     // another complete output window. Planning and encoding arrays are scoped.
@@ -956,7 +979,8 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     uint64_t const contribution_window = std::max(config.window_bytes,
         grow_add(sizeof(ChunkInput) + sizeof(uint64_t) + sizeof(EncodedBlock), multiply(batch_members, sizeof(FragmentRegion))));
     uint64_t const packing_window = std::max(config.window_bytes,
-        uint64_t(sizeof(ChunkInput) + sizeof(uint64_t) + sizeof(EncodedBlock) + max_runs * sizeof(uint64_t)));
+        grow_add(sizeof(ChunkInput) + sizeof(uint64_t) + sizeof(EncodedBlock) + max_runs * sizeof(uint64_t),
+            multiply(batch_members, sizeof(FragmentRegion))));
     uint64_t const planning_window = std::max(config.window_bytes,
         grow_add(sizeof(ChunkInput) + sizeof(ChunkSummary) + sizeof(EncodedBlock) + 3 * sizeof(uint64_t),
             multiply(batch_members, sizeof(FragmentRegion))));
@@ -968,11 +992,11 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
         grow_add(index_memory, PackingCheckpointHistory::memory_bytes() + max_roots * sizeof(bool)));
     uint64_t const tasks = staging ? std::max({planning_window, multiply(lanes, contribution_window), packing_tasks}) : packing_tasks;
     return grow_add(grow_add(config.codec_bytes, ParallelEncoder::memory_bytes(config.workers, !config.cpu_scheduler)), grow_add(grow_add(grow_add(multiply(config.window_bytes, 2 * lanes), tasks), std::max(config.window_bytes, uint64_t(max_runs * sizeof(Packet)))),
-        grow_add(metadata,
+        grow_add(grow_add(metadata, digest_memory),
         // Exact admission retains the candidate summary and a bounded writer
         // for one canonical size field, with payload and bit totals in scalars.
         grow_add(staging ? grow_add(multiply(PlotGroupFile::getChunkCountForK(k), sizeof(Summary)), sizeof(uint64_t)) : 0,
-            grow_add(staging ? multiply(batch_members, sizeof(size_t) + sizeof(FragmentRegion)) : 0,
+            grow_add(multiply(batch_members, sizeof(size_t) + sizeof(FragmentRegion)),
                 multiply(multiply(lanes, UINT16_MAX), sizeof(EncodedChunk)))))));
 }
 inline bool ExternalEngine::pending(std::string const& path)
@@ -1154,6 +1178,7 @@ inline void ExternalEngine::save(std::string const& label, std::span<Summary con
     }
     put(out, index_bytes_); put(out, index_carry_bits_); put(out, index_carry_value_); put(out, index_identity_); put_string(out, index_name_); put(out, completed_); put(out, packing_source_bytes_); put(out, packing_work_); put(out, packet_count_);
     if (durable) put_native_identity(out, index_native_identity_);
+    if (terminal_members_) { put(out, terminal_members_); put(out, terminal_symbols_); put(out, terminal_digest_); }
     return out.record(config_.cpu_scheduler.get());
     };
     auto check_summary = [&]
@@ -1325,6 +1350,13 @@ inline void ExternalEngine::load()
     require(index_name_.empty() || (index_name_.starts_with("index.") && file_io::native_path(index_name_).filename() == index_name_), "invalid external index name");
     packing_source_bytes_ = get<uint64_t>(in); packing_work_ = get<uint64_t>(in); packet_count_ = get<uint64_t>(in);
     if (durable) index_native_identity_ = get_native_identity(in);
+    if (checkpoint_header.terminal)
+    {
+        terminal_members_ = get<uint16_t>(in); terminal_symbols_ = get<uint64_t>(in); terminal_digest_ = get<std::array<uint8_t, 32>>(in);
+        require(terminal_members_ && terminal_members_ <= members_ &&
+            (phase_ == Phase::pack || phase_ == Phase::ready || phase_ == Phase::done), "invalid external resident batch checkpoint");
+        require(required_memory() <= config_.memory_limit_bytes, "saved external resident batch workspace exceeds memory budget");
+    }
     require(index_identity_.inode || !file_io::has_durable_identity(index_native_identity_), "absent external index has native authority");
     require(!durable || native_evidence() || file_io::has_durable_identity(checkpoint_native_identity_), "external native checkpoint schema has no object evidence");
     require(index_carry_bits_ < 8 && (index_carry_bits_ ? index_carry_value_ < (1u << index_carry_bits_) : !index_carry_value_), "invalid external partial index byte");
@@ -1345,7 +1377,7 @@ inline void ExternalEngine::load()
     uint64_t const metadata = metadata_bytes(identity_.header.k, external_);
     require(metadata <= config_.capacity_bytes && final_bound_ <= config_.capacity_bytes - metadata,
         "saved external output/checkpoint reservation exceeds capacity");
-    validate_packing_shape(identity_.header.k, members_, packet_count_, packing_source_bytes_, packing_work_);
+    validate_packing_shape(identity_.header.k, members_, packet_count_, packing_source_bytes_, packing_work_, terminal_members_, terminal_symbols_);
     require(!members_ || (packing_source_bytes_ <= config_.window_bytes && packing_work_ <= config_.codec_bytes),
         "saved external packing workspace exceeds admission");
     initialized_ = true; check_paths(); validate_runs();
@@ -1461,7 +1493,7 @@ inline void ExternalEngine::validate_runs() const
         }
         require(bytes == run.bytes, "external run length changed");
     }
-    require(first == members_ || (phase_ == Phase::done && runs_.empty()), "external committed member coverage changed");
+    require(first + terminal_members_ == members_ || (phase_ == Phase::done && runs_.empty()), "external committed member coverage changed");
 }
 inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalConfig external,
                                      bool resume, std::optional<Identity> initial)
@@ -1517,7 +1549,7 @@ inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalC
         require(valid_identity(h, identity_.memo.size()), "invalid external group identity");
         require(required_memory() <= config_.memory_limit_bytes, "external workspace exceeds memory budget");
         identity_.pending = phase_ != Phase::done && members_;
-        identity_.old_members = 0; identity_.target_members = members_;
+        identity_.old_members = terminal_members_ ? committed_member_count() : 0; identity_.target_members = members_;
         identity_.pending_peak_bytes = grow_add(final_bound_, metadata_bytes(h.k, external_));
         if (phase_ == Phase::done) { identity_.bytes = output_bytes_; identity_.header.group_size = members_; }
     }
@@ -2428,6 +2460,27 @@ inline AppendResult ExternalEngine::append(Members members)
     require(!members.empty() && members.size() <= size_t(UINT16_MAX - members_), "invalid external batch membership");
     return append_source(members, nullptr, uint16_t(members.size()));
 }
+inline AppendResult ExternalEngine::append_and_finish(Members members, MemberBatchHash const* hash)
+{
+    require(can_finish_with_members() && !prepared_ && !contributions_, "resident final batch requires an idle compatible external engine");
+    require(!members.empty() && members.size() <= size_t(UINT16_MAX - members_), "invalid external final batch membership");
+    auto result = append_source(members, nullptr, uint16_t(members.size()), true, hash);
+    if (result.accepted) { pack(members); result.result = finish(); }
+    return result;
+}
+inline Result ExternalEngine::resume(Members members, MemberBatchHash const* hash)
+{
+    config_.check_running();
+    require(confirmed_ && pending_members() && members.size() == pending_members(), "external recovery needs its saved resident batch");
+    for (size_t i = 0; i < members.size(); ++i)
+        require(!members[i].empty() && (!members[i].compact() || members[i].k() == identity_.header.k), "invalid regenerated external member");
+    {
+        CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
+        require(members_digest(identity_.header.k, members, hash, [&] { config_.check_running(); }) == terminal_digest_,
+            "regenerated external batch differs from its checkpoint");
+    }
+    pack(members); return finish();
+}
 inline AppendResult ExternalEngine::append(PreparedInput& input, uint16_t prefix)
 {
     require(prepared_ == &input && input.engine_ == this && input.sealed_ && input.frontier_ == members_,
@@ -2582,7 +2635,8 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     config_.check_running();
     return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
 }
-inline AppendResult ExternalEngine::append_source(Members members, PreparedInput* input, uint16_t count)
+inline AppendResult ExternalEngine::append_source(Members members, PreparedInput* input, uint16_t count,
+                                                  bool terminal, MemberBatchHash const* hash)
 {
     config_.check_running();
     ThreadCpuTimer cpu(contribution_owner_cpu_);
@@ -2596,7 +2650,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         if (!member.compact()) require(std::is_sorted(member.raw().begin(), member.raw().end()) &&
             member.raw().back() < (1ull << (identity_.header.k * 2)), "unsorted/out-of-range external member");
     }
-    if (!staging_slot())
+    if (!terminal && !staging_slot())
         return {false, false, final_bound_, grow_add(final_bound_, metadata_bytes(identity_.header.k, external_)),
             "external run limit needs more scratch; finish the committed prefix", {}};
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
@@ -2622,6 +2676,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
     };
     rewind();
     uint64_t maximum_input_words = 0;
+    uint64_t maximum_symbols = 0;
     uint64_t contribution_bound = 0, final_bound = sizeof(Header) + identity_.memo.size();
     uint64_t maximum_incoming_work = ChunkCodec::estimate_base();
     bool fits = true; std::string reason;
@@ -2630,6 +2685,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         uint64_t incoming_symbols = 0;
         for (size_t member = 0; member < fresh_regions.size(); ++member)
             incoming_symbols = grow_add(incoming_symbols, fresh_regions[member].size());
+        maximum_symbols = std::max(maximum_symbols, incoming_symbols);
         maximum_incoming_work = std::max(maximum_incoming_work, ChunkCodec::estimate_work(identity_.header.k, 0, incoming_symbols));
         auto const bounded = std::min(ChunkCodec::fresh_bound(identity_.header.k, chunk, fresh_regions, config_.cpu_scheduler.get()), ChunkCodec::size_bounds(fresh).second);
         require(bounded <= UINT32_MAX, "external contribution packet exceeds its size field");
@@ -2638,12 +2694,13 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         summary.codec = ChunkCodec::combine(identity_.header.k, summary.codec, fresh, fresh_regions[0].front(), chunk);
         // Keep prior actual source bytes until encoding commits this chunk's
         // new contribution. Exact sizing may retry with a smaller reservation.
-        uint64_t const source_bytes = grow_add(summary.bytes, bounded);
+        uint64_t const source_bytes = terminal ? summary.bytes : grow_add(summary.bytes, bounded);
         auto const sizes = ChunkCodec::size_bounds(summary.codec);
         final_bound = grow_add(final_bound, sizes.second);
         try { check_gsz_size(sizes.first, after); check_gsz_size(sizes.second, after); }
         catch (UnencodableChunkSize const&) { fits = false; reason = "external canonical chunk index exceeds conservative admission"; }
-        if (sizes.second > config_.window_bytes || source_bytes > config_.window_bytes || ChunkCodec::estimate_work(identity_.header.k, source_bytes, 0) > config_.codec_bytes ||
+        if (sizes.second > config_.window_bytes || source_bytes > config_.window_bytes ||
+            ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? incoming_symbols : 0) > config_.codec_bytes ||
             ChunkCodec::estimate_work(identity_.header.k, 0, incoming_symbols) > config_.codec_bytes)
         { fits = false; reason = "external final chunk exceeds codec/window budget"; }
     };
@@ -2743,7 +2800,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
                     check_gsz_size(final_size, after);
                     if (final_size > config_.window_bytes) buffers = false; ++stats_.sized_chunks;
                 }
-                bytes = codec.encoded_size(chunk, {}, 0, regions); ++stats_.sized_chunks;
+                if (!terminal) { bytes = codec.encoded_size(chunk, {}, 0, regions); ++stats_.sized_chunks; }
             }
             catch (UnencodableChunkSize const&) { encodable = false; break; }
             stats_.codec_ns += elapsed_ns(begin);
@@ -2753,9 +2810,9 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
                 field.clear(); gsz_encode(std::span<uint64_t const>(&final_size, 1), after, field);
                 index_bits = grow_add(index_bits, field.bitCount());
             }
-            uint64_t const source_bytes = grow_add(summaries[size_t(chunk)].bytes, bytes);
+            uint64_t const source_bytes = terminal ? summaries[size_t(chunk)].bytes : grow_add(summaries[size_t(chunk)].bytes, bytes);
             if (source_bytes > config_.window_bytes ||
-                ChunkCodec::estimate_work(identity_.header.k, source_bytes, 0) > config_.codec_bytes)
+                ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? symbols : 0) > config_.codec_bytes)
                 buffers = false;
             contribution_bound = grow_add(contribution_bound, grow_add(sizeof(Packet), bytes));
         }
@@ -2771,6 +2828,24 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         fits = exact(true) && peak <= config_.capacity_bytes;
         if (!fits) return {false, false, final_bound, peak,
             reason.empty() ? "external exact output and checkpoint reserve exceed capacity" : reason, {}};
+    }
+    if (terminal)
+    {
+        uint64_t const work = ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, maximum_symbols);
+        if (work > config_.codec_bytes)
+            return {false, false, final_bound, peak, "external resident batch exceeds codec budget", {}};
+        std::array<uint8_t, 32> digest;
+        {
+            CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
+            digest = members_digest(identity_.header.k, members, hash, [&] { config_.check_running(); });
+        }
+        if (!initialized_) initialize();
+        terminal_members_ = count; terminal_symbols_ = maximum_symbols; terminal_digest_ = digest;
+        members_ = after; final_bound_ = final_bound; packing_work_ = work;
+        identity_.pending = true; identity_.old_members = members_ - count;
+        identity_.target_members = members_; identity_.pending_peak_bytes = peak;
+        planning.finish(); start_packing();
+        return {true, true, final_bound, peak, {}, {final_bound, peak, peak - final_bound, members_}};
     }
     require(pending_summary_.segments.empty(), "external summary generation is already pending");
     Run incoming_storage;
@@ -2992,9 +3067,10 @@ inline void ExternalEngine::start_packing()
         phase_ = Phase::pack; save("external-pack-initialized");
     }
 }
-inline void ExternalEngine::pack()
+inline void ExternalEngine::pack(Members members)
 {
     config_.check_running();
+    require(members.size() == pending_members(), "external packing requires its saved resident batch");
     if (phase_ == Phase::stage) start_packing();
     else { check_paths(); validate_runs(); }
     PhaseTimer packing(stats_, WorkPhase::pack, config_.progress);
@@ -3042,9 +3118,10 @@ inline void ExternalEngine::pack()
     for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
     stats_.max_active_runs = std::max<uint64_t>(stats_.max_active_runs, readers.size());
     stats_.merge_inputs = readers.size();
-    uint64_t const task_bytes = sizeof(ChunkInput) + sizeof(uint64_t) + sizeof(EncodedBlock) + runs_.size() * sizeof(uint64_t);
-    uint64_t const limit = std::min({chunks, uint64_t(65536), config_.window_bytes / packing_source_bytes_,
-        uint64_t(UINT16_MAX) / packet_count_, std::max<uint64_t>(1, config_.window_bytes / task_bytes)});
+    uint64_t const task_bytes = sizeof(ChunkInput) + sizeof(uint64_t) + sizeof(EncodedBlock) +
+        runs_.size() * sizeof(uint64_t) + members.size() * sizeof(FragmentRegion);
+    uint64_t const limit = std::min({chunks, uint64_t(65536), config_.window_bytes / std::max(uint64_t(1), packing_source_bytes_),
+        uint64_t(UINT16_MAX) / std::max(uint64_t(1), packet_count_), std::max<uint64_t>(1, config_.window_bytes / task_bytes)});
     bool const overlap = config_.io_overlap && packing_work_ <= config_.codec_bytes / 2;
     uint64_t const budget = overlap ? config_.codec_bytes / 2 : config_.codec_bytes;
     unsigned const workers = unsigned(std::max<uint64_t>(1, std::min({uint64_t(config_.workers),
@@ -3058,17 +3135,27 @@ inline void ExternalEngine::pack()
         uint64_t first = 0, next = 0, codec_ns = 0;
         std::vector<uint8_t> payload;
         std::vector<EncodedChunk> contributions;
+        std::vector<FragmentRegion> regions;
         std::vector<ChunkInput> tasks;
         std::vector<uint64_t> lengths, frontiers;
         std::vector<EncodedBlock> blocks;
-        Window(size_t bytes, size_t chunks, size_t runs, size_t workers)
+        Window(size_t bytes, size_t chunks, size_t runs, size_t workers, size_t members)
         {
             payload.reserve(bytes); contributions.reserve(UINT16_MAX); tasks.reserve(chunks);
             lengths.reserve(chunks); frontiers.reserve(chunks * runs); blocks.reserve(workers);
+            regions.reserve(chunks * members);
         }
     };
-    auto current = std::make_unique<Window>(size_t(config_.window_bytes), size_t(window_chunks), runs_.size(), workers);
-    auto next = overlap ? std::make_unique<Window>(size_t(config_.window_bytes), size_t(window_chunks), runs_.size(), workers) : nullptr;
+    auto current = std::make_unique<Window>(size_t(config_.window_bytes), size_t(window_chunks), runs_.size(), workers, members.size());
+    auto next = overlap ? std::make_unique<Window>(size_t(config_.window_bytes), size_t(window_chunks), runs_.size(), workers, members.size()) : nullptr;
+    std::vector<size_t> cursors(members.size(), 0);
+    std::vector<FragmentRegion> regions(members.size());
+    for (size_t i = 0; i < members.size(); ++i) if (!members[i].compact())
+    {
+        auto const raw = members[i].raw();
+        cursors[i] = size_t(std::lower_bound(raw.begin(), raw.end(),
+            packed_chunks_ << (identity_.header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS)) - raw.begin());
+    }
     std::vector<size_t> released_segments(runs_.size(), 0); std::vector<uint64_t> released_bytes(runs_.size(), 0);
     std::vector<uint8_t> output_window; output_window.reserve(size_t(config_.window_bytes));
     bool output_overlap = overlap;
@@ -3191,7 +3278,7 @@ inline void ExternalEngine::pack()
         config_.check_running();
         auto& payload = window.payload; auto& contributions = window.contributions;
         auto& tasks = window.tasks; auto& frontiers = window.frontiers;
-        payload.clear(); contributions.clear(); tasks.clear(); frontiers.clear();
+        payload.clear(); contributions.clear(); tasks.clear(); frontiers.clear(); window.regions.clear();
         window.first = first;
         uint64_t const count = std::min<uint64_t>(window_chunks, chunks - first);
         for (uint64_t i = 0; i < count; ++i)
@@ -3211,8 +3298,12 @@ inline void ExternalEngine::pack()
                 }
                 frontiers.push_back(readers[r]->position());
             }
-            require(covered == members_, "external final member coverage changed");
-            tasks.push_back({first + i, {}, 0, {}, std::span<EncodedChunk const>(contributions).subspan(begin)});
+            require(covered + members.size() == members_, "external final member coverage changed");
+            incoming_regions(members, first + i, cursors, regions);
+            size_t const fresh = window.regions.size();
+            window.regions.insert(window.regions.end(), regions.begin(), regions.end());
+            tasks.push_back({first + i, {}, 0, std::span<FragmentRegion const>(window.regions).subspan(fresh),
+                std::span<EncodedChunk const>(contributions).subspan(begin)});
         }
         window.lengths.resize(size_t(count)); window.next = first + count;
     };
@@ -3264,6 +3355,7 @@ inline void ExternalEngine::pack()
             }
             require(offset == block.bytes.size(), "external packed block has trailing bytes");
         }
+        if (!members.empty() && consumed_) consumed_(current->next);
         if (current->next == chunks) break;
         if (next)
         {
@@ -3290,7 +3382,7 @@ inline void ExternalEngine::pack()
     auto target_guard = target_lock();
     require(!file_io::resize_file(fd_, file_io::Offset(output_bytes_)), "cannot trim external output reservation");
     sync_target(); grow_failpoint("external-index-flushed");
-    identity_.header = header; phase_ = Phase::ready; save("external-ready");
+    identity_.header = header; phase_ = Phase::ready; identity_.old_members = members_; save("external-ready");
     packing_driver_cpu_.add(driver_cpu); packing_driver_cpu_.add(output_cpu);
     packing_cpu_.add(driver_cpu); packing_cpu_.add(output_cpu); packing_cpu_.add(encoder.cpu_time());
 }
@@ -3567,7 +3659,6 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
         }
         require(position == bytes, "external run length changed");
     }
-    require(member == result.members || (phase == Phase::done && !count), "external member coverage is incomplete");
     auto const summaries = get<uint64_t>(in);
     require(summaries == (phase == Phase::stage ? chunks : 0), "external summary table coverage changed");
     if (phase == Phase::stage && result.members)
@@ -3606,10 +3697,21 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     auto const packing_source = get<uint64_t>(in), packing_work = get<uint64_t>(in), packets = get<uint64_t>(in);
     result.packing_source_bytes = packing_source; result.packing_work_bytes = packing_work; result.packet_count = packets;
     auto const index_native = durable ? get_native_identity(in) : file_io::DurableIdentity{};
+    if (checkpoint_header.terminal)
+    {
+        result.terminal_members = get<uint16_t>(in); result.terminal_symbols = get<uint64_t>(in);
+        (void)get<std::array<uint8_t, 32>>(in);
+        require(result.terminal_members && result.terminal_members <= result.members &&
+            (phase == Phase::pack || phase == Phase::ready || phase == Phase::done), "invalid external resident batch checkpoint");
+        result.pending_members = phase == Phase::pack && chunk < chunks ? result.terminal_members : 0;
+        result.identity.old_members = result.members - result.pending_members;
+    }
+    require(member + result.terminal_members == result.members || (phase == Phase::done && !count),
+        "external member coverage is incomplete");
     prospective = prospective || file_io::has_durable_identity(index_native);
     require(!durable || prospective, "external native checkpoint schema has no object evidence");
     require(index_identity.inode || !file_io::has_durable_identity(index_native), "absent external index has native authority");
-    validate_packing_shape(header.k, result.members, packets, packing_source, packing_work);
+    validate_packing_shape(header.k, result.members, packets, packing_source, packing_work, result.terminal_members, result.terminal_symbols);
     validate_checkpoint_shape(phase, result.members, next_id, committed, chunk, index_bytes, index_identity, size_t(count), header,
         memo.size(), checkpoint != work + "/checkpoint");
     require(index_bytes <= multiply(chunks, 8) && carry_bits < 8 && (carry_bits ? carry_value < (1u << carry_bits) : !carry_value),
@@ -3649,7 +3751,7 @@ inline ExternalEngine::Inspection ExternalEngine::inspect_at(std::string const& 
     if (binding)
     {
         result.construction.target = target_stamp; result.construction.identity = result.identity;
-        result.construction.checkpoint = true; result.construction.committed_members = result.members;
+        result.construction.checkpoint = true; result.construction.committed_members = result.members - result.pending_members;
         result.construction.can_append = !result.finishing;
         auto const namespace_digest = binding->finish(std::string_view(record).substr(0, 64));
         result.construction.inspection_memory_bytes = grow_add(memory_limit_bytes, binding->memory_bytes());

@@ -360,7 +360,8 @@ def check_farm_guided_plans(run, command, verify, root):
     runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 1,
                "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
     limits = ["-k", 18, "--group-members", 2, "--meta-group", 0, "--max-groups", 2,
-              "--max-total-members", 3, "--capacity-bytes", "32M", "--leave-free", 0]
+              "--max-total-members", 3, "--capacity-bytes", "32M", "--leave-free", 0,
+              "--destination-temp", "off"]
     constrained = [*limits, "--farming-memory-bytes", 1]
     before = snapshot(directory)
     baseline = json.loads(run("plan", directory, *constrained, "--json", code=2).stdout)
@@ -574,7 +575,7 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     first.mkdir()
     second.mkdir()
     options = [first, second, "-k", 18, "--strength", 4, "--group-members", 8, "--max-groups", 1,
-               "--max-total-members", 8, "--leave-free", 0]
+               "--max-total-members", 8, "--leave-free", 0, "--destination-temp", "off"]
     forecast = json.loads(run("plan", *options, "--capacity-bytes", "8M", "--json").stdout)
     # This deterministic strength/meta cohort packs below the next forecast
     # boundary. Keep the independently reserved metadata outside its tested
@@ -755,7 +756,7 @@ def check_farm_v8_retirement(run, command, verify, root, legacy_run=None):
     if legacy_run:
         legacy_run(*create)
     else:
-        run(*create)
+        run(*create, "--destination-temp", "off")
         # The installed suite has one producer. Capture its complete native
         # policy, then encode the representable older contract; private
         # qualification supplies the actual older executable instead.
@@ -1082,9 +1083,10 @@ def check_farm_updates(run, command, verify, root):
 
 
 def check_farm_returning_drives(run, command, verify, root):
+    # Independent offline grants require a policy without shared scratch.
     runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", 2,
                "--construction", "incremental", "--batch-members", 1,
-               "--window-bytes", "64K", "--checkpoint-bytes", "64K"]
+               "--window-bytes", "64K", "--checkpoint-bytes", "64K", "--destination-temp", "off"]
 
     def wait_for(test, process, log):
         deadline = time.monotonic() + 90
@@ -1658,6 +1660,34 @@ def check(binary, root, reference=None):
         verify(recovered)
     print("PASS all construction engines recover to identical ordinary bytes and full proofs", flush=True)
 
+    expanded = Path(run("plot", "-k", 18, *keys, "-S", SEED, "-o", root / "resident growth reference",
+                        "--group-members", 5, "--batch-members", 5, "--construction", "incremental",
+                        *construction, "--quiet").stdout.strip())
+    for entrypoint in ("plot", "batch", "grow"):
+        for point in ("external-pack-initialized-after-checkpoint", "external-pack-after-checkpoint"):
+            directory = root / ("resident " + entrypoint + " " + point)
+            terminal = ["plot", "-k", 18, *keys, "-S", SEED, "-o", directory,
+                        "--group-members", 3, "--batch-members", 2, "--construction", "external",
+                        *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+            run(*terminal, point=point, code=86)
+            assert not list(directory.glob("*.gplot"))
+            checkpoint, = directory.glob("*.external/checkpoint")
+            assert b"/terminal-1" in checkpoint.read_bytes()
+            if entrypoint == "batch":
+                manifest, = directory.glob("xchplot2-job-*.tsv")
+                terminal = ["batch", manifest, "--construction", "external", "--batch-members", 1,
+                            *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+            if entrypoint == "grow":
+                partial, = directory.glob("*.gplot.partial")
+                run("grow", partial.with_suffix(""), "--max-members", 5, "--batch-members", 2,
+                    *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet")
+            else:
+                run(*terminal, "--resume")
+            recovered, = directory.glob("*.gplot")
+            assert digest(recovered) == (digest(expanded) if entrypoint == "grow" else expected)
+            assert not list(directory.glob("*.partial"))
+    print("PASS resident final batch recovery, changed batch cap and further growth", flush=True)
+
     # The final payload is durable before publication. A crash on either side
     # of the rename must resume without exposing a prefix or changing bytes.
     for mode in ("incremental", "staged", "merged", "external"):
@@ -1794,7 +1824,7 @@ def check(binary, root, reference=None):
     a, b, c = members
     initial = ["fill", *keys, "-k", 18, "--group-members", 2, "--max-total-members", 3,
                "--max-groups", 2, "--farming-max-eligible-groups", 4, *construction,
-               "--construction", "incremental", "--quiet", "--", a, b]
+               "--construction", "incremental", "--destination-temp", "off", "--quiet", "--", a, b]
     run(*initial, point="farm-plan-published", code=86)
     # A compatible creating build is provenance. Establish that source before
     # constructing files so their authoritative journals bind the same policy.
@@ -3289,7 +3319,7 @@ def check_replot(binary, root, reference=None):
             ("incremental", "marked", "direct-committed", "finalizing"),
             ("staged", "stage-run-committed", "stage-pack-committed", "stage-tail-committed"),
             ("merged", "merge-run-committed", "merge-pack-committed", "merge-layout-ready-committed"),
-            ("external", "external-run-after-checkpoint", "external-pack-after-checkpoint", "external-ready-after-checkpoint")):
+            ("external", "external-pack-initialized-after-checkpoint", "external-pack-after-checkpoint", "external-ready-after-checkpoint")):
         partial_farm = directory / ("partial successor " + engine)
         partial_farm.mkdir()
         partial_source = partial_farm / "legacy.plot"

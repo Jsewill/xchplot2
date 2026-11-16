@@ -830,8 +830,7 @@ void packing_transition(fs::path const& root, Members input, ExternalConfig ext,
     auto const stage = ExternalEngine::phase_memory_bytes(18, cfg, ext, Phase::staging, uint16_t(input.size()));
     auto const pack = ExternalEngine::phase_memory_bytes(18, cfg, ext, Phase::packing);
     auto const publication = ExternalEngine::phase_memory_bytes(18, cfg, ext, Phase::publication);
-    require(stage == ExternalEngine::memory_bytes(18, cfg, ext, uint16_t(input.size())) && stage > pack && pack > publication &&
-        pack == ExternalEngine::phase_memory_bytes(18, cfg, ext, Phase::packing, UINT16_MAX),
+    require(stage == ExternalEngine::memory_bytes(18, cfg, ext, uint16_t(input.size())) && stage > pack && pack > publication,
         "external phase reservations lost summary release or retained incoming batch storage");
     cfg.memory_limit_bytes = stage; ext.target_gate = std::make_shared<std::recursive_mutex>();
     auto const path = root / "packing-transition";
@@ -842,7 +841,7 @@ void packing_transition(fs::path const& root, Members input, ExternalConfig ext,
         // The owner can prepare on the existing kind of queued writer, and
         // release its old grant only after joining that operation.
         auto preparation = std::async(std::launch::async, [&] { engine.start_packing(); }); preparation.get();
-        require(!engine.can_append() && engine.memory_phase() == Phase::packing && engine.required_memory() == pack &&
+        require(!engine.can_append() && engine.memory_phase() == Phase::packing && engine.required_memory(UINT16_MAX) == pack &&
             ExternalEngine::inspect(path.string()).finishing, "external phase preparation did not durably release the summary");
         engine.start_packing();
     }
@@ -2496,6 +2495,108 @@ void native_identity_recovery(fs::path const& root, Members input, ExternalConfi
     }
 }
 
+void terminal_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> const& raw,
+                     ExternalConfig const& ext, std::vector<uint8_t> const& reference)
+{
+    Members input(raw);
+    for (bool overlap : {false, true}) for (bool exact : {false, true}) for (bool compact : {false, true})
+        for (size_t prefix : {size_t(0), size_t(3), raw.size() - 1})
+    {
+        auto cfg = config(); cfg.io_overlap = overlap;
+        if (exact) cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, ext);
+        auto const path = root / ("resident-" + std::to_string(prefix) + (overlap ? "-overlap" : "-serial") +
+            (exact ? "-exact" : "-bounded") + (compact ? "-compact" : "-raw"));
+        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+        if (prefix) require(engine.append(input.subspan(0, prefix)).accepted, "resident fixture prefix rejected");
+        auto const written = engine.scratch_service().written_bytes;
+        std::vector<Member> incoming;
+        uint64_t previous = 0, calls = 0;
+        if (compact)
+        {
+            for (size_t i = prefix; i < raw.size(); ++i)
+            { incoming.emplace_back(std::vector<uint64_t>(raw[i])); incoming.back().compact(18); }
+            engine.consumed([&](uint64_t first)
+            {
+                require(first >= previous, "resident consumption moved backwards"); previous = first; ++calls;
+                for (auto& member : incoming) member.release_before(first);
+            });
+        }
+        auto const result = engine.append_and_finish(compact ? Members(incoming) : input.subspan(prefix));
+        engine.consumed({});
+        require(result.accepted && result.result.members == raw.size() && !engine.pending_members() &&
+            engine.committed_member_count() == raw.size() && contents(path) == reference,
+            "resident final batch changed ordinary output");
+        require(engine.scratch_service().written_bytes == written,
+            "resident final batch was written to temporary storage");
+        if (compact)
+        {
+            auto const chunks = PlotGroupFile::getChunkCountForK(18);
+            require(calls && previous == chunks, "resident packing did not release its consumed input");
+            for (auto const& member : incoming)
+                require(member.storage_bytes() == FragmentBoundaries::allocation_bytes(size_t(chunks), member.size()),
+                    "resident packing retained consumed input pages");
+        }
+        require(!exact || engine.stats().sized_chunks, "resident exact-capacity fixture did not use exact sizing");
+        require(engine.release_completed(), "resident final batch retained owned scratch");
+    }
+    for (auto const* boundary : {"external-pack-initialized-after-checkpoint", "external-pack-flushed",
+        "external-pack-after-checkpoint:2", "external-pack-window-checkpoint", "external-ready-after-checkpoint",
+        "external-header-flushed"})
+    {
+        auto const path = root / (std::string("resident-recovery-") + boundary);
+        auto cfg = config(); cfg.io_overlap = true;
+        {
+            ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+            require(engine.append(input.subspan(0, 3)).accepted, "resident recovery prefix rejected");
+        }
+        auto child = ::fork(); require(child >= 0, "fork failed");
+        if (!child)
+        {
+            std::vector<Member> compact;
+            MemberBatchHash hash(raw.size() - 3);
+            for (size_t i = 3; i < raw.size(); ++i)
+            { compact.emplace_back(std::vector<uint64_t>(raw[i])); compact.back().compact(18, &hash); }
+            ::setenv("XCHPLOT2_GROW_FAILPOINT", boundary, 1);
+            if (std::string_view(boundary) == "external-pack-window-checkpoint") cfg.checkpoint_bytes = 1;
+            ExternalEngine engine(path.string(), cfg, ext, true); engine.confirm_identity();
+            (void)engine.append_and_finish(compact, &hash); std::_Exit(0);
+        }
+        int status = 0;
+        require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
+            std::string("resident recovery boundary was not reached: ") + boundary);
+        auto const saved = ExternalEngine::inspect(path.string());
+        require(saved.members == raw.size() && saved.terminal_members == raw.size() - 3 && saved.finishing &&
+            saved.construction.checkpoint_identity.algorithm.ends_with("/terminal-1"),
+            "resident checkpoint lost its regeneration contract");
+        ConstructionInspectionLimits limits{64 * 1024 * 1024, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+        auto const inspected = ExternalEngine::inspect_construction(path.string(), 64 * 1024 * 1024, limits);
+        require(inspected.pending_members == saved.pending_members &&
+            inspected.construction.committed_members == raw.size() - saved.pending_members &&
+            inspected.identity.old_members == raw.size() - saved.pending_members,
+            "resident inspection changed the durable member frontier");
+        {
+            ExternalEngine engine(path.string(), cfg, ext, true); engine.confirm_identity();
+            if (saved.pending_members)
+            {
+                require(engine.required_memory() == ExternalEngine::phase_memory_bytes(18, cfg, saved.external,
+                    ExternalEngine::MemoryPhase::packing, saved.terminal_members), "resident recovery lost its descriptor reservation");
+                auto damaged = raw; ++damaged.back().back();
+                auto const before = contents(path), checkpoint = contents(fs::path(path.string() + ".external") / "checkpoint");
+                bool rejected = false;
+                try { engine.resume(Members(damaged).subspan(3)); }
+                catch (std::exception const& error) { rejected = std::string(error.what()).find("differs from its checkpoint") != std::string::npos; }
+                require(rejected && contents(path) == before &&
+                    contents(fs::path(path.string() + ".external") / "checkpoint") == checkpoint,
+                    "mismatched resident recovery changed durable data");
+                engine.resume(input.subspan(3));
+            }
+            else engine.finish();
+            require(contents(path) == reference && engine.release_completed(),
+                "resident checkpoint recovery changed bytes or retained owned scratch");
+        }
+    }
+}
+
 int main(int argc, char** argv)
 try
 {
@@ -2504,8 +2605,8 @@ try
         io_trace(std::string(argv[1]) == "--io-trace-enabled"); std::cout << "external I/O tracing tests passed\n"; return 0;
     }
     bool const independent_io_only = argc == 3 && std::string(argv[1]) == "--independent-io-only";
-    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--native-identity-only" || std::string(argv[1]) == "--farm-io-only" || std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
-        "usage: grow-external-test [--native-identity-only|--farm-io-only|--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
+    require(argc == 1 || independent_io_only || (argc == 2 && (std::string(argv[1]) == "--terminal-input-only" || std::string(argv[1]) == "--native-identity-only" || std::string(argv[1]) == "--farm-io-only" || std::string(argv[1]) == "--retirement-only" || std::string(argv[1]) == "--windows-only" || std::string(argv[1]) == "--planning-only" || std::string(argv[1]) == "--checkpoints-only" || std::string(argv[1]) == "--bulk-checkpoints-only" || std::string(argv[1]) == "--prepared-input-only" || std::string(argv[1]) == "--contribution-input-only")),
+        "usage: grow-external-test [--terminal-input-only|--native-identity-only|--farm-io-only|--retirement-only|--windows-only|--planning-only|--checkpoints-only|--bulk-checkpoints-only|--prepared-input-only|--contribution-input-only|--independent-io-only SCRATCH_PARENT]");
     if (independent_io_only)
     {
 #ifdef GROW_TEST_WRAP_PWRITE
@@ -2538,6 +2639,9 @@ try
     auto raw = members(retirement_only || windows_only ? 2 : 8); Members input(raw);
     { Engine engine((root / "reference").string(), config(), false, initial_identity()); engine.confirm_identity(); require(engine.append(input).accepted, "reference append rejected"); }
     auto const reference = contents(root / "reference"); auto ext = external(root);
+    if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--terminal-input-only")) terminal_inputs(root, raw, ext, reference);
+    if (argc == 2 && std::string(argv[1]) == "--terminal-input-only")
+    { fs::remove_all(root); std::cout << "external resident final batch tests passed\n"; return 0; }
     if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--farm-io-only"))
     {
         auto governed = ext;

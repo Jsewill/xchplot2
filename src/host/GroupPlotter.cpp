@@ -2476,6 +2476,8 @@ struct Construction
     bool can_select() const
     { return automatic && !merge_reserve_failed && incremental && !identity().pending && (identity().header.group_size || history.shapes.count); }
     bool can_append() const { return external ? external->can_append() : merged ? merged->can_append() : !staged || staged->can_append(); }
+    bool needs_regeneration() const
+    { return external ? external->pending_members() != 0 : incremental && identity().pending; }
     uint16_t member_count() const
     { return external ? external->committed_member_count() : merged ? merged->committed_member_count() : staged ? staged->committed_member_count() : identity().header.group_size; }
     uint64_t memory_bytes(uint16_t batch_members, bool compact) const
@@ -2677,6 +2679,14 @@ struct Construction
     }
     group_grow::Result resume(group_grow::Members members, group_grow::MemberBatchHash const* hash = nullptr)
     {
+        if (external)
+        {
+            auto const before = external->checkpoint_tuning_changes();
+            external->resume(members, hash);
+            tuning_changes = sum(tuning_changes, external->checkpoint_tuning_changes() - before);
+            external_checkpoint_bytes = std::max(external_checkpoint_bytes, external->packing_checkpoint_bytes());
+            return finish_staging(finish_merged);
+        }
         require(bool(incremental), "staged recovery must not regenerate committed members");
         return account_metadata(incremental->resume(members, hash));
     }
@@ -2732,14 +2742,28 @@ struct Construction
         merge_reserve_failed = true; return result;
     }
     group_grow::AppendResult append(group_grow::Members members,
-                                    group_grow::MemberBatchHash const* hash = nullptr, bool reject_window = false)
+                                    group_grow::MemberBatchHash const* hash = nullptr, bool reject_window = false, bool final = false)
     {
         // A legacy terminal external checkpoint retains its original filename
         // until retirement. Hide it after that handoff before another append.
         if (config.private_output && !publication::pending(path)) confirm_identity(true);
         if (external)
         {
-            auto result = append_external([&] { return external->append(members); }, uint16_t(members.size()));
+            bool const resident = final && external->can_finish_with_members();
+            auto const cpu = external->packing_cpu_time();
+            auto const elapsed = external->packing_body_ns(), tuning = external->checkpoint_tuning_changes();
+            auto result = resident ? external->append_and_finish(members, hash) :
+                append_external([&] { return external->append(members); }, uint16_t(members.size()));
+            if (resident && result.accepted)
+            {
+                // Planning and packing do not form a contribution-rate sample.
+                // Retain the packer's measured worker demand and tuning.
+                tuning_changes = sum(tuning_changes, external->checkpoint_tuning_changes() - tuning);
+                external_checkpoint_bytes = std::max(external_checkpoint_bytes, external->packing_checkpoint_bytes());
+                observe_demand(cpu, external->packing_cpu_time(), external->packing_body_ns() - elapsed,
+                    config.workers, true, true);
+                observe_shape(result.result);
+            }
             if (result.accepted) return account_metadata(std::move(result));
             if (members.size() > 1) return account_metadata(std::move(result));
             if (verbose) std::cerr << path << ": temporary reserve exhausted; finishing committed runs before incremental admission\n";
@@ -3235,8 +3259,14 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
     config.capacity_bytes = original; return {};
 }
 
-uint16_t incremental_batch_members(Construction const& engine, uint16_t maximum, uint16_t admitted)
+uint16_t construction_batch_members(Construction const& engine, uint16_t maximum, uint16_t admitted,
+                                     bool resident_input = true)
 {
+    if (resident_input && engine.external && engine.external->can_finish_with_members() && maximum != UINT16_MAX &&
+        engine.member_count() < maximum)
+        // A short first batch starts I/O sooner and retains a full final
+        // batch for packing directly from RAM.
+        return group_grow::construction_initial_batch(uint16_t(maximum - engine.member_count()), admitted);
     // Incremental appends rewrite the accepted prefix. With the same number
     // of batches, placing the short batch first minimizes that repeated I/O.
     // An explicit batch cap remains an upper bound. Saved transactions and
@@ -3827,11 +3857,11 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     if (fixture) same_identity(fixture->identity, identity);
     require(engine.member_count() <= maximum,
             "existing membership exceeds requested member limit");
-    uint16_t const pending_count = !engine.is_staging() && saved.pending ? saved.target_members - saved.old_members : 0;
+    uint16_t const pending_count = engine.needs_regeneration() ? saved.target_members - saved.old_members : 0;
     uint64_t const base_fixed = sum(sum(external_bytes, fixture ? fixture->bytes : 0), mib);
     if (!backend) backend = std::make_unique<Backend>();
     uint64_t generation_reserve = 0;
-    uint16_t const after_recovery = saved.pending && !engine.is_staging() ? saved.target_members : engine.member_count();
+    uint16_t const after_recovery = engine.needs_regeneration() ? saved.target_members : engine.member_count();
     if (pending_count || (engine.can_append() && after_recovery < maximum))
     {
         uint16_t const minimum = std::max(uint16_t(1), pending_count);
@@ -3914,7 +3944,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         require(scratch_pool->try_reserve_output(0, target.parent_path(), expanded), "cannot expand destination after scratch cleanup");
         engine.resize_capacity(expanded); capacity = expanded; metrics.capacity_bytes = expanded; return true;
     };
-    if (engine.is_staging() && !engine.can_append())
+    if (engine.is_staging() && !engine.can_append() && !engine.needs_regeneration())
     {
         auto const result = engine.finish_staging(args.construction == "merged");
         metrics.members = result.members;
@@ -3923,7 +3953,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         metrics.workspace_bytes = std::max(metrics.workspace_bytes, result.workspace_bytes);
         (void)release_scratch();
     }
-    else if (!engine.is_staging() && saved.pending)
+    else if (engine.needs_regeneration())
     {
         std::vector<group_grow::Member> incoming;
         auto hash = compact && !has_compute(args) ? std::make_unique<group_grow::MemberBatchHash>(batch_cap) : nullptr;
@@ -3935,13 +3965,17 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         require(incoming.size() == pending_count,
                 "recovery member batch exceeds --max-ram or available host memory");
         producer.admit_engine(incoming);
+        if (engine.external && compact)
+            engine.consumed([&](uint64_t first) { for (auto& member : incoming) member.release_before(first); });
         auto const result = engine.resume(incoming, hash.get());
+        engine.consumed({});
         metrics.members = result.members;
         metrics.final_bytes = result.final_bytes;
         metrics.peak_file_bytes = std::max(metrics.peak_file_bytes, result.peak_file_bytes);
         metrics.workspace_bytes = std::max(metrics.workspace_bytes, result.workspace_bytes);
         ++metrics.batches;
         metrics.recovered = true;
+        (void)release_scratch();
     }
 
     uint64_t observed_member_bytes = metrics.members ?
@@ -3971,7 +4005,9 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 producer, engine.config, maximum, batch_cap, 0, observed_member_storage);
         uint64_t wanted = std::min({args.batch, uint64_t(batch_cap), uint64_t(maximum - metrics.members)});
         if (selected_batch) wanted = std::min(wanted, selected_batch);
-        if (prefetched.empty()) wanted = incremental_batch_members(engine, maximum, uint16_t(wanted));
+        // Prefetched external members still obey the final-batch boundary.
+        if (prefetched.empty() || engine.external)
+            wanted = construction_batch_members(engine, maximum, uint16_t(wanted), !input_required && !has_compute(args));
         if (!engine.is_staging() && observed_member_bytes && metrics.final_bytes < capacity)
         {
             uint64_t const remaining = capacity - metrics.final_bytes;
@@ -3980,7 +4016,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         }
         auto incoming = std::move(prefetched);
         auto hash = std::move(prefetched_hash);
-        if (compact && !has_compute(args) && !engine.is_staging() && !hash && incoming.empty())
+        if (compact && !has_compute(args) && (!engine.is_staging() || metrics.members + wanted == maximum) && !hash && incoming.empty())
             hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
         MemberLease borrowed;
         std::unique_ptr<group_grow::ExternalEngine::ContributionInput> contribution_input;
@@ -4045,16 +4081,19 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             auto const external_before = engine.external ?
                 std::optional(engine.external->stats()) : std::optional<group_grow::Stats>{};
             bool const need_prefetch_hash = compact && !has_compute(args) && !engine.is_staging();
-            size_t const prefetch_count = size_t(std::min({args.batch, uint64_t(batch_cap), uint64_t(maximum - next),
+            size_t prefetch_count = size_t(std::min({args.batch, uint64_t(batch_cap), uint64_t(maximum - next),
                 selected_batch ? selected_batch : uint64_t(batch_cap)}));
+            if (engine.external && engine.external->can_finish_with_members() && maximum != UINT16_MAX)
+                prefetch_count = group_grow::construction_initial_batch(uint16_t(maximum - next), uint16_t(prefetch_count));
             uint64_t received = resident(incoming);
             accepted_member_storage = received;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             if (contribution_input) received = producer.contribution_bytes(engine.config, contribution_input->size());
 #endif
             bool const forward = engine.is_staging();
-            bool const recycle = !incoming.empty() && next < maximum &&
-                producer.overlap_enabled() && backend->mode == "gpu" &&
+            bool const terminal = next == maximum && engine.external && engine.external->can_finish_with_members();
+            bool const recycle = !incoming.empty() && (terminal ||
+                (next < maximum && producer.overlap_enabled() && backend->mode == "gpu")) &&
                 std::all_of(incoming.begin(), incoming.end(), [](auto const& member) { return member.compact(); });
             engine.consumed(recycle ? std::function<void(uint64_t)>([&, forward](uint64_t first)
                 {
@@ -4097,9 +4136,9 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 appended = join_consumer(pending, fill_wait_reason(producer.fill_stop));
             }
             else appended = prepared_input ? engine.append(*prepared_input, prepared_members) :
-                contribution_input ? engine.append(*contribution_input, contribution_members) : engine.append(incoming, hash.get());
+                contribution_input ? engine.append(*contribution_input, contribution_members) : engine.append(incoming, hash.get(), false, next == maximum);
             engine.consumed({});
-            if (appended->accepted && external_before && engine.external && !contribution_input && !prepared_input)
+            if (appended->accepted && external_before && engine.external && engine.can_append() && !contribution_input && !prepared_input)
                 engine.observe_external(uint16_t(incoming.size()), *external_before);
             if (release_scratch() && !appended->accepted)
                 appended = engine.append(incoming, hash.get());
@@ -12791,8 +12830,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             d.saved = audit.identity(); d.mode = audit.mode();
             if (audit.external) audit.external->run_shapes(d.execution_runs);
             d.metrics.members = audit.member_count();
-            d.needs_resume = !audit.is_staging() && d.saved.pending;
-            d.needs_finish = audit.is_staging() && !audit.can_append();
+            d.needs_resume = audit.needs_regeneration();
+            d.needs_finish = audit.is_staging() && !audit.can_append() && !d.needs_resume;
             d.metrics.recovered = audit.staged_recovery || d.needs_resume;
             d.complete = !publication::pending(d.path) && !d.saved.pending && !audit.is_staging() && d.metrics.members == d.maximum &&
                 (!farm || !farm->state.capacity_fill || farm->lanes[i].ordinal < farm->state.directories[i].sealed_files);
@@ -13460,9 +13499,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             require(next.recovery.has_value(), "saved successor lost its audited checkpoint");
             auto& saved = *next.recovery;
             d.scratch = std::move(saved.external); d.scratch->io_governor = args.disk_io; d.saved = std::move(saved.identity); d.guard = next.guard;
-            d.metrics.members = saved.members; d.metrics.final_bytes = d.saved.bytes;
+            d.metrics.members = saved.members - saved.pending_members; d.metrics.final_bytes = d.saved.bytes;
             d.metrics.peak_file_bytes = sum(saved.peak_bytes, d.guard->retired);
-            d.metrics.recovered = true; d.needs_finish = saved.finishing; d.mode = "external";
+            d.needs_resume = saved.pending_members != 0; d.recover_count = saved.pending_members;
+            d.metrics.recovered = true; d.needs_finish = saved.finishing && !d.needs_resume; d.mode = "external";
         }
         fixed -= next.metadata_bytes; metadata -= next.metadata_bytes;
         return live;
@@ -13712,10 +13752,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         d.workers = count;
         task->original_member_bytes = resident(task->members);
+        bool const terminal = d.engine->external &&
+            ((task->work == Work::recover && d.engine->needs_regeneration()) ||
+                (task->work == Work::append && (!farm || !farm->state.capacity_fill) &&
+                    d.metrics.members + task->members.size() == d.maximum && d.engine->external->can_finish_with_members()));
         task->recycle_members = !task->select_merged &&
-            task->work == Work::append && !task->members.empty() &&
-            d.metrics.members + task->members.size() < d.maximum &&
-            group_prefetch_enabled(args, *backend) && backend->mode == "gpu" &&
+            !task->members.empty() && (terminal || (task->work == Work::append &&
+                d.metrics.members + task->members.size() < d.maximum &&
+                group_prefetch_enabled(args, *backend) && backend->mode == "gpu")) &&
             std::all_of(task->members.begin(), task->members.end(), [](auto const& member) { return member.compact(); });
         bool const forward = d.engine->is_staging();
         d.engine->consumed(task->recycle_members ? std::function<void(uint64_t)>([task, &wake, forward](uint64_t first)
@@ -13741,9 +13785,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             d.metrics.members >= directory.layout.file_members(ordinal - directory.layout_first);
                     }
                     if (task->select_merged) { d.engine->select_merged(detailed_output(args)); task->select_merged = false; }
+                    // Capacity fill may extend this provisional limit after
+                    // admission; its last batch must remain appendable.
                     task->appended = task->contribution_input ? d.engine->append(*task->contribution_input, task->prepared_members) :
                         task->prepared_input ? d.engine->append(*task->prepared_input, task->prepared_members) :
-                        d.engine->append(task->members, task->hash.get(), reject_window); break;
+                        d.engine->append(task->members, task->hash.get(), reject_window,
+                            (!farm || !farm->state.capacity_fill) && d.metrics.members + task->members.size() == d.maximum); break;
                 }
                 case Work::recover: task->finished = d.engine->resume(task->members, task->hash.get()); break;
                 case Work::prepare_finish: d.engine->prepare_finish(); break;
@@ -13920,8 +13967,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const occupied = sum(producer.fixed, generation);
         if (occupied >= args.max_ram) return false;
         uint64_t const slots = std::max(size_t(1), active);
-        size_t const wanted = size_t(std::min({args.batch, uint64_t(d.batch_cap), uint64_t(maximum - first),
+        size_t wanted = size_t(std::min({args.batch, uint64_t(d.batch_cap), uint64_t(maximum - first),
             std::max<uint64_t>(1, sum((args.max_ram - occupied) / member_storage_bound(args, d.requested), 1) / slots)}));
+        if ((!farm || !farm->state.capacity_fill) && d.engine->external &&
+            d.engine->external->can_finish_with_members() && maximum != UINT16_MAX)
+            wanted = group_grow::construction_initial_batch(uint16_t(maximum - first), uint16_t(wanted));
         if (prefetched.members.size() >= wanted) return false;
         uint64_t const held = retained() - prefetched.resident_bytes();
         if (!producer.fits(uint16_t(first + prefetched.members.size()), sum(held, prefetched.resident_bytes()))) return false;
@@ -14453,8 +14503,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 size_t const slots = std::max(size_t(1), active);
                 wanted = std::min(wanted, size_t(std::max<uint64_t>(1, sum(room / member, 1) / slots)));
             }
-            if (!has_prefetched && !d.needs_resume && !select_merged)
-                wanted = incremental_batch_members(*d.engine, d.maximum, uint16_t(wanted));
+            if ((!has_prefetched || d.engine->external) && !d.needs_resume && !select_merged)
+                wanted = construction_batch_members(*d.engine, d.maximum, uint16_t(wanted),
+                    (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
             d.pending = std::make_unique<Task>(); auto& task = *d.pending;
             task.work = d.needs_resume ? Work::recover : Work::append;
             task.select_merged = select_merged;
@@ -14591,7 +14642,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (!producer.fits(first, held))
                 { d.pending.reset(); blocked(ControllerWait::producer_memory); continue; }
             }
-            if (args.member_storage == "compact" && !has_compute(args) && !d.engine->is_staging() && !task.select_merged &&
+            if (args.member_storage == "compact" && !has_compute(args) &&
+                (!d.engine->is_staging() || ((!farm || !farm->state.capacity_fill) && first + wanted == d.maximum) ||
+                    d.needs_resume) && !task.select_merged &&
                 !task.hash && task.members.empty())
                 task.hash = std::make_unique<group_grow::MemberBatchHash>(d.batch_cap);
             task.members.reserve(wanted);
@@ -15343,14 +15396,15 @@ ReplotConstructionAudit inspect_replot_construction(Arguments const& args, Replo
         result.external = ExternalEngine::inspect_construction(path, limits.memory_bytes - binding.memory_bytes, binding);
         result.inspected = result.external->construction;
         require(cfg.window_bytes >= sizeof(Header) && (!result.external->members ||
-            (result.external->packet_count && result.external->packet_count <= result.external->members && result.external->packing_source_bytes &&
-                result.external->packing_source_bytes <= cfg.window_bytes &&
-                result.external->packing_work_bytes == ChunkCodec::estimate_work(inputs.review.farm.config.k, result.external->packing_source_bytes, 0) &&
+            (result.external->packing_source_bytes <= cfg.window_bytes &&
+                result.external->packing_work_bytes == ChunkCodec::estimate_work(inputs.review.farm.config.k,
+                    result.external->packing_source_bytes, result.external->terminal_symbols) &&
                 result.external->packing_work_bytes <= cfg.codec_bytes)),
             "saved external chunks exceed current window/codec grants; restore compatible grants before recovery");
         auto const phase = result.external->complete ? ExternalEngine::MemoryPhase::publication :
             result.external->finishing ? ExternalEngine::MemoryPhase::packing : ExternalEngine::MemoryPhase::staging;
-        result.inspected.recovery_memory_bytes = ExternalEngine::phase_memory_bytes(inputs.review.farm.config.k, cfg, result.external->external, phase);
+        result.inspected.recovery_memory_bytes = ExternalEngine::phase_memory_bytes(inputs.review.farm.config.k, cfg, result.external->external, phase,
+            std::max(uint16_t(1), result.external->terminal_members));
         require(result.inspected.recovery_memory_bytes <= cfg.memory_limit_bytes,
             "saved external construction exceeds current memory/codec grants; restore compatible grants or resume its original review");
     }
