@@ -1295,7 +1295,8 @@ std::vector<std::string> group_arguments(std::vector<std::string> const& input)
             i += 2;
             continue;
         }
-        if (key == "--max-host-ram" || key == "--max-ram" || key == "-M" || key == "--leave-free" || key.ends_with("-bytes") ||
+        if (key == "--max-host-ram" || key == "--max-ram" || key == "-M" || key == "--leave-free" ||
+            (key.starts_with("--") && key.ends_with("-bytes")) ||
             key == "--compute-offer-ram" || key == "--compute-offer-vram" || key == "--compute-codec-ram") {
             if (++i == input.size()) throw std::invalid_argument(key + " requires a size");
             if (key == "--compute-codec-ram" && input[i] == "auto") {
@@ -1419,6 +1420,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
                     "--no-auto-spill", "--keep", "--compute-only", "--full", "--json", "--plan-only",
+                    "--replot", "--discover-farm",
                     "--extend", "--update", "--cancel-update", "--policy-only", "--upgrade-job", "--status", "--watch", "--inspect", "--live", "--revalidate", "--allow-missing", "--metadata-only", "--assess-jobs", "--calibrate", "--inventory"
                 };
                 std::string const bool_flag = flag.starts_with("--no-") ? "--" + flag.substr(5) : flag;

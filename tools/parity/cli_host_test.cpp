@@ -629,6 +629,26 @@ int main(int argc, char** argv)
     }
     assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
     assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());
+    for (auto const* command : {"plan", "fill"}) {
+        for (bool enabled : {false, true}) {
+            auto const value = enabled ? "true" : "false";
+            put(config, std::string("[defaults]\nreplot=") + value + "\ndiscover-farm=" + value +
+                "\n[" + command + "]\nplan-only=true\n");
+            assert(cli({command, dir.string(), "--config", config.string()}) == 0);
+            assert(last_group_options.replot == enabled && last_group_options.discover_farm == enabled);
+            assert(last_group_options.discover_farm_set && last_group_options.target == dir &&
+                last_group_options.destinations.empty());
+            assert(cli({command, dir.string(), "--config", config.string(),
+                enabled ? "--no-replot" : "--replot", enabled ? "--no-discover-farm" : "--discover-farm"}) == 0);
+            assert(last_group_options.replot != enabled && last_group_options.discover_farm != enabled &&
+                last_group_options.destinations.empty());
+        }
+        put(config, std::string("[defaults]\nreplot=true\ndiscover-farm=true\n[") + command +
+            "]\nplan-only=true\nreplot=false\ndiscover-farm=false\n");
+        assert(cli({command, dir.string(), "--config", config.string()}) == 0);
+        assert(!last_group_options.replot && !last_group_options.discover_farm && last_group_options.destinations.empty());
+    }
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     for (auto const* option : {"--temp-dirs", "--farm-config", "--exclude-destination"})
         assert(cli({"fill", dir.string(), "--config", config.string(), option, "--json"}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--replot-confirmation", "directory"}) != 0);
@@ -651,6 +671,15 @@ int main(int argc, char** argv)
     assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) != 0);
     auto const previous_directory = std::filesystem::current_path();
     std::filesystem::current_path(dir);
+    for (auto const* command : {"plan", "fill"}) {
+        assert(cli({command, "--config", config.string(), "plots-bytes"}) == 0);
+        assert(last_group_options.target == dir / "plots-bytes" && last_group_options.destinations.empty());
+        assert(cli({command, "--config", config.string(), (dir / "plots-bytes").string(), "second-bytes",
+            "--headroom-bytes", "32M"}) == 0);
+        assert(last_group_options.target == dir / "plots-bytes" &&
+            last_group_options.destinations == std::vector{dir / "second-bytes"});
+        assert(last_group_options.headroom_set && last_group_options.headroom == 32ull * 1024 * 1024);
+    }
     assert(cli({"plan", "--config", config.string(), "--temp-dirs", "@scratch", "another scratch-bytes",
                 "--exclude-destination", "@excluded", "--", "@destination"}) == 0);
     assert(last_group_options.target == dir / "@destination" &&

@@ -9,8 +9,9 @@ on:
 permissions:
   contents: read
 
+# Push filters cover only that push; later pushes must not discard its checks.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -61,7 +62,7 @@ jobs:
               - 'src/host/{ComputeNetwork,ComputePool,ComputeSession,ComputeWorker}.hpp'
               - 'src/host/{GroupCalibrationProcess,GroupComputeSettings,GroupFarmComputeResources,GroupFarmFile,GroupFarmMetadata,GroupFarmResources}.hpp'
               - 'src/host/{GroupFarming,GroupFile,GroupHarvesterProfile,GroupNativeIdentity,GroupOptions,GroupPacked,GroupPlotter,GroupPublication}.hpp'
-              - 'src/host/{HostGuard,HostRamPolicy,Json,MultiGpuPipelineParallel,NumaTopology,PlotFileWriterParallel,PoolSizing,Random,Spill*,TempFile,Utf8,Vram*}.hpp'
+              - 'src/host/{HostGuard,HostRamPolicy,Json,MultiGpuPipelineParallel,MultiGpuShardBufferPool,NumaTopology,PlotFileWriterParallel,PoolSizing,Random,Spill*,TempFile,Utf8,Vram*}.hpp'
               - 'src/host/{BatchManifest,Cancel,ConfigFile,HostRamPolicy,MultiGpuPipelineParallel,NumaTopology,TempFile}.cpp'
               - 'src/gpu/{DeviceIds,SpillTileReader,SyclDeviceList}.hpp'
               - 'keygen-rs/include/**'

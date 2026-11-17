@@ -81,8 +81,9 @@ on:
 permissions:
   contents: read
 
+# Push filters cover only that push; later pushes must not discard its checks.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 jobs:

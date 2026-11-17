@@ -3057,7 +3057,7 @@ BatchResult run_batch_sharded(std::vector<BatchEntry> const& entries,
     live_work_start(live, 0, res.work_start_seconds);
 
     for (BatchEntry const& entry : entries) {
-        if (consumer_failed.load(std::memory_order_acquire)) {
+        if (consumer_failed.load(std::memory_order_acquire) || cancel_requested()) {
             early_stop = true;
             break;
         }

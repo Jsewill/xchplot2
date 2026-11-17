@@ -159,9 +159,10 @@ and WSL checks separately from container builds; release PRs select Linux and
 Windows builds separately. Manual dispatch runs all checks for the selected
 workflow, subject to its platform, architecture or suite inputs. Scheduled
 installation checks and tag release builds retain their full matrices.
-CI, architecture and installation workflows cancel older
-runs for the same event and ref. Release builds cancel superseded PR runs only;
-running tag and manual release builds are not cancelled.
+CI and installation workflows keep each push run because their job filters
+cover only that push. Their PR and manual runs, and architecture workflow
+runs, cancel older runs for the same event and ref. Release builds cancel
+superseded PR runs only; running tag and manual release builds are not cancelled.
 GPU execution remains separate from hosted build and CPU checks.
 Update path filters when adding a build input or a script called by a workflow.
 For workflows with job filters, update both the workflow trigger and the
