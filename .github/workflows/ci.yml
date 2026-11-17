@@ -258,7 +258,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: crate-ci/typos@v1.52.0
+      - uses: crate-ci/typos@v1.52.2
 
   markdownlint:
     name: Markdown documentation
