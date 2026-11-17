@@ -2186,7 +2186,7 @@ struct WorkerClient::Impl
         Operation operation;
         uint64_t input_bytes = 0, output_bytes = 0;
         uint64_t logical_input_bytes = 0, logical_output_bytes = 0;
-        bool completed = false, resource_rejected = false, declined = false, local_direct = false;
+        bool completed = false, resource_rejected = false, declined = false, local_direct = false, retry_same_worker = false;
         std::shared_ptr<WorkerService> local_service;
         Clock::time_point selected_at = Clock::now(), first_output{};
         WorkerTaskOptions options;
@@ -2221,9 +2221,25 @@ struct WorkerClient::Impl
                     impl.failures.fetch_add(1);
                     { std::lock_guard lock(impl.planning_mutex); impl.planning.failed(observation(), lease.endpoint, planning_selection); }
                 }
-                if (declined) try { impl.cleanup_control().cancel(session, lease.task.task_id, lease.task.attempt); } catch (...) {}
+                if (declined || retry_same_worker) try { impl.cleanup_control().cancel(session, lease.task.task_id, lease.task.attempt); } catch (...) {}
                 else if (!resource_rejected) try { impl.cleanup_control().abandon(lease); } catch (...) {}
             }
+        }
+        void check_frame(pool::Frame const& frame)
+        {
+            if (frame.type == pool::Message::Error)
+            {
+                try { throw_worker_error(frame.payload); }
+                catch (pool::TransientTransport const&)
+                {
+                    // An authenticated temporary refusal (for example, a full
+                    // shared queue) must not exclude this worker from retries.
+                    // Cancel retains any running reservation until finish.
+                    retry_same_worker = true; throw;
+                }
+            }
+            require(frame.type == pool::Message::Data || frame.type == pool::Message::Reply ||
+                frame.type == pool::Message::Result || frame.type == pool::Message::End, "unexpected compute result frame");
         }
         void delivered()
         {
@@ -2325,13 +2341,6 @@ struct WorkerClient::Impl
         connection->channel = pool::Channel::connect(lease->endpoint, tls, lease->worker_identity);
         return connection;
     }
-    void check_frame(pool::Frame const& frame)
-    {
-        if (frame.type == pool::Message::Error)
-            throw_worker_error(frame.payload);
-        require(frame.type == pool::Message::Data || frame.type == pool::Message::Reply ||
-            frame.type == pool::Message::Result || frame.type == pool::Message::End, "unexpected compute result frame");
-    }
     void generate_once(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity)
@@ -2362,6 +2371,8 @@ struct WorkerClient::Impl
             catch (pool::UnsupportedResources const&)
             { require(!connection->logical_output_bytes, "local worker rejected resources after partial output");
               connection->resource_rejected = true; throw; }
+            catch (pool::TransientTransport const&)
+            { connection->retry_same_worker = true; throw; }
             cancel.check(); connection->delivered(); return;
         }
         auto compute = cpu_lease(cancel);
@@ -2380,7 +2391,7 @@ struct WorkerClient::Impl
         for (;;)
         {
             cancel.check(); auto frame = connection->channel.receive();
-            try { check_frame(frame); }
+            try { connection->check_frame(frame); }
             catch (pool::UnsupportedResources const&)
             { require(!connection->output_bytes, "compute worker rejected resources after partial output"); connection->resource_rejected = true; throw; }
             if (frame.type == pool::Message::Reply) { require(frame.payload.empty(), "invalid compute keepalive"); continue; }
@@ -2541,11 +2552,16 @@ std::vector<std::vector<uint8_t>> WorkerClient::encode(uint8_t k, std::span<Work
     {
         std::vector<std::vector<uint8_t>> output(chunks.size());
         connection->logical_input_bytes = payload.data().size();
-        connection->local_service->encode_assigned(connection->lease, payload.data(), maximum,
-            [&](size_t index, std::span<uint8_t const> bytes)
-            { require(index < output.size(), "local worker returned an invalid encoded chunk");
-              connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
-              output[index].assign(bytes.begin(), bytes.end()); }, cancel);
+        try
+        {
+            connection->local_service->encode_assigned(connection->lease, payload.data(), maximum,
+                [&](size_t index, std::span<uint8_t const> bytes)
+                { require(index < output.size(), "local worker returned an invalid encoded chunk");
+                  connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
+                  output[index].assign(bytes.begin(), bytes.end()); }, cancel);
+        }
+        catch (pool::TransientTransport const&)
+        { connection->retry_same_worker = true; throw; }
         if (validator) { compute = impl_->cpu_lease(cancel); validator(output); compute.reset(); }
         cancel.check(); connection->delivered(); return output;
     }
@@ -2560,7 +2576,7 @@ std::vector<std::vector<uint8_t>> WorkerClient::encode(uint8_t k, std::span<Work
     uint64_t size = 0; size_t current = 0, announced = 0;
     for (;;)
     {
-        cancel.check(); auto frame = connection->channel.receive(); impl_->check_frame(frame);
+        cancel.check(); auto frame = connection->channel.receive(); connection->check_frame(frame);
         if (frame.type == pool::Message::Reply) { require(frame.payload.empty(), "invalid compute keepalive"); continue; }
         if (connection->first_output == Clock::time_point{}) connection->first_output = Clock::now();
         compute = impl_->cpu_lease(cancel);

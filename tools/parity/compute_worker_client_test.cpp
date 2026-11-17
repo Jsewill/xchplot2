@@ -438,6 +438,73 @@ void assigned_local_and_fencing()
     scratch_limited.stop();
 }
 
+void temporary_worker_refusal()
+{
+    pool_test::Directory directory;
+    auto ca = pool_test::issue(directory.path, "refusal-ca");
+    auto identity = pool_test::issue(directory.path, "refusal-host", &ca);
+    auto tls = pool_test::tls(ca, identity); tls.timeout_ms = 3000;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    RunningBroker broker(options);
+    WorkerConfig offer; offer.broker = broker.server.endpoint(); offer.listen = {"127.0.0.1", 0}; offer.tls = tls;
+    offer.capacity = {1, 1, uint64_t(512) << 20, 0};
+    offer.available_resources = [](uint32_t) { return pool::Resources{1, 1, uint64_t(2) << 30, 0}; };
+    WorkerService service(offer); service.start();
+    std::array<uint8_t, 32> id{};
+    std::array<uint64_t, 3> fragments{1, 2, 3}; std::span<uint64_t const> region(fragments);
+    WorkerChunkInput chunk{0, {}, 0, {}, {&region, 1}};
+    ChunkCodec codec(18, uint64_t(1) << 20);
+    auto expected = codec.encode(0, {}, 0, {&region, 1});
+    for (bool local : {false, true})
+    {
+        bool refuse = false;
+        WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
+        config.owner_id = local ? "local-refusal-owner" : "remote-refusal-owner";
+        config.local_service = local ? &service : nullptr;
+        // Pause after the broker grants the lease, before the worker accepts
+        // it. This deterministically exercises a temporary admission refusal.
+        config.selected = [&](auto const&) { if (std::exchange(refuse, false)) service.control(WorkerControl::Pause); };
+        WorkerClient client(config);
+        for (unsigned kind = 0; kind < 3; ++kind)
+        {
+            WorkerTaskIdentity task(pool::random_token()); bool output = false;
+            auto request = [&]
+            {
+                if (!kind)
+                {
+                    std::unique_ptr<CompactMemberReceiver> receiver;
+                    client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t count)
+                    {
+                        if (!receiver) receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count));
+                        receiver->append(tile);
+                    }, {}, task);
+                    require(receiver && receiver->finish().size(), "retried generation produced no member");
+                }
+                else if (kind == 1)
+                {
+                    uint64_t chunks = 0;
+                    client.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, auto bytes, uint16_t members)
+                    { require(ordinal == chunks++ && !bytes.empty() && members == 1, "retried contribution was invalid"); }, {}, task);
+                    require(chunks == PlotGroupFile::getChunkCountForK(18), "retried contributions were truncated");
+                }
+                else require(std::ranges::equal(client.encode(18, {&chunk, 1}, uint64_t(1) << 20, {}, task).front(), expected),
+                    "retried encoding changed canonical bytes");
+                output = true;
+            };
+            refuse = true; bool rejected = false;
+            try { request(); } catch (pool::TransientTransport const&) { rejected = true; }
+            require(rejected && !output && !service.status().accepted_tasks,
+                "paused worker did not refuse the granted task before execution");
+            service.control(WorkerControl::Resume); ++task.attempt;
+            try { request(); }
+            catch (std::exception const& error)
+            { throw std::runtime_error("retry after temporary worker refusal failed: " + std::string(error.what())); }
+            require(output, "temporary refusal excluded the only worker from the task's retry");
+        }
+        require(client.stats().failed_tasks == 3, "temporary refusals lost their failure accounting");
+    }
+}
+
 void expired_cleanup()
 {
     pool_test::Directory directory;
@@ -1059,7 +1126,7 @@ void status_inspection()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }
