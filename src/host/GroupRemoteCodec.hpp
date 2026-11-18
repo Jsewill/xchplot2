@@ -36,6 +36,7 @@ class PoolRemoteEncoder final : public RemoteEncoder
         Shape shape;
         uint64_t windows = 0, next_probe = 1, remote_windows = 0, used = 0;
         long double ns_per_byte = 0;
+        unsigned failures = 0;
         bool probing = false;
     };
     struct WorkerSample
@@ -78,8 +79,11 @@ public:
     struct Counters
     {
         std::atomic<uint64_t> accepted_windows{0}, accepted_chunks{0}, fallback_windows{0},
-            calibration_windows{0}, calibration_attempts{0}, input_bytes{0}, output_bytes{0};
+            calibration_windows{0}, calibration_attempts{0}, failed_windows{0}, declined_windows{0},
+            unavailable_windows{0}, input_bytes{0}, output_bytes{0};
     } counters;
+    std::string last_failure()
+    { std::lock_guard lock(policy_); return last_failure_.data(); }
 
     PoolRemoteEncoder(uint64_t budget, uint32_t frame, uint64_t task_bytes,
         std::function<std::shared_ptr<WorkerClient>()> client,
@@ -100,7 +104,7 @@ public:
             std::lock_guard lock(policy_);
             auto& sample = local_sample(shape);
             local = sample.ns_per_byte;
-            bool const measured = local > 0 && std::any_of(workers_.begin(), workers_.end(), [&](auto const& worker)
+            bool const measured = !sample.failures && local > 0 && std::any_of(workers_.begin(), workers_.end(), [&](auto const& worker)
             { return worker.valid && worker.shape == shape && worker.ns_per_byte < local; });
             if (!measured || ++sample.remote_windows >= 64)
             {
@@ -111,7 +115,11 @@ public:
         }
         auto result = dispatch(k, chunks, summaries, shape, local, false,
             std::min<long double>(5000000000.0L, std::max<long double>(25000000.0L, local * work * 2)));
-        if (!result) { counters.fallback_windows.fetch_add(1); return {}; }
+        if (!result)
+        {
+            std::lock_guard lock(policy_); backoff(local_sample(shape));
+            counters.fallback_windows.fetch_add(1); return {};
+        }
         record(*result, shape);
         counters.accepted_windows.fetch_add(1); counters.accepted_chunks.fetch_add(chunks.size());
         return std::move(result->window);
@@ -154,7 +162,10 @@ public:
         if (result && (position != result->window.bytes.size() || sizes.size() != result->window.sizes.size() ||
             !std::equal(sizes.begin(), sizes.end(), result->window.sizes.begin()))) identical = false;
         {
-            std::lock_guard lock(policy_); local_sample(shape).probing = false;
+            std::lock_guard lock(policy_);
+            auto& sample = local_sample(shape); sample.probing = false;
+            if (identical) sample.failures = 0;
+            else backoff(sample);
         }
         if (identical)
         { record(*result, shape); counters.calibration_windows.fetch_add(1); }
@@ -162,10 +173,24 @@ public:
         {
             std::lock_guard lock(policy_);
             for (auto const& worker : result->workers) worker_sample(shape, worker).valid = false;
+            failure("remote codec calibration differs from local canonical bytes");
         }
     }
 
 private:
+    static void backoff(LocalSample& sample)
+    {
+        sample.failures = std::min(sample.failures + 1, 6u);
+        sample.next_probe = sample.windows + (uint64_t(64) << sample.failures);
+    }
+    // Called with the policy lock. Retain one bounded diagnostic rather than
+    // accumulating arbitrary worker-controlled error strings or logging retries.
+    void failure(char const* message)
+    {
+        counters.failed_windows.fetch_add(1);
+        size_t const size = std::min(std::strlen(message), last_failure_.size() - 1);
+        std::copy_n(message, size, last_failure_.begin()); last_failure_[size] = 0;
+    }
     static uint64_t add(uint64_t a, uint64_t b)
     { group_tools::require(b <= UINT64_MAX - a, "remote codec byte count overflow"); return a + b; }
     static uint64_t multiply(uint64_t a, uint64_t b)
@@ -414,13 +439,17 @@ private:
                     multiply(result.summaries.capacity(), sizeof(ChunkSummary)))));
                 reservation->retain(retained); result.admission = std::move(reservation);
             }
+            else counters.unavailable_windows.fetch_add(1);
             return outcome;
         }
         catch (WorkerAdmissionRejected const&) { throw; }
-        catch (std::exception const&)
+        catch (WorkerTaskDeclined const&)
+        { counters.declined_windows.fetch_add(1); return {}; }
+        catch (std::exception const& error)
         {
             std::lock_guard lock(policy_);
             for (auto const& worker : selected) worker_sample(shape, worker).valid = false;
+            failure(error.what());
             return {};
         }
     }
@@ -433,6 +462,7 @@ private:
     std::mutex policy_;
     std::array<LocalSample, sample_limit> locals_{};
     std::array<WorkerSample, sample_limit> workers_{};
+    std::array<char, 256> last_failure_{};
     uint64_t clock_ = 0;
 };
 } // namespace group_grow

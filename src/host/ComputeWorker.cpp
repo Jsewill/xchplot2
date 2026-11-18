@@ -2343,7 +2343,8 @@ struct WorkerClient::Impl
     }
     void generate_once(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
-                  WorkerCancellation cancel, WorkerTaskIdentity identity)
+                  WorkerCancellation cancel, WorkerTaskIdentity identity,
+                  WorkerContributionWindowSink const& contribution_window)
     {
         cancel = cancellation(cancel); auto const count_bound = fragment_count_bound(k, strength);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members &&
@@ -2458,11 +2459,21 @@ struct WorkerClient::Impl
             else if (type == DataKind::Contributions)
             {
                 require(bool(contribution_sink), "unexpected compute contribution stream");
+                std::array<std::span<uint8_t const>, contribution_window_chunks> chunks;
                 while (input.remaining())
                 {
-                    auto const ordinal = input.u64(); auto const members = input.u16(); auto const bytes = input.bytes(config.tls.max_frame_bytes);
-                    require(ordinal == next_chunk++ && ordinal < PlotGroupFile::getChunkCountForK(k) && members == ids.size() && !bytes.empty(), "invalid compute contribution order or membership");
-                    compute.reset(); contribution_sink(ordinal, bytes, members); compute = cpu_lease(cancel);
+                    uint64_t const first = next_chunk;
+                    size_t count = 0;
+                    do
+                    {
+                        auto const ordinal = input.u64(); auto const members = input.u16(); auto const bytes = input.bytes(config.tls.max_frame_bytes);
+                        require(ordinal == next_chunk++ && ordinal < PlotGroupFile::getChunkCountForK(k) && members == ids.size() && !bytes.empty(), "invalid compute contribution order or membership");
+                        chunks[count++] = bytes;
+                    } while (contribution_window && input.remaining() && count < chunks.size());
+                    compute.reset();
+                    if (contribution_window) contribution_window(first, {chunks.data(), count}, uint16_t(ids.size()));
+                    else contribution_sink(first, chunks[0], uint16_t(ids.size()));
+                    compute = cpu_lease(cancel);
                 }
             }
             else throw std::runtime_error("unexpected compute generation data");
@@ -2471,7 +2482,8 @@ struct WorkerClient::Impl
     }
     void generate(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
-                  WorkerCancellation cancel, WorkerTaskIdentity identity)
+                  WorkerCancellation cancel, WorkerTaskIdentity identity,
+                  WorkerContributionWindowSink const& contribution_window = {})
     {
         cancel = cancellation(cancel);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members,
@@ -2481,7 +2493,7 @@ struct WorkerClient::Impl
         if (identity.task_id.empty()) identity.task_id = pool::random_token();
         for (unsigned failed = 0;; ++failed)
         {
-            try { generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity); return; }
+            try { generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window); return; }
             catch (pool::UnsupportedResources const&)
             {
                 // A refused batch may need a different shape. Its owner must
@@ -2506,8 +2518,9 @@ void WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32>
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
 { impl_->generate(k, strength, {&id, 1}, sink, {}, cancel, std::move(identity)); }
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
-    WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
-{ impl_->generate(k, strength, ids, {}, sink, cancel, std::move(identity)); }
+    WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
+    WorkerContributionWindowSink const& window)
+{ impl_->generate(k, strength, ids, {}, sink, cancel, std::move(identity), window); }
 void WorkerClient::generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
     WorkerPackedSink const& sink, WorkerCancellation cancel)
 {

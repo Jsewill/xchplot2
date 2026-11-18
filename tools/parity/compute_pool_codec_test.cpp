@@ -335,6 +335,18 @@ void integration(uint8_t k)
         require(std::chrono::steady_clock::now() - begin < std::chrono::seconds(1) &&
             optional->counters.calibration_attempts.load() == 1 && optional->counters.calibration_windows.load() == 0,
             "optional codec probe waited for the generation timeout after local bytes were ready");
+        ParallelEncoder fallback(k, 1, uint64_t(8) << 20, scheduler);
+        auto blocks = fallback.encode(tasks, sizes);
+        for (unsigned window = 0; window < 127; ++window)
+            optional->observe_local(k, tasks, sizes, blocks, 1000000);
+        require(optional->counters.calibration_attempts.load() == 1 && optional->counters.failed_windows.load() == 1 &&
+            !optional->last_failure().empty(), "failed codec probe did not back off or retain its cause");
+        optional->observe_local(k, tasks, sizes, blocks, 1000000);
+        require(optional->counters.calibration_attempts.load() == 2, "codec probe never retried after its backoff");
+        for (unsigned window = 0; window < 255; ++window)
+            optional->observe_local(k, tasks, sizes, blocks, 1000000);
+        require(optional->counters.calibration_attempts.load() == 2,
+            "consecutive codec failures did not increase the backoff");
     }
     auto const stats = client->stats();
     require(stats.completed_codec > 0 && stats.input_bytes > 0 && stats.output_bytes > 0 && stats.failed_tasks > 0,

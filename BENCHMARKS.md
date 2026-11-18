@@ -1,8 +1,8 @@
 # Benchmarks
 
-These historical measurements use the pre-1.0 cipher and raw format. They do
-not estimate current `.gplot` performance or memory requirements. Use
-[`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
+The September GPU measurements use the pre-1.0 cipher and raw format. For
+current `.gplot` measurements, see [grouped plots on HDDs](#grouped-plots-on-hdds).
+Use [`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
 
 Single-GPU results measured September 9, 2026, at **k=28, strength=2**.
 Each run measured ten plots after two warmups, including FSE compression,
@@ -86,3 +86,59 @@ The report did not specify the driver version, CPU model, storage, or Windows
 version. Full-proof and CPU byte-parity results were not provided. Treat this
 as a completed benchmark report; hardware qualification still needs those
 correctness checks.
+
+## Grouped plots on HDDs
+
+On November 17, 2026, a Linux storage host with a Ryzen 7 5800X used one
+RTX 4090 worker over 1 Gb Ethernet to build k=28, strength=2 groups on
+18 TB Toshiba MG09SCA18TA HDDs with Btrfs. Plotting used `--workers 8` on
+the storage host. The SYCL Release build included the grouped-compute changes
+based on `e0173cbad19a` and pos2-chip `ff89d3e`.
+
+With a 4 GiB plotting RAM budget, a three-member group on one HDD took
+153 s with the original external construction path. The updated receiver
+and codec policy took 99 s in each of two runs with the same inputs.
+These are whole-job times sampled once per second, with no separate warmup.
+
+Across four matching HDDs, the plotter wrote one six-member group per drive
+under an 8 GiB RAM budget. With destination scratch enabled, the original
+plotter took 16.78 minutes and the updated plotter took 8.87 minutes. Both
+reported 53.42 GB of construction writes. With destination scratch disabled,
+the updated plotter took 11.59 minutes and reported 86.04 GB of writes. Each
+configuration had one uninterrupted timed run with the same plot identities.
+
+### Group size, build time and reader latency
+
+Each size had one fresh build with the same group identity, HDD and 8 GiB
+plotting RAM budget. Destination scratch was enabled. All three file sizes
+rounded to 988.2 MB per member in decimal units.
+
+| Members | Full build, min | Build, s/member | First quality lookup, ms | Repeat lookup, ms |
+|---:|---:|---:|---:|---:|
+| 71 | 47.91 | 40.49 | 98.27 | 42.25 |
+| 72 | 48.45 | 40.37 | 99.18 | 42.76 |
+| 73 | 49.17 | 40.41 | 98.53 | 43.31 |
+
+Reader times are means over three passes of the same 32 deterministic
+challenges per file. Each size had a separate calibration before the timed
+passes. File order rotated on each pass. The first lookup includes opening
+a new reader. The repeat uses the same reader and challenge. Before each pass
+the test requested file-cache eviction. Linux controlled which pages stayed
+cached. The per-pass mean first-lookup times overlapped across group sizes.
+The 71-member file had the fastest mean repeat lookup.
+
+Growing an already published group on one HDD took 13.66 minutes from 71 to
+72 members and 13.98 minutes from 72 to 73. Each run used an 8 GiB plotting
+RAM budget and included rewriting the group. Preparing independent copies
+for the comparison took place outside those timings.
+
+For a layout of 10,000 members on each of four HDDs, a target of 73 used
+137 files per drive. A target of 71 used 141. The calibrated stateless
+reader profile gave 73 the lowest modeled recurring work of the three,
+1.67% below 71. The model used four harvester cores, four lookup workers,
+the default storage service estimates and an eight-second response deadline.
+With automatic sizing it selected groups of up to 1,667 members on four
+drives and up to 385 on all 16 test drives at the same per-drive workload.
+The corresponding modeled response bounds were 7.08 s and 7.78 s. The
+physical builds and reader measurements covered 71 through 73 members.
+See [farming layout and reader calibration](REFERENCE.md#farming-layout).

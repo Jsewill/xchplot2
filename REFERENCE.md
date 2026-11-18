@@ -620,6 +620,9 @@ construction before extending it. It reads the file's identity and parameters;
 keys are unnecessary. `--max-members N` is the desired total membership, with
 a maximum of 65535. Capacity and construction limits can stop growth earlier.
 Use `plot` to create a new named job, or `fill` to manage a directory layout.
+On Linux, in-place growth requires private data extents. Use
+`cp --reflink=never` when making a copy to grow on a filesystem that supports
+reflinks.
 
 ### Construction and recovery
 
@@ -627,10 +630,12 @@ Use `plot` to create a new named job, or `fill` to manage a directory layout.
 codec buffers across the job. When omitted, planning and plotting use the
 available host RAM, including process cgroup limits on Linux. This is a ceiling;
 small groups allocate only the buffers they need. Set an explicit cap to leave
-more memory for other applications.
-`-j`/`--workers N` sets the shared plotting CPU budget; zero or omission
-uses the available logical CPU count. The operating system, libraries and
-file cache are outside that buffer model. Separate plotting processes each
+more memory for other applications. The operating system, libraries and file
+cache are outside that buffer model.
+
+`-j`/`--workers N` sets the shared plotting CPU budget for grouped construction.
+Native CPU generation and chunk compression draw from the same budget. Zero or
+omission uses the available logical CPU count. Separate plotting processes each
 have their own construction budget.
 
 Automatic construction chooses among incremental rewriting, staging,
@@ -699,6 +704,8 @@ topology and a declared farming profile. The default preview reports the
 profile's source, CPU and memory allowances and initial file counts.
 `--verbose` adds response estimates, assumptions, detected configuration,
 identity families, resource sharing and workload estimates.
+For measured construction and lookup costs at 71, 72 and 73 members, see
+[grouped plots on HDDs](BENCHMARKS.md#grouped-plots-on-hdds).
 
 File sizes are estimates: compressed output can be slightly larger or smaller,
 and a small difference can decide whether one more whole member fits. Filling
@@ -1681,20 +1688,24 @@ Create a separate invitation for each additional machine. An invitation holds
 that machine's private TLS identity, not the pool's signing key. Delete
 transferred copies after joining. Enrollment is pool membership: every member
 can share with multiple plotting hosts. It is not an exclusive machine pair.
-`setup` reuses existing enrollment, accepts the same resource settings as
-`configure`, and installs and starts the helper's background worker. Use
-`--role plotter` or `--role worker` to choose that role explicitly. If service
-installation fails, enrollment and settings remain saved; the diagnostic gives
-the worker startup command. `init`, `join` and foreground `worker` remain
-available for separate setup steps.
+`setup` reuses existing enrollment and broker selection, accepts the same resource
+settings as `configure`, and installs and starts a worker on a helper.
+A new plotting-host setup installs and starts a background broker.
+New setups use TCP 18444 for the broker and TCP 18445 for the worker.
+Use `--role plotter` or `--role worker` to choose the role explicitly.
+If service installation fails, use the startup command in the diagnostic with
+the saved enrollment and settings. To run the steps individually, use `init`,
+`join` and the foreground `worker` command.
 
 After enrollment, `plot`, `fill`, and `grow` use shared compute automatically.
-Each job starts an embedded broker unless a dedicated broker is configured.
-Its local executor also offers bounded capacity while the job runs; nearby
-workers discover the broker and join. Several brokers can use one worker at
-once. The worker enforces one combined CPU, RAM, GPU and task-slot budget
-across their requests. One executor per enrolled machine identity prevents
-concurrent local jobs from advertising the same capacity twice.
+New plotting-host setups share one persistent broker between jobs. To select
+an existing dedicated broker, use `setup --broker HOST:PORT`. For an embedded
+broker per job, use `setup --broker auto`. While a plotting job runs, its local
+executor offers bounded capacity. Nearby workers discover the broker and join.
+Several brokers can use one worker at once. The worker enforces one combined
+CPU, RAM, GPU and task-slot budget across their requests. One executor per
+enrolled machine identity prevents concurrent local jobs from advertising
+the same capacity twice.
 
 Run `compute worker` to keep offering capacity independently of a plotting
 job; it stays in the foreground until stopped. Save defaults for future jobs:
@@ -1735,6 +1746,11 @@ identities, owners, jobs, queue wait reasons, offered resources, broker
 reservations and actual worker usage. A worker shared by
 several brokers enforces its total limit locally; a broker's reservation view
 is not a pool-wide capacity measurement.
+The foreground worker reports its authenticated broker registrations. Run
+`compute status` on the plotting host to check its connection back to the
+worker. During plotting, `--progress` reports members generated, bytes
+received, members assembled and files published by the current process.
+Received bytes include retry traffic and local executor transfers.
 
 ```bash
 xchplot2 compute status --json
@@ -1830,10 +1846,38 @@ xchplot2 compute configure --broker auto
 `compute worker --broker HOST:PORT` can repeat direct addresses and also
 browse discovered brokers. `--discovery off` disables discovery; a standalone
 worker then needs a direct broker. Broker and worker `--listen` / `--advertise`
-options set fixed reachable endpoints. Firewalls must permit UDP 5353 for
-discovery and the chosen TCP listener ports; automatic embedded services and
-workers choose available TCP ports. Use explicit interfaces for a VPN rather
-than exposing the services publicly.
+options override saved listener settings. Save predictable ports with
+`compute configure --broker-port 18444 --worker-port 18445`, then restart
+the affected services. The worker port also applies to a plotting job's local
+executor. Changing a local dedicated broker port updates its matching saved
+loopback route. Update explicit routes on remote machines to use the new port.
+Older compute profiles default to TCP 18444 for the broker and an available
+port for the worker. Set `--worker-port 0` to select an available worker port.
+Embedded per-job brokers choose available ports. Use a persistent broker
+when a firewall rule requires a fixed port.
+The current build reads older compute profiles automatically. Newly saved
+profiles include listener ports and require a build that supports them.
+
+Firewalls must permit the chosen TCP listeners and UDP 5353 when discovery is
+enabled. On each machine, `compute firewall` prints commands for its saved
+ports, inbound role (`broker`, `worker`, or `both`) and the peer addresses or
+LAN subnet you permit.
+
+```bash
+# Broker host with its LAN interface in the FedoraServer zone
+xchplot2 compute firewall --firewall firewalld --zone FedoraServer --role broker --from 192.168.1.0/24
+# Helper host using UFW on enp3s0
+xchplot2 compute firewall --firewall ufw --interface enp3s0 --role worker --from 192.168.1.0/24
+```
+
+Review and run the printed commands locally. The firewalld commands add both
+runtime and permanent rules. The UFW commands use the selected or saved
+interfaces. Use `--discovery off` for direct routes without mDNS, and repeat
+`--from` for additional IPv4 or IPv6 peers. Use `firewall-cmd --get-active-zones`
+to find the zone assigned to the LAN interface. Select the VPN interface when
+allowing connections over a VPN. For rule management, see the
+[firewalld rich-rule reference](https://firewalld.org/documentation/man-pages/firewalld.richlanguage.html)
+and [UFW manual](https://manpages.ubuntu.com/manpages/jammy/man8/ufw.8.html).
 
 The saved setup is in `$XDG_CONFIG_HOME/xchplot2/compute`, falling back to
 `$HOME/.config/xchplot2/compute`; Windows instead defaults to
@@ -1872,6 +1916,11 @@ waits. The defaults are one hour per task and 30 seconds per socket operation.
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
 lists standalone task, thread, window and transport limits.
+Optional encoding probes back off after repeated failures while local encoding
+continues. Plotting JSON distinguishes calibration attempts, declined or failed
+codec windows and unavailable windows, and retains the latest bounded failure
+message in `pool_codec_last_failure`. These counters are separate from completed
+generation tasks.
 
 Workers may arrive or leave while jobs run. Lost or expired work is retried
 without publishing incomplete results. Available local compute permits

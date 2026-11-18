@@ -1,4 +1,4 @@
-// Worker-only overlay: inherit a scoped CPU allowance through reference threads.
+// Grouped producer overlay: inherit a scoped CPU allowance through reference threads.
 #ifndef GROW_WORKER_THREADS_HPP
 #define GROW_WORKER_THREADS_HPP
 #include <algorithm>

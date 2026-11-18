@@ -1,8 +1,18 @@
-# Worker reference fanout is scoped per task, and inherited by its children.
-# The upstream checkout and ordinary standalone producer keep their behavior.
+# Reference producer fanout is scoped per task, and inherited by its children.
+# The upstream checkout and single-member batch producer keep their behavior.
 include_guard(GLOBAL)
 function(pos2_worker_prepare upstream_dir output_include)
     set(worker_dir "${CMAKE_CURRENT_BINARY_DIR}/pos2-worker")
+    # Grouped generation, workers and parity targets share this overlay. Build
+    # it once per configure so the ARM platform patch is not applied twice.
+    get_property(prepared_from DIRECTORY PROPERTY XCHPLOT2_WORKER_UPSTREAM)
+    if(prepared_from)
+        if(NOT prepared_from STREQUAL upstream_dir)
+            message(FATAL_ERROR "Reference producers in one build must use the same upstream source")
+        endif()
+        set(${output_include} "${worker_dir}" PARENT_SCOPE)
+        return()
+    endif()
     get_filename_component(repo_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
     # Relative AES includes need the complete platform-patched header tree,
     # matching the ordinary plotter's ARM overlay.
@@ -30,6 +40,7 @@ function(pos2_worker_prepare upstream_dir output_include)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
             "${repo_dir}/contrib/${patch}")
     endforeach()
+    set_property(DIRECTORY PROPERTY XCHPLOT2_WORKER_UPSTREAM "${upstream_dir}")
     set(${output_include} "${worker_dir}" PARENT_SCOPE)
 endfunction()
 

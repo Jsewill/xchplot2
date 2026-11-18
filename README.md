@@ -124,9 +124,12 @@ recover old plots already deleted under the allowance.
 |---|---|
 | [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
 
-Run `xchplot2 compute setup` on the first machine, then create an invitation for
-each helper. On a helper, `xchplot2 compute setup INVITATION` enrolls it and starts
-its persistent worker. Plotting jobs discover enrolled helpers automatically.
+Run `xchplot2 compute setup` on the first machine to start its broker, then
+create an invitation for each helper. On a helper,
+`xchplot2 compute setup INVITATION` enrolls it and starts its persistent
+worker. Plotting jobs discover enrolled helpers automatically. For the
+default ports and commands to allow connections through a firewall, see the
+[network guide](REFERENCE.md#networks-and-dedicated-brokers).
 
 ### Plotting jobs
 

@@ -216,7 +216,7 @@ void reference_help()
         "  --headroom-bytes N        filesystem bytes left free, default 67108864\n"
         "  -M, --max-ram N           modeled app buffer budget in bytes, default available RAM\n"
         "  --window-bytes N          fixed I/O window; default auto up to 16777216\n"
-        "  -j, --workers N           compression workers, default available CPU count\n"
+        "  -j, --workers N           shared plotting CPU budget, default available CPU count\n"
         "  --batch-members N         maximum additions per rewrite, default fits available RAM\n"
         "  --max-members N           stop at this total membership, default 65535\n"
         "  --max-groups N            per-directory rollover file limit; default fills capacity\n"
@@ -913,7 +913,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--chia-root and --chia-executable require --harvester local");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
                 result.max_members <= 65535, "member caps must be in 1..65535");
-    require(result.workers <= 1024, "compression worker cap exceeds 1024");
+    require(result.workers <= 1024, "plotting CPU budget exceeds 1024");
     require(result.group_members <= 65535 && result.max_groups && result.max_total_members,
             "rollover group membership must fit in 1..65535 and limits must be positive");
     if (!result.target.empty()) result.target = fs::absolute(result.target).lexically_normal();

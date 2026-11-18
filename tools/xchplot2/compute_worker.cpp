@@ -42,7 +42,7 @@ void help(bool all)
         "  --directory DIR         saved compute setup directory\n"
         "  --interface NAME        sharing/discovery interface; repeat for more\n"
         "  --discovery on|off      LAN discovery, default from saved setup\n"
-        "  --listen HOST:PORT      listener override; otherwise an available port\n"
+        "  --listen HOST:PORT      override the saved worker listener port\n"
 #else
         "Usage: pos2_pr118_grow_worker --broker HOST:PORT --listen HOST:PORT\n"
 #endif
@@ -140,7 +140,7 @@ int main(int argc, char** argv)
             if (config.brokers.empty() && !identity->defaults.broker.empty())
                 config.brokers.push_back(group_grow::pool::parse_endpoint(identity->defaults.broker));
             for (auto& broker : config.brokers) broker.server_name = identity->server_name;
-            if (config.listen.host.empty()) config.listen = {"::", 0};
+            if (config.listen.host.empty()) config.listen = {"::", identity->defaults.worker_port};
             if (interfaces.empty()) interfaces = identity->defaults.interfaces;
             config.tls.listen_lan = interfaces.empty();
             config.tls.listen_interfaces = interfaces;
@@ -171,14 +171,35 @@ int main(int argc, char** argv)
             std::cerr << "Worker limits: " << capacity.slots << " slots, " << capacity.gpu_bytes << " GPU bytes; backend "
                 << config.backend << ", generation threads " << config.generation_threads << ", broker limit " << config.max_brokers << '\n';
         group_grow::WorkerService worker(std::move(config)); worker.start();
+        capacity = worker.status().capacity;
         if (identity && discover)
         {
             announcement.role = "worker"; announcement.endpoint = worker.endpoint();
             advertisement = std::make_unique<group_grow::pool::ComputeDiscovery>(std::move(announcement));
         }
-        if (!output.quiet) std::cout << "Sharing " << capacity.cpu_threads << " CPU threads and " << capacity.host_bytes
-            << " bytes of host RAM on port " << worker.endpoint().port << ". Waiting for plotting work.\n" << std::flush;
-        while (!stopped) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!output.quiet) std::cout << "Worker listening on port " << worker.endpoint().port << ": "
+            << capacity.cpu_threads << " CPU threads, " << capacity.host_bytes / (uint64_t(1) << 20)
+            << " MiB host RAM, " << capacity.gpu_bytes / (uint64_t(1) << 20) << " MiB GPU RAM.\n" << std::flush;
+        uint64_t healthy = UINT64_MAX;
+        auto admission = group_grow::pool::WorkerAdmission::Accepting;
+        while (!stopped)
+        {
+            auto const status = worker.status();
+            if (!output.quiet && (healthy != status.healthy_brokers || admission != status.admission))
+            {
+                healthy = status.healthy_brokers; admission = status.admission;
+                if (!healthy) std::cout << "Waiting for an authenticated broker connection. Check broker availability, network and firewall settings.\n";
+                else
+                {
+                    std::cout << "Registered with " << healthy << (healthy == 1 ? " broker" : " brokers");
+                    if (admission == group_grow::pool::WorkerAdmission::Accepting)
+                        std::cout << "; accepting plotting work. Plotting hosts must also be able to reach this worker's port.\n";
+                    else std::cout << "; worker admission is " << group_grow::pool::admission_name(admission) << ".\n";
+                }
+                std::cout << std::flush;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
         worker.stop(); return 0;
     }
     catch (std::exception const& error)

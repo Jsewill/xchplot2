@@ -265,7 +265,9 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         pool::DiscoveryOptions options; options.pool_id = identity->pool_id; options.node_id = identity->node_id;
         options.name = identity->name; options.server_name = identity->server_name; options.interfaces = identity->defaults.interfaces;
         pool::ComputeDiscovery discovery(std::move(options));
-        std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(1)));
+        // Match live job inspection: leave time for the initial one-second
+        // query retry when another browser consumed the throttled first reply.
+        std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(2)));
         for (auto const& service : discovery.services())
         {
             auto& destination = service.role == "broker" ? brokers : workers;
@@ -297,6 +299,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         std::cout << ",\"backend\":"; string(identity->defaults.backend);
         std::cout << ",\"cpus\":" << identity->defaults.cpus << ",\"host_bytes\":" << identity->defaults.host_bytes
             << ",\"gpu_bytes\":" << identity->defaults.gpu_bytes << ",\"max_brokers\":" << identity->defaults.max_brokers
+            << ",\"broker_port\":" << identity->defaults.broker_port << ",\"worker_port\":" << identity->defaults.worker_port
             << ",\"discovery\":" << (identity->defaults.discovery ? "true" : "false") << ",\"interfaces\":[";
         bool comma = false;
         for (auto const& interface : identity->defaults.interfaces)
@@ -317,7 +320,9 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
             std::cout << "LAN discovery: " << (identity->defaults.discovery ? "on" : "off")
                 << "\nOffered defaults: " << identity->defaults.backend << ", CPUs " << automatic(identity->defaults.cpus)
                 << ", host bytes " << automatic(identity->defaults.host_bytes) << ", GPU bytes " << automatic(identity->defaults.gpu_bytes)
-                << ", broker limit " << identity->defaults.max_brokers << "\nInterfaces:";
+                << ", broker limit " << identity->defaults.max_brokers
+                << "\nListener ports: broker " << identity->defaults.broker_port << ", worker "
+                << automatic(identity->defaults.worker_port) << "\nInterfaces:";
             if (identity->defaults.interfaces.empty()) std::cout << " active LAN interfaces";
             else for (auto const& interface : identity->defaults.interfaces) std::cout << ' ' << interface;
             std::cout << '\n';

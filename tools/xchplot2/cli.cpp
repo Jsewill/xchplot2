@@ -1514,6 +1514,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                       << "  invite     Create a private invitation for another machine\n"
                       << "  join       Enroll this machine from an invitation\n"
                       << "  configure  Save resource, network and dedicated broker defaults\n"
+                      << "  firewall   Print firewall commands for permitted peers\n"
                       << "  status     Show live workers, plotting job owners and tasks\n"
                       << "  pause / drain / resume  Control this machine's running worker\n"
                       << "  service    Manage a background worker or broker\n"
@@ -1542,6 +1543,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             if (values.front() == "broker") return pos2gpu::run_compute_broker(int(arguments.size()), arguments.data());
             if (values.front() == "worker") return pos2gpu::run_compute_worker(int(arguments.size()), arguments.data());
             if (values.front() == "service") return pos2gpu::run_compute_service(int(arguments.size()), arguments.data());
+            if (values.front() == "firewall") return pos2gpu::run_compute_firewall(int(arguments.size()), arguments.data());
             if (values.front() == "status" || values.front() == "pause" || values.front() == "drain" || values.front() == "resume")
                 return pos2gpu::run_compute_status(int(arguments.size()), arguments.data());
             if (values.front() == "members" || values.front() == "revoke" || values.front().starts_with("renew-") || values.front().starts_with("policy-"))
@@ -2992,9 +2994,9 @@ _xchplot2() {
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
-        compute)           COMPREPLY=( $(compgen -W "setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker" -- "$cur") ); return 0 ;;
+        compute)           COMPREPLY=( $(compgen -W "setup init invite join configure firewall members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker" -- "$cur") ); return 0 ;;
         service)           if [[ "${COMP_WORDS[1]}" == compute ]]; then COMPREPLY=( $(compgen -W "install start stop restart status remove print" -- "$cur") ); return 0; fi ;;
-        --role)            if [[ "${COMP_WORDS[2]}" == setup ]]; then COMPREPLY=( $(compgen -W "plotter worker" -- "$cur") ); else COMPREPLY=( $(compgen -W "worker broker" -- "$cur") ); fi; return 0 ;;
+        --role)            if [[ "${COMP_WORDS[2]}" == setup ]]; then COMPREPLY=( $(compgen -W "plotter worker" -- "$cur") ); elif [[ "${COMP_WORDS[2]}" == firewall ]]; then COMPREPLY=( $(compgen -W "worker broker both" -- "$cur") ); else COMPREPLY=( $(compgen -W "worker broker" -- "$cur") ); fi; return 0 ;;
         completions)       COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return 0 ;;
     esac
     if [ $COMP_CWORD -eq 1 ]; then
@@ -3010,7 +3012,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
@@ -3033,7 +3035,7 @@ _xchplot2() {
         return
     fi
     if [[ "${words[2]}" == compute && $CURRENT -eq 3 ]]; then
-        _values 'compute command' setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker
+        _values 'compute command' setup init invite join configure firewall members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker
         return
     fi
     if [[ "${words[2]}" == compute && "${words[3]}" == service && $CURRENT -eq 4 ]]; then
@@ -3057,10 +3059,15 @@ _xchplot2() {
         '--compute-directory[Saved compute setup directory]:value:' \
         '--compute-local[Offer local compute on or off]:value:' \
         '--directory[Saved compute setup directory]:value:' \
-        '--role[Compute setup or background service role]:role:(plotter worker broker)' \
+        '--role[Compute setup, service or firewall role]:role:(plotter worker broker both)' \
         '--worker[Worker status or control endpoint]:address:' \
         '--limit[Rows per broker status section]:count:' \
         '--max-brokers[Worker broker registration limit]:count:' \
+        '--broker-port[Saved dedicated broker port]:port:' \
+        '--worker-port[Saved worker listener port]:port:' \
+        '--firewall[Firewall command syntax]:firewall:(firewalld ufw)' \
+        '*--from[Permitted firewall peer or subnet]:address:' \
+        '--zone[Firewalld LAN zone]:zone:' \
         '--name[Machine display name]:value:' \
         '--interface[Sharing network interface]:value:' \
         '--discovery[LAN discovery on or off]:value:' \
@@ -3249,7 +3256,7 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'resume' -d 'Continue paused 
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'retire' -d 'Detach destinations, keep plots'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'grow' -d 'Extend an existing group'
 complete -c xchplot2 -n '__fish_use_subcommand' -a 'compute' -d 'Share compute'
-complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'setup init invite join configure members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and not __fish_seen_subcommand_from setup init invite join configure firewall members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker' -a 'setup init invite join configure firewall members revoke renew-request renew-sign renew-import policy-export policy-import status pause drain resume service broker worker'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute -r -d 'Shared compute auto or off'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-directory -r -d 'Saved compute setup directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l compute-local -r -d 'Offer local compute on or off'
@@ -3259,6 +3266,12 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_su
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l worker -r -d 'Worker status or control endpoint'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l limit -r -d 'Rows per broker status section'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l max-brokers -r -d 'Worker broker registration limit'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l broker-port -r -d 'Saved dedicated broker port'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l worker-port -r -d 'Saved worker listener port'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l firewall -r -a 'firewalld ufw' -d 'Firewall command syntax'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l from -r -d 'Permitted peer or subnet'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l zone -r -d 'Firewalld LAN zone'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l role -r -a 'broker worker both' -d 'Inbound listener roles'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l directory -r -d 'Saved compute setup directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l name -r -d 'Machine display name'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l interface -r -d 'Sharing network interface'

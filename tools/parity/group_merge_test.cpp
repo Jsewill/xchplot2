@@ -710,6 +710,45 @@ Config configuration()
     result.memory_limit_bytes = std::max(Engine::memory_bytes(18, result, 16), MergeEngine::memory_bytes(18, result, 16));
     return result;
 }
+void native_cpu_budget()
+{
+    using namespace grow_controller_test;
+    Arguments args; args.backend = "cpu"; args.workers = 1;
+    Backend backend; backend.mode = "cpu";
+    backend.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    auto const requested = identity_from(identity());
+    auto const original = worker_detail::cpu_threads();
+    std::atomic<bool> started{false}, observed{false}, escaped{false};
+    args.cancelled = [&]
+    {
+        if (worker_detail::cpu_limit)
+        {
+            observed.store(true);
+            if (worker_detail::cpu_threads() != 1) escaped.store(true);
+        }
+        return false;
+    };
+    std::future<Member> generated;
+    {
+        CodecScheduler::Lease occupied(backend.cpu_scheduler.get());
+        generated = std::async(std::launch::async, [&]
+        {
+            started.store(true);
+            return backend.generate(requested, 0, args, nullptr, nullptr);
+        });
+        while (!started.load()) std::this_thread::yield();
+        require(generated.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready && !observed.load(),
+            "native CPU generation escaped the shared plotting budget");
+    }
+    auto output = generated.get();
+    require(output.size() && observed.load() && !escaped.load() && worker_detail::cpu_threads() == original,
+        "native CPU generation lost its scoped allowance or leaked it into the caller");
+    args.cancelled = [] { return true; };
+    bool interrupted = false;
+    try { (void)backend.generate(requested, 0, args, nullptr, nullptr); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted, "native CPU budget wait ignored cancellation");
+}
 std::vector<std::vector<uint64_t>> members(size_t count = 8, uint64_t symbols = 64)
 {
     std::vector<std::vector<uint64_t>> result(count);
@@ -7992,6 +8031,7 @@ int main(int argc, char** argv) try
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
+    native_cpu_budget();
     controller_wakeups();
     test_destination_temporary();
     metadata_options();

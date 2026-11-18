@@ -2121,8 +2121,13 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     };
     auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset)
     {
-        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
-            input.append_chunk(member, chunk, encoded[offset + member][size_t(chunk)]);
+        for (uint64_t chunk = 0; chunk < chunks;)
+        {
+            std::array<std::span<uint8_t const>, 17> window;
+            size_t const count = size_t(std::min<uint64_t>(window.size(), chunks - chunk));
+            for (size_t i = 0; i < count; ++i) window[i] = encoded[offset + member][size_t(chunk) + i];
+            input.append_chunks(member, chunk, {window.data(), count}); chunk += count;
+        }
         input.finish_member(member);
     };
     auto feed = [&](ExternalEngine::ContributionInput& input, size_t offset, bool concurrent)
@@ -2256,8 +2261,10 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         for (uint64_t chunk = 0; chunk < 7; ++chunk) input->append_chunk(0, chunk, encoded[0][size_t(chunk)]);
         input->reset_member(0);
         require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
-        auto invalid = encoded[0][0]; invalid.push_back(0);
-        rejects([&] { input->append_chunk(0, 0, invalid); });
+        auto invalid = encoded[0][1]; invalid.push_back(0);
+        std::array<std::span<uint8_t const>, 2> window{encoded[0][0], invalid};
+        rejects([&] { input->append_chunks(0, 0, window); });
+        rejects([&] { input->append_chunk(0, 0, encoded[0][0]); });
         input->reset_member(0); feed_member(*input, 0, 0);
         for (auto& future : pending) future.get();
         input->seal(); rejects([&] { input->reset_member(0); });

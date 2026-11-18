@@ -1929,6 +1929,9 @@ public:
         return bytes;
     }
     void append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
+    { append_chunks(member, chunk, {&bytes, 1}, count); }
+    void append_chunks(uint16_t member, uint64_t chunk,
+        std::span<std::span<uint8_t const> const> chunks, uint16_t count = 1)
     {
         std::lock_guard lock(mutex_);
         if (engine_) engine_->config_.check_running();
@@ -1936,25 +1939,37 @@ public:
             "invalid contribution input member");
         claim(member, count);
         auto& entry = members_[member];
-        require(!entry.failed && !entry.finished && chunk == entry.next && chunk < PlotGroupFile::getChunkCountForK(engine_->identity_.header.k),
+        auto const total = PlotGroupFile::getChunkCountForK(engine_->identity_.header.k);
+        require(!entry.failed && !entry.finished && chunk == entry.next && chunk < total &&
+            !chunks.empty() && chunks.size() <= total - chunk,
             "contribution input chunks must arrive once in order");
         entry.failed = true;
-        require(bytes.size() > 1 && bytes.size() <= UINT32_MAX && bytes.size() <= engine_->config_.window_bytes,
-            "contribution input exceeds its receive window");
-        auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, bytes.size(), 0);
-        require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
         {
             ThreadCpuTimer timing(engine_->contribution_cpu_);
-            validator_->prepare(work);
-            auto const inspected = validator_->inspect(chunk, bytes, count);
-            require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
-                "contribution input exceeds its admitted fragment count");
-            entry.symbols += inspected.summary.symbols;
+            CodecScheduler::Lease compute(engine_->config_.cpu_scheduler.get(), 1,
+                [&] { engine_->config_.check_running(); });
+            uint64_t ordinal = chunk;
+            for (auto const bytes : chunks)
+            {
+                engine_->config_.check_running();
+                require(bytes.size() > 1 && bytes.size() <= UINT32_MAX && bytes.size() <= engine_->config_.window_bytes,
+                    "contribution input exceeds its receive window");
+                auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, bytes.size(), 0);
+                require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
+                validator_->prepare(work);
+                auto const inspected = validator_->inspect(ordinal++, bytes, count);
+                require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
+                    "contribution input exceeds its admitted fragment count");
+                entry.symbols += inspected.summary.symbols;
+            }
         }
         if (!entry.writer) entry.writer = std::make_unique<Writer>(*engine_, entry.run, "contribution", true);
-        Packet const packet{uint16_t(frontier_ + member), count, uint32_t(bytes.size())};
-        entry.writer->value(packet); entry.writer->write(bytes);
-        ++entry.next; entry.failed = false;
+        for (auto const bytes : chunks)
+        {
+            Packet const packet{uint16_t(frontier_ + member), count, uint32_t(bytes.size())};
+            entry.writer->value(packet); entry.writer->write(bytes);
+        }
+        entry.next += chunks.size(); entry.failed = false;
     }
     void finish_member(uint16_t member, uint16_t count = 1)
     {

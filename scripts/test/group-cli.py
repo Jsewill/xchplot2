@@ -1382,6 +1382,7 @@ def check(binary, root, reference=None):
     concise = run("plan", *options).stdout
     detailed = run("plan", *options, "-v").stdout
     assert len(concise) < len(detailed) and "--harvester" in concise
+    assert "Membership:" not in concise and "Membership:" in detailed
     assert "k18 (test only)" in concise
     assert run("plan", *options, "--progress").stdout == concise
     assert run("plan", *options, "-v", "--no-progress").stdout == detailed
@@ -4158,6 +4159,11 @@ def check_automatic_compute(binary, root):
         for name in states:
             run(name, "compute", "configure", "--interface", "lo", "--backend", "cpu",
                 "--cpus", 1, "--host-bytes", "512M")
+        # A saved listener must also work when concurrent jobs share one executor.
+        with socket.socket() as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            worker_port = port_socket.getsockname()[1]
+        run("first", "compute", "configure", "--worker-port", worker_port)
         refused = run("worker", "compute", "worker", "--max-brokers", 128, code=1)
         assert "reduce --max-brokers or increase --host-bytes" in refused.stderr, refused
         run("worker", "compute", "configure", "--max-brokers", 16)

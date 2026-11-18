@@ -41,6 +41,11 @@ struct WorkerChunkInput
 using WorkerPackedSink = std::function<void(PackedFragmentTile const&, uint64_t total_count)>;
 using WorkerContributionSink = std::function<void(uint64_t ordinal,
     std::span<uint8_t const> encoded, uint16_t members)>;
+// Borrowed spans remain valid only during the callback. A transport frame is
+// delivered in bounded windows without extending its lifetime or copying data.
+inline constexpr size_t contribution_window_chunks = 64;
+using WorkerContributionWindowSink = std::function<void(uint64_t ordinal,
+    std::span<std::span<uint8_t const> const> encoded, uint16_t members)>;
 struct WorkerTaskIdentity
 {
     std::string task_id;
@@ -260,7 +265,8 @@ public:
                   WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
-        WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
+        WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
+        WorkerContributionWindowSink const& = {});
     // Outage fallback shares the same admission ceiling as broker tasks. The
     // embedding owner records fallback completions separately from pool stats.
     void generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const&,

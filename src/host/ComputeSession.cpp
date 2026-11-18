@@ -128,6 +128,8 @@ void prepare_group_compute(GroupOptions& args)
             "--compute-local off cannot be combined with local compute offer options");
         return;
     }
+    if (args.pool_listen.empty() && identity->defaults.worker_port)
+        args.pool_listen = endpoint_text({"::", identity->defaults.worker_port});
     if (!args.pool_offer_ram) args.pool_offer_ram = std::max(args.max_ram / 2, std::min(uint64_t(256) << 20, args.max_ram / 4 * 3));
     auto limit = [](uint64_t selected, uint64_t saved) { return !selected ? saved : !saved ? selected : std::min(selected, saved); };
     args.pool_offer_ram_limit = limit(args.pool_offer_ram_limit, identity->defaults.host_bytes);

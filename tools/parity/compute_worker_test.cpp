@@ -542,15 +542,26 @@ void network(char const* ca, char const* cert, char const* key)
     rejects([&] { (void)client.encode(18, chunks, 1); });
     require(client.encode(18, chunks, uint64_t(1) << 20) == canonical, "worker codec failed reuse after owner output-bound rejection");
     uint64_t next_chunk = 0; size_t first = 0;
-    client.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+    auto check_contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
     {
         require(ordinal == next_chunk++ && members == 1, "TLS contribution order changed");
         size_t last = first; while (last < expected.size() && expected[last] < (ordinal + 1) * range) ++last;
         std::span<uint64_t const> values(expected.data() + first, last - first);
         require(std::ranges::equal(bytes, codec.encode(ordinal, {}, 0, {&values, 1})), "TLS initial contribution differs from local codec");
         first = last;
-    });
+    };
+    client.contributions(18, 2, {&id, 1}, check_contribution);
     require(next_chunk == PlotGroupFile::getChunkCountForK(18), "TLS contribution stream was truncated");
+    next_chunk = 0; first = 0; size_t largest_window = 0;
+    client.contributions(18, 2, {&id, 1}, check_contribution, {}, {},
+        [&](uint64_t ordinal, std::span<std::span<uint8_t const> const> window, uint16_t members)
+        {
+            require(!window.empty() && window.size() <= contribution_window_chunks, "unbounded contribution window");
+            largest_window = std::max(largest_window, window.size());
+            for (auto const bytes : window) check_contribution(ordinal++, bytes, members);
+        });
+    require(next_chunk == PlotGroupFile::getChunkCountForK(18) && largest_window > 1,
+        "TLS contribution windows were truncated or never coalesced");
 
     // A stalled consumer retains memory but relinquishes application compute.
     pool::BrokerClient controller(options.broker, tls); auto owner = controller.open_owner("stalled-worker-test");

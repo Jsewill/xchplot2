@@ -230,6 +230,7 @@ void validate_defaults(ComputeDefaults const& value)
 {
     if (!value.broker.empty()) (void)parse_endpoint(value.broker);
     require(value.cpus <= 1024 && value.max_brokers && value.max_brokers <= 4096 &&
+        value.broker_port && (!value.worker_port || value.worker_port != value.broker_port) &&
         (value.backend == "auto" || value.backend == "cpu" || value.backend == "gpu"),
         "invalid saved compute resources");
     require(value.interfaces.size() <= 32, "too many compute network interfaces");
@@ -246,9 +247,10 @@ std::string profile(std::string const& name, std::string const& node, ComputeDef
 {
     validate_name(name); validate_node(node); validate_defaults(defaults);
     std::ostringstream output;
-    output << "xchplot2-compute-2\n" << std::quoted(name) << ' ' << node << '\n'
+    output << "xchplot2-compute-3\n" << std::quoted(name) << ' ' << node << '\n'
         << std::quoted(defaults.broker) << ' ' << defaults.cpus << ' ' << defaults.host_bytes << ' '
-        << defaults.gpu_bytes << ' ' << defaults.backend << ' ' << defaults.discovery << ' ' << defaults.max_brokers << '\n';
+        << defaults.gpu_bytes << ' ' << defaults.backend << ' ' << defaults.discovery << ' ' << defaults.max_brokers
+        << ' ' << defaults.broker_port << ' ' << defaults.worker_port << '\n';
     for (auto const& item : defaults.interfaces) output << std::quoted(item) << '\n';
     return output.str();
 }
@@ -550,8 +552,10 @@ std::optional<PoolIdentity> load_pool(fs::path const& directory)
     auto& defaults = result.defaults;
     require(bool(input >> version >> std::quoted(result.name) >> result.node_id >> std::quoted(defaults.broker)
         >> defaults.cpus >> defaults.host_bytes >> defaults.gpu_bytes >> defaults.backend >> defaults.discovery) &&
-        (version == "xchplot2-compute-1" || version == "xchplot2-compute-2"), "invalid saved pool profile");
-    if (version == "xchplot2-compute-2") require(bool(input >> defaults.max_brokers), "invalid saved compute broker limit");
+        (version == "xchplot2-compute-1" || version == "xchplot2-compute-2" || version == "xchplot2-compute-3"), "invalid saved pool profile");
+    if (version != "xchplot2-compute-1") require(bool(input >> defaults.max_brokers), "invalid saved compute broker limit");
+    if (version == "xchplot2-compute-3")
+        require(bool(input >> defaults.broker_port >> defaults.worker_port), "invalid saved compute listener ports");
     input >> std::ws;
     while (input.peek() != std::char_traits<char>::eof())
     {

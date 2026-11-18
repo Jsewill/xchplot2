@@ -11,6 +11,7 @@ struct ComputeDefaults
     std::vector<std::string> interfaces;
     uint32_t cpus = 0;
     uint32_t max_brokers = 128;
+    uint16_t broker_port = 18444, worker_port = 0;
     uint64_t host_bytes = 0, gpu_bytes = 0;
     std::string backend = "auto";
     bool discovery = true;

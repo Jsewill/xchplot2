@@ -51,22 +51,37 @@ int main()
         rejects([&] { (void)join_pool(invitation, root / "worker"); });
         auto defaults = worker.defaults; defaults.broker = "127.0.0.1:12345";
         defaults.cpus = 2; defaults.host_bytes = 1ULL << 30; defaults.interfaces = {"eth0", "wlan0"}; defaults.max_brokers = 256;
+        defaults.broker_port = 23456; defaults.worker_port = 23457;
         configure_pool(worker, defaults); auto reloaded = *load_pool(worker.directory);
         require(reloaded.defaults.broker == defaults.broker && reloaded.defaults.cpus == 2 &&
             reloaded.defaults.host_bytes == defaults.host_bytes && reloaded.defaults.interfaces == defaults.interfaces &&
-            reloaded.defaults.max_brokers == defaults.max_brokers && reloaded.node_id == worker.node_id,
+            reloaded.defaults.max_brokers == defaults.max_brokers && reloaded.node_id == worker.node_id &&
+            reloaded.defaults.broker_port == defaults.broker_port && reloaded.defaults.worker_port == defaults.worker_port,
             "saved defaults changed membership or did not persist");
         defaults.backend = "invalid"; rejects([&] { configure_pool(worker, defaults); });
         require(load_pool(worker.directory)->defaults.backend == "auto", "rejected defaults changed the profile");
         defaults.backend = "auto"; defaults.max_brokers = 0; rejects([&] { configure_pool(worker, defaults); });
         defaults.max_brokers = 4097; rejects([&] { configure_pool(worker, defaults); });
+        defaults.max_brokers = 256; defaults.worker_port = defaults.broker_port;
+        rejects([&] { configure_pool(worker, defaults); });
+        defaults.worker_port = 0;
         std::ostringstream original;
         original << "xchplot2-compute-1\n" << std::quoted(worker.name) << ' ' << worker.node_id << '\n'
             << std::quoted(defaults.broker) << ' ' << defaults.cpus << ' ' << defaults.host_bytes << ' '
             << defaults.gpu_bytes << ' ' << defaults.backend << ' ' << defaults.discovery << '\n';
         for (auto const& interface : defaults.interfaces) original << std::quoted(interface) << '\n';
         { std::ofstream output(worker.directory / "profile"); output << original.str(); }
-        require(load_pool(worker.directory)->defaults.max_brokers == 128, "original profile did not receive the default broker limit");
+        auto legacy = *load_pool(worker.directory);
+        require(legacy.defaults.max_brokers == 128 && legacy.defaults.broker_port == 18444 && legacy.defaults.worker_port == 0,
+            "original profile changed its listener behavior or broker limit");
+        std::string v2 = original.str(); v2.replace(0, 18, "xchplot2-compute-2");
+        auto const interfaces = v2.find('\n', v2.find('\n') + 1);
+        auto const resources = v2.find('\n', interfaces + 1);
+        v2.insert(resources, " 256");
+        { std::ofstream output(worker.directory / "profile"); output << v2; }
+        legacy = *load_pool(worker.directory);
+        require(legacy.defaults.max_brokers == 256 && legacy.defaults.broker_port == 18444 && legacy.defaults.worker_port == 0,
+            "v2 profile changed its listener behavior");
 #ifdef _WIN32
         auto key_path = std::filesystem::path(reinterpret_cast<char8_t const*>(worker.tls.key_file.c_str()));
         auto key = pos2gpu::create_private_file_handle(key_path, GENERIC_READ, OPEN_EXISTING); ::CloseHandle(key);

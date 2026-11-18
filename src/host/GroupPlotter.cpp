@@ -24,6 +24,7 @@
 #include "host/GroupFarmReplotResources.hpp"
 #include "host/GroupWriter.hpp"
 #include "host/Random.hpp"
+#include "host/ComputeThreads.hpp"
 #include "plot/Plotter.hpp"
 #include "pos2_keygen.h"
 #include "host/GroupPlotter.hpp"
@@ -151,8 +152,12 @@ struct ProgressRegistry
 {
     std::mutex mutex;
     std::vector<std::weak_ptr<group_grow::WorkProgress>> work;
-    std::atomic<uint64_t> members{0}, published{0};
+    std::atomic<uint64_t> members{0}, published{0}, generated{0}, received_bytes{0};
 };
+void progress_generated(std::weak_ptr<ProgressRegistry> const& registry, uint64_t members = 1)
+{ if (auto state = registry.lock()) state->generated.fetch_add(members); }
+void progress_received(std::weak_ptr<ProgressRegistry> const& registry, uint64_t bytes)
+{ if (auto state = registry.lock()) state->received_bytes.fetch_add(bytes); }
 std::shared_ptr<group_grow::WorkProgress> progress_activity(std::weak_ptr<ProgressRegistry> const& registry,
     group_grow::ProgressPhase phase = group_grow::ProgressPhase::idle)
 {
@@ -204,7 +209,9 @@ public:
                     std::osyncstream out(std::cerr);
                     if (in_place) out << "\r\033[K";
                     out << '[' << args_.command << "] " << state->members.load() << " members assembled; "
-                        << state->published.load() << " files published";
+                        << state->published.load() << " files published; " << state->generated.load() << " members generated";
+                    auto const received = state->received_bytes.load();
+                    if (received) out << "; " << received / mib << " MiB received";
                     for (size_t i = 1; i < counts.size(); ++i) if (counts[i])
                     {
                         out << "; " << names[i];
@@ -402,8 +409,8 @@ uint64_t cpu_peak(PlotGroupParams const& group)
     uint64_t const section_pairs = max_pairs_per_section_possible(params);
     uint64_t const pairs = product(section_pairs, params.get_num_sections());
     uint64_t const element = std::max(
-        {sizeof(Xs_Candidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing)});
-    uint64_t const block = PlotLayout::align_up(product(section_pairs, element) / 4, 64);
+        {sizeof(WorkerReferenceXsCandidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing)});
+    uint64_t const block = WorkerReferencePlotLayout::align_up(product(section_pairs, element) / 4, 64);
     uint64_t const layout = sum(product(block, 32), 2 * mib);
 #if defined(GROW_MOVE_PLOTTER_OUTPUT) && GROW_MOVE_PLOTTER_OUTPUT
     constexpr uint64_t copies = 1;
@@ -780,6 +787,7 @@ struct Backend
                     "remote member count exceeds admitted bound or changed during transfer");
                 if (!receiver) { receiver.emplace(k, size_t(count), false); received_count = count; }
                 receiver->append(tile);
+                progress_received(progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
             };
         std::string const task_id = group_grow::pool::random_token();
         group_grow::WorkerTaskIdentity task(task_id);
@@ -1079,11 +1087,15 @@ struct Backend
                 return !stopped;
             }
         } progress(args);
-        Plotter::Options options{};
+        unsigned const threads = cpu_scheduler ? cpu_scheduler->workers() : unsigned(args.workers);
+        require(threads, "CPU producer has no plotting CPU allowance");
+        group_grow::CodecScheduler::Lease compute(cpu_scheduler.get(), threads, [&] { check_cancel(args); });
+        group_grow::worker_detail::CpuLimit limit(threads);
+        WorkerReferencePlotter::Options options{};
         options.validate = false;
         options.verbose = false;
         options.sink = &progress;
-        auto result = Plotter(identity.params.get_plot_params_for_index(index)).run(options).t3_proof_fragments;
+        auto result = WorkerReferencePlotter(identity.params.get_plot_params_for_index(index)).run(options).t3_proof_fragments;
         if (progress.failure) std::rethrow_exception(progress.failure);
         if (progress.stopped) throw Interrupted{};
         check_cancel(args);
@@ -1118,7 +1130,8 @@ struct Producer
     {
         return sum(group_grow::ExternalEngine::contribution_input_memory_bytes(config, count),
             product(count, sum(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)),
-                sizeof(std::future<void>) + 256)));
+                sizeof(std::future<void>) + 256 +
+                group_grow::contribution_window_chunks * sizeof(std::span<uint8_t const>))));
     }
     // A fill may run beside other destinations. The owner records its timing
     // only after joining, keeping the construction history on its controller.
@@ -1210,15 +1223,19 @@ struct Producer
                     {
                         uint16_t const members = uint16_t(ids.size());
                         bool touched = false;
-                        auto receive = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t received)
+                        auto receive_window = [&](uint64_t ordinal,
+                            std::span<std::span<uint8_t const> const> chunks, uint16_t received)
                         {
                             require(received == members, "pool contribution membership changed during transfer");
                             with_io(cancel, [&]
                             {
                                 touched = true; // append may claim its group before validation or I/O throws.
-                                input.append_chunk(slot, ordinal, bytes, received);
+                                input.append_chunks(slot, ordinal, chunks, received);
+                                for (auto const bytes : chunks) progress_received(backend.progress, bytes.size());
                             });
                         };
+                        auto receive = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t received)
+                        { receive_window(ordinal, {&bytes, 1}, received); };
                         auto reset = [&]
                         {
                             if (touched)
@@ -1249,7 +1266,7 @@ struct Producer
                             require(attempt < UINT64_MAX, "pool task attempt exhausted"); task.attempt = ++attempt;
                             try
                             {
-                                client->contributions(k, strength, ids, receive, cancel, task);
+                                client->contributions(k, strength, ids, receive, cancel, task, receive_window);
                                 break;
                             }
                             catch (group_grow::WorkerAdmissionRejected const&) { throw; }
@@ -1278,6 +1295,7 @@ struct Producer
                             }
                         }
                         with_io(cancel, [&] { input.finish_member(slot, members); });
+                        progress_generated(backend.progress, members);
                     };
                     try { generate(member, plot_ids); }
                     catch (group_grow::pool::UnsupportedResources const&)
@@ -1349,6 +1367,7 @@ struct Producer
                 auto result = item.ready.get(); in_flight -= item.bytes;
                 completed_bytes = sum(completed_bytes, sum(result.storage_bytes(), completed_metadata));
                 completed.emplace(item.member, std::move(result));
+                progress_generated(backend.progress);
                 pending.erase(pending.begin() + slot); made_progress = true;
             }
             while (!completed.empty() && completed.begin()->first == values.size())
@@ -1512,6 +1531,7 @@ struct Producer
             if (pending)
             {
                 values.push_back(pending->take());
+                progress_generated(backend.progress);
                 Backend::report_compact_cpu(pending->index, pending->compact_cpu, pending->profile);
                 pending.reset();
             }
@@ -1681,7 +1701,7 @@ struct Producer
                         if (tile.size() == tile.capacity()) { input.append_raw(tile); tile.clear(); }
                     }
                 if (!tile.empty()) input.append_raw(tile);
-                input.finish_member(); ++generated; continue;
+                input.finish_member(); ++generated; progress_generated(backend.progress); continue;
             }
 #endif
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
@@ -1703,11 +1723,15 @@ struct Producer
                         backend.gpu->generate_into_async(plot_id,
                             [sink](std::span<uint64_t const> tile, uint64_t total) { sink->raw(tile, total); });
                     auto previous = std::move(pending.ready); pending.ready = std::move(ready);
-                    if (previous.valid()) previous.get();
+                    if (previous.valid()) { previous.get(); progress_generated(backend.progress); }
                     if (overlaps) ++overlap_members;
                 }
-                else backend.gpu->generate_into(plot_id,
-                    [sink](std::span<uint64_t const> tile, uint64_t total) { sink->raw(tile, total); });
+                else
+                {
+                    backend.gpu->generate_into(plot_id,
+                        [sink](std::span<uint64_t const> tile, uint64_t total) { sink->raw(tile, total); });
+                    progress_generated(backend.progress);
+                }
                 ++generated; continue;
             }
 #endif
@@ -1726,9 +1750,10 @@ struct Producer
                 values = backend.generate(identity, index, options, nullptr, nullptr);
             }
             input.begin_member(member, values.size()); input.append_raw(values.view().raw()); input.finish_member(); ++generated;
+            progress_generated(backend.progress);
         }
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-        if (pending.ready.valid()) pending.ready.get();
+        if (pending.ready.valid()) { pending.ready.get(); progress_generated(backend.progress); }
 #endif
         if (generated < wanted) input.seal_prefix(); else input.seal();
         backend.generation_ns = sum(backend.generation_ns, group_grow::elapsed_ns(begin));
@@ -1823,6 +1848,7 @@ struct Producer
         require(actual <= budget,
                 "returned producer allocation exceeds --max-ram");
         peak = std::max(peak, actual);
+        progress_generated(backend.progress);
         return values;
     }
     void admit_engine(std::span<group_grow::Member const> values, uint64_t other_retained = 0)
@@ -4531,8 +4557,14 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
                       << ",\"pool_codec_chunks\":" << remote.accepted_chunks.load()
                       << ",\"pool_codec_fallback_windows\":" << remote.fallback_windows.load()
                       << ",\"pool_codec_calibration_windows\":" << remote.calibration_windows.load()
+                      << ",\"pool_codec_calibration_attempts\":" << remote.calibration_attempts.load()
+                      << ",\"pool_codec_failed_windows\":" << remote.failed_windows.load()
+                      << ",\"pool_codec_declined_windows\":" << remote.declined_windows.load()
+                      << ",\"pool_codec_unavailable_windows\":" << remote.unavailable_windows.load()
                       << ",\"pool_codec_input_bytes\":" << remote.input_bytes.load()
                       << ",\"pool_codec_output_bytes\":" << remote.output_bytes.load();
+            std::cout << ",\"pool_codec_last_failure\":";
+            pos2gpu::write_json_string(std::cout, backend.pool_remote->last_failure());
         }
         if (backend.pool_client)
         {
@@ -11975,7 +12007,8 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             if (!run.available[index]) out << " [unavailable]";
             else if (run.previous_destinations && index >= run.previous_destinations) out << " [new]";
             out << '\n';
-            print_farming_membership(out, run.state, d, false);
+            if (args.verbose || !args.plan_only || run.previous_destinations || !args.from_plan.empty())
+                print_farming_membership(out, run.state, d, false);
             if (run.available[index] && index < run.previous_destinations)
             {
                 auto const& lane = run.lanes[index];
