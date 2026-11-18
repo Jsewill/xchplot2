@@ -663,6 +663,20 @@ uniformly matching drives. Explicit scratch directories remain available
 regardless of that policy. Saved jobs and previews retain their scratch
 restrictions. `--temp-capacity-bytes SIZE` caps scratch per filesystem.
 External construction needs permitted scratch.
+
+With I/O overlap enabled, external construction can use several independent
+HDDs for one plot. The planner leaves drives available for other simultaneous
+destinations and divides scratch work by the bandwidth each disk can supply.
+It starts unmeasured drives with an equal share and updates placement as bulk
+transfers finish. On Linux it compares the plotter's submitted reads and writes
+with block-device counters to estimate bandwidth used by other processes.
+It also measures simultaneous transfers to account for shared storage paths.
+
+The plotter reads ahead and flushes extents on separate spindles concurrently.
+The RAM grant bounds the read cache and the number of outstanding transfers.
+Partitions and alternate paths to one drive share its bandwidth. Resuming a
+plot uses the scratch locations and capacities saved in its checkpoint.
+
 When a compute worker supplies compressed contributions, the plotting host
 validates their chunks as they arrive. It reuses the consecutive prefix in
 member order for conservative sizing. An out-of-order suffix is read from

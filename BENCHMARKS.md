@@ -107,6 +107,46 @@ reported 53.42 GB of construction writes. With destination scratch disabled,
 the updated plotter took 11.59 minutes and reported 86.04 GB of writes. Each
 configuration had one uninterrupted timed run with the same plot identities.
 
+### External scratch bandwidth
+
+A 4 GiB stream through the external run writer and reader measured the
+following rates on the storage host. The scratch write includes physical
+reservation, payload writes and durable flushes. Reads checked ordering after
+clean-cache eviction. The direct-I/O columns use separate sequential tests
+with 2 MiB requests and five seconds of work per HDD. Rates are decimal MB/s.
+
+| Scratch HDDs | External write | External read | Direct write | Direct read |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 819 | 918 | 1,064–1,071 | 1,072–1,073 |
+| 16 | 2,281 | 2,492 | 3,322–3,329 | 3,234–3,237 |
+
+The scratch runs used a 4 GiB RAM grant, a 16 MiB I/O window and 32 MiB
+extents. A longer 16 GiB stream with those settings sustained 807 MB/s
+writing and 957 MB/s reading on four HDDs, and 2,395 MB/s writing and
+2,797 MB/s reading on 16. For the 4 GiB stream the previous external writer
+and reader delivered 259 and 269 MB/s with the run distributed across four
+disks. Supplying those same directories to the previous plotter for a fresh
+job selected one scratch disk.
+
+A 24-member k=26, strength=2 plot used four scratch HDDs, a separate output
+HDD, eight CPU workers and 4 GiB of RAM. With the same identity and two-member
+batches, the previous plotter finished in 379.1 s and the updated plotter
+finished in 345.6 and 347.6 s. Encoding fell from 25.9 to 11.1–11.5 s,
+merging from 13.9 to 5.3–6.1 s, and final packing from 43.3 to 33.8–34.9 s.
+CPU generation took 291.3 s before and 289.3–290.0 s after the change.
+All three 5,530,724,485-byte files had the same SHA-256.
+
+With two simultaneous eight-member k=24 groups, each destination used a
+different pair of the four scratch HDDs. The previous planner assigned one
+scratch HDD per destination. Both runs took about 48 s under the shared
+eight-worker CPU budget. Each group matched its counterpart byte for byte.
+
+In a separate 12-member k=24 plot, an independent sequential reader sustained
+279 MB/s on one of the four scratch HDDs. That disk received 7.2% of the
+physical scratch-drive writes, compared with 32.0% for the same plot with the
+reader stopped. The two runs took 41.5 and 40.1 s respectively and produced
+identical files.
+
 ### Group size, build time and reader latency
 
 Each size had one fresh build with the same group identity, HDD and 8 GiB

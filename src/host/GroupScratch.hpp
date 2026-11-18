@@ -70,6 +70,23 @@ public:
         io_governor_ = std::move(governor);
         if (io_governor_) for (auto const& root : roots_)
             io_governor_->register_device(root.value.device, root.value.directory_device);
+        bandwidth_ = io_governor_;
+        if (!bandwidth_ && std::count_if(roots_.begin(), roots_.end(), [](Root const& root)
+            { return root.value.device.rotating && !root.value.device.drives.empty(); }) > 1)
+        {
+            bandwidth_ = std::make_shared<DiskIoGovernor>(DiskIoGovernor::sample_device, 0);
+            for (auto const& root : roots_) bandwidth_->register_device(root.value.device);
+        }
+    }
+    void bind_runtime(ExternalConfig& external) const
+    { external.io_governor = io_governor_; external.bandwidth = bandwidth_; }
+    std::vector<StorageDevice> scratch_devices(uint64_t owner) const
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<StorageDevice> devices;
+        if (auto const* entry = find(owner))
+            for (auto root : entry->roots) devices.push_back(roots_[root].value.device);
+        return devices;
     }
 
     // Register every saved output and its sidecar peak before seal_recovery().
@@ -140,7 +157,7 @@ public:
                 "saved physical scratch allocation exceeds its grant");
             roots.push_back(root);
         }
-        entry.external = external; entry.external.io_governor = io_governor_; entry.roots = std::move(roots);
+        entry.external = external; bind_runtime(entry.external); entry.roots = std::move(roots);
         entry.allocated.assign(allocated.begin(), allocated.end()); entry.restored = true;
         if (entry.output) entry.output->saved = true;
         for (size_t i = 0; i < entry.roots.size(); ++i)
@@ -200,7 +217,8 @@ public:
 
     std::optional<ExternalConfig> grant(uint64_t owner, uint64_t desired, uint64_t minimum,
                                         uint64_t segment_bytes, unsigned fan_in, bool automatic = false,
-                                        unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0)
+                                        unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0,
+                                        size_t parallel_roots = 1, size_t open_slots = SIZE_MAX)
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -209,7 +227,8 @@ public:
         auto* entry = find(owner);
         require(entry && entry->output && entry->external.scratch.empty() && !entry->io,
             "fresh scratch requires an idle destination reservation");
-        ExternalConfig external; external.segment_bytes = segment_bytes; external.fan_in = fan_in; external.io_governor = io_governor_;
+        ExternalConfig external; external.segment_bytes = segment_bytes; external.fan_in = fan_in;
+        bind_runtime(external);
         std::vector<size_t> selected; std::vector<size_t> seen;
         std::vector<size_t> order, ssds;
         order.reserve(roots_.size()); ssds.reserve(roots_.size());
@@ -220,9 +239,7 @@ public:
         }
         uint64_t remaining = desired;
         auto const& destination = roots_[entry->output->root].value.device;
-        // Quotas are a conservative backlog proxy, not measured bandwidth.
-        // Rank only known SSD slots; unknown and rotating storage retain the
-        // established supplied-order and physical-exclusion policy.
+        // Rank known SSDs by their outstanding capacity and active writers.
         auto pressure = [&](size_t root)
         {
             uint64_t reserved = 0; size_t active = 0;
@@ -252,6 +269,18 @@ public:
             size_t next = 0;
             for (auto& index : order) if (!roots_[index].value.device.nonrotating) index = rotating[next++];
         }
+        if (parallel_roots > 1)
+        {
+            uint64_t const extent = std::min(segment_bytes, read_buffer_bytes ? std::max(uint64_t(1), read_buffer_bytes / 8) : segment_bytes);
+            size_t const width = std::min<uint64_t>(parallel_roots, std::max<uint64_t>(1, desired / extent));
+            for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots))
+            {
+                auto const& root = roots_[i]; root.value.check();
+                selected.push_back(i); seen.push_back(root.filesystem);
+                external.scratch.push_back({root.value.directory, quota}); remaining -= quota;
+            }
+            external.striped = selected.size() > 1;
+        }
         // Prefer unused rotating drives before sharing a partial grant.
         for (unsigned speed : {0u, 1u}) for (bool sharing : {false, true})
             for (size_t const i : order)
@@ -265,10 +294,7 @@ public:
             if (shared_rotating(i, owner) != sharing) continue;
             seen.push_back(root.filesystem); root.value.check();
             if (segment_bytes > root.value.file_limit) continue;
-            auto const& filesystem = filesystems_[root.filesystem];
-            uint64_t room = free_bytes(filesystem);
-            if (capacity_) room = std::min(room, capacity_ - std::min(capacity_, filesystem.scratch));
-            uint64_t const quota = std::min(remaining, room) / root.value.alignment * root.value.alignment;
+            uint64_t const quota = std::min(remaining, grant_room(i)) / root.value.alignment * root.value.alignment;
             if (!quota) continue;
             selected.push_back(i); external.scratch.push_back({root.value.directory, quota}); remaining -= quota;
         }
@@ -365,6 +391,7 @@ public:
         uint64_t bytes = sizeof(*this) + 2 * (roots_.capacity() * sizeof(Root) +
             filesystems_.capacity() * sizeof(Filesystem) + owners_.capacity() * sizeof(Owner));
         if (io_governor_) bytes = grow_add(bytes, io_governor_->memory_bytes());
+        if (bandwidth_ && bandwidth_ != io_governor_) bytes = grow_add(bytes, bandwidth_->memory_bytes());
         for (auto const& root : roots_)
         {
             bytes = grow_add(bytes, root.value.directory.capacity() + 1 + root.value.device.filesystem.capacity() + 1 +
@@ -372,7 +399,7 @@ public:
             for (auto const& drive : root.value.device.drives) bytes = grow_add(bytes, drive.capacity() + 1);
             // One in-progress grant can own selected/seen tables and both
             // candidate/result grant arrays before their storage is moved.
-            bytes = grow_add(bytes, 6 * sizeof(size_t) + 2 * sizeof(ScratchGrant) + 2 * (root.value.directory.capacity() + 1));
+            bytes = grow_add(bytes, 8 * sizeof(size_t) + 2 * sizeof(long double) + 2 * sizeof(ScratchGrant) + 2 * (root.value.directory.capacity() + 1));
         }
         for (auto const& filesystem : filesystems_) bytes = grow_add(bytes, filesystem.name.capacity() + 1);
         for (auto const& entry : owners_)
@@ -403,6 +430,7 @@ private:
     std::vector<Filesystem> filesystems_;
     std::vector<Owner> owners_;
     std::shared_ptr<DiskIoGovernor> io_governor_;
+    std::shared_ptr<DiskIoGovernor> bandwidth_;
     mutable std::mutex mutex_;
     static uint64_t free_bytes(Filesystem const& filesystem)
     { return filesystem.headroom_available && filesystem.budget > filesystem.reserved ? filesystem.budget - filesystem.reserved : 0; }
@@ -460,6 +488,82 @@ private:
         for (auto const& drive : left.drives)
             if (std::find(right.drives.begin(), right.drives.end(), drive) != right.drives.end()) return true;
         return false;
+    }
+    uint64_t grant_room(size_t i) const
+    {
+        auto const& fs = filesystems_[roots_[i].filesystem]; auto const alignment = roots_[i].value.alignment;
+        uint64_t room = free_bytes(fs);
+        if (capacity_) room = std::min(room, capacity_ - std::min(capacity_, fs.scratch));
+        return room / alignment * alignment;
+    }
+    // Reserve the spindles needed by simultaneous output writers and balance
+    // the remaining drives by throughput before splitting a capacity grant.
+    std::vector<std::pair<size_t, uint64_t>> rotating_shares(uint64_t owner, StorageDevice const& destination,
+        std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots) const
+    {
+        struct Candidate { size_t root; uint64_t room; long double rate; };
+        std::vector<Candidate> disks;
+        size_t waiting = 1;
+        std::vector<size_t> outputs;
+        for (auto const& other : owners_) if (other.id != owner && other.output)
+        {
+            if (other.io || !other.external.scratch.empty()) outputs.push_back(other.output->root);
+            else if (waiting < open_slots)
+            { outputs.push_back(other.output->root); ++waiting; }
+        }
+        for (size_t i : order)
+        {
+            auto const& root = roots_[i];
+            if (!root.grantable || segment_bytes > root.value.file_limit || !grant_room(i)) continue;
+            if (!root.value.device.rotating || root.value.device.drives.empty())
+            {
+                if (root.value.device.nonrotating && (disks.empty() || automatic)) return {};
+                continue;
+            }
+            if ((automatic && destination.nonrotating) || shared_rotating(i, owner) ||
+                std::any_of(outputs.begin(), outputs.end(), [&](size_t output)
+                { return overlap(root.value.device, roots_[output].value.device); }) ||
+                std::any_of(disks.begin(), disks.end(), [&](Candidate const& other)
+                { return roots_[other.root].filesystem == root.filesystem || overlap(roots_[other.root].value.device, root.value.device); })) continue;
+            disks.push_back({i, grant_room(i), bandwidth_ ? bandwidth_->bandwidth(root.value.device) : 0});
+        }
+        // The output already has sequential writes of its own. Use it for
+        // scratch only when the dedicated disks cannot supply the grant.
+        uint64_t dedicated = 0;
+        for (auto const& disk : disks) if (!overlap(destination, roots_[disk.root].value.device))
+            dedicated += std::min(desired - dedicated, disk.room);
+        if (dedicated >= desired) std::erase_if(disks, [&](Candidate const& disk)
+            { return overlap(destination, roots_[disk.root].value.device); });
+        // Give unmeasured roots an equal first trial. A slow/busy root
+        // with a measured rate gets correspondingly less work.
+        long double total_rate = 0; size_t measured = 0;
+        for (auto const& disk : disks) if (disk.rate > 0) { total_rate += disk.rate; ++measured; }
+        for (auto& disk : disks) if (!disk.rate) disk.rate = measured ? total_rate / measured : 1;
+        std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.rate > b.rate; });
+        // Balance the available bandwidth of simultaneous owners. One
+        // fast spindle can serve the same work as several slower ones.
+        std::vector<long double> loads(std::min(waiting, disks.size()));
+        std::erase_if(disks, [&](Candidate const& disk)
+        {
+            auto least = std::min_element(loads.begin(), loads.end());
+            *least += disk.rate; return least != loads.begin();
+        });
+        if (disks.size() > width) disks.resize(width);
+        std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.room / a.rate < b.room / b.rate; });
+        total_rate = 0; for (auto const& disk : disks) total_rate += disk.rate;
+        std::vector<std::pair<size_t, uint64_t>> shares;
+        uint64_t remaining = desired;
+        for (size_t i = 0; i < disks.size(); ++i)
+        {
+            auto const& disk = disks[i];
+            auto const& root = roots_[disk.root];
+            uint64_t const share = i + 1 == disks.size() ? remaining : uint64_t(remaining * (disk.rate / total_rate));
+            uint64_t const quota = std::min(disk.room, share) / root.value.alignment * root.value.alignment;
+            total_rate -= disk.rate;
+            if (!quota) continue;
+            shares.emplace_back(disk.root, quota); remaining -= quota;
+        }
+        return shares;
     }
     bool shared_rotating(size_t root, uint64_t owner) const
     {

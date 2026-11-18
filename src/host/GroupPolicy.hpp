@@ -230,6 +230,7 @@ struct ExecutionWork
     long double scratch_read = 0, scratch_write = 0, destination = 0;
     uint64_t batches = 0;
     bool known = false, io_overlap = false;
+    long double scratch_bytes = 0;
 };
 struct ExecutionEstimate
 {
@@ -239,7 +240,10 @@ struct ExecutionEstimate
 struct ExecutionLane
 {
     ExecutionWork work;
-    size_t destination = 0, scratch = SIZE_MAX;
+    size_t destination = 0;
+    struct Scratch { size_t resource; long double weight; long double transfer_ns = 0; };
+    std::vector<Scratch> scratch;
+    bool parallel_scratch = false;
 };
 struct ExecutionReady
 {
@@ -377,33 +381,53 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
         { return a.remaining < b.remaining; })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
-    size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap)
+    size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap,
+    long double concurrent_scratch_bandwidth = 0)
 {
     ExecutionEstimate result;
     if (lanes.empty() || !active || active > lanes.size() || !workers || !granted || !resources) return result;
-    std::vector<long double> io(resources, 0);
-    long double cpu = 0, consumers = 0, longest = 0, drain = 0;
+    std::vector<long double> io(resources, 0), local(resources, 0);
+    long double cpu = 0, consumers = 0, longest = 0, drain = 0, scratch_bytes = 0;
     for (auto const& lane : lanes)
     {
         auto const& work = lane.work;
-        if (!work.known || !work.batches || lane.destination >= resources ||
-            ((work.scratch_read || work.scratch_write) && lane.scratch >= resources)) return {};
+        if (!work.known || !work.batches || lane.destination >= resources) return {};
         long double const scratch = work.scratch_read + work.scratch_write;
-        io[lane.destination] += work.destination;
-        if (scratch) io[lane.scratch] += scratch;
+        long double weights = 0;
+        for (auto const& part : lane.scratch)
+        {
+            if (part.resource >= resources || !(part.weight > 0) || !std::isfinite(part.weight)) return {};
+            weights += part.weight;
+        }
+        if (scratch && !weights) return {};
+        scratch_bytes += work.scratch_bytes;
+        local[lane.destination] = work.destination;
+        long double scratch_service = 0;
+        for (auto const& part : lane.scratch)
+        {
+            long double const service = std::max(part.transfer_ns, scratch * (part.weight / weights));
+            local[part.resource] += service; scratch_service += service;
+        }
+        long double lane_io = local[lane.destination];
+        auto charge = [&](size_t resource)
+        {
+            lane_io = std::max(lane_io, local[resource]);
+            io[resource] += local[resource]; local[resource] = 0;
+        };
+        charge(lane.destination);
+        for (auto const& part : lane.scratch) charge(part.resource);
+        if (!lane.parallel_scratch) lane_io = std::max(lane_io, scratch_service);
         result.generation += work.generation; cpu += work.cpu + work.serial;
-        result.scratch += scratch; result.destination += work.destination;
+        result.scratch += scratch_service; result.destination += work.destination;
         long double const compute = std::max(work.cpu / granted, work.serial);
-        long double const lane_io = lane.scratch == lane.destination ? scratch + work.destination :
-            std::max(scratch, work.destination);
         long double const consumer = work.io_overlap ? std::max(compute, lane_io) :
-            work.cpu / granted + work.serial + scratch + work.destination;
+            work.cpu / granted + work.serial + scratch_service + work.destination;
         consumers += consumer; longest = std::max(longest, consumer);
         drain = std::max(drain, std::min(work.generation, consumer) / work.batches);
     }
     result.cpu = cpu / std::min<long double>(workers, active * granted);
     long double const downstream = std::max({result.cpu, *std::max_element(io.begin(), io.end()),
-        consumers / active, longest});
+        concurrent_scratch_bandwidth > 0 ? scratch_bytes / concurrent_scratch_bandwidth : 0, consumers / active, longest});
     result.completion = generation_overlap ? std::max(result.generation, downstream) + drain :
         result.generation + downstream;
     result.known = std::isfinite(result.completion) && result.completion > 0;
@@ -983,6 +1007,7 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
             if (!read || !packed_read || !written) return {};
             result.scratch_read = runs.read * *read + pack.read * *packed_read;
             result.scratch_write = runs.write * *written;
+            result.scratch_bytes = runs.read + pack.read + runs.write;
             auto median = [](ConstructionSamples const& samples, auto field) -> std::optional<long double>
             {
                 if (!samples.count) return {};

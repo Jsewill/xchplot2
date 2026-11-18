@@ -2895,14 +2895,14 @@ void execution_planning()
     require(select(1).active == 1, "partitions multiplied one physical output's execution capacity");
     for (size_t i = 0; i < lanes.size(); ++i)
     {
-        lanes[i].destination = i; lanes[i].scratch = lanes.size();
+        lanes[i].destination = i; lanes[i].scratch = {{lanes.size(), 1}};
         lanes[i].work.destination = 1; lanes[i].work.scratch_read = lanes[i].work.scratch_write = 1000;
     }
     require(select(lanes.size() + 1).active == 1, "shared scratch demand was divided by active destinations");
     lanes.back().work.known = false;
     require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
         "an unmeasured destination inherited another drive's service rate");
-    lanes.back().work.known = true; lanes.back().scratch = SIZE_MAX;
+    lanes.back().work.known = true; lanes.back().scratch.clear();
     require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
         "unknown scratch attribution acquired an execution estimate");
     std::array<ExecutionReady, 3> ready{{{7, 0, 100, true}, {8, 0, 300, true}, {9, 0, 200, true}}};
@@ -2991,11 +2991,24 @@ void execution_planning()
         "a heterogeneous peer consumed another owner's ordinary singleton fallback headroom");
     std::array<ExecutionLane, 2> mixed;
     for (auto& lane : mixed) { lane.work.generation = 1; lane.work.batches = 1; lane.work.known = lane.work.io_overlap = true; }
-    mixed[0].destination = 0; mixed[0].scratch = 1; mixed[0].work.scratch_write = 1000;
+    mixed[0].destination = 0; mixed[0].scratch = {{1, 1}}; mixed[0].work.scratch_write = 1000;
     mixed[1].destination = 1; mixed[1].work.destination = 1000;
     auto const same_nvme = pipeline_execution_estimate(mixed, 2, 24, 12, 2, true);
     require(same_nvme.known && same_nvme.completion >= mixed[0].work.scratch_write + mixed[1].work.destination,
         "NVMe output and another owner's scratch multiplied the same physical resource");
+    mixed[0].scratch = {{1, 2}, {2, 1}, {2, 1}}; mixed[0].parallel_scratch = true;
+    mixed[0].work.scratch_bytes = 3000;
+    auto stripe = [&](long double bandwidth)
+    { return pipeline_execution_estimate(mixed, 2, 24, 12, 3, false, bandwidth).completion; };
+    require(stripe(0) == 1502 && stripe(1) == 3002,
+        "striped execution lost shared destination service or exceeded observed simultaneous bandwidth");
+    mixed[1].work.destination = 0;
+    require(stripe(0) == 502, "two paths to one scratch disk multiplied its parallel service");
+    mixed[0].parallel_scratch = false;
+    require(stripe(0) == 1002, "an unmeasured stripe earned an unobserved bandwidth gain");
+    mixed[0].parallel_scratch = true;
+    mixed[0].scratch.front().transfer_ns = 4000;
+    require(stripe(0) == 4002, "a fall in available scratch bandwidth left the execution estimate unchanged");
     StreamingInputCohort cohort(3);
     require(cohort.stream_allowed(0) && !cohort.stream_allowed(1), "cold compact input split an existing cohort");
     cohort.admit(0, 98, 10, true, 100); cohort.admit(1, 48, 11, false, 110);

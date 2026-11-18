@@ -93,6 +93,7 @@ class DiskIoGovernor
 {
 public:
     using Clock = std::chrono::steady_clock;
+    enum class Transfer { read, write, flush };
     struct Counters
     {
         uint64_t reads = 0, writes = 0, read_ms = 0, write_ms = 0;
@@ -106,7 +107,8 @@ public:
         bool farming_known = false, pressured = false;
         uint64_t completed_bytes = 0, waits = 0;
     };
-    explicit DiskIoGovernor(Sampler sampler = sample_device) : sampler_(std::move(sampler)) { pending_.reserve(4096); }
+    explicit DiskIoGovernor(Sampler sampler = sample_device, size_t pending_capacity = 4096)
+        : sampler_(std::move(sampler)) { pending_.reserve(pending_capacity); }
 
     void register_device(StorageDevice const& device, std::optional<uint64_t> filesystem = {})
     {
@@ -164,6 +166,64 @@ public:
         std::lock_guard lock(mutex_); ++selection_;
         for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end()) at->second.selected = selection_;
     }
+    // Bytes per nanosecond available to a scratch stream. Multiple paths to
+    // one volume do not multiply its rate. Prefer block-device service to a
+    // buffered syscall and let foreign traffic keep its observed share.
+    long double bandwidth(StorageDevice const& device, Clock::time_point now = Clock::now())
+    {
+        std::lock_guard lock(mutex_); poll_locked(now);
+        long double service = 0, occupied = 0;
+        for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end())
+        {
+            auto const& drive = at->second;
+            service = std::max(service, drive.counters ? (drive.bulk_bytes ? drive.bulk_ns / drive.bulk_bytes : 0) : drive.ns_per_byte);
+            if (now < drive.share_until) occupied = std::max(occupied, drive.foreign_fraction);
+        }
+        return service > 0 ? (1 - occupied) / service : 0;
+    }
+    // Only combine rates observed during the same busy interval. In
+    // particular, isolated drive peaks cannot establish a shared HBA rate.
+    long double concurrent_bandwidth(std::span<StorageDevice const> devices, Clock::time_point now = Clock::now())
+    {
+        if (devices.size() < 2) return 0;
+        std::lock_guard lock(mutex_); poll_locked(now);
+        Clock::time_point sampled{}; long double total = 0;
+        size_t covered = 0, width = 0;
+        for (auto const& device : devices)
+        {
+            Clock::time_point latest{}; long double rate = 0;
+            size_t paths = 0;
+            for (auto const& name : device.drives) if (auto it = drives_.find(name); it != drives_.end())
+            {
+                auto const& drive = it->second;
+                if (drive.busy_sample > latest) { latest = drive.busy_sample; rate = 0; paths = 0; }
+                if (drive.busy_sample == latest && drive.busy_rate > 0)
+                { rate = std::max(rate, drive.busy_rate); width = drive.busy_width; ++paths; }
+            }
+            if (!rate || (total && latest != sampled)) return 0;
+            sampled = latest; total += rate; covered += paths;
+        }
+        return covered == width ? total : 0;
+    }
+    // Ordinary construction samples transfers without installing a farming
+    // throttle. The protected path already observes its own native permits.
+    void observe_transfer(StorageDevice const& device, uint64_t bytes, uint64_t ns,
+                          Transfer transfer = Transfer::read, Clock::time_point now = Clock::now())
+    {
+        if (!bytes || !device.rotating || device.drives.empty()) return;
+        std::lock_guard lock(mutex_);
+        for_drives(device, [&](Drive& drive)
+        {
+            drive.own_at = now;
+            drive.submit(transfer, bytes);
+            if (ns)
+            {
+                long double const cost = static_cast<long double>(ns) / bytes;
+                drive.ns_per_byte = drive.ns_per_byte ? (3 * drive.ns_per_byte + cost) / 4 : cost;
+            }
+        });
+        poll_locked(now);
+    }
     class Permit
     {
     public:
@@ -183,8 +243,8 @@ public:
         Permit(Permit const&) = delete;
         Permit& operator=(Permit const&) = delete;
         size_t bytes() const { return bytes_; }
-        void complete(uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
-        { if (auto* governor = std::exchange(governor_, nullptr)) governor->complete(*device_, bytes, elapsed_ns, now); }
+        void complete(uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now(), Transfer transfer = Transfer::read)
+        { if (auto* governor = std::exchange(governor_, nullptr)) governor->complete(*device_, bytes, elapsed_ns, now, transfer); }
     private:
         friend class DiskIoGovernor;
         Permit(DiskIoGovernor* governor, StorageDevice const* device, size_t bytes)
@@ -274,11 +334,33 @@ private:
     static constexpr char const* unknown_drive = "unresolved";
     struct Drive
     {
+        struct Stream
+        {
+            long double physical = 0, submitted = 0, carry = 0;
+            long double outside()
+            {
+                long double const excess = physical - submitted - carry;
+                // Cached submissions may reach disk in the following interval.
+                // Credit them once, separately for reads and writes.
+                carry = std::min(submitted, std::max(0.L, -excess));
+                physical = submitted = 0;
+                return std::max(0.L, excess);
+            }
+        } reads, writes;
         std::optional<Counters> counters;
         Clock::time_point sampled{}, own_at{}, next{}, foreign_until{};
-        long double ns_per_byte = 0, device_ns_per_byte = 0;
+        long double ns_per_byte = 0, device_ns_per_byte = 0, foreign_fraction = 0;
+        Clock::time_point busy_sample{}, share_until{}, traffic_since{};
+        long double traffic_busy_ns = 0;
+        long double busy_rate = 0, interval_rate = 0, bulk_bytes = 0, bulk_ns = 0;
+        size_t busy_width = 0;
         uint64_t selected = 0;
         size_t active = 0;
+        void submit(Transfer transfer, uint64_t bytes)
+        {
+            if (transfer == Transfer::read) reads.submitted += bytes;
+            if (transfer == Transfer::write) writes.submitted += bytes;
+        }
     };
     std::map<std::string, Drive> drives_;
     std::map<uint64_t, StorageDevice> filesystems_;
@@ -362,12 +444,32 @@ private:
         if (sampled_ != Clock::time_point{} && now >= sampled_ && now - sampled_ < std::chrono::milliseconds(250)) return;
         sampled_ = now;
         if (!farming_timely(now)) limit_ = std::min<size_t>(limit_, 2);
+        size_t busy = 0;
         for (auto& [name, drive] : drives_)
         {
+            drive.interval_rate = 0;
             auto current = sampler_ ? sampler_(name) : std::optional<Counters>{};
             if (current && drive.counters && current->busy_ms >= drive.counters->busy_ms &&
                 current->read_sectors >= drive.counters->read_sectors && current->write_sectors >= drive.counters->write_sectors)
             {
+                drive.reads.physical += (current->read_sectors - drive.counters->read_sectors) * 512.L;
+                drive.writes.physical += (current->write_sectors - drive.counters->write_sectors) * 512.L;
+                auto const interval = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.sampled).count();
+                drive.traffic_busy_ns += std::clamp<long double>((current->busy_ms - drive.counters->busy_ms) * 1000000.L,
+                    0, std::max<int64_t>(0, interval));
+                if (now - drive.traffic_since >= std::chrono::seconds(1))
+                {
+                    long double const physical = drive.reads.physical + drive.writes.physical;
+                    long double const outside = drive.reads.outside() + drive.writes.outside();
+                    auto const elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.traffic_since).count();
+                    // Attribute bulk traffic even while this plot is active.
+                    // Metadata-only contention is observable on a quiet disk.
+                    long double const fraction = physical >= 1024 * 1024 ? outside / physical :
+                        !drive.active && drive.own_at < drive.traffic_since ? 1.L : 0.L;
+                    drive.foreign_fraction = std::min(.99L, fraction * drive.traffic_busy_ns / elapsed);
+                    drive.share_until = now + std::chrono::seconds(2);
+                    drive.traffic_since = now; drive.traffic_busy_ns = 0;
+                }
                 // Sector and busy counters see completed block work below the
                 // page cache. Do not let fast cached writes erase that service
                 // cost or create an unbounded deferred writeback queue.
@@ -377,9 +479,25 @@ private:
                 {
                     long double const service = (current->busy_ms - drive.counters->busy_ms) * 1000000.L / (sectors * 512.L);
                     drive.device_ns_per_byte = drive.device_ns_per_byte ? (drive.device_ns_per_byte * 3 + service) / 4 : service;
+                    // Small metadata transactions and seeks do not measure a
+                    // spindle's sequential transfer rate. Weight bulk samples
+                    // by bytes so a short flush cannot sideline a whole disk.
+                    if (sectors >= 2048)
+                    {
+                        long double const ns_busy = (current->busy_ms - drive.counters->busy_ms) * 1000000.L;
+                        drive.bulk_bytes = .75L * drive.bulk_bytes + sectors * 512.L;
+                        drive.bulk_ns = .75L * drive.bulk_ns + ns_busy;
+                        auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.sampled).count();
+                        if (ns > 0 && ns_busy >= .8L * ns)
+                        { drive.interval_rate = sectors * 512.L / ns; ++busy; }
+                    }
                 }
             }
-            else drive.device_ns_per_byte = 0;
+            else
+            {
+                drive.device_ns_per_byte = drive.bulk_bytes = drive.bulk_ns = drive.busy_rate = 0; drive.busy_sample = {};
+                drive.reads = {}; drive.writes = {}; drive.traffic_busy_ns = drive.foreign_fraction = 0; drive.traffic_since = now;
+            }
             if (current && drive.counters && now > drive.sampled && drive.own_at < drive.sampled &&
                 !drive.active && now - drive.own_at > std::chrono::seconds(1) &&
                 current->busy_ms >= drive.counters->busy_ms && current->queue_ms >= drive.counters->queue_ms)
@@ -391,6 +509,10 @@ private:
             }
             drive.counters = current; drive.sampled = now;
         }
+        // A serial tail cannot replace a joint measurement. Only reuse the
+        // sample for a plan covering the physical paths that produced it.
+        if (busy > 1) for (auto& [name, drive] : drives_) if (drive.interval_rate > 0)
+        { drive.busy_sample = now; drive.busy_rate = drive.interval_rate; drive.busy_width = busy; }
         if (window_ == Clock::time_point{} || now < window_) { window_ = now; window_bytes_ = completed_bytes_; return; }
         if (now - window_ < std::chrono::seconds(2)) return;
         long double const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - window_).count();
@@ -410,13 +532,14 @@ private:
         }
         window_ = now; window_bytes_ = completed_bytes_; waiting_ = false;
     }
-    void complete(StorageDevice const& device, uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
+    void complete(StorageDevice const& device, uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now(),
+                  Transfer transfer = Transfer::read)
     {
         std::lock_guard lock(mutex_);
         --active_; completed_bytes_ = grow_add(completed_bytes_, bytes);
         for_drives(device, [&](Drive& drive)
         {
-            --drive.active; drive.own_at = now;
+            --drive.active; drive.own_at = now; drive.submit(transfer, bytes);
             if (bytes && elapsed_ns)
             {
                 long double const rate = static_cast<long double>(elapsed_ns) / bytes;

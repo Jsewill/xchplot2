@@ -471,6 +471,85 @@ void ssd_backlog(fs::path const& directory)
     require(io && !unknown.try_io(1), "backlog ranking weakened unknown-resource I/O exclusion");
     io.reset(); unknown.cancel(0); unknown.cancel(1);
 }
+void rotating_bandwidth(fs::path const& directory)
+{
+    std::vector<ScratchRoot> disks;
+    for (std::string name : {"a", "b", "c", "d"})
+    {
+        disks.push_back(root(directory / name, name, {name}));
+        disks.back().device.rotating = true;
+    }
+    auto first = root(directory / "e", "output-1", {"output-1"});
+    auto second = root(directory / "f", "output-2", {"output-2"});
+    auto observe = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+    ScratchPool pool(disks, 0); pool.set_io_governor(observe);
+    for (size_t i = 0; i < disks.size(); ++i) observe->observe_transfer(disks[i].device, (4 - i) * unit, unit);
+    require(pool.try_reserve_output(0, first, unit) && pool.try_reserve_output(1, second, unit), "HDD output admission failed");
+    pool.seal_recovery();
+    auto a = pool.grant(0, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 2);
+    auto b = pool.grant(1, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 1);
+    auto check = [&](ExternalConfig const& grant, size_t root, uint64_t bytes)
+    { return std::any_of(grant.scratch.begin(), grant.scratch.end(), [&](auto const& part)
+        { return part.directory == disks[root].directory && part.capacity_bytes == bytes; }); };
+    require(a && b && a->striped && b->striped && pool.io_compatible(0, 1) &&
+        check(*a, 0, 40 * unit) && check(*a, 3, 10 * unit) &&
+        check(*b, 1, 30 * unit) && check(*b, 2, 20 * unit),
+        "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
+    pool.cancel(0); pool.cancel(1);
+
+    auto alias = disks.front(); alias.directory = first.directory; alias.directory_inode = first.directory_inode;
+    alias.device.filesystem = "other-partition";
+    disks.push_back(alias);
+    ScratchPool alone(disks, 0);
+    require(alone.try_reserve_output(0, second, unit) && alone.try_reserve_output(1, second, unit), "queued HDD output admission failed");
+    alone.seal_recovery();
+    auto wide = alone.grant(0, 100 * unit, 100 * unit, unit, 2, true, 0, 0, 8, 1);
+    require(wide && wide->scratch.size() == 4 && quota(*wide) == 100 * unit,
+        "a queued owner stranded bandwidth or a partition multiplied one HDD");
+
+    using namespace std::chrono;
+    std::array<DiskIoGovernor::Counters, 2> counters{};
+    DiskIoGovernor shared([&](std::string const& name) { return std::optional{counters[name == "a" ? 0 : 1]}; });
+    std::array<StorageDevice, 2> pair{disks[0].device, disks[1].device};
+    for (auto const& device : pair) shared.register_device(device);
+    auto const begin = DiskIoGovernor::Clock::now(); shared.poll(begin);
+    counters[0].read_sectors = 200000; counters[0].busy_ms = 1000;
+    require(!shared.concurrent_bandwidth(pair, begin + seconds(1)), "an isolated drive supplied aggregate controller bandwidth");
+    counters[0].read_sectors += 100000; counters[0].busy_ms += 1000;
+    counters[1].write_sectors = 150000; counters[1].busy_ms = 1000;
+    require(std::abs(shared.concurrent_bandwidth(pair, begin + seconds(2)) - 250000 * 512.L / 1000000000) < 1e-15L,
+        "shared paths were priced at isolated rates despite concurrent block measurements");
+    counters[0].read_sectors += 100000; counters[0].busy_ms += 500;
+    auto const concurrent = shared.concurrent_bandwidth(pair, begin + seconds(3));
+    auto const available = shared.bandwidth(pair[0], begin + seconds(3));
+    require(concurrent > 0 && available < shared.bandwidth(pair[0], begin + seconds(5)),
+        "a partial foreign load failed to reserve its bandwidth or erased a joint measurement");
+
+    // Both disks complete our writes. A competing sequential reader on one
+    // of them cannot turn its extra sectors into bandwidth for this plot.
+    DiskIoGovernor competing([&](std::string const& name) { return std::optional{counters[name == "a" ? 0 : 1]}; });
+    for (auto const& device : pair) competing.register_device(device);
+    competing.poll(begin);
+    constexpr uint64_t mib = 1024 * 1024;
+    for (size_t i = 0; i < pair.size(); ++i)
+    {
+        competing.observe_transfer(pair[i], 16 * mib, 0, DiskIoGovernor::Transfer::write, begin + milliseconds(100));
+        counters[i].write_sectors += 16 * mib / 512;
+        counters[i].busy_ms += i ? 100 : 1000;
+    }
+    counters[0].read_sectors += 144 * mib / 512;
+    auto const busy = competing.bandwidth(pair[0], begin + seconds(1));
+    require(busy > 0 && busy < competing.bandwidth(pair[1], begin + seconds(1)) / 5,
+        "another reader's throughput was credited to an active scratch writer");
+    competing.observe_transfer(pair[1], 32 * mib, 0, DiskIoGovernor::Transfer::write, begin + milliseconds(1100));
+    competing.poll(begin + seconds(2));
+    counters[1].write_sectors += 32 * mib / 512; counters[1].busy_ms += 1000;
+    auto const writeback = competing.bandwidth(pair[1], begin + seconds(3));
+    competing.observe_transfer(pair[1], 32 * mib, 1000000, DiskIoGovernor::Transfer::flush, begin + milliseconds(3100));
+    counters[1].write_sectors += 32 * mib / 512; counters[1].busy_ms += 1000;
+    require(writeback > 0 && competing.bandwidth(pair[1], begin + seconds(4)) < writeback / 5,
+        "deferred own writeback or its flush hid a subsequent outside writer");
+}
 void disk_feedback(fs::path const& directory)
 {
     using Clock = DiskIoGovernor::Clock;
@@ -724,7 +803,8 @@ int main() try
     topology(directory, true, false); topology(directory, false, false); topology(directory, true, true);
     staged_topology(directory, true, false); staged_topology(directory, false, false); staged_topology(directory, true, true);
     staged_aliases(directory); saved_staging(directory); staged_distributed(directory);
-    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory); disk_feedback(directory);
+    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory);
+    rotating_bandwidth(directory); disk_feedback(directory);
     for (std::string const name : {"a", "b", "c", "d", "e", "f"})
         require(fs::is_empty(directory / name), "capacity discovery or admission wrote to a supplied directory");
     fs::remove_all(directory);

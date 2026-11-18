@@ -3276,7 +3276,7 @@ uint64_t temporary_output_capacity(Arguments const& args, Identity const& identi
 std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPool& pool,
     uint64_t owner, fs::path const& directory, Identity const& identity, uint16_t maximum, uint16_t batch,
     group_grow::Config& config, bool automatic, bool* output_capacity_rejected = nullptr, bool preserve_output = false,
-    bool input = false)
+    bool input = false, size_t open_slots = SIZE_MAX)
 {
     uint64_t const batches = (uint64_t(maximum) + batch - 1) / batch;
     uint64_t const run = sum(canonical_bound(identity, batch),
@@ -3300,7 +3300,24 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
         }
         if (!minimum) return {};
         auto grant = pool.grant(owner, desired, minimum, segment, 4, automatic, packing_inputs,
-            product(config.window_bytes, 8));
+            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots);
+        if (grant && grant->striped)
+        {
+            // Keep each disk sequential, but expose several disks within a
+            // contribution. Larger extents remain available under tight RAM.
+            uint8_t const k = uint8_t(identity.params.get_k());
+            uint64_t const cache = group_grow::ExternalEngine::read_buffer_bytes(k, config, *grant);
+            uint64_t extent = std::min({segment, std::max(mib, product(config.window_bytes, 2)),
+                std::max(mib, std::bit_floor(std::min(cache, run) / grant->scratch.size()))});
+            for (; extent < segment; extent = std::min(segment, 2 * extent))
+            {
+                grant->segment_bytes = extent;
+                if (group_grow::ExternalEngine::memory_bytes(k, config, *grant, batch) <= config.memory_limit_bytes &&
+                    sum(group_grow::ExternalEngine::metadata_bytes(k, *grant),
+                        sizeof(group_grow::Header) + identity.memo.size()) <= config.capacity_bytes) break;
+            }
+            grant->segment_bytes = extent;
+        }
         if (grant && group_grow::ExternalEngine::metadata_bytes(uint8_t(identity.params.get_k()), *grant) +
                 sizeof(group_grow::Header) + identity.memo.size() > config.capacity_bytes)
         {
@@ -3795,7 +3812,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             require(sum(recovery->peak_bytes, auxiliary.retired) <= capacity_limit,
                 "saved external output and metadata exceed capacity");
             scratch_pool->restore(0, recovery->external, recovery->allocated_bytes);
-            scratch = recovery->external; scratch->io_governor = args.disk_io;
+            scratch = recovery->external; scratch_pool->bind_runtime(*scratch);
         }
         if (successor && successor->recovery)
         {
@@ -10032,6 +10049,7 @@ bool replot_external_capacity(Arguments const& args, Identity const& identity, u
     remember(output);
     for (auto const& root : roots) { remember(root); paths.push_back(file_io::native_path(root.directory)); }
     ScratchPool pool(std::move(roots), args.headroom, args.temporary_capacity);
+    pool.set_io_governor(args.disk_io);
     uint64_t const metadata = sum(CodecScheduler::memory_bytes(unsigned(args.workers)), sum(path_metadata(args.temporary),
         sum(path_metadata(paths), recovery ? external_metadata(*recovery) : 0)));
     uint64_t const parse_room = args.max_ram - std::min(args.max_ram, metadata);
@@ -10055,7 +10073,7 @@ bool replot_external_capacity(Arguments const& args, Identity const& identity, u
     {
         same_identity(identity, identity_from(recovery->identity));
         require(sum(recovery->peak_bytes, auxiliary.retired) <= limit, "saved external output and metadata exceed reviewed migration capacity");
-        pool.restore(0, recovery->external, recovery->allocated_bytes); scratch = recovery->external; scratch->io_governor = args.disk_io;
+        pool.restore(0, recovery->external, recovery->allocated_bytes); scratch = recovery->external; pool.bind_runtime(*scratch);
     }
     uint64_t const capacity = std::min(limit, pool.available_for_output(0, output));
     if (capacity < minimum || !pool.try_reserve_output(0, output, capacity)) return false;
@@ -13059,7 +13077,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 "saved output and temporary reservations exceed the destination capacity share");
             if (inspections[i])
             {
-                d.scratch = inspections[i]->external; d.scratch->io_governor = args.disk_io;
+                d.scratch = inspections[i]->external; scratch_pool->bind_runtime(*d.scratch);
                 uint64_t const bytes = external_metadata(*d.scratch);
                 metadata = sum(metadata, bytes); fixed = sum(fixed, bytes);
             }
@@ -13256,6 +13274,65 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             item->manifest_charge = charge;
         }
     };
+    struct ExecutionResources
+    {
+        std::map<std::vector<std::string>, size_t> indices;
+        std::vector<group_grow::StorageDevice> devices;
+        size_t index(group_grow::StorageDevice const& device)
+        {
+            auto [at, added] = indices.try_emplace(device.drives, devices.size());
+            if (added) devices.push_back(device);
+            return at->second;
+        }
+    };
+    auto execution_lane = [&](Destination const& d, group_grow::ExecutionWork work, uint64_t window, ExecutionResources& resources)
+    {
+        group_grow::ExecutionLane lane{work, resources.index(devices[d.owner])};
+        if (d.scratch)
+        {
+            auto disks = scratch_pool->scratch_devices(d.scratch_owner);
+            require(disks.size() == d.scratch->scratch.size(), "execution scratch topology changed");
+            lane.parallel_scratch = work.io_overlap && group_grow::ExternalEngine::scratch_overlap(window, *d.scratch);
+            long double quota = 0;
+            for (auto const& part : d.scratch->scratch) quota += part.capacity_bytes;
+            for (size_t i = 0; i < disks.size(); ++i)
+            {
+                auto const rate = d.scratch->bandwidth ? d.scratch->bandwidth->bandwidth(disks[i]) : 0;
+                // Divide byte shares by available bytes/ns to apportion the
+                // measured service time. An unmeasured stripe earns no speedup.
+                lane.parallel_scratch = lane.parallel_scratch && disks[i].rotating && rate > 0;
+                long double const bytes = d.scratch->scratch[i].capacity_bytes;
+                lane.scratch.push_back({resources.index(disks[i]), rate > 0 ? bytes / rate : bytes,
+                    rate > 0 ? work.scratch_bytes * (bytes / quota) / rate : 0});
+            }
+            if (!lane.parallel_scratch) for (size_t i = 0; i < lane.scratch.size(); ++i)
+                lane.scratch[i].weight = d.scratch->scratch[i].capacity_bytes;
+        }
+        return lane;
+    };
+    auto physical_estimate = [&](std::vector<group_grow::ExecutionLane>& lanes, auto const& resources,
+                                  size_t count, unsigned grant, bool overlap,
+                                  group_grow::DiskIoGovernor* bandwidth)
+    {
+        if (resources.empty() || std::any_of(resources.begin(), resources.end(), [](auto const& device)
+            { return device.drives.empty(); })) return group_grow::ExecutionEstimate{};
+        auto const physical = group_grow::writer_groups(resources);
+        auto const groups = *std::max_element(physical.begin(), physical.end()) + 1;
+        std::vector<bool> seen(groups);
+        std::vector<group_grow::StorageDevice> scratch;
+        for (auto& lane : lanes)
+        {
+            lane.destination = physical[lane.destination];
+            for (auto& part : lane.scratch)
+            {
+                size_t const group = physical[part.resource];
+                if (!seen[group]) { scratch.push_back(resources[part.resource]); seen[group] = true; }
+                part.resource = group;
+            }
+        }
+        return group_grow::pipeline_execution_estimate(lanes, count, workers, grant, groups, overlap,
+            bandwidth ? bandwidth->concurrent_bandwidth(scratch) : 0);
+    };
     auto activate = [&](Destination& d)
     {
         if (d.engine) return true;
@@ -13399,8 +13476,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (std::any_of(destinations.begin(), destinations.end(), [](auto const& other)
                 { return other->engine && other->stream_input_bytes; })) return group_grow::ExecutionEstimate{};
             std::vector<group_grow::ExecutionLane> lanes;
-            std::vector<group_grow::StorageDevice> resources;
-            lanes.reserve(destinations.size()); resources.reserve(2 * destinations.size());
+            ExecutionResources resources;
+            group_grow::DiskIoGovernor* bandwidth = nullptr;
+            lanes.reserve(destinations.size());
             for (auto const& other : destinations) if (!other->complete)
             {
                 long double member_ns = backend->generation_history.member_ns();
@@ -13409,8 +13487,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     bool(other->scratch), unsigned(count), batch).member_ns;
 #endif
                 if (!member_ns) return group_grow::ExecutionEstimate{};
-                if (other->needs_resume || other->needs_finish ||
-                    (other->scratch && other->scratch->scratch.size() != 1)) return group_grow::ExecutionEstimate{};
+                if (other->needs_resume || other->needs_finish) return group_grow::ExecutionEstimate{};
                 auto options = args; options.workers = grant;
                 auto source = construction_history(&histories, options, other->path,
                     initial_identity(other->requested), grant, false, other->scratch ? &*other->scratch : nullptr, {}, true);
@@ -13433,26 +13510,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto work = group_grow::construction_execution_work(forecast, observed,
                     member_ns * (forecast.members > other->metrics.members ? forecast.members - other->metrics.members : 0), merging, bool(other->scratch), args.io_overlap);
                 if (!work.known) return group_grow::ExecutionEstimate{};
-                group_grow::ExecutionLane lane{work, resources.size()};
-                resources.push_back(devices[other->owner]);
-                if (other->scratch)
-                {
-                    lane.scratch = resources.size();
-                    resources.push_back(group_grow::storage_device(file_io::native_path(other->scratch->scratch.front().directory)));
-                }
-                lanes.push_back(lane);
+                lanes.push_back(execution_lane(*other, work, cfg.window_bytes, resources));
+                if (other->scratch) bandwidth = other->scratch->bandwidth.get();
             }
-            if (std::any_of(resources.begin(), resources.end(), [](auto const& device) { return device.drives.empty(); }))
-                return group_grow::ExecutionEstimate{};
-            auto const physical = group_grow::writer_groups(resources);
-            for (auto& lane : lanes)
-            {
-                lane.destination = physical[lane.destination];
-                if (lane.scratch != SIZE_MAX) lane.scratch = physical[lane.scratch];
-            }
-            return group_grow::pipeline_execution_estimate(lanes, count, workers, grant,
-                *std::max_element(physical.begin(), physical.end()) + 1,
-                args.generation_overlap && (pooled_generation ? count > 1 : backend->generation_overlap));
+            return physical_estimate(lanes, resources.devices, count, grant,
+                args.generation_overlap && (pooled_generation ? count > 1 : backend->generation_overlap), bandwidth);
         };
         auto cost = [&](size_t count, unsigned grant, uint16_t batch)
         {
@@ -13479,7 +13541,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto config = configuration(options, d.metrics.capacity_bytes, shared_fixed, cpu_scheduler, backend->remote_encoder());
                 config.path_bindings = path_bindings;
                 d.scratch = temporary_grant(*scratch_pool, d.scratch_owner, d.path.parent_path(), d.requested,
-                    uint16_t(d.maximum), plan.batch, config, args.construction == "auto", &d.output_capacity_rejected, false, input_required);
+                    uint16_t(d.maximum), plan.batch, config, args.construction == "auto", &d.output_capacity_rejected, false, input_required,
+                    plan.active - std::min(plan.active - 1, active));
                 d.metrics.capacity_bytes = config.capacity_bytes; fresh_scratch = d.scratch.has_value();
                 update_pool_memory();
                 if (d.scratch)
@@ -13745,7 +13808,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         {
             require(next.recovery.has_value(), "saved successor lost its audited checkpoint");
             auto& saved = *next.recovery;
-            d.scratch = std::move(saved.external); d.scratch->io_governor = args.disk_io; d.saved = std::move(saved.identity); d.guard = next.guard;
+            d.scratch = std::move(saved.external); scratch_pool->bind_runtime(*d.scratch); d.saved = std::move(saved.identity); d.guard = next.guard;
             d.metrics.members = saved.members - saved.pending_members; d.metrics.final_bytes = d.saved.bytes;
             d.metrics.peak_file_bytes = sum(saved.peak_bytes, d.guard->retired);
             d.needs_resume = saved.pending_members != 0; d.recover_count = saved.pending_members;
@@ -14649,9 +14712,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto const work = group_grow::construction_execution_work(forecast, observed,
                     member_ns * (forecast.members > d.metrics.members ? forecast.members - d.metrics.members : 0),
                     d.engine->is_staging(), bool(d.scratch), args.io_overlap);
-                candidate.known = work.known && !d.stream_input_bytes && (!d.scratch || d.scratch->scratch.size() == 1);
+                candidate.known = work.known && !d.stream_input_bytes;
                 candidate.remaining = work.cpu / std::max(1u, d.engine->config.workers) + work.serial +
                     work.scratch_read + work.scratch_write + work.destination;
+                if (candidate.known && d.scratch && d.scratch->scratch.size() > 1)
+                {
+                    ExecutionResources resources;
+                    std::vector<group_grow::ExecutionLane> lanes{execution_lane(d, work, d.engine->config.window_bytes, resources)};
+                    lanes.front().work.generation = 0;
+                    auto const estimate = physical_estimate(lanes, resources.devices, 1, d.engine->config.workers, false, d.scratch->bandwidth.get());
+                    candidate.known = estimate.known; candidate.remaining = estimate.completion;
+                }
             }
             generation_ready.push_back(candidate);
         }
