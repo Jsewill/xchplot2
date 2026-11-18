@@ -192,6 +192,12 @@ public:
         return external.scratch.size() > 1 && external.scratch.size() <= max_runs &&
             scratch_queue_bytes(external) <= window / 2;
     }
+    static uint64_t striped_reader_bytes(uint8_t k, Config const& config, ExternalConfig const& external)
+    {
+        auto const cache = read_buffer_bytes(k, config, external);
+        if (config.io_overlap && scratch_overlap(config.window_bytes, external)) return cache - scratch_queue_bytes(external);
+        return std::min(cache, multiply(config.window_bytes, 8));
+    }
     uint64_t required_memory(uint16_t batch_members = 1, unsigned workers = 0) const
     {
         auto cfg = config_; if (workers) cfg.workers = workers;
@@ -544,6 +550,14 @@ inline void evict(int fd)
     (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #else
     (void)fd;
+#endif
+}
+inline void start_writeback(int fd, uint64_t offset, uint64_t bytes)
+{
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+    (void)::sync_file_range(fd, off_t(offset), off_t(bytes), SYNC_FILE_RANGE_WRITE);
+#else
+    (void)fd; (void)offset; (void)bytes;
 #endif
 }
 inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats* stats = nullptr, IOContext context = {})
@@ -1923,12 +1937,10 @@ public:
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
             if (position_ == segment.bytes)
             {
-#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
                 // Start writeback while subsequent disks fill. finish()
                 // still verifies and synchronizes every completed extent.
                 if (!engine_.disk_workers_.empty() && !engine_.external_.io_governor)
-                    (void)::sync_file_range(file_->fd, 0, 0, SYNC_FILE_RANGE_WRITE);
-#endif
+                    external_detail::start_writeback(file_->fd, 0, 0);
                 ++segment_; position_ = 0;
             }
         }
@@ -2000,9 +2012,10 @@ public:
         {
             block_ = size_t(std::min<uint64_t>(engine_.external_.segment_bytes, buffer_.size() / 2));
             pending_.reads.resize(std::min(2 * engine_.disk_workers_.size(), buffer_.size() / block_));
-            prefetch(false);
+            read_ahead();
         }
     }
+    void read_ahead() { prefetch(false); }
     uint64_t position() const { return position_; }
     uint64_t remaining() const { return run_.bytes - position_; }
     void checkpoint(uint64_t consumed)
@@ -3448,6 +3461,7 @@ inline void ExternalEngine::pack(Members members)
     std::vector<size_t> released_segments(runs_.size(), 0); std::vector<uint64_t> released_bytes(runs_.size(), 0);
     std::vector<uint8_t> output_window; output_window.reserve(size_t(config_.window_bytes));
     bool output_overlap = overlap;
+    bool output_writeback = false;
     if (output_overlap)
     {
         auto const target = storage_device(file_io::native_path(path_).parent_path());
@@ -3456,6 +3470,7 @@ inline void ExternalEngine::pack(Members members)
             auto const source = storage_device(file_io::native_path(root.path));
             if (!external_detail::independent_packing_io(target, {&source, 1})) { output_overlap = false; break; }
         }
+        output_writeback = output_overlap && target.rotating && !external_.io_governor;
     }
     std::vector<uint8_t> writing_window;
     if (output_overlap) writing_window.reserve(size_t(config_.window_bytes));
@@ -3491,6 +3506,9 @@ inline void ExternalEngine::pack(Members members)
                 {
                     ThreadCpuTimer cpu(output_cpu);
                     auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, io_context("final_output", &output_service));
+                    // Keep the output spindle writing while the next chunks
+                    // are packed. The checkpoint still syncs data and index.
+                    if (output_writeback) external_detail::start_writeback(fd_, offset, writing_window.size());
                 });
             }
             else { write_target(window_offset, output_window); output_window.clear(); }
@@ -3567,6 +3585,9 @@ inline void ExternalEngine::pack(Members members)
         config_.check_running();
         auto& payload = window.payload; auto& contributions = window.contributions;
         auto& tasks = window.tasks; auto& frontiers = window.frontiers;
+        // A busy spindle can defer a preread. Retry while gathering the next
+        // window, before its reader exhausts the data already in memory.
+        if (!disk_workers_.empty()) for (auto& reader : readers) reader->read_ahead();
         payload.clear(); contributions.clear(); tasks.clear(); frontiers.clear(); window.regions.clear();
         window.first = first;
         uint64_t const count = std::min<uint64_t>(window_chunks, chunks - first);

@@ -3,6 +3,7 @@
 // Protocol discovery, exact allocation and durable cleanup remain engine-owned.
 #pragma once
 #include "host/GroupExternal.hpp"
+#include <functional>
 #include <tuple>
 #include <utility>
 
@@ -218,7 +219,8 @@ public:
     std::optional<ExternalConfig> grant(uint64_t owner, uint64_t desired, uint64_t minimum,
                                         uint64_t segment_bytes, unsigned fan_in, bool automatic = false,
                                         unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0,
-                                        size_t parallel_roots = 1, size_t open_slots = SIZE_MAX)
+                                        size_t parallel_roots = 1, size_t open_slots = SIZE_MAX,
+                                        std::function<uint64_t(ExternalConfig&)> const& configure_stripes = {})
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -299,6 +301,9 @@ public:
             selected.push_back(i); external.scratch.push_back({root.value.directory, quota}); remaining -= quota;
         }
         if (desired - remaining < minimum) return {};
+        // The selected roots determine the extent layout and the RAM left for
+        // readers. Use that admission before deciding which runs to retain.
+        if (external.striped && configure_stripes) read_buffer_bytes = configure_stripes(external);
         // Retaining more readers avoids copying packets that the final packer
         // can already join. Known HDDs can also retain more when the requested
         // aggregate cache leaves large refills; unknown storage keeps the

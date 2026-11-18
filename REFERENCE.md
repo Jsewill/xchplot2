@@ -673,9 +673,18 @@ with block-device counters to estimate bandwidth used by other processes.
 It also measures simultaneous transfers to account for shared storage paths.
 
 The plotter reads ahead and flushes extents on separate spindles concurrently.
-The RAM grant bounds the read cache and the number of outstanding transfers.
+During final packing it retries reads deferred by a busy disk before the
+current reader buffer runs out. The RAM grant bounds the read cache and the
+number of outstanding transfers. On striped HDD scratch, the planner can
+retain additional runs when the cache provides 16 MiB per reader after
+reserving space for disk queues. This can eliminate an intermediate scratch
+read and rewrite.
 Partitions and alternate paths to one drive share its bandwidth. Resuming a
 plot uses the scratch locations and capacities saved in its checkpoint.
+
+On Linux, an independent output HDD can start writing completed ranges while
+the plotter prepares the next chunks. The packing checkpoint synchronizes the
+output and index before releasing consumed scratch.
 
 When a compute worker supplies compressed contributions, the plotting host
 validates their chunks as they arrive. It reuses the consecutive prefix in

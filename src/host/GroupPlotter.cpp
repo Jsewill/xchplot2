@@ -3299,25 +3299,26 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
             minimum = std::max(minimum, bytes(1));
         }
         if (!minimum) return {};
-        auto grant = pool.grant(owner, desired, minimum, segment, 4, automatic, packing_inputs,
-            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots);
-        if (grant && grant->striped)
+        auto configure_stripes = [&](group_grow::ExternalConfig& external)
         {
             // Keep each disk sequential, but expose several disks within a
             // contribution. Larger extents remain available under tight RAM.
             uint8_t const k = uint8_t(identity.params.get_k());
-            uint64_t const cache = group_grow::ExternalEngine::read_buffer_bytes(k, config, *grant);
+            uint64_t const cache = group_grow::ExternalEngine::read_buffer_bytes(k, config, external);
             uint64_t extent = std::min({segment, std::max(mib, product(config.window_bytes, 2)),
-                std::max(mib, std::bit_floor(std::min(cache, run) / grant->scratch.size()))});
+                std::max(mib, std::bit_floor(std::min(cache, run) / external.scratch.size()))});
             for (; extent < segment; extent = std::min(segment, 2 * extent))
             {
-                grant->segment_bytes = extent;
-                if (group_grow::ExternalEngine::memory_bytes(k, config, *grant, batch) <= config.memory_limit_bytes &&
-                    sum(group_grow::ExternalEngine::metadata_bytes(k, *grant),
+                external.segment_bytes = extent;
+                if (group_grow::ExternalEngine::memory_bytes(k, config, external, batch) <= config.memory_limit_bytes &&
+                    sum(group_grow::ExternalEngine::metadata_bytes(k, external),
                         sizeof(group_grow::Header) + identity.memo.size()) <= config.capacity_bytes) break;
             }
-            grant->segment_bytes = extent;
-        }
+            external.segment_bytes = extent;
+            return group_grow::ExternalEngine::striped_reader_bytes(k, config, external);
+        };
+        auto grant = pool.grant(owner, desired, minimum, segment, 4, automatic, packing_inputs,
+            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots, configure_stripes);
         if (grant && group_grow::ExternalEngine::metadata_bytes(uint8_t(identity.params.get_k()), *grant) +
                 sizeof(group_grow::Header) + identity.memo.size() > config.capacity_bytes)
         {

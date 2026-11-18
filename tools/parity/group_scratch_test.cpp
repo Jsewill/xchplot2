@@ -497,6 +497,28 @@ void rotating_bandwidth(fs::path const& directory)
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
 
+    for (auto const [limit, tight, readers] : {std::tuple{24u, false, 16u}, {6u, false, 6u}, {24u, true, 4u}})
+    {
+        Config work; work.memory_limit_bytes = 4ull << 30;
+        ScratchPool striped(disks, 0);
+        require(striped.try_reserve_output(0, first, unit), "striped reader fixture output admission failed");
+        striped.seal_recovery();
+        auto layout = [&](ExternalConfig& external)
+        {
+            if (tight)
+            {
+                auto serial = external; serial.striped = false;
+                work.memory_limit_bytes = std::max(
+                    ExternalEngine::phase_memory_bytes(26, work, serial, ExternalEngine::MemoryPhase::staging, UINT16_MAX),
+                    ExternalEngine::phase_memory_bytes(26, work, serial, ExternalEngine::MemoryPhase::packing));
+            }
+            return ExternalEngine::striped_reader_bytes(26, work, external);
+        };
+        auto grant = striped.grant(0, 80 * unit, 80 * unit, unit, 4, false, limit, 8 * work.window_bytes, 4, 1, layout);
+        require(grant && grant->striped && grant->scratch.size() == 4 && grant->packing_inputs == readers,
+            "striped run retention did not respect the admitted reader cache and membership limit");
+    }
+
     auto alias = disks.front(); alias.directory = first.directory; alias.directory_inode = first.directory_inode;
     alias.device.filesystem = "other-partition";
     disks.push_back(alias);

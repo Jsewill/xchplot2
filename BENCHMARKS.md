@@ -147,6 +147,45 @@ physical scratch-drive writes, compared with 32.0% for the same plot with the
 reader stopped. The two runs took 41.5 and 40.1 s respectively and produced
 identical files.
 
+#### Final packing on four scratch HDDs
+
+Both builds used bandwidth-aware scratch placement. The previous planner
+merged four runs before packing the eight that remained. The updated planner
+packed all 11 directly. This avoided 1.89 GB each of scratch reads and writes
+for a 24-member k=26 group, and 4.13 GB each for a 12-member k=28 group. Both
+used strength 2, eight CPU workers, four scratch HDDs and a separate output
+HDD. The modeled peak RAM and the SHA-256 of each finished plot matched across
+builds.
+
+The k=26 job generated its members on the CPU in two-member batches under a
+4 GiB RAM limit. The k=28 job used one-member batches and an 8 GiB limit.
+The same twelve raw inputs were generated once on an RTX 4090 in 26.30 s
+and loaded from the storage host for each run. The k=28 construction time
+excludes the measured time to load and decode those inputs. Each build ran
+the k=26 job once. The k=28 ranges cover three runs of the previous build
+and two of the updated build.
+
+| Per-group measurement | Previous | Updated |
+| --- | ---: | ---: |
+| k=26, 24 members, entire CPU job | 347.1 s | 333.1 s |
+| k=26, final packing | 34.1 s | 26.6 s |
+| k=28, 12 members, construction | 126.1–127.5 s | 97.6–99.1 s |
+| k=28, final packing | 71.4–72.2 s | 55.6–57.1 s |
+
+At 2.2 s of production per member, 12 members add 26.4 s when generation
+and construction run in sequence. On this layout that projects to 281–283
+finished k=28 members per hour with the previous build and 344–348 with the
+updated build. Final packing produced 208–214 MB/s of finished plot data.
+Two isolated sequential writes on the output HDD measured 251 and 253 MB/s.
+Keeping up with one member every 2.2 s at this plot size requires 450 MB/s of
+aggregate output bandwidth.
+
+A separate k=28 comparison used three dedicated scratch HDDs and shared the
+output HDD as a fourth scratch disk, with a 3 GiB scratch allowance per disk.
+Both runs packed all 11 inputs directly. Packing took 77.8 s with the previous
+read-ahead schedule and 72.2 s when the packer retried deferred reads each
+window, with one run per setting.
+
 ### Group size, build time and reader latency
 
 Each size had one fresh build with the same group identity, HDD and 8 GiB
