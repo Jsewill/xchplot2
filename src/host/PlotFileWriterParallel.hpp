@@ -124,13 +124,18 @@ struct ReaderCalibrationPhase
     uint64_t logical_requested_bytes = 0;
     bool cpu_measured = true;
 };
+struct ReaderCalibrationLatency
+{
+    uint64_t p50_ns = 0, p95_ns = 0, p99_ns = 0, max_ns = 0;
+};
 struct ReaderCalibrationResult
 {
     uint8_t k = 0, strength = 0;
     uint16_t members = 0;
     uint64_t chunks = 0, index_bytes = 0, largest_chunk_bytes = 0;
     uint64_t samples = 0, quality_chains = 0, logical_lookup_bytes = 0, storage_bytes = 0;
-    ReaderCalibrationPhase index_probe, fresh_open, first_lookup, retained_lookup, storage_reads;
+    ReaderCalibrationPhase index_probe, fresh_open, first_lookup, retained_lookup, distinct_lookup, storage_reads;
+    ReaderCalibrationLatency fresh_latency, distinct_latency;
 };
 ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint64_t samples,
     uint64_t memory_bytes, std::function<void()> const& check_cancelled);

@@ -1508,10 +1508,22 @@ def check(binary, root, reference=None):
                                 "--save-profile", calibrated_file, "--json", "--", calibration_plot).stdout)
     assert json.loads(calibrated_file.read_text(encoding="utf-8")) == calibrated
     assert calibrated["reader_calibration"] and not calibrated["hardware_qualified"]
+    members = header(calibration_plot)[3]
+    assert calibrated["sampled_members"] == {"min": members, "max": members}
+    measured = calibrated["files"][0]["observations"]
+    distinct = measured["phases"]["distinct_lookup"]
+    assert distinct["calls"] == 2 and distinct["logical_requested_bytes"] > 0
+    assert measured["latency"]["retained_distinct"]["max_ns"] == distinct["max_wall_ns"]
+    for latency in measured["latency"].values():
+        assert 0 < latency["p50_ns"] <= latency["p95_ns"] == latency["p99_ns"] == latency["max_ns"]
     calibrated_profile = calibrated["farming_profile"]
     scope = calibrated_profile["reader_calibration"]
     assert calibrated_profile["schema_version"] == 2 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
     assert scope["reader"] == calibrated_profile["reader"] and scope["method"] == "pos2-group-reference-reader-gsz-1"
+    for phase in (measured["phases"]["retained_lookup"], distinct):
+        if phase["cpu_measured"]:
+            modeled_ns = calibrated_profile["chain_seconds_per_member"] * members * 1e9
+            assert round(modeled_ns) >= phase["max_cpu_ns"] * scope["margin"]
     assert scope["host_name"] and scope["captured_at"]
     assert scope["host_name"] != reviewed_profile["host_name"] and scope["captured_at"] != reviewed_profile["captured_at"]
     for field in ("source", "captured_at", "host_name", "chia_version", "config_status", "inventory_status",
@@ -1739,6 +1751,21 @@ def check(binary, root, reference=None):
     run("plan", *options, "--devices", cpu, "--compute-local", "off", code=2)
     print("PASS local device selection, shared limits, staged recovery and ordinary byte parity", flush=True)
 
+    combined, successive = root / "combined.gplot", root / "successive.gplot"
+    for copy in (combined, successive):
+        with grouped_one.open("rb") as source, copy.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        shutil.copymode(grouped_one, copy)
+    report = json.loads(run("grow", combined, "--max-members", 3, *construction, "--json").stdout)
+    assert report["batches"] == 1 and report["generated_members"] == report["max_batch_members"] == 2, report
+    for target in (2, 3):
+        run("grow", successive, "--max-members", target, *construction)
+    group_id, k, strength, _, meta, memo = header(grouped_one)
+    manifest = root / "fresh-three.tsv"
+    manifest.write_text(f'{k} {strength} 0 {meta} gplot-v2-grouped {group_id} "{memo}" '
+                        f'{json.dumps(str(root), ensure_ascii=False)} "fresh-three.gplot" 3\n', encoding="utf-8")
+    run("batch", manifest, *construction)
+    assert digest(combined) == digest(successive) == digest(root / "fresh-three.gplot")
     run("grow", grouped_one, "--max-members", 3, *construction, point="publication-hidden", code=86)
     assert not grouped_one.exists() and Path(str(grouped_one) + ".partial").is_file()
     concise_grow = run("grow", grouped_one, "--max-members", 3, *construction)

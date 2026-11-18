@@ -619,6 +619,12 @@ xchplot2 grow /plots/example.gplot --max-members 8
 construction before extending it. It reads the file's identity and parameters;
 keys are unnecessary. `--max-members N` is the desired total membership, with
 a maximum of 65535. Capacity and construction limits can stop growth earlier.
+If several additions are ready, request their final membership in one command.
+For example, growing a 72-member file to 74 lets the plotter publish both
+additions in one rewrite when they fit the RAM and capacity budgets.
+Incremental growth reads existing chunks during sizing and encoding. Separate
+requests for 73 and 74 each require a rewrite. `--batch-members` can also
+limit how many additions fit in one rewrite.
 Use `plot` to create a new named job, or `fill` to manage a directory layout.
 On Linux, in-place growth requires private data extents. Use
 `cp --reflink=never` when making a copy to grow on a filesystem that supports
@@ -657,6 +663,10 @@ uniformly matching drives. Explicit scratch directories remain available
 regardless of that policy. Saved jobs and previews retain their scratch
 restrictions. `--temp-capacity-bytes SIZE` caps scratch per filesystem.
 External construction needs permitted scratch.
+When a compute worker supplies compressed contributions, the plotting host
+validates their chunks as they arrive. It reuses the consecutive prefix in
+member order for conservative sizing. An out-of-order suffix is read from
+scratch. Tight capacity still triggers exact sizing against the saved runs.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both
@@ -784,13 +794,20 @@ xchplot2 plan /new/plots --harvester reader-profile.json --save-plan farm.plan
 
 Calibration reads the supplied files without changing them. It reports fresh
 and retained-reader quality lookups, foreground reader CPU time, and separate
-read-only storage observations. Storage observations remain report-only; they
-do not replace bandwidth, seek or concurrency assumptions. OS cache state is
-uncontrolled, so opening a fresh reader does not establish cold physical reads.
+read-only storage observations. Each file reports p50, p95, p99 and maximum
+wall time for opening a reader and looking up its first challenge, and for a
+different challenge on the retained reader. Percentiles use nearest rank across
+the requested samples. The repeated-challenge timing remains available under
+`retained_lookup`. The report also gives the smallest and largest sampled
+membership. The planner uses the configured bandwidth, seek and concurrency
+assumptions for storage. The operating system controls which file pages stay
+in cache between samples.
 Calibration does not solve full proofs or measure spare harvester capacity.
 
-Existing CPU inputs only increase from the scoped samples and margin. These
-are editable, conditional service envelopes, not measured worst-case bounds.
+The per-member CPU estimate uses the higher measured CPU time from the repeated
+and distinct challenges on the retained reader. Calibration can raise the
+existing CPU estimates using the sampled maxima and margin. The resulting
+estimates are editable and apply to the sampled conditions.
 The saved profile records the sampled k, strength, reader, method and margin,
 with its own calibration hostname/time. An imported baseline's configuration,
 inventory and hardware snapshot keep their original hostname/time. Planning
@@ -1671,6 +1688,21 @@ leases; workers return computed fragments directly to the plotting host.
 Workers never receive destination paths, farmer/pool keys, seeds or private
 plot memos. Enroll only machines you trust to compute correctly.
 
+On a timed generation connection the worker reports time spent generating and
+encoding, and time spent sending results. The owner measures time waiting for
+frames after first output and time consuming frames, including scratch writes.
+Send and receive waits include backpressure and can overlap. After three
+completed samples for a matching plot size, strength and result type, the
+owner can compare generation batch sizes and choose how many destinations
+receive concurrently. With an older peer the owner uses the existing task
+timings. The full execution
+forecast also needs measured packing and storage costs for the destination.
+In construction JSON, `pool_timed_generation_tasks` counts measured tasks.
+The destination scheduler reports its most recent generation estimate in
+`pool_generation_seconds_per_member` and its receiver count in
+`pool_receiving_destinations`. Both start at zero. The `phases` object gives
+the logical bytes read and written in each construction phase.
+
 On the first machine, create a pool and an invitation for another machine:
 
 ```bash
@@ -1917,7 +1949,9 @@ are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
 lists standalone task, thread, window and transport limits.
 Optional encoding probes back off after repeated failures while local encoding
-continues. Plotting JSON distinguishes calibration attempts, declined or failed
+continues. When a window spans several network requests, the owner compares
+local encoding with each worker's total time per byte across its share of that
+window. Plotting JSON distinguishes calibration attempts, declined or failed
 codec windows and unavailable windows, and retains the latest bounded failure
 message in `pool_codec_last_failure`. These counters are separate from completed
 generation tasks.

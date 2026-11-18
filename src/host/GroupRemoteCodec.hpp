@@ -2,6 +2,7 @@
 #pragma once
 #include "host/GroupCodec.hpp"
 #include "host/ComputeWorker.hpp"
+#include <tuple>
 
 namespace group_grow
 {
@@ -229,22 +230,32 @@ private:
         }
         found->used = ++clock_; return *found;
     }
-    void record(DispatchResult const& result, Shape shape)
+    void record(DispatchResult& result, Shape shape)
     {
-        std::lock_guard lock(policy_);
         uint64_t elapsed = 0, units = 0;
         for (auto const& worker : result.workers)
         { elapsed = add(elapsed, worker.elapsed_ns); units = add(units, worker.work_units); }
+        if (!units) return;
         long double const preparation = static_cast<long double>(result.elapsed - std::min(result.elapsed, elapsed)) / result.work;
-        for (auto const& worker : result.workers)
+        auto peer = [](WorkerTaskObservation const& worker)
+        { return std::tie(worker.worker_identity, worker.worker_instance); };
+        std::ranges::sort(result.workers, {}, peer);
+        std::lock_guard lock(policy_);
+        for (size_t i = 0; i < result.workers.size();)
         {
-            if (!worker.work_units || !units) continue;
+            auto const& worker = result.workers[i];
+            uint64_t peer_elapsed = 0, peer_units = 0;
+            do
+            {
+                auto const& part = result.workers[i++];
+                peer_elapsed = add(peer_elapsed, part.elapsed_ns); peer_units = add(peer_units, part.work_units);
+            } while (i < result.workers.size() && peer(result.workers[i]) == peer(worker));
+            if (!peer_units) continue;
+            // Price each worker's share of the complete window. A short last
+            // request still contributes its setup time and its actual bytes.
+            long double const work = static_cast<long double>(result.work) * peer_units / units;
             auto& sample = worker_sample(shape, worker);
-            // Each split task keeps its worker's measured end-to-end cost.
-            // Amortize only the common owner preparation across the window.
-            long double const work = static_cast<long double>(result.work) * worker.work_units / units;
-            sample.ns_per_byte = worker.elapsed_ns / work + preparation;
-            sample.valid = true;
+            sample.ns_per_byte = peer_elapsed / work + preparation; sample.valid = true;
         }
     }
     std::optional<DispatchResult> dispatch(uint8_t k, std::span<ChunkInput const> chunks, bool summaries,

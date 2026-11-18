@@ -2181,7 +2181,10 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         feed_groups(*input, prior, concurrent);
         require(input->reserved_bytes() <= reserved && input->written_bytes() <= input->reserved_bytes(),
             "grouped contribution exceeded its original reservation");
+        auto const reads = engine.stats().phases[size_t(WorkPhase::plan)].read_bytes;
         require(engine.append(*input).accepted, "grouped contribution append rejected");
+        if (!concurrent) require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
+            "ordered validated contributions were reread during conservative sizing");
         input.reset(); engine.finish(); require(contents(path) == reference, "grouped contributions changed canonical bytes");
     }
     for (bool split : {false, true})
@@ -2255,12 +2258,14 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
         require(bool(input), "contribution retry reservation rejected");
         uint64_t const reserved = input->reserved_bytes();
+        for (uint64_t chunk = 0; chunk < 7; ++chunk) input->append_chunk(0, chunk, encoded[0][size_t(chunk)]);
+        input->reset_member(0);
+        // A peer finishing its run returns unused scratch. Check this reset
+        // before launching the peers that overlap the next failed attempt.
+        require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
         std::vector<std::future<void>> pending;
         for (uint16_t member = 1; member < input->size(); ++member)
             pending.push_back(std::async(std::launch::async, [&, member] { feed_member(*input, member, 0); }));
-        for (uint64_t chunk = 0; chunk < 7; ++chunk) input->append_chunk(0, chunk, encoded[0][size_t(chunk)]);
-        input->reset_member(0);
-        require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
         auto invalid = encoded[0][1]; invalid.push_back(0);
         std::array<std::span<uint8_t const>, 2> window{encoded[0][0], invalid};
         rejects([&] { input->append_chunks(0, 0, window); });
@@ -2270,6 +2275,18 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         input->seal(); rejects([&] { input->reset_member(0); });
         require(engine.append(*input).accepted, "restarted contribution input rejected");
         engine.finish(); require(contents(path) == reference, "member retry disturbed another contribution");
+    }
+    {
+        auto const path = root / "contribution-changed-source";
+        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        auto input = engine.prepare_contributions(1, raw.front().size());
+        require(bool(input), "changed contribution fixture reservation rejected");
+        feed_member(*input, 0, 0); input->seal();
+        auto const segments = summary_segments(path, ext, 0);
+        require(!segments.empty(), "completed contribution has no scratch segment");
+        fs::last_write_time(segments.front(), fs::last_write_time(segments.front()) + std::chrono::seconds(2));
+        rejects([&] { (void)engine.append(*input); });
+        require(!engine.committed_member_count(), "changed contribution advanced the cached summary");
     }
     {
         auto const path = root / "contribution-exact"; auto cfg = config();

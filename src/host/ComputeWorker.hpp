@@ -59,12 +59,23 @@ private:
     friend class worker_detail::TaskRegistry;
 };
 using WorkerEncodedValidator = std::function<void(std::span<std::vector<uint8_t> const>)>;
+struct WorkerGenerationTiming
+{
+    uint64_t worker_ns = 0, send_ns = 0, frame_wait_ns = 0, receiver_ns = 0;
+};
+struct WorkerGenerationEstimate
+{
+    long double member_ns = 0;
+    unsigned receivers = 0;
+};
 struct WorkerStats
 {
     uint64_t input_bytes = 0, output_bytes = 0;
     uint64_t completed_generation = 0, completed_contributions = 0, completed_codec = 0, failed_tasks = 0;
     uint64_t local_tasks = 0, task_elapsed_ns = 0;
     uint64_t peak_generation_members = 0, peak_active_generation = 0;
+    uint64_t timed_generation_tasks = 0;
+    WorkerGenerationTiming generation;
 };
 struct WorkerTaskObservation
 {
@@ -77,6 +88,9 @@ struct WorkerTaskObservation
     uint64_t work_units = 0, elapsed_ns = 0, execution_ns = 0, transfer_ns = 0;
     uint64_t input_bytes = 0, output_bytes = 0;
     bool local_direct = false;
+    bool contributions = false;
+    unsigned worker_slots = 0;
+    WorkerGenerationTiming generation;
 };
 class WorkerTaskDeclined : public std::runtime_error
 {
@@ -283,6 +297,8 @@ public:
     uint64_t max_task_bytes() const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
     unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;
+    WorkerGenerationEstimate generation_estimate(uint8_t k, uint8_t strength, bool contributions,
+        unsigned active, unsigned batch) const;
     static uint64_t memory_bytes();
 private:
     struct Impl;

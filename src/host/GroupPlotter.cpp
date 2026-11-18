@@ -605,7 +605,9 @@ struct Backend
         std::osyncstream(std::cerr) << "[grow-pool-task] worker=" << task.worker_identity
             << " instance=" << task.worker_instance << " work_units=" << task.work_units
             << " elapsed_ns=" << task.elapsed_ns << " execution_ns=" << task.execution_ns
-            << " transfer_ns=" << task.transfer_ns << " local_direct=" << unsigned(task.local_direct) << '\n';
+            << " transfer_ns=" << task.transfer_ns << " worker_ns=" << task.generation.worker_ns
+            << " send_ns=" << task.generation.send_ns << " frame_wait_ns=" << task.generation.frame_wait_ns
+            << " receiver_ns=" << task.generation.receiver_ns << " local_direct=" << unsigned(task.local_direct) << '\n';
     }
     static void wait_pool_retry(group_grow::WorkerCancellation const& cancel, std::chrono::milliseconds& delay)
     {
@@ -624,6 +626,14 @@ struct Backend
         std::lock_guard lock(pool_mutex);
         if (!pool_client) pool_client = std::make_shared<group_grow::WorkerClient>(pool_client_config);
         return pool_client;
+    }
+
+    group_grow::WorkerGenerationEstimate pool_estimate(Identity const& identity, bool contributions, unsigned active, unsigned batch)
+    {
+        std::lock_guard lock(pool_mutex);
+        if (!pool_client) return {};
+        return pool_client->generation_estimate(uint8_t(identity.params.get_k()),
+            uint8_t(identity.params.get_strength()), contributions, active, batch);
     }
 
     void initialize_local(Arguments const& args)
@@ -2016,6 +2026,8 @@ struct Metrics : group_grow::Stats
     uint64_t packing_engine_bytes = 0, packing_released_bytes = 0;
     uint64_t destination_count = 0, writer_count = 0, queued_peak_bytes = 0, drive_overlap_batches = 0, queue_wait_ns = 0;
     uint64_t execution_active = 0, execution_batch = 0;
+    uint64_t pool_receiving_destinations = 0;
+    long double pool_generation_member_ns = 0;
     group_grow::ExecutionEstimate execution_estimate;
     bool recovered = false, scratch_released = true;
     long double farming_response_bound_seconds = 0, farming_dynamic_work_seconds_per_sp = 0;
@@ -4518,6 +4530,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
         if (i) std::cout << ',';
         auto const& phase = metrics.phases[i];
         std::cout << '"' << phases[i] << "\":{\"seconds\":" << double(phase.elapsed_ns) / 1e9
+                  << ",\"read_bytes\":" << phase.read_bytes << ",\"written_bytes\":" << phase.written_bytes
                   << ",\"read_seconds\":" << double(phase.read_ns) / 1e9
                   << ",\"write_seconds\":" << double(phase.write_ns) / 1e9
                   << ",\"sync_seconds\":" << double(phase.sync_ns) / 1e9
@@ -4576,6 +4589,13 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
                       << ",\"pool_completed_codec_tasks\":" << wire.completed_codec
                       << ",\"pool_local_direct_tasks\":" << wire.local_tasks
                       << ",\"pool_task_elapsed_ns\":" << wire.task_elapsed_ns
+                      << ",\"pool_timed_generation_tasks\":" << wire.timed_generation_tasks
+                      << ",\"pool_receiving_destinations\":" << metrics.pool_receiving_destinations
+                      << ",\"pool_generation_seconds_per_member\":" << double(metrics.pool_generation_member_ns / 1e9L)
+                      << ",\"pool_worker_processing_ns\":" << wire.generation.worker_ns
+                      << ",\"pool_worker_send_ns\":" << wire.generation.send_ns
+                      << ",\"pool_frame_wait_ns\":" << wire.generation.frame_wait_ns
+                      << ",\"pool_receiver_ns\":" << wire.generation.receiver_ns
                       << ",\"pool_peak_generation_members\":" << wire.peak_generation_members
                       << ",\"pool_peak_active_generation\":" << wire.peak_active_generation
                       << ",\"pool_failed_tasks\":" << wire.failed_tasks;
@@ -12348,7 +12368,15 @@ int reader_calibration_worker(Arguments const& args)
     write_calibration_phase(out, result.index_probe); out << ",\"fresh_open\":"; write_calibration_phase(out, result.fresh_open);
     out << ",\"first_lookup\":"; write_calibration_phase(out, result.first_lookup);
     out << ",\"retained_lookup\":"; write_calibration_phase(out, result.retained_lookup);
-    out << ",\"storage_reads\":"; write_calibration_phase(out, result.storage_reads); out << "}}\n";
+    out << ",\"distinct_lookup\":"; write_calibration_phase(out, result.distinct_lookup);
+    out << ",\"storage_reads\":"; write_calibration_phase(out, result.storage_reads);
+    auto latency = [&](pos2gpu::ReaderCalibrationLatency const& sample)
+    {
+        out << "{\"p50_ns\":" << sample.p50_ns << ",\"p95_ns\":" << sample.p95_ns
+            << ",\"p99_ns\":" << sample.p99_ns << ",\"max_ns\":" << sample.max_ns << '}';
+    };
+    out << "},\"latency\":{\"fresh\":"; latency(result.fresh_latency);
+    out << ",\"retained_distinct\":"; latency(result.distinct_latency); out << "}}\n";
     auto const text = out.str(); require(text.size() <= 65536, "calibration worker report exceeds its output bound");
     input.check(); std::cout << text; return 0;
 }
@@ -12387,9 +12415,23 @@ pos2gpu::ReaderCalibrationResult read_calibration_observations(std::string const
         return value;
     };
     result.index_probe = phase("index_probe"); result.fresh_open = phase("fresh_open"); result.first_lookup = phase("first_lookup");
-    result.retained_lookup = phase("retained_lookup"); result.storage_reads = phase("storage_reads");
+    result.retained_lookup = phase("retained_lookup"); result.distinct_lookup = phase("distinct_lookup");
+    result.storage_reads = phase("storage_reads");
     require(result.index_probe.calls == 1 && result.fresh_open.calls == samples && result.first_lookup.calls == samples &&
-        result.retained_lookup.calls == samples, "incomplete calibration reader phases");
+        result.retained_lookup.calls == samples && result.distinct_lookup.calls == samples, "incomplete calibration reader phases");
+    auto latency = [&](char const* name)
+    {
+        auto const& source = required(required(object, "latency"), name);
+        pos2gpu::ReaderCalibrationLatency value{integer(required(source, "p50_ns")), integer(required(source, "p95_ns")),
+            integer(required(source, "p99_ns")), integer(required(source, "max_ns"))};
+        require(value.p50_ns <= value.p95_ns && value.p95_ns <= value.p99_ns && value.p99_ns <= value.max_ns,
+            "invalid calibration lookup percentiles");
+        return value;
+    };
+    result.fresh_latency = latency("fresh"); result.distinct_latency = latency("retained_distinct");
+    require(result.distinct_latency.max_ns == result.distinct_lookup.max_wall_ns &&
+        result.fresh_latency.max_ns <= sum(result.fresh_open.max_wall_ns, result.first_lookup.max_wall_ns),
+        "calibration lookup latency differs from its phases");
     return result;
 }
 int calibrate_harvester_reader(Arguments const& args)
@@ -12412,6 +12454,7 @@ int calibrate_harvester_reader(Arguments const& args)
     std::vector<std::pair<fs::path, stream_state::Stamp>> inputs; inputs.reserve(args.calibration_plots.size());
     std::optional<group_grow::FarmingProfile> profile;
     group_grow::ReaderCalibrationScope scope;
+    uint16_t smallest = UINT16_MAX, largest = 0;
     for (auto const& supplied : args.calibration_plots)
     {
         check_cancel(args);
@@ -12422,6 +12465,7 @@ int calibrate_harvester_reader(Arguments const& args)
         catch (...) { check_cancel(args); throw; }
         require(stream_state::stamp(path) == before, "calibration input changed during the worker run");
         auto const result = read_calibration_observations(raw, parsing_bytes, before, args.calibration_samples);
+        smallest = std::min(smallest, result.members); largest = std::max(largest, result.members);
         if (!profile)
         {
             auto contextual = args; contextual.k = result.k; contextual.strength = result.strength;
@@ -12434,9 +12478,10 @@ int calibrate_harvester_reader(Arguments const& args)
         if (result.index_probe.cpu_measured)
             config.index_seconds_per_entry = std::max(config.index_seconds_per_entry,
                 scope.margin * static_cast<long double>(result.index_probe.max_cpu_ns) / result.chunks / 1000000000);
-        if (result.retained_lookup.cpu_measured)
-            config.chain_seconds_per_member = std::max(config.chain_seconds_per_member,
-                scope.margin * static_cast<long double>(result.retained_lookup.max_cpu_ns) / result.members / 1000000000);
+        for (auto const* phase : {&result.retained_lookup, &result.distinct_lookup})
+            if (phase->cpu_measured)
+                config.chain_seconds_per_member = std::max(config.chain_seconds_per_member,
+                    scope.margin * static_cast<long double>(phase->max_cpu_ns) / result.members / 1000000000);
         if (result.first_lookup.cpu_measured && result.fresh_open.cpu_measured)
         {
             // Cover the observed fresh-reader CPU total too. This adjusts a
@@ -12475,11 +12520,13 @@ int calibrate_harvester_reader(Arguments const& args)
     std::ostringstream report;
     report << "{\"reader_calibration\":true,\"hardware_qualified\":false,\"parent_buffer_reservation_bytes\":" << parent_bytes
         << ",\"child_requested_memory_bytes\":" << args.calibration_memory_bytes << ",\"child_admitted_memory_bytes\":" << child_bytes
+        << ",\"sampled_members\":{\"min\":" << smallest << ",\"max\":" << largest << '}'
         << ",\"measurement\":{\"method\":" << json_string(group_grow::reader_calibration_method)
         << ",\"cpu\":\"foreground reader thread CPU; unavailable observations are marked and do not raise envelopes\""
         << ",\"index_probe\":\"pinned GSZ decode, canonical validation and offset prefix; includes preflight open/read work, not an isolated GroupProver index hook\""
         << ",\"fresh\":\"new GroupProver for each challenge: open and first lazy-index lookup reported separately\""
-        << ",\"retained\":\"same reader and challenge with retained expanded index; informs member CPU envelope\""
+        << ",\"retained\":\"the maximum measured CPU time across repeated and distinct challenges on a retained reader informs the per-member CPU estimate\""
+        << ",\"latency\":\"per-file nearest-rank wall times for fresh open plus first lookup and for a second deterministic challenge on the retained reader\""
         << ",\"suggestions\":\"existing CPU inputs only increase; scoped margin applies to observed maxima, with a fresh-reader CPU envelope check; editable conditional inputs, not worst-case guarantees\""
         << ",\"logical_bytes\":\"requested header/index/chunk bytes derived from the pinned challenge selector and validated index; repeated ranges retained; not measured physical I/O\""
         << ",\"storage\":\"separate read-only byte/wall observations; report-only, no inferred bandwidth/seek/concurrency service inputs\""
@@ -13338,8 +13385,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (pooled_generation)
         {
             // Remote receivers can make progress independently even when
-            // their final outputs share one ordered physical writer. The
-            // serial local-producer forecast cannot price those task lanes.
+            // their final outputs share one ordered physical writer.
             unfinished_groups = size_t(std::count_if(destinations.begin(), destinations.end(),
                 [](auto const& other) { return !other->complete; }));
         }
@@ -13355,10 +13401,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             std::vector<group_grow::ExecutionLane> lanes;
             std::vector<group_grow::StorageDevice> resources;
             lanes.reserve(destinations.size()); resources.reserve(2 * destinations.size());
-            long double const member_ns = backend->generation_history.member_ns();
-            if (!member_ns) return group_grow::ExecutionEstimate{};
             for (auto const& other : destinations) if (!other->complete)
             {
+                long double member_ns = backend->generation_history.member_ns();
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                if (pooled_generation) member_ns = backend->pool_estimate(other->requested,
+                    bool(other->scratch), unsigned(count), batch).member_ns;
+#endif
+                if (!member_ns) return group_grow::ExecutionEstimate{};
                 if (other->needs_resume || other->needs_finish ||
                     (other->scratch && other->scratch->scratch.size() != 1)) return group_grow::ExecutionEstimate{};
                 auto options = args; options.workers = grant;
@@ -13402,7 +13452,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             return group_grow::pipeline_execution_estimate(lanes, count, workers, grant,
                 *std::max_element(physical.begin(), physical.end()) + 1,
-                args.generation_overlap && backend->generation_overlap);
+                args.generation_overlap && (pooled_generation ? count > 1 : backend->generation_overlap));
         };
         auto cost = [&](size_t count, unsigned grant, uint16_t batch)
         {
@@ -13414,9 +13464,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             unfinished_groups, workers, maximum, minimum, memory, neutral, receiving_lanes);
         // Every physical destination must have matched completed observations.
         // Unknown contexts keep ordinary exact RAM/topology admission.
-        if (!pooled_generation && plan.active && std::isfinite(cost(plan.active, plan.workers, plan.batch)))
+        if (plan.active && std::isfinite(cost(plan.active, plan.workers, plan.batch)))
             if (auto priced = destination_plan(args.max_ram, shared_fixed, generation, storage,
-                unfinished_groups, workers, maximum, minimum, memory, cost); priced.active) plan = priced;
+                unfinished_groups, workers, maximum, minimum, memory, cost, receiving_lanes); priced.active) plan = priced;
         if (!plan.active) return false;
         // Saved roots only recover their existing jobs. Fresh roots come from
         // explicit directories and the enabled destination policy.
@@ -13454,10 +13504,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     if (external_plan.active)
                     {
                         plan = external_plan;
-                        if (!pooled_generation && std::isfinite(cost(plan.active, plan.workers, plan.batch)))
+                        if (std::isfinite(cost(plan.active, plan.workers, plan.batch)))
                             if (auto priced = destination_plan(args.max_ram,
                                 sum(sum(metadata, histories.memory_bytes()), pool_memory), generation, storage,
-                                unfinished_groups, workers, maximum, minimum, memory, cost); priced.active) plan = priced;
+                                unfinished_groups, workers, maximum, minimum, memory, cost, receiving_lanes); priced.active) plan = priced;
                     }
                     else
                     {
@@ -13557,7 +13607,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         if (!plan.active || active >= plan.active) return defer();
         total.execution_active = plan.active; total.execution_batch = plan.batch;
-        total.execution_estimate = use_stream_input || pooled_generation ? group_grow::ExecutionEstimate{} :
+        total.execution_estimate = use_stream_input ? group_grow::ExecutionEstimate{} :
             estimate(plan.active, plan.workers, plan.batch);
         unsigned const share = plan.workers;
         if (!admit_producer(memory(share, minimum))) return defer();
@@ -14591,8 +14641,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         d.metrics.final_bytes, std::max(uint16_t(1), d.batch_cap), d.maximum,
                         group_grow::construction_shape(observed.shapes),
                         prefetched.members.empty() || prefetched.owner != d.owner);
+                long double member_ns = backend->generation_history.member_ns();
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                if (backend->mode == "pool") member_ns = backend->pool_estimate(d.requested, bool(d.engine->external),
+                    unsigned(std::min<uint64_t>(active, args.pool_inflight)), std::max(uint16_t(1), d.batch_cap)).member_ns;
+#endif
                 auto const work = group_grow::construction_execution_work(forecast, observed,
-                    backend->generation_history.member_ns() * (forecast.members > d.metrics.members ? forecast.members - d.metrics.members : 0),
+                    member_ns * (forecast.members > d.metrics.members ? forecast.members - d.metrics.members : 0),
                     d.engine->is_staging(), bool(d.scratch), args.io_overlap);
                 candidate.known = work.known && !d.stream_input_bytes && (!d.scratch || d.scratch->scratch.size() == 1);
                 candidate.remaining = work.cpu / std::max(1u, d.engine->config.workers) + work.serial +
@@ -14722,6 +14777,27 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if ((!has_prefetched || d.engine->external) && !d.needs_resume && !select_merged)
                 wanted = construction_batch_members(*d.engine, d.maximum, uint16_t(wanted),
                     (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
+            {
+                // A writer can continue packing while another drive receives.
+                // Price only simultaneous generation until packing is measured.
+                auto const forecast = backend->pool_estimate(d.requested, bool(d.engine->external) && !select_merged,
+                    unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(wanted));
+                if (forecast.receivers)
+                {
+                    total.pool_receiving_destinations = forecast.receivers;
+                    total.pool_generation_member_ns = forecast.member_ns;
+                    auto const receiving = std::count_if(destinations.begin(), destinations.end(), [&](auto const& other)
+                    {
+                        return other->pending && other->pending->generating.valid() &&
+                            other->requested.params.get_k() == d.requested.params.get_k() &&
+                            other->requested.params.get_strength() == d.requested.params.get_strength();
+                    });
+                    if (receiving >= forecast.receivers) { blocked(ControllerWait::generation_order); continue; }
+                }
+            }
+#endif
             d.pending = std::make_unique<Task>(); auto& task = *d.pending;
             task.work = d.needs_resume ? Work::recover : Work::append;
             task.select_merged = select_merged;

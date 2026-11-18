@@ -164,6 +164,17 @@ void transport(TlsOptions server_tls, TlsOptions const& client_tls, TlsOptions c
     channel.send(Message::Data, message.data()); auto frame = channel.receive();
     require(frame.type == Message::Data && frame.payload == message.data(), "direct payload changed");
     require(echo.get() == certificate_identity(client_tls.cert_file), "direct owner identity changed"); channel.close();
+    for (auto [server_offers, client_offers] : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}})
+    {
+        auto server = server_tls, client = client_tls;
+        server.generation_timing = server_offers; client.generation_timing = client_offers;
+        Listener peer({"127.0.0.1", 0}, server);
+        auto accepted = std::async(std::launch::async, [&]
+        { auto incoming = peer.accept(1000); require(bool(incoming), "missing timing peer"); return incoming.generation_timing(); });
+        auto connection = Channel::connect(peer.endpoint(), client, identity);
+        require(connection.generation_timing() == (server_offers && client_offers) &&
+            accepted.get() == connection.generation_timing(), "generation timing was not negotiated by both peers");
+    }
     auto closed_peer = std::async(std::launch::async, [&] { auto incoming = listener.accept(1000); incoming.close(); });
     auto broken = Channel::connect(listener.endpoint(), client_tls, identity); closed_peer.get();
     transient_rejects([&]

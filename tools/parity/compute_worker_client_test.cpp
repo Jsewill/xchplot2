@@ -157,6 +157,32 @@ void planning_feedback()
     late.observed(changed, route, expired_selection, expired); late.failed(changed, route, expired_selection, expired);
     require(late.suggested(18, 2, pool::Kind::GenerateCpu, expired).batch == 1,
         "a delayed completion revived a peer after its monotonic observation timeout");
+
+    Planning measured(1000);
+    auto remote = slow; remote.contributions = true; remote.worker_slots = 1;
+    remote.generation = {300, 100, 80, 120};
+    auto price = [&](unsigned lanes, unsigned batch = 1, bool contributions = true)
+    { return measured.estimate(18, 2, remote.kind, contributions, lanes, batch, now); };
+    observe(measured, remote, route); observe(measured, remote, route);
+    require(!price(2).receivers, "two samples priced an untrained remote receiver");
+    observe(measured, remote, route);
+    require(price(2).member_ns == 400 && price(2).receivers == 1 && !price(2, 1, false).receivers &&
+        hint(measured).batch == 2, "a remote singleton did not price its measured service and trial a coencoded batch");
+    auto pair = remote; pair.work_units = 2; pair.generation = {700, 300, 250, 250};
+    train(measured, pair, route);
+    require(hint(measured).batch == 1, "a slower measured batch displaced the faster singleton");
+    auto peer = remote; peer.worker_identity = "second-timed-worker";
+    train(measured, peer, route);
+    require(price(2).receivers == 2 && price(2).member_ns == 200 && price(1).member_ns == 400,
+        "independent worker service did not improve the two-receiver forecast");
+    peer.generation = remote.generation = {10, 990, 990, 10};
+    Planning shared(1000);
+    remote.worker_slots = 8; train(shared, remote, route);
+    auto const limited = shared.estimate(18, 2, remote.kind, true, 8, 1, now);
+    require(limited.receivers == 2 && std::abs(limited.member_ns - 990) < 1e-6L,
+        "multiple worker slots multiplied shared link bandwidth");
+    measured.failed(remote, route, measured.selected(remote, route, now), now);
+    require(!price(2).receivers, "failed generation retained a measured receiver forecast");
 }
 
 struct RunningBroker
@@ -341,8 +367,12 @@ void assigned_local_and_fencing()
         auto const begin = Clock::now(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
         sink_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
     });
+    auto const timing = remote.stats();
     require(!remote_observation.local_direct && remote_observation.execution_ns &&
-        sink_ns && remote_observation.transfer_ns >= sink_ns,
+        sink_ns && remote_observation.transfer_ns >= sink_ns && timing.timed_generation_tasks == 1 &&
+        timing.generation.worker_ns && timing.generation.send_ns && timing.generation.frame_wait_ns &&
+        timing.generation.receiver_ns >= sink_ns && remote_observation.worker_slots == offer.capacity.slots &&
+        !stats.timed_generation_tasks,
         "TLS result consumption used a different sink observation boundary");
 
     std::array<uint64_t, 3> fragments{1, 2, 3}; std::span<uint64_t const> region(fragments);

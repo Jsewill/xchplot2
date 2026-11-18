@@ -47,6 +47,9 @@ struct TlsOptions
     // Diagnostic probes enforce saved membership without learning/persisting
     // peer policies. No policy exchange is negotiated on these channels.
     bool read_only_membership = false;
+    // Opt in on direct generation channels. Older peers keep the original
+    // empty result terminator when TLS does not negotiate the timed protocol.
+    bool generation_timing = false;
 };
 // A numeric route avoids the synchronous hostname resolver. Scoped IPv6
 // interface suffixes are local routing information and are accepted here.
@@ -124,6 +127,7 @@ public:
     // not consume application bytes or wait for a request/response.
     bool peer_closed();
     std::string const& peer_identity() const;
+    bool generation_timing() const;
     std::string const& peer_node_id() const;
     explicit operator bool() const noexcept { return bool(impl_); }
     uint32_t max_frame_bytes() const;

@@ -31,11 +31,20 @@
 #include <climits>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 
 namespace group_grow::pool
 {
 namespace
 {
+constexpr auto timed_generation_protocol = []
+{
+    constexpr std::string_view name = "xchplot2-generation-time/1";
+    std::array<unsigned char, 1 + name.size()> list{};
+    list.front() = static_cast<unsigned char>(name.size());
+    std::copy(name.begin(), name.end(), list.begin() + 1);
+    return list;
+}();
 void require(bool condition, char const* message)
 { if (!condition) throw std::runtime_error(message); }
 void transport_require(bool condition, char const* message)
@@ -272,6 +281,21 @@ Context context(TlsOptions const& options, bool server)
     SSL_CTX_set_max_cert_list(result.get(), 65536);
     SSL_CTX_set_options(result.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(result.get(), SSL_SESS_CACHE_OFF);
+    if (options.generation_timing)
+    {
+        if (server) SSL_CTX_set_alpn_select_cb(result.get(),
+            [](SSL*, unsigned char const** out, unsigned char* length, unsigned char const* offered,
+               unsigned int size, void*)
+            {
+                unsigned char* selected = nullptr;
+                if (SSL_select_next_proto(&selected, length, timed_generation_protocol.data(),
+                    timed_generation_protocol.size(), offered, size) != OPENSSL_NPN_NEGOTIATED)
+                    return SSL_TLSEXT_ERR_NOACK;
+                *out = selected; return SSL_TLSEXT_ERR_OK;
+            }, nullptr);
+        else require(SSL_CTX_set_alpn_protos(result.get(), timed_generation_protocol.data(),
+            timed_generation_protocol.size()) == 0, "cannot offer timed generation protocol");
+    }
     require(SSL_CTX_load_verify_locations(result.get(), options.ca_file.c_str(), nullptr) == 1,
             "cannot load network TLS CA");
     require(SSL_CTX_use_certificate_chain_file(result.get(), options.cert_file.c_str()) == 1 &&
@@ -657,6 +681,14 @@ bool Channel::peer_closed()
     if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) return false;
     try { ssl_failure(impl_->ssl, result, error, error_number); }
     catch (TransientTransport const&) { return true; }
+}
+bool Channel::generation_timing() const
+{
+    unsigned char const* selected = nullptr; unsigned size = 0;
+    if (!impl_) return false;
+    SSL_get0_alpn_selected(impl_->ssl, &selected, &size);
+    return size == timed_generation_protocol.front() &&
+        std::equal(timed_generation_protocol.begin() + 1, timed_generation_protocol.end(), selected);
 }
 std::string const& Channel::peer_identity() const
 { require(bool(impl_), "network channel is closed"); return impl_->peer; }

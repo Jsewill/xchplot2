@@ -465,6 +465,7 @@ private:
                              ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
     void write_summary(std::span<Summary const> summaries);
     std::vector<Summary> take_summary();
+    void check_summary_source(Run const& run) const;
     bool reserve(Run& run, uint64_t bytes, char const* role = "contribution");
     void discard(Run const& run);
     void incoming_regions(Members members, uint64_t chunk, std::vector<size_t>& cursors,
@@ -1102,16 +1103,20 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
     std::array<uint8_t, 32> actual{}; sha256_sum(&context, actual.data());
     require(position == run.bytes && actual == checksum, "external summary checksum or coverage changed");
 }
+inline void ExternalEngine::check_summary_source(Run const& run) const
+{
+    for (auto const& segment : run.segments)
+    {
+        config_.check_running();
+        require(bind_stamp(segment_path(run, segment), segment.stamp, segment.identity) == segment.stamp,
+            "external summary source changed");
+    }
+}
 inline std::vector<ExternalEngine::Summary> ExternalEngine::take_summary()
 {
     if (!summary_cache_.empty())
     {
-        for (auto const& segment : summary_run_.segments)
-        {
-            auto const path = segment_path(summary_run_, segment);
-            require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp,
-                "external cached summary changed");
-        }
+        check_summary_source(summary_run_);
         // The candidate owns this allocation until its checkpoint commits.
         // Rejection or failure discards it; a retry reloads the durable table.
         return std::exchange(summary_cache_, {});
@@ -1944,6 +1949,7 @@ public:
             !chunks.empty() && chunks.size() <= total - chunk,
             "contribution input chunks must arrive once in order");
         entry.failed = true;
+        if (!chunk) entry.summarizing = member == summarized_ && !candidate_.empty();
         {
             ThreadCpuTimer timing(engine_->contribution_cpu_);
             CodecScheduler::Lease compute(engine_->config_.cpu_scheduler.get(), 1,
@@ -1957,10 +1963,18 @@ public:
                 auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, bytes.size(), 0);
                 require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
                 validator_->prepare(work);
-                auto const inspected = validator_->inspect(ordinal++, bytes, count);
+                auto const inspected = validator_->inspect(ordinal, bytes, count);
                 require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
                     "contribution input exceeds its admitted fragment count");
                 entry.symbols += inspected.summary.symbols;
+                if (entry.summarizing)
+                {
+                    auto& summary = candidate_[size_t(ordinal)];
+                    summary.codec = ChunkCodec::combine(engine_->identity_.header.k, summary.codec,
+                        inspected.summary, inspected.first, ordinal);
+                    summary.bytes = grow_add(summary.bytes, bytes.size());
+                }
+                ++ordinal;
             }
         }
         if (!entry.writer) entry.writer = std::make_unique<Writer>(*engine_, entry.run, "contribution", true);
@@ -1979,6 +1993,7 @@ public:
         require(entry.owner == member && entry.count == count && !entry.failed && !entry.finished && entry.writer && entry.next == PlotGroupFile::getChunkCountForK(engine_->identity_.header.k),
             "contribution member has missing chunks");
         entry.failed = true; entry.writer->finish(); entry.writer.reset(); entry.finished = true; entry.failed = false;
+        if (entry.summarizing) summarized_ += count;
     }
     // Only the controller of these members may restart them, after the prior
     // producer has stopped. Restore their original singleton reservations so
@@ -1994,6 +2009,13 @@ public:
         for (uint16_t i = member; i < member + count; ++i)
             require(entry.count ? members_[i].owner == member :
                 members_[i].owner == i && !members_[i].count, "contribution reset overlaps another batch");
+        // A retry can replace already inspected chunks. Recover the candidate
+        // from the durable frontier and the surviving run bytes at append.
+        if (member < summarized_ || entry.summarizing)
+        {
+            std::vector<Summary>().swap(candidate_); summarized_ = 0;
+            for (auto& slot : members_) slot.summarizing = false;
+        }
         for (uint16_t i = member; i < member + count; ++i)
         {
             auto& slot = members_[i]; slot.writer.reset();
@@ -2019,7 +2041,7 @@ private:
         std::unique_ptr<Writer> writer;
         uint64_t next = 0, symbols = 0;
         uint16_t owner = 0, count = 0;
-        bool finished = false, failed = false;
+        bool finished = false, failed = false, summarizing = false;
     };
     ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound)
         : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), members_(count),
@@ -2058,6 +2080,10 @@ private:
     uint64_t fragment_bound_;
     std::vector<MemberRecord> members_;
     Run summary_;
+    // The existing staging workspace holds one candidate, in canonical member
+    // order. Streams that start out of order stay on the bounded reread path.
+    std::vector<Summary> candidate_;
+    uint16_t summarized_ = 0;
     std::unique_ptr<ChunkCodec> validator_;
     mutable std::mutex mutex_;
     bool sealed_ = false;
@@ -2337,6 +2363,9 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
     input->summary_.id = next_id_; input->summary_.count = uint16_t(members_ + members);
     if (!reserve(input->summary_, summary_bytes, "checkpoint_summary")) return {};
     next_id_ = input->summary_.id + 1;
+    // A restored checkpoint may only have an on-disk summary. Leave that
+    // read to the admitted sizing pass on the destination writer.
+    if (!members_ || !summary_cache_.empty()) input->candidate_ = take_summary();
     return input;
 }
 inline uint64_t ExternalEngine::input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
@@ -2558,7 +2587,15 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
-    auto summaries = take_summary();
+    uint16_t const cached = !input.candidate_.empty() && input.summarized_ <= count ? input.summarized_ : 0;
+    if (!cached) std::vector<Summary>().swap(input.candidate_);
+    else
+    {
+        check_summary_source(summary_run_);
+        for (uint16_t member = 0; member < cached; member += input.members_[member].count)
+            check_summary_source(input.members_[member].run);
+    }
+    auto summaries = cached ? std::move(input.candidate_) : take_summary();
     auto codec = std::make_unique<ChunkCodec>(identity_.header.k, config_.codec_bytes, config_.cpu_scheduler);
     std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
     std::vector<EncodedChunk> parts; parts.reserve(UINT16_MAX);
@@ -2568,7 +2605,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     {
         readers.clear(); sources.clear();
         if (all) for (auto const& run : runs_) sources.push_back(&run);
-        for (uint16_t member = 0; member < count; member += input.members_[member].count)
+        for (uint16_t member = all ? 0 : cached; member < count; member += input.members_[member].count)
             sources.push_back(&input.members_[member].run);
         for (auto const* run : sources) readers.push_back(std::make_unique<Reader>(*this, *run, sources.size()));
     };

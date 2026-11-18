@@ -125,7 +125,11 @@ void bounded_coalescing()
         expected.insert(expected.end(), encoded.begin(), encoded.end());
         tasks.push_back({uint64_t(i), {}, 0, {&regions.back(), 1}, {}});
     }
-    for (uint64_t limit : {uint64_t(1) << 20, uint64_t(16) << 10})
+    // The middle limit leaves one chunk in the last request. Its fixed
+    // transport cost must be amortized over this worker's whole window.
+    uint64_t const chunk_bytes = pool::codec_chunk_header_bytes + sizeof(uint32_t) + raw.front().size() * sizeof(uint64_t);
+    uint64_t const partial = pool::codec_window_header_bytes + (tasks.size() - 1) * chunk_bytes;
+    for (uint64_t limit : {uint64_t(1) << 20, partial, uint64_t(16) << 10})
     {
         auto scheduler = std::make_shared<CodecScheduler>(1);
         WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;
@@ -153,9 +157,8 @@ void bounded_coalescing()
                 "coalescing fixture escaped shared CPU pressure");
         }
         calibration.get();
-        // Each raw chunk has 18 fixed bytes, a 4-byte raw count and
-        // 64 uint64 values; each request starts with one chunk count.
-        uint64_t const per_request = std::min<uint64_t>(client->max_window_chunks(), (limit - 4) / (22 + 64 * 8));
+        uint64_t const per_request = std::min<uint64_t>(client->max_window_chunks(),
+            (limit - pool::codec_window_header_bytes) / chunk_bytes);
         uint64_t const requests = (tasks.size() + per_request - 1) / per_request;
         require(remote.counters.calibration_windows == 1 && client->stats().completed_codec == requests,
             "remote calibration did not coalesce within count and serialized byte limits");

@@ -693,7 +693,7 @@ std::optional<uint64_t> calibration_cpu_now()
 #endif
 }
 template <typename Operation>
-void calibration_measure(ReaderCalibrationPhase& phase, Operation&& operation)
+uint64_t calibration_measure(ReaderCalibrationPhase& phase, Operation&& operation)
 {
     auto const cpu_begin = calibration_cpu_now();
     auto const begin = std::chrono::steady_clock::now();
@@ -709,6 +709,7 @@ void calibration_measure(ReaderCalibrationPhase& phase, Operation&& operation)
         auto const cpu = *cpu_end - *cpu_begin;
         phase.cpu_ns = calibration_add(phase.cpu_ns, cpu); phase.max_cpu_ns = std::max(phase.max_cpu_ns, cpu);
     }
+    return wall;
 }
 struct CanonicalGroupIndex
 {
@@ -856,18 +857,19 @@ ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint6
     std::vector<uint8_t> transfer(65536);
     std::ifstream storage(std::filesystem::path(reinterpret_cast<char8_t const*>(filename.c_str())), std::ios::binary);
     storage.exceptions(std::ios::failbit | std::ios::badbit);
-    std::mt19937_64 random(0);
-    uint64_t const range_per_chunk = uint64_t(1) << (header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
-    for (uint64_t sample = 0; sample < samples; ++sample)
+    std::mt19937_64 fresh_random(0), retained_random(1);
+    auto next_challenge = [](std::mt19937_64& random)
     {
-        check();
-        std::array<uint8_t, 32> challenge{};
-        for (size_t word = 0; word < challenge.size(); word += sizeof(uint64_t))
-        { auto const value = random(); std::memcpy(challenge.data() + word, &value, sizeof(value)); }
-        std::unique_ptr<GroupProver> prover;
-        calibration_measure(result.fresh_open, [&] { prover = std::make_unique<GroupProver>(filename); });
-        result.fresh_open.logical_requested_bytes = calibration_add(result.fresh_open.logical_requested_bytes, sizeof(header));
-        auto const selected = ChallengeSetSelector::selectChallengeSets(prover->getPlotGroup().getGroupProofParams(), challenge);
+        std::array<uint8_t, 32> value{};
+        for (size_t i = 0; i < value.size(); i += sizeof(uint64_t))
+        { auto const word = random(); std::memcpy(value.data() + i, &word, sizeof(word)); }
+        return value;
+    };
+    // At most 16 KiB of samples inside the fixed worker reservation.
+    std::vector<uint64_t> fresh_times(samples), distinct_times(samples);
+    uint64_t const range_per_chunk = uint64_t(1) << (header.k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    auto requested_bytes = [&](auto const& selected)
+    {
         uint64_t requested = 0;
         for (auto const& range : selected.fragment_set_ranges)
         {
@@ -880,8 +882,20 @@ ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint6
                 requested = calibration_add(requested, end - offsets[size_t(chunk)]);
             }
         }
+        return requested;
+    };
+    for (uint64_t sample = 0; sample < samples; ++sample)
+    {
+        check();
+        auto const challenge = next_challenge(fresh_random);
+        std::unique_ptr<GroupProver> prover;
+        auto const open_ns = calibration_measure(result.fresh_open, [&] { prover = std::make_unique<GroupProver>(filename); });
+        result.fresh_open.logical_requested_bytes = calibration_add(result.fresh_open.logical_requested_bytes, sizeof(header));
+        auto const params = prover->getPlotGroup().getGroupProofParams();
+        auto const selected = ChallengeSetSelector::selectChallengeSets(params, challenge);
+        auto const requested = requested_bytes(selected);
         std::vector<PlotQualityChains> qualities;
-        calibration_measure(result.first_lookup, [&] { qualities = prover->prove(challenge); });
+        fresh_times[sample] = calibration_add(open_ns, calibration_measure(result.first_lookup, [&] { qualities = prover->prove(challenge); }));
         result.first_lookup.logical_requested_bytes = calibration_add(result.first_lookup.logical_requested_bytes,
             calibration_add(requested, result.index_bytes));
         qualities.clear(); qualities.shrink_to_fit();
@@ -889,8 +903,15 @@ ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint6
         calibration_measure(result.retained_lookup, [&] { qualities = prover->prove(challenge); });
         result.retained_lookup.logical_requested_bytes = calibration_add(result.retained_lookup.logical_requested_bytes, requested);
         for (auto const& member : qualities) result.quality_chains = calibration_add(result.quality_chains, member.quality_chains.size());
+        qualities.clear(); qualities.shrink_to_fit();
+        check();
+        auto const distinct = next_challenge(retained_random);
+        auto const distinct_bytes = requested_bytes(ChallengeSetSelector::selectChallengeSets(params, distinct));
+        distinct_times[sample] = calibration_measure(result.distinct_lookup, [&] { qualities = prover->prove(distinct); });
+        result.distinct_lookup.logical_requested_bytes = calibration_add(result.distinct_lookup.logical_requested_bytes, distinct_bytes);
         qualities.clear(); qualities.shrink_to_fit(); prover.reset();
-        result.logical_lookup_bytes = calibration_add(result.logical_lookup_bytes, calibration_product(requested, 2));
+        result.logical_lookup_bytes = calibration_add(result.logical_lookup_bytes,
+            calibration_add(calibration_product(requested, 2), distinct_bytes));
         // Independent read-only storage observations retain repeated requests
         // across ranges. OS caching is deliberately left uncontrolled.
         for (auto const& range : selected.fragment_set_ranges)
@@ -915,6 +936,13 @@ ReaderCalibrationResult calibrate_plot_reader(std::string const& filename, uint6
         }
         ++result.samples;
     }
+    auto distribution = [](std::vector<uint64_t>& times)
+    {
+        std::sort(times.begin(), times.end());
+        auto rank = [&](size_t percent) { return times[(times.size() * percent - 1) / 100]; };
+        return ReaderCalibrationLatency{rank(50), rank(95), rank(99), times.back()};
+    };
+    result.fresh_latency = distribution(fresh_times); result.distinct_latency = distribution(distinct_times);
     check(); return result;
 }
 

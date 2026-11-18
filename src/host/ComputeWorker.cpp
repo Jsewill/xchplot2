@@ -1407,9 +1407,13 @@ struct WorkerService::Impl
         std::mutex output_mutex;
         bool keepalive_enabled = false;
         std::optional<Acceptance> accepted;
+        bool const timed = channel.generation_timing();
+        Clock::duration sending{}, processing{};
         auto send = [&](pool::Message type, std::span<uint8_t const> bytes)
         {
+            auto const start = timed ? Clock::now() : Clock::time_point{};
             std::lock_guard lock(output_mutex); channel.send(type, bytes);
+            if (timed) sending += Clock::now() - start;
             if (type == pool::Message::Data && !std::exchange(generation_failpoint_checked, true))
             {
                 auto const failpoint = std::getenv("XCHPLOT2_GROW_FAILPOINT");
@@ -1507,9 +1511,11 @@ struct WorkerService::Impl
                     CpuWork compute(offered_cpu, scheduler.get(), cancel);
                     output.u64(ordinal); output.u16(members); output.bytes(bytes);
                 };
+                auto const start = Clock::now();
                 generation(k, strength, ids, operation == Operation::Packed ? WorkerPackedSink(packed_sink) : WorkerPackedSink{},
                     operation == Operation::Contributions ? WorkerContributionSink(contribution_sink) : WorkerContributionSink{}, cancel, use_gpu, false, &lease->task.resources);
                 flush();
+                processing = Clock::now() - start - sending;
             }
             else if (operation == Operation::Encode)
             {
@@ -1547,7 +1553,14 @@ struct WorkerService::Impl
             }
             else throw std::runtime_error("unknown worker operation");
             cancel.check();
-            { std::lock_guard lock(output_mutex); keepalive_enabled = false; channel.send(pool::Message::End, {}); }
+            pool::Writer end(config.tls.max_frame_bytes);
+            if (timed && operation != Operation::Encode)
+            {
+                end.u64(std::chrono::duration_cast<std::chrono::nanoseconds>(processing).count());
+                end.u64(std::chrono::duration_cast<std::chrono::nanoseconds>(sending).count());
+                end.u32(config.capacity.slots);
+            }
+            { std::lock_guard lock(output_mutex); keepalive_enabled = false; channel.send(pool::Message::End, end.data()); }
         }
         catch (std::exception const&)
         {
@@ -1606,7 +1619,8 @@ struct WorkerService::Impl
         if (!config.identity_reservation) config.identity_reservation = WorkerService::reserve_identity(config.tls.cert_file);
         require(config.identity_reservation->identity == pool::certificate_identity(config.tls.cert_file),
             "compute identity reservation belongs to another certificate");
-        listener = std::make_unique<pool::Listener>(config.listen, config.tls, config.capacity.slots);
+        auto listener_tls = config.tls; listener_tls.generation_timing = true;
+        listener = std::make_unique<pool::Listener>(config.listen, listener_tls, config.capacity.slots);
         try { refresh_brokers(); }
         catch (...) { /* A local executor stays usable while the broker restarts. */ }
         started = true;
@@ -1858,17 +1872,37 @@ public:
             *at = History{}; at->peer = peer; at->kind = value.kind; at->k = value.k; at->strength = value.strength;
         }
         at->seen = now; at->sequence = sequence_;
-        int const direction = value.execution_ns > value.transfer_ns ? 1 : value.execution_ns < value.transfer_ns ? -1 : 0;
+        bool const timed = value.generation.worker_ns && value.work_units <= pool::max_generation_batch_members && !value.local_direct;
+        uint64_t production = value.execution_ns, delivery = value.transfer_ns;
+        if (timed)
+        {
+            auto& rates = at->rates[value.contributions ? value.work_units : 0];
+            rates.add(value);
+            at->slots = std::clamp(value.worker_slots, 1u, 64u);
+            production = value.generation.worker_ns;
+            delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns, value.generation.receiver_ns});
+            if (value.contributions && rates.samples == 3)
+            {
+                // Try one larger coencoded batch after a sustained baseline.
+                // Once both have observations, prefer lower time per member.
+                unsigned best = unsigned(value.work_units);
+                for (unsigned n = 1; n < at->rates.size(); ++n)
+                    if (at->rates[n].samples == 3 && at->rates[n].service < at->rates[best].service) best = n;
+                at->plan.batch = best < pool::max_generation_batch_members && at->rates[best + 1].samples < 3 ? best + 1 : best;
+            }
+        }
+        int const direction = production > delivery ? 1 : production < delivery ? -1 : 0;
         at->votes = direction && direction == at->direction ? at->votes + 1 : unsigned(direction != 0);
         at->direction = direction;
         // A single noisy completion must not change every following request.
         if (at->votes < 3) return;
         at->votes = 0;
         if (direction > 0)
-        { at->plan.batch = std::min(unsigned(pool::max_generation_batch_members), at->plan.batch + 1);
+        { if (!timed) at->plan.batch = std::min(unsigned(pool::max_generation_batch_members), at->plan.batch + 1);
           at->plan.concurrency = std::min(64u, at->plan.concurrency + 1); }
         else
-        { at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2); }
+        { if (!timed) at->plan.batch = std::max(1u, at->plan.batch / 2);
+          at->plan.concurrency = std::max(1u, at->plan.concurrency / 2); }
     }
     void failed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection,
                 Clock::time_point now = Clock::now())
@@ -1880,6 +1914,45 @@ public:
         if (at == histories_.begin() + count_) return;
         at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2);
         at->votes = 0; at->direction = 0;
+        at->rates = {};
+    }
+    WorkerGenerationEstimate estimate(uint8_t k, uint8_t strength, pool::Kind kind, bool contributions,
+                          unsigned active, unsigned batch, Clock::time_point now = Clock::now())
+    {
+        if (!active || !batch) return {};
+        retire(now);
+        std::array<History const*, maximum> peers{}; size_t count = 0;
+        for (size_t i = 0; i < count_; ++i)
+        {
+            auto const& item = histories_[i];
+            if (item.k != k || item.strength != strength ||
+                (kind != pool::Kind::GenerateAny && kind != item.kind)) continue;
+            if (item.peer.local) return {};
+            size_t at = 0; while (at < count && peers[at]->peer.worker != item.peer.worker) ++at;
+            if (at == count) peers[count++] = &item;
+            else if (item.sequence > peers[at]->sequence) peers[at] = &item;
+        }
+        long double throughput = 0, link = 0, receiver = 0;
+        unsigned slots = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            auto const& item = *peers[i];
+            unsigned n = contributions ? std::min(batch, item.plan.batch) : 0;
+            while (n > 1 && item.rates[n].samples < 3) --n;
+            auto const& rates = item.rates[n]; if (rates.samples < 3) return {};
+            slots += item.slots;
+            long double const share = item.slots / rates.service;
+            throughput += share; link += share * rates.link; receiver += share * rates.receiver;
+        }
+        if (!throughput) return {};
+        // Worker occupancy includes sends. The same transfer and receiver
+        // can overlap that service. The owner link is shared across lanes.
+        auto occupancy = [&](unsigned lanes)
+        { return std::max({static_cast<long double>(slots) / std::min(lanes, slots), link, receiver / lanes}); };
+        auto const best = occupancy(active);
+        unsigned receivers = 1;
+        while (receivers < active && occupancy(receivers) > best) ++receivers;
+        return {best / throughput, receivers};
     }
     Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, Clock::time_point now = Clock::now())
     {
@@ -1917,6 +1990,23 @@ private:
     };
     struct History
     {
+        struct Rate
+        {
+            long double service = 0, link = 0, receiver = 0;
+            unsigned samples = 0;
+            void add(WorkerTaskObservation const& task)
+            {
+                auto const& t = task.generation;
+                samples = std::min(samples + 1, 3u);
+                auto update = [&](long double& rate, long double ns)
+                { rate += (ns / task.work_units - rate) / samples; };
+                update(service, std::max(static_cast<long double>(t.worker_ns) + t.send_ns,
+                    static_cast<long double>(t.receiver_ns) + t.frame_wait_ns));
+                // The shorter observed endpoint wait avoids charging all
+                // producer stalls or receiver backpressure as wire service.
+                update(link, std::min(t.send_ns, t.frame_wait_ns)); update(receiver, t.receiver_ns);
+            }
+        };
         Peer peer;
         pool::Kind kind = pool::Kind::GenerateCpu;
         uint8_t k = 0, strength = 0;
@@ -1924,7 +2014,8 @@ private:
         uint64_t sequence = 0;
         Clock::time_point seen{};
         int direction = 0;
-        unsigned votes = 0;
+        unsigned votes = 0, slots = 1;
+        std::array<Rate, pool::max_generation_batch_members + 1> rates{};
     };
     struct ActivePeer
     {
@@ -2100,6 +2191,7 @@ struct WorkerClient::Impl
     std::atomic<uint64_t> input_bytes{0}, output_bytes{0}, generations{0}, contributions{0}, codecs{0}, failures{0};
     std::atomic<uint64_t> local_tasks{0}, task_elapsed_ns{0};
     std::atomic<uint64_t> active_generation{0}, peak_active_generation{0}, peak_generation_members{0};
+    std::atomic<uint64_t> timed_generation_tasks{0}, worker_ns{0}, send_ns{0}, frame_wait_ns{0}, receiver_ns{0};
     struct GenerationLease
     {
         Impl& impl;
@@ -2189,6 +2281,8 @@ struct WorkerClient::Impl
         bool completed = false, resource_rejected = false, declined = false, local_direct = false, retry_same_worker = false;
         std::shared_ptr<WorkerService> local_service;
         Clock::time_point selected_at = Clock::now(), first_output{};
+        WorkerGenerationTiming generation;
+        unsigned worker_slots = 0;
         WorkerTaskOptions options;
         uint64_t planning_selection = 0;
         WorkerTaskObservation observation() const
@@ -2202,6 +2296,8 @@ struct WorkerClient::Impl
             auto const boundary = first_output == Clock::time_point{} ? end : first_output;
             result.execution_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(boundary - selected_at).count());
             result.transfer_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - boundary).count());
+            result.contributions = operation == Operation::Contributions; result.generation = generation;
+            result.worker_slots = worker_slots;
             return result;
         }
         ~Connection()
@@ -2251,7 +2347,14 @@ struct WorkerClient::Impl
             completed = true;
             if (local_direct) impl.local_tasks.fetch_add(1);
             impl.task_elapsed_ns.fetch_add(uint64_t(std::max<int64_t>(0, elapsed)));
-            auto const value = observation(); impl.observed(value, lease.endpoint, planning_selection);
+            auto const value = observation();
+            if (generation.worker_ns)
+            {
+                impl.timed_generation_tasks.fetch_add(1); impl.worker_ns.fetch_add(generation.worker_ns);
+                impl.send_ns.fetch_add(generation.send_ns); impl.frame_wait_ns.fetch_add(generation.frame_wait_ns);
+                impl.receiver_ns.fetch_add(generation.receiver_ns);
+            }
+            impl.observed(value, lease.endpoint, planning_selection);
             if (options.observe) try { options.observe(value); } catch (...) {}
         }
     };
@@ -2338,6 +2441,7 @@ struct WorkerClient::Impl
         catch (...) { connection->declined = true; throw; }
         if (connection->local_direct) return connection;
         auto tls = config.tls; tls.deadline = std::min(tls.deadline, cancel.deadline);
+        tls.generation_timing = kind != pool::Kind::Pack;
         connection->channel = pool::Channel::connect(lease->endpoint, tls, lease->worker_identity);
         return connection;
     }
@@ -2391,7 +2495,10 @@ struct WorkerClient::Impl
         size_t decoded_chunk = 0;
         for (;;)
         {
-            cancel.check(); auto frame = connection->channel.receive();
+            cancel.check(); auto const before = Clock::now(); auto frame = connection->channel.receive();
+            auto const received = Clock::now();
+            if (connection->first_output != Clock::time_point{})
+                connection->generation.frame_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(received - before).count();
             try { connection->check_frame(frame); }
             catch (pool::UnsupportedResources const&)
             { require(!connection->output_bytes, "compute worker rejected resources after partial output"); connection->resource_rejected = true; throw; }
@@ -2401,7 +2508,18 @@ struct WorkerClient::Impl
             connection->output_bytes = add(connection->output_bytes, frame.payload.size());
             if (frame.type == pool::Message::End)
             {
-                require(frame.payload.empty(), "compute result end carries trailing bytes");
+                pool::Reader end(frame.payload);
+                if (connection->channel.generation_timing())
+                {
+                    auto const work = end.u64(), sending = end.u64();
+                    connection->worker_slots = end.u32();
+                    auto const wall = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(received - connection->begin).count());
+                    // Peer timings can guide scheduling only within observed
+                    // owner wall time. Admission and output checks are independent.
+                    if (work <= wall && sending <= wall - work)
+                    { connection->generation.worker_ns = work; connection->generation.send_ns = sending; }
+                }
+                end.finish();
                 if (packed_sink) require(delivered_prelude && received_words == expected_words && decoded == total && packed_bits == 0,
                     "compute result member is truncated or has nonzero padding");
                 else require(next_chunk == PlotGroupFile::getChunkCountForK(k), "compute contributions are truncated");
@@ -2478,6 +2596,7 @@ struct WorkerClient::Impl
             }
             else throw std::runtime_error("unexpected compute generation data");
             compute.reset();
+            connection->generation.receiver_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - received).count();
         }
     }
     void generate(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
@@ -2625,9 +2744,16 @@ WorkerStats WorkerClient::stats() const
     return {impl_->input_bytes.load(), impl_->output_bytes.load(), impl_->generations.load(),
         impl_->contributions.load(), impl_->codecs.load(), impl_->failures.load(),
         impl_->local_tasks.load(), impl_->task_elapsed_ns.load(),
-        impl_->peak_generation_members.load(), impl_->peak_active_generation.load()};
+        impl_->peak_generation_members.load(), impl_->peak_active_generation.load(), impl_->timed_generation_tasks.load(),
+        {impl_->worker_ns.load(), impl_->send_ns.load(), impl_->frame_wait_ns.load(), impl_->receiver_ns.load()}};
 }
 unsigned WorkerClient::max_window_chunks() const { return impl_->config.max_window_chunks; }
+WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t strength, bool contributions,
+                                                          unsigned active, unsigned batch) const
+{
+    std::lock_guard lock(impl_->planning_mutex);
+    return impl_->planning.estimate(k, strength, impl_->config.generation_kind, contributions, active, batch);
+}
 uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_bytes; }
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {
