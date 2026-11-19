@@ -46,9 +46,9 @@ void validate_batch_entry(BatchEntry const& e)
         (!e.grouped && e.group_members != 1) || (e.raw && e.grouped))
         throw std::invalid_argument("group membership must be in [1, 65535] and requires grouped output");
     if (e.meta_group < 0 || e.meta_group > 255)
-        throw std::invalid_argument("meta group must be in [0, 255]");
+        throw std::invalid_argument("collection number must be in [0, 255]");
     if (e.plot_id != plot_id_for_group(e.group_id, uint16_t(e.plot_index), uint8_t(e.meta_group)))
-        throw std::invalid_argument("plot ID does not match group/index/meta group");
+        throw std::invalid_argument("plot ID does not match group/index/collection");
     if (e.memo.size() > 255) throw std::invalid_argument("memo exceeds 255 bytes");
     if (e.out_dir.empty()) throw std::invalid_argument("output directory is empty");
     if (group_grow::farming_metadata_namespace(std::filesystem::path(e.out_dir)))
@@ -115,7 +115,7 @@ std::vector<BatchEntry> parse_manifest(std::string const& path)
                  >> std::quoted(e.out_dir) >> std::quoted(e.out_name))) {
             throw std::runtime_error("manifest line " + std::to_string(line_no) +
                                      ": expected 9 whitespace-separated fields "
-                                     "(k strength plot_index meta_group format "
+                                     "(k strength plot_index collection format "
                                      "group_id_hex memo_hex out_dir out_name)");
         }
         if (format_s != "gplot-v2" && format_s != "raw-v2" && format_s != "gplot-v2-grouped")

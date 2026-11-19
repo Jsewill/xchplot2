@@ -118,6 +118,8 @@ int run_compute_status(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
 int run_compute_service(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_firewall(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
 #endif
 VerifyResult verify_plot_file(std::string const&, size_t trials, bool full)
 {
@@ -224,7 +226,7 @@ int main(int argc, char** argv)
         assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", value}) == 1);
         for (auto const* option : {"--k", "--num", "--strength", "--warmup"})
             assert(cli({"bench", "--config", config.string(), option, value}) == 1);
-        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--meta-group", "--pipeline-depth"})
+        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--collection", "--meta-group", "--pipeline-depth"})
             assert(cli({"plot", "--config", config.string(), option, value}) == 1);
         assert(cli({"batch", manifest.string(), "--config", config.string(), "--pipeline-depth", value}) == 1);
         assert(cli({"test", value, std::string(64, 'a'), "--config", config.string()}) == 1);
@@ -491,7 +493,7 @@ int main(int argc, char** argv)
     auto const seeded_entries = last_entries;
     seeded.push_back("--resume");
     assert(capture(seeded).first == 0 && last_entries == seeded_entries);
-    // A fixed seed shares group keys across meta groups, but their files and
+    // A fixed seed shares group keys across collections, but their files and
     // default job manifests must remain distinct.
     auto seeded_meta = args;
     seeded_meta.insert(seeded_meta.end(), {"--seed", std::string(64, 'd')});
@@ -504,6 +506,10 @@ int main(int argc, char** argv)
         assert(last_entries[i].plot_id != meta_zero[i].plot_id);
         assert(last_entries[i].out_name != meta_zero[i].out_name);
     }
+    auto const collection_entries = last_entries;
+    seeded_meta[seeded_meta.size() - 2] = "--collection";
+    seeded_meta.push_back("--resume");
+    assert(capture(seeded_meta).first == 0 && last_entries == collection_entries);
     // Grouped jobs retain membership in durable manifests, including one-member
     // jobs, so an old batch runner cannot silently treat them as ordinary jobs.
     auto grouped_entry = entry; grouped_entry.grouped = true; grouped_entry.group_members = 7;
@@ -542,6 +548,7 @@ int main(int argc, char** argv)
     assert(fill_help.find("--discover-drives") != std::string::npos && fill_help.find("--leave-free") != std::string::npos);
     auto const [fill_all_code, fill_all] = capture({"fill", "--config", config.string(), "--help-all"});
     assert(fill_all_code == 0 && fill_all.find("--paths-from") != std::string::npos && fill_all.size() > fill_help.size());
+    assert(fill_help.find("--collection") != std::string::npos && fill_all.find("--collection") != std::string::npos);
     auto const [grow_help_code, grow_help] = capture({"grow", "--config", config.string(), "--help"});
     assert(grow_help_code == 0 && grow_help.find("always enabled") != std::string::npos);
     assert(grow_help.find("--paths-from") == std::string::npos && grow_help.find("--manifest") == std::string::npos);
@@ -730,7 +737,7 @@ int main(int argc, char** argv)
     assert(cli({"plan", "--config", config.string(), other.string(), "--group-members", "auto"}) == 0);
     assert(last_group_options.group_auto && last_group_options.group_members_set && !last_group_options.group_members);
     assert(cli({"plan", "--config", config.string(), other.string()}) == 0 && !last_group_options.group_members_set);
-    assert(cli({"plan", "--config", config.string(), other.string(), "-k", "18", "-s", "3", "--meta-group", "7"}) == 0);
+    assert(cli({"plan", "--config", config.string(), other.string(), "-k", "18", "-s", "3", "--collection", "7"}) == 0);
     assert(last_group_options.k_set && last_group_options.strength_set && last_group_options.meta_set);
     assert(cli({"plan", "--config", config.string(), other.string()}) == 0);
     assert(!last_group_options.k_set && !last_group_options.strength_set && !last_group_options.meta_set);

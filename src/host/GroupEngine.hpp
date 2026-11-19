@@ -1440,24 +1440,31 @@ inline std::optional<Plan> Engine::plan_fresh(Members members, MemberBatchHash c
     result.sizes.resize(size_t(chunks));
     std::vector<FragmentRegion> regions(members.size());
     uint64_t offset = sizeof(Header) + identity_.memo.size();
-    for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+    // Size a window under one shared CPU permit, then yield to other producers and writers.
+    for (uint64_t chunk = 0; chunk < chunks;)
     {
-        config_.check_running();
-        uint64_t incoming = 0;
-        for (size_t member = 0; member < members.size(); ++member)
+        CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
+        uint64_t const begin = offset;
+        do
         {
-            auto const view = members[member];
-            auto const& boundaries = member_boundaries_[member];
-            regions[member] = view.compact() ? view.region(chunk) : view.region(chunk,
-                boundaries[size_t(chunk)], boundaries[size_t(chunk + 1)] - boundaries[size_t(chunk)]);
-            incoming = grow_add(incoming, regions[member].size());
-        }
-        admit_chunk(ChunkCodec::estimate_work(identity_.header.k, 0, incoming));
-        uint64_t const bound = ChunkCodec::fresh_bound(identity_.header.k, chunk, regions, config_.cpu_scheduler.get());
-        if (bound > config_.window_bytes) return std::nullopt;
-        result.sizes[size_t(chunk)] = bound;
-        result.largest_chunk_bytes = std::max(result.largest_chunk_bytes, bound);
-        offset = grow_add(offset, bound);
+            config_.check_running();
+            uint64_t incoming = 0;
+            for (size_t member = 0; member < members.size(); ++member)
+            {
+                auto const view = members[member];
+                auto const& boundaries = member_boundaries_[member];
+                regions[member] = view.compact() ? view.region(chunk) : view.region(chunk,
+                    boundaries[size_t(chunk)], boundaries[size_t(chunk + 1)] - boundaries[size_t(chunk)]);
+                incoming = grow_add(incoming, regions[member].size());
+            }
+            admit_chunk(ChunkCodec::estimate_work(identity_.header.k, 0, incoming));
+            uint64_t const bound = ChunkCodec::fresh_bound(identity_.header.k, chunk, regions);
+            if (bound > config_.window_bytes) return std::nullopt;
+            result.sizes[size_t(chunk)] = bound;
+            result.largest_chunk_bytes = std::max(result.largest_chunk_bytes, bound);
+            offset = grow_add(offset, bound);
+            ++chunk;
+        } while (chunk < chunks && offset - begin < config_.window_bytes);
     }
     result.header.chunk_index_offset = offset;
     // Every canonical size code is at most a machine word (check_gsz_size).

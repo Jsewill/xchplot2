@@ -321,7 +321,7 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
         value.identity = observe_inventory_file(root, file_io::path_text(value.path.filename()), options.limits).identity; return value;
     };
     for (unsigned i = 0; i < files; ++i) write(prototype.path.parent_path() / ("prefix-" + std::to_string(i) + ".plot2"), bytes);
-    auto registry = [&](bool wrong = false, bool duplicate = false, bool wrong_meta = false)
+    auto registry = [&](bool wrong = false, bool duplicate = false, bool wrong_meta = false, char const* field = "collection")
     {
         std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
         for (unsigned i = 0; i < files + unsigned(duplicate); ++i)
@@ -329,7 +329,7 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
             auto expected = expectation(i % files); if (i) out << ','; out << "{\"filename\":"; profile_detail::quote(out, file_io::path_text(expected.path));
             out << ",\"size\":130,\"plot_id\":\"" << expected.group_id << "\",\"file_size\":" << expected.identity.stamp.bytes << ",\"time_modified\":" << expected.identity.stamp.mtime
                 << ",\"pool_contract_puzzle_hash\":\"" << expected.pool_contract_puzzle_hash << "\",\"plot_public_key\":\"" << (wrong && i == files - 1 ? std::string(96, '7') : loaded_key)
-                << "\",\"meta_group\":" << unsigned(expected.meta_group + uint8_t(wrong_meta && i == files - 1)) << ",\"group_size\":" << expected.members << '}';
+                << "\",\"" << field << "\":" << unsigned(expected.meta_group + uint8_t(wrong_meta && i == files - 1)) << ",\"group_size\":" << expected.members << '}';
         }
         out << "]}";
     };
@@ -365,10 +365,11 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
         require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot accepted a mismatched loaded public key");
         rejects([&] { mismatch.finish(); }, "failed prefix check retained a healthy snapshot");
     }
-    registry(false, false, true);
+    for (auto field : {"collection", "meta_group"})
     {
+        registry(false, false, true, field);
         TargetReadinessSnapshot mismatch(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(files - 1);
-        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot ignored an explicitly reported wrong meta group");
+        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot ignored an explicitly reported wrong collection");
     }
     registry(false, true);
     rejects([&] { TargetReadinessSnapshot duplicate(options, projection, prototype.k, prototype.strength, service); }, "duplicate target registry paths accepted");

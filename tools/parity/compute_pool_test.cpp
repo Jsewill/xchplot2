@@ -111,6 +111,14 @@ void codecs()
     writer.string("hello"); Reader reader(writer.data());
     require(reader.u8() == 0xab && reader.u16() == 0xcdef && reader.u32() == 0x12345678 &&
         reader.u64() == 0x0123456789abcdef && reader.string() == "hello", "wire integer round trip changed"); reader.finish();
+    std::array<uint64_t, 3> const words{0, 0x0123456789abcdef, UINT64_MAX};
+    Writer bulk(25), scalar(25); bulk.u8(1); scalar.u8(1);
+    bulk.words(words); for (auto word : words) scalar.u64(word);
+    require(bulk.data() == scalar.data(), "packed word frames differ from scalar wire format");
+    Reader packed(scalar.data()); (void)packed.u8(); std::array<uint64_t, 3> decoded{};
+    packed.words(decoded); packed.finish();
+    require(decoded == words, "packed word frame changed payload");
+    rejects([&] { bulk.words(words); }); rejects([&] { packed.words(decoded); });
     rejects([&] { Reader short_reader(std::span(writer.data()).first(1)); (void)short_reader.u16(); });
     rejects([&] { Reader trailing(writer.data()); trailing.finish(); });
     rejects([&] { Writer limited(3); limited.u32(1); });

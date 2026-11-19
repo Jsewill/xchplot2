@@ -399,16 +399,29 @@ void Writer::reserve(size_t bytes)
     }
 }
 void Writer::u8(uint8_t value) { reserve(1); data_.push_back(value); }
+template <typename T> static void encode_integer(uint8_t* bytes, T value)
+{
+    for (size_t i = sizeof(T); i > 0; --i) { bytes[i - 1] = uint8_t(value); value >>= 8; }
+}
 template <typename T> void Writer::integer(T value)
 {
     std::array<uint8_t, sizeof(T)> encoded;
     reserve(encoded.size());
-    for (size_t i = encoded.size(); i > 0; --i) { encoded[i - 1] = uint8_t(value); value >>= 8; }
+    encode_integer(encoded.data(), value);
     data_.insert(data_.end(), encoded.begin(), encoded.end());
 }
 void Writer::u16(uint16_t value) { integer(value); }
 void Writer::u32(uint32_t value) { integer(value); }
 void Writer::u64(uint64_t value) { integer(value); }
+void Writer::words(std::span<uint64_t const> values)
+{
+    require(values.size() <= limit_ / sizeof(uint64_t), "network message exceeds its byte limit");
+    size_t const start = data_.size();
+    reserve(values.size_bytes());
+    data_.resize(start + values.size_bytes());
+    for (size_t i = 0; i < values.size(); ++i)
+        encode_integer(data_.data() + start + i * sizeof(uint64_t), values[i]);
+}
 void Writer::bytes(std::span<uint8_t const> value)
 {
     require(value.size() <= UINT32_MAX, "network blob is too large");
@@ -423,15 +436,22 @@ std::span<uint8_t const> Reader::take(size_t bytes)
     auto result = data_.subspan(position_, bytes); position_ += bytes; return result;
 }
 uint8_t Reader::u8() { return take(1)[0]; }
-template <typename T> T Reader::integer()
+template <typename T> static T decode_integer(uint8_t const* bytes)
 {
     T value = 0;
-    for (uint8_t byte : take(sizeof(T))) value = T((value << 8) | byte);
+    for (size_t i = 0; i < sizeof(T); ++i) value = T((value << 8) | bytes[i]);
     return value;
 }
+template <typename T> T Reader::integer() { return decode_integer<T>(take(sizeof(T)).data()); }
 uint16_t Reader::u16() { return integer<uint16_t>(); }
 uint32_t Reader::u32() { return integer<uint32_t>(); }
 uint64_t Reader::u64() { return integer<uint64_t>(); }
+void Reader::words(std::span<uint64_t> values)
+{
+    auto const bytes = take(values.size_bytes());
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = decode_integer<uint64_t>(bytes.data() + i * sizeof(uint64_t));
+}
 std::span<uint8_t const> Reader::bytes(uint32_t limit)
 { uint32_t const size = u32(); require(size <= limit, "network blob exceeds its byte limit"); return take(size); }
 std::string Reader::string(uint32_t limit)

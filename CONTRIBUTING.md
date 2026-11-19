@@ -53,7 +53,7 @@ identities with matching numeric representation; the
 recorded source build is provenance for new plans. Bump the schema for
 incompatible saved-policy or plan-format changes,
 the model identity when assessment semantics change, and the key-derivation
-identity when owner/seed derivation, family/meta schedules or group-key
+identity when owner/seed derivation, family/collection schedules or group-key
 derivation changes. Keep existing plan bytes and parent digests stable when
 loading compatible records. New construction checkpoints use explicit format,
 algorithm and native-representation identities; bump the affected identity when
@@ -270,8 +270,8 @@ as a physical dedicated VRAM capacity.
 
 Every suite also compares two k=18 raw-member vectors against CPU output on each
 selected tier and spill variant: strength 3 with an all-`ff` group ID, maximum
-index/meta group (65535/255), and a patterned 255-byte memo; strength 4 with a
-group ID containing bytes `00` through `1f` and index/meta group 1/1. Each path must
+index/collection (65535/255), and a patterned 255-byte memo; strength 4 with a
+group ID containing bytes `00` through `1f` and index/collection 1/1. Each path must
 report positive solved full proofs. The summary records vector parameters,
 reference hashes, and proof counts. Production k=28 checks and original log
 names remain intact. The baseline writes an official single-member `.gplot`; the boundary

@@ -305,9 +305,9 @@ inline void validate(FarmingConfig const& config, std::vector<FarmingDestination
     farming_require(destinations.size() <= 1024, "too many farming destinations");
     unsigned const slots = 1u << std::min({8u, filter(config, false), filter(config, true)});
     farming_require(!config.meta_slots_override || config.meta_slots_override <= slots,
-        "farming meta slots alias under a forecast filter");
+        "farming collection slots alias under a forecast filter");
     farming_require(!config.fixed_meta || !config.meta_slots_override || config.meta_slots_override == 1,
-        "fixed farming meta cannot rotate slots");
+        "fixed farming collection cannot rotate slots");
     for (auto const& destination : destinations)
         farming_require(std::isfinite(destination.read_bytes_per_second) && destination.read_bytes_per_second >= 0 &&
             std::isfinite(destination.read_latency_seconds) && destination.read_latency_seconds >= 0 &&
@@ -460,7 +460,7 @@ inline FarmingAssessment assess_cohorts(FarmingConfig const& config, std::vector
             plan.meta_slots && plan.meta_slots <= (1u << meta_bits) && plan.meta_bits == meta_bits &&
             plan.meta_base == parameters.meta_group_override && (!parameters.fixed_meta || plan.meta_slots == 1) &&
             (!parameters.meta_slots_override || plan.meta_slots == parameters.meta_slots_override),
-            "farming assessment layout aliases resource/meta identities");
+            "farming assessment layout aliases resource/collection identities");
         auto const& first = layouts[prepared->first[lane]];
         auto const& identity = configs[prepared->first[lane]];
         farming_require(identity.k == parameters.k && identity.strength == parameters.strength,
@@ -650,7 +650,7 @@ inline FarmingAssessment assess(FarmingConfig const& config, std::vector<Farming
             plan.meta_slots && plan.meta_slots <= (1u << meta_bits) && plan.meta_bits == meta_bits &&
             plan.meta_base == parameters.meta_group_override && (!parameters.fixed_meta || plan.meta_slots == 1) &&
             (!parameters.meta_slots_override || plan.meta_slots == parameters.meta_slots_override),
-            "farming assessment layout aliases resource/meta identities");
+            "farming assessment layout aliases resource/collection identities");
         auto const& first = layouts[prepared->first[lane]];
         if (cohort_costs && !cohort_configs.empty())
         {

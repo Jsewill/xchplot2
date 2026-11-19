@@ -208,14 +208,14 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
         << "    Farming-layout preview, capacity-driven plotting, group growth and shared compute.\n"
         << "    Use COMMAND --help for its options. Previews write only requested plan or profile exports.\n"
-        << "  " << prog << " test <k> <group_id_hex> [strength] [plot_index] [meta_group] [verbose]\n"
+        << "  " << prog << " test <k> <group_id_hex> [strength] [plot_index] [collection] [verbose]\n"
         << "         [--raw] [-o|--out DIR] [-m|--memo HEX] [-N|--out-name NAME]\n"
         << "         [--gpu-t1] [--gpu-t2] [--gpu-t3] [-G|--gpu-all] [-P|--profile]\n"
         << "  " << prog << " batch <manifest.tsv> [-v|--verbose] [-q|--quiet]\n"
         << "         [-r|--resume] [--continue-on-error]\n"
         << "         [--progress|--no-progress] [-d|--devices <SPEC>]\n"
         << "    Manifest: one plot per non-empty/non-# line, whitespace-separated:\n"
-        << "      k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name\n"
+        << "      k strength plot_index collection format group_id_hex memo_hex out_dir out_name\n"
         << "    The gplot-v2-grouped format adds a final member count.\n"
         << "    Runs GPU compute and CPU FSE in a producer/consumer pipeline so they overlap\n"
         << "    across consecutive plots. ~2x throughput vs separate `test` invocations.\n"
@@ -248,7 +248,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    --manifest FILE                 : save/reuse this job manifest (default: unique\n"
         << "                                      xchplot2-job-*.tsv in the output directory).\n"
         << "    -i, --plot-index N              : member index (must be 0 for single-member groups).\n"
-        << "    -g, --meta-group N              : v2 PoS meta_group field (default 0).\n"
+        << "    -g, --collection N              : v2 PoS collection number (default 0).\n"
         << "    -S, --seed HEX                  : optional 64 hex chars of master-SK\n"
         << "                                      entropy. Per-plot seed = SHA256(seed || i).\n"
         << "                                      Reproducible across runs. Defaults to\n"
@@ -394,7 +394,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "    <group_id_hex>  : 64 hex characters\n"
         << "    [strength]     : optional, defaults to 2\n"
         << "    [plot_index]   : optional, defaults to 0\n"
-        << "    [meta_group]   : optional, defaults to 0\n"
+        << "    [collection]   : optional, defaults to 0\n"
         << "    [verbose]      : optional, 0/1, default 0\n"
         << "  test-mode flags:\n"
         << "        --raw         : write a temporary raw member for group assembly\n"
@@ -569,7 +569,7 @@ bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)
 
 std::string plot_id_to_filename(int k, std::array<uint8_t, 32> const& plot_id)
 {
-    // The sole member ID includes meta_group as well as the group identity.
+    // The sole member ID includes the collection number as well as the group identity.
     static char const hex[] = "0123456789abcdef";
     std::string out = "plot-k" + std::to_string(k) + "-";
     out.reserve(out.size() + 64 + 6);
@@ -2496,7 +2496,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--pool-ph"                  && need(1)) pool_ph_hex   = argv[++i];
             else if ((a == "--pool-contract-address" || a == "-c") && need(1)) pool_addr = argv[++i];
             else if ((a == "--plot-index" || a == "-i") && need(1)) { if (!parse_integer_arg(argv[++i], plot_index_base, a)) return 1; }
-            else if ((a == "--meta-group" || a == "-g") && need(1)) { if (!parse_integer_arg(argv[++i], meta_group, a)) return 1; }
+            else if ((a == "--collection" || a == "--meta-group" || a == "-g") && need(1)) { if (!parse_integer_arg(argv[++i], meta_group, a)) return 1; }
             else if ((a == "--seed"       || a == "-S") && need(1)) seed_hex        = argv[++i];
             else if  (a == "--manifest" && need(1)) manifest_path = argv[++i];
             else if (a == "--testnet" || a == "-T") {
@@ -2699,7 +2699,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             return 1;
         }
         if (meta_group < 0 || meta_group > 0xFF) {
-            std::cerr << "Error: --meta-group must be in [0, 255]\n";
+            std::cerr << "Error: --collection must be in [0, 255]\n";
             return 1;
         }
 
@@ -3012,7 +3012,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --meta-group --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --collection --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
@@ -3235,7 +3235,7 @@ _xchplot2() {
         '-k[Plot size]:k:' '-n[Plot count]:count:' '-s[Strength]:strength:' \
         '-f[Farmer public key]:hex:' '-p[Pool public key]:hex:' \
         '--pool-ph[Pool puzzle hash]:hex:' '-c[Pool contract address]:address:' \
-        '-i[Plot index]:index:' '-g[Meta group]:group:' '-S[Seed]:hex:' \
+        '-i[Plot index]:index:' '-g[Collection number]:collection:' '--collection[Collection number]:collection:' '-S[Seed]:hex:' \
         '--raw[Temporary raw group member (test only)]' \
         '-o[Output dir]:dir:_files -/' \
         "$positional"
@@ -3439,7 +3439,7 @@ complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s f -l farmer-
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s p -l pool-pk -x -d 'Pool public key'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s c -l pool-contract-address -x -d 'Pool contract address'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s i -l plot-index -x -d 'Plot index'
-complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s g -l meta-group -x -d 'Meta group'
+complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s g -l collection -x -d 'Collection number'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s S -l seed -x -d 'Seed'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -s n -l num -x -d 'Plot count'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l pool-ph -x -d 'Pool puzzle hash'
@@ -3540,7 +3540,7 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
     }
     if (pos.size() >= 3 && !parse_integer_arg(pos[2], opts.strength, "strength")) return 1;
     if (pos.size() >= 4 && !parse_integer_arg(pos[3], opts.plot_index, "plot_index")) return 1;
-    if (pos.size() >= 5 && !parse_integer_arg(pos[4], opts.meta_group, "meta_group")) return 1;
+    if (pos.size() >= 5 && !parse_integer_arg(pos[4], opts.meta_group, "collection")) return 1;
     if (pos.size() >= 6) {
         int verbose = 0;
         if (!parse_integer_arg(pos[5], verbose, "verbose")) return 1;
@@ -3553,7 +3553,7 @@ complete -c xchplot2 -n "__fish_seen_subcommand_from completions" -a 'bash zsh f
 
     if (opts.plot_index < 0 || opts.plot_index > 65535 ||
         opts.meta_group < 0 || opts.meta_group > 255 || (!opts.raw && opts.plot_index != 0)) {
-        std::cerr << "Error: group files require index 0; raw member indices must be 0..65535 and meta group 0..255\n";
+        std::cerr << "Error: group files require index 0; raw member indices must be 0..65535 and collection 0..255\n";
         return 1;
     }
     opts.plot_id = pos2gpu::plot_id_for_group(opts.group_id, uint16_t(opts.plot_index), uint8_t(opts.meta_group));

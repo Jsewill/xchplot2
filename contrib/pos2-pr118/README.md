@@ -47,10 +47,10 @@ For an already checked-out upstream revision, configure with
 when evaluating a new revision, and record its commit alongside the results.
 
 The test generates four temporary fixtures with plot indices 0, 1,
-4660, and 65535, meta groups 0, 7, and 255, and strengths 2 and 4. It checks:
+4660, and 65535, collections 0, 7, and 255, and strengths 2 and 4. It checks:
 
 - Plot ID derivation against Python's SHA-256 of
-  `group_id || big_endian_u16(plot_index) || u8(meta_group)`.
+  `group_id || big_endian_u16(plot_index) || u8(collection)`.
 - Exact raw fragment equality between current xchplot2 and upstream's CPU
   plotter, including duplicate counts.
 - Byte-for-byte native single-member `.gplot` equality with the upstream writer.
@@ -83,7 +83,7 @@ released chia-protocol/chia-bls 0.52 for BLS and identity hashing, with
 the V2 taproot hash SHA-256 of `(local_pk + farmer_pk) || farmer_pk` for both
 pool-public-key and pool-contract modes. It generates one seed and memo per group, exposes the group
 hash, and derives each member ID as SHA-256 of the group ID, big-endian u16
-index, and u8 meta group. New jobs generate fresh random keys by default, so
+index, and u8 collection number. New jobs generate fresh random keys by default, so
 repeating the same plotting parameters produces distinct group and member IDs.
 `--seed` makes the group reproducible. k must be even
 in 18..28; `--testnet` is explicitly rejected because PoS2 1.0 removes it.
@@ -92,9 +92,9 @@ Add `--files N` to write multiple files sharing one group ID and memo.
 `--group-size` is the number of members in each file. For example,
 `--out /plots/example.gplot --group-size 2 --files 3` writes six unique members
 in `example.gplot`, `example-001.gplot`, and `example-002.gplot`. Each file
-uses the same meta group and a distinct member-index range: 0–1, 2–3, and 4–5
+uses the same collection and a distinct member-index range: 0–1, 2–3, and 4–5
 in this example. `--plot-index` sets the first member's index (default 0);
-the last member's index must be at most 65535. `--meta-group` stays explicit
+the last member's index must be at most 65535. `--collection` stays explicit
 and defaults to 0 for every file. It controls challenge scheduling and is
 independent of how the group is divided into files. Each file is plotted,
 assembled, and verified before starting the next, using the same per-file

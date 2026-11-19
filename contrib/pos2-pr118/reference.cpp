@@ -91,7 +91,7 @@ try {
     }
     assert(validated > 0);
     std::cout << "PASS index=" << header.index
-              << " meta_group=" << group_params.get_meta_group()
+              << " collection=" << group_params.get_meta_group()
               << " strength=" << int(params.get_strength())
               << ": " << plot.t3_proof_fragments.size() << " matching fragments, "
               << validated << " full group proofs\n";

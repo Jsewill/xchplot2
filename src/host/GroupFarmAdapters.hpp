@@ -2334,8 +2334,9 @@ public:
                 inventory_detail::require(adapter_detail::hex_string(inventory_detail::required_field(p, "plot_id"), 32) == expected.group_id &&
                     inventory_detail::integer(p, "file_size") == expected.identity.stamp.bytes && inventory_detail::integer(p, "size") == uint64_t(0x80 | expected.strength) &&
                     inventory_detail::integer(p, "time_modified") == uint64_t(expected.identity.stamp.mtime), "native harvester replacement ID/parameters differ");
-                if (auto const* meta = profile_detail::field(p, "meta_group"))
-                    inventory_detail::require(profile_detail::integer(*meta) == expected.meta_group, "native harvester replacement meta group differs");
+                for (auto field : {"collection", "meta_group"})
+                    if (auto const* collection = profile_detail::field(p, field))
+                        inventory_detail::require(profile_detail::integer(*collection) == expected.meta_group, "native harvester replacement collection differs");
                 if (auto const* count = profile_detail::field(p, "group_size"))
                     inventory_detail::require(profile_detail::integer(*count) == expected.members, "target service replacement group membership differs");
                 else inventory_detail::require(record != farmer_at->second || expected.members == 1,

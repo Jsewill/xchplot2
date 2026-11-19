@@ -246,6 +246,31 @@ build took 216.2 s. All three files matched across builds. The planner keeps
 its ordinary concurrency during unmeasured CPU generation and can open
 independent HDDs for final packing.
 
+#### Time to publish a group assembled in RAM
+
+A single RTX 4090 worker sent three k=28 members over 10 GbE to a storage
+host with eight plotting CPU workers and a 32 GiB RAM grant. With
+`--construction auto`, `fill` kept all three members in RAM and wrote the
+group directly to one HDD. Each build ran twice with the same owner and seed.
+
+| Mean time per group | Previous | Updated |
+| --- | ---: | ---: |
+| Generate and receive three members | 16.0 s | 15.9 s |
+| Plan the first batch | 4.60 s | 1.00 s |
+| Encode and durably write the group | 14.4 s | 14.4 s |
+| Launch to publication | 35.5 s | 31.9 s |
+
+Planning now acquires a CPU slot per output window and can reuse the member
+hash calculated during delivery. Mean time to publication fell 10.1%.
+The final write phase delivered 208 MB/s against a 241 MB/s sequential
+direct-write measurement on the same HDD. All four files had the same
+SHA-256 and contained 2,983,531,299 bytes.
+
+With two output HDDs sharing the same GPU and RAM grant, each drive received
+one three-member group. The mean time until both groups were published fell
+from 51.4 s to 46.0 s across two runs per build. Each drive's file matched
+across builds, and every run used zero scratch bytes.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

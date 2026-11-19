@@ -1484,7 +1484,7 @@ struct WorkerService::Impl
                         pool::Writer out(config.tls.max_frame_bytes);
                         auto const part = words.first(std::min<size_t>(words.size(), (config.tls.max_frame_bytes - 16) / 8));
                         { CpuWork compute(offered_cpu, scheduler.get(), cancel); out.u8(uint8_t(DataKind::Words));
-                          out.u32(uint32_t(part.size())); for (auto value : part) out.u64(value); }
+                          out.u32(uint32_t(part.size())); out.words(part); }
                         cancel.check(); send(pool::Message::Data, out.data()); words = words.subspan(part.size());
                     }
                 };
@@ -2445,7 +2445,7 @@ struct WorkerClient::Impl
         connection->channel = pool::Channel::connect(lease->endpoint, tls, lease->worker_identity);
         return connection;
     }
-    void generate_once(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
+    bool generate_once(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity,
                   WorkerContributionWindowSink const& contribution_window)
@@ -2479,7 +2479,7 @@ struct WorkerClient::Impl
               connection->resource_rejected = true; throw; }
             catch (pool::TransientTransport const&)
             { connection->retry_same_worker = true; throw; }
-            cancel.check(); connection->delivered(); return;
+            cancel.check(); connection->delivered(); return false;
         }
         auto compute = cpu_lease(cancel);
         pool::Writer request(config.tls.max_frame_bytes); pool::write_lease(request, connection->lease);
@@ -2524,7 +2524,8 @@ struct WorkerClient::Impl
                 if (packed_sink) require(delivered_prelude && received_words == expected_words && decoded == total && packed_bits == 0,
                     "compute result member is truncated or has nonzero padding");
                 else require(next_chunk == PlotGroupFile::getChunkCountForK(k), "compute contributions are truncated");
-                compute.reset(); connection->delivered(); return;
+                compute.reset(); connection->delivered();
+                return packed_sink && !(validation.flags & PackedMemberValidation::wide_delta);
             }
             pool::Reader input(frame.payload); auto const type = DataKind(input.u8());
             if (type == DataKind::Prelude)
@@ -2554,7 +2555,7 @@ struct WorkerClient::Impl
             {
                 require(delivered_prelude, "compute words precede complete boundaries"); auto const count = input.u32();
                 require(count && count <= expected_words - received_words && uint64_t(count) * 8 <= input.remaining(), "compute word tile exceeds member");
-                words.clear(); words.reserve(count); for (uint32_t i = 0; i < count; ++i) words.push_back(input.u64()); input.finish();
+                words.resize(count); input.words(words); input.finish();
                 unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
                 uint64_t const range = uint64_t(1) << width;
                 uint64_t const maximum_delta = uint64_t(72 - k) * (178ull << (k - 8));
@@ -2604,7 +2605,7 @@ struct WorkerClient::Impl
             connection->generation.receiver_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - received).count();
         }
     }
-    void generate(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
+    bool generate(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity,
                   WorkerContributionWindowSink const& contribution_window = {})
@@ -2613,11 +2614,11 @@ struct WorkerClient::Impl
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members,
             "invalid compute generation batch");
         GenerationLease admission(*this, ids.size(), cancel);
-        if (config.local_only) { generate_private(k, strength, ids, packed_sink, contribution_sink, cancel); return; }
+        if (config.local_only) { generate_private(k, strength, ids, packed_sink, contribution_sink, cancel); return false; }
         if (identity.task_id.empty()) identity.task_id = pool::random_token();
         for (unsigned failed = 0;; ++failed)
         {
-            try { generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window); return; }
+            try { return generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window); }
             catch (pool::UnsupportedResources const&)
             {
                 // A refused batch may need a different shape. Its owner must
@@ -2638,9 +2639,9 @@ bool WorkerClient::local_available() const
     if (impl_->config.local_only) return impl_->config.local_service || bool(impl_->config.local_service_provider);
     return bool(impl_->local_service());
 }
-void WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
+bool WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
-{ impl_->generate(k, strength, {&id, 1}, sink, {}, cancel, std::move(identity)); }
+{ return impl_->generate(k, strength, {&id, 1}, sink, {}, cancel, std::move(identity)); }
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
     WorkerContributionWindowSink const& window)

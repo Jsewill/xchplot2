@@ -966,6 +966,13 @@ void batch_hashing()
     require(hash.digest_for(members) == std::optional(framed_digest(std::span(raw).first(2))) &&
             hash.digest_for(Members(members).subspan(0, 1)) == first_digest,
             "batch hash did not preserve full and reduced prefixes");
+    MemberBatchHash received(2);
+    received.append(members[0].view(), {});
+    rejects([&] { received.append(members[1].view(), [] { throw std::runtime_error("cancelled"); }); });
+    require(received.size() == 1 && received.digest_for(Members(members).subspan(0, 1)) == first_digest,
+            "interrupted receive hashing changed the committed prefix");
+    received.append(members[1].view(), {});
+    require(received.digest_for(members) == hash.digest_for(members), "received and generated batch digests differ");
     require(!hash.digest_for(std::span(raw).first(2)), "mutable raw data reused an immutable hash");
     std::array<Member, 2> borrowed{Member::borrowed(raw[0]), Member::borrowed(raw[1])};
     require(!hash.digest_for(borrowed), "borrowed raw data reused an immutable hash");

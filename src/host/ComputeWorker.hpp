@@ -275,7 +275,8 @@ public:
     ~WorkerClient();
     WorkerClient(WorkerClient const&) = delete;
     WorkerClient& operator=(WorkerClient const&) = delete;
-    void generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& plot_id,
+    // True only if this client checked all packed fields and their narrow deltas on receipt.
+    bool generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& plot_id,
                   WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,

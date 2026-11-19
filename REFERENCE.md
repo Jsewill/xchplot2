@@ -36,12 +36,12 @@ xchplot2 plot -k 28 -n 10 \
 | `-j`, `--workers N` | Shared plotting CPU budget for grouped construction |
 | `-r`, `--resume` | Recover the saved job and skip validated completed files |
 | `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
-| `-g`, `--meta-group N` | Meta-group field; default 0 |
+| `-g`, `--collection N` | Collection number (default 0). Also accepts `--meta-group`. |
 | `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
 | `-v`, `--verbose` | Print additional worker and plotting details |
 
 Supply the farmer key and one of the pool key, puzzle hash, or contract
-address forms. See [plot indices and meta groups](#plot-indices-and-meta-groups)
+address forms. See [plot indices and collections](#plot-indices-and-collections)
 for the grouping distinction. Full help: `xchplot2 --help`.
 Only k28 is valid for farming. Smaller sizes exercise construction, recovery
 and proof validation in tests; their output is not farmable.
@@ -131,12 +131,12 @@ xchplot2 batch /path/to/job.tsv --devices gpu --resume
 Ordinary single-member and raw manifests have nine whitespace-separated fields in this order:
 
 ```text
-k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
+k strength plot_index collection format group_id_hex memo_hex out_dir out_name
 ```
 
 `format` is `gplot-v2` for a single-member group (index 0), or `raw-v2`
 for a temporary member consumed by the group assembler. `group_id_hex` is
-64 hex characters; the member ID is derived from it, the index, and meta group.
+64 hex characters; the member ID is derived from it, the index, and collection number.
 `memo_hex` encodes up to 255 bytes (`""` represents an empty memo).
 `plot --group-members N` and automatic shared plotting save `gplot-v2-grouped`
 rows with a tenth field, the member count. This explicit format prevents older
@@ -273,7 +273,7 @@ xchplot2 fill /disk-b/plots
 `fill` always plans a farming layout, including with an explicit
 `--group-members N`. Omit that option or use `auto` to select file membership
 from the farming profile. Files start at index zero; the planner assigns
-shared-ID families and meta groups across physical storage resources.
+shared-ID families and collections across physical storage resources.
 `--max-groups N` limits files per directory, and `--max-total-members N`
 limits membership per directory. Without those limits, the initial layout uses
 available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
@@ -333,7 +333,7 @@ expansions. Joint assessment includes those full promises even for offline
 destinations. It shares the declared CPU, lookup-worker, cache and reader-memory
 budgets, keeps independent jobs' identity families independent, and combines
 known storage sharing conservatively. Duplicate jobs and destination aliases
-are rejected. Harvester service inputs, plot parameters and meta constraints
+are rejected. Harvester service inputs, plot parameters and collection constraints
 must match; saved group-size choices and layout objectives may differ.
 
 This mode reads the supplied summaries and checks their explicit destination
@@ -655,6 +655,12 @@ needed. `--batch-members N` bounds construction batches independently of the
 final file membership. `--member-storage compact|raw` selects retained
 fragments; compact is the default.
 
+When automatic construction admits a fresh group in one incremental batch,
+the members stay in RAM and the plotter writes the final file directly to the
+destination. With pooled compute, the plotting host can hash completed compact
+members in order while other members arrive. The hash cache uses the same RAM
+grant as the batch.
+
 Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems, or use
 `--temp-dirs /scratch-a /scratch-b`. End a multi-directory list with another
 option or `--`; destinations after `--` are positional arguments.
@@ -746,12 +752,12 @@ updates; the terminal defaults match `plot`.
 
 ### Farming layout
 
-Automatic directory planning chooses farming group size and meta families
-together. The plotting machine's RAM, GPU speed and temporary disks determine
-how to construct that layout; the planner does not use them as the final
-harvester's CPU or cache capacity. It uses the destination's physical-resource
-topology and a declared farming profile. The default preview reports the
-profile's source, CPU and memory allowances and initial file counts.
+The directory planner chooses how many members to put in each file and assigns
+collections within each shared-ID family. The plotting machine's RAM, GPU speed
+and temporary disks determine how to construct that layout. The planner models
+the harvester using the destination's physical-resource topology and the CPU
+and cache capacities in the declared farming profile. The default preview
+reports the profile's source, CPU and memory allowances and initial file counts.
 `--verbose` adds response estimates, assumptions, detected configuration,
 identity families, resource sharing and workload estimates.
 For measured construction and lookup costs at 71, 72 and 73 members, see
@@ -905,21 +911,21 @@ lookups while increasing the repeated work. The planner compares balanced
 integer layouts within the declared storage, CPU, worker and memory limits.
 An efficient average workload alone does not establish a response deadline.
 
-Meta groups change eligibility correlations, so choose them together with file
+Collections change eligibility correlations, so choose them together with file
 size. The [filter implementation](https://github.com/Chia-Network/chia-blockchain/blob/main/chia/types/blockchain_format/proof_of_space.py)
 compares a hash of the group ID and filter challenge with the signage-point
-index XOR the meta value, masked by the effective filter. Distinct masked meta
-values exclude simultaneous eligibility only within the same group ID.
-Rotating meta numbers while generating unrelated group IDs does not provide
-that guarantee. When the effective filter shrinks, some meta values alias.
+index XOR the collection number, masked by the effective filter. Within one
+group ID, distinct masked collection numbers exclude simultaneous eligibility.
+Rotating collection numbers while generating unrelated group IDs does not provide
+that guarantee. When the effective filter shrinks, some collection numbers alias.
 Window scheduling also correlates neighboring signage points; a planner must
 evaluate consecutive challenges, including carried-over work.
 
-Within one shared-ID family, balance member counts across its usable meta
+Within one shared-ID family, balance member counts across its usable collection
 slots. With one file per slot and no other eligible work on the drive, this
 minimizes the largest activation. Ordinary files start at member index zero:
-reusing both the group ID and meta value in another such file duplicates member
-identities. Exhausted meta slots require a new identity family. Assign families
+reusing both the group ID and collection number in another such file duplicates member
+identities. Exhausted collection slots require a new identity family. Assign families
 per physical storage resource, keeping that assignment stable on resume.
 
 Measure or explicitly model the actual reader. The pinned k28 C++ reader
@@ -944,7 +950,7 @@ together, including families on different drives. It bounds CPU, lookup-worker
 and physical I/O contention for that burst. The bound must fit both the response
 deadline and the signage-point interval, so admitted work finishes before the
 next arrival. The model assumes work-conserving queues with FIFO admission to
-CPU and read resources. Same-family meta exclusion is retained under both
+CPU and read resources. Same-family collection exclusion is retained under both
 modeled filter settings. A finite sample with no late responses cannot replace
 this admission check.
 
@@ -2144,14 +2150,14 @@ spaces. For `plan` and `fill` destination lists, use
 [`--paths-from` or `--paths0-from`](#grouped-plotting-and-drive-filling).
 Pass `--config` directly on the command line, not inside an argument file.
 
-## Plot indices and meta groups
+## Plot indices and collections
 
 Both are v2 PoS fields and default to 0. `plot -n N` writes N independent
 `.gplot` groups with fresh keys. `--group-members M` chooses M members per
 file; every file starts at member index zero.
-`--seed` and saved-job resume preserve those identities. The meta group (u8)
+`--seed` and saved-job resume preserve those identities. The collection number (u8)
 selects a challenge-isolation boundary. Every member of a group shares its
-group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || meta_group`.
+group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || collection`.
 
 The official version 2 format from
 [pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118)
@@ -2480,7 +2486,7 @@ Notes:
 ### Single test plot
 
 ```bash
-xchplot2 test <k> <group-id-hex> [strength] [plot-index] [meta-group] [verbose]
+xchplot2 test <k> <group-id-hex> [strength] [plot-index] [collection] [verbose]
 ```
 
 This accepts a 64-character hex group ID and derives its member ID. It uses CPU phases by default;

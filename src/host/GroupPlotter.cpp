@@ -292,7 +292,7 @@ void requested_identity(Arguments const& args, Identity const& identity)
     if (args.strength)
         require(*args.strength == identity.params.get_strength(), "--strength differs from saved identity");
     if (args.meta)
-        require(*args.meta == identity.params.get_meta_group(), "--meta-group differs from saved identity");
+        require(*args.meta == identity.params.get_meta_group(), "--collection differs from saved identity");
 }
 
 // Use exactly the production CLI's base-seed/subseed and BLS group derivation.
@@ -522,10 +522,12 @@ uint64_t resident(std::span<group_grow::Member const> values)
     for (auto const& value : values) bytes = sum(bytes, value.storage_bytes());
     return bytes;
 }
+bool has_compute(Arguments const& args)
+{ return args.local_compute || !args.pool_broker.empty(); }
 uint64_t batch_hash_bytes(Arguments const& args, size_t count)
 {
     // A generation-overlap batch can coexist with the batch being consumed.
-    return args.member_storage == "compact" && !args.local_compute && args.pool_broker.empty() ?
+    return args.member_storage == "compact" && !has_compute(args) ?
         product(2, group_grow::MemberBatchHash::memory_bytes(count)) : 0;
 }
 uint64_t filesystem_capacity(fs::path const& target, uint64_t headroom, uint64_t metadata_allocated = 0)
@@ -574,8 +576,6 @@ struct MemberLease
     }
 };
 bool controller_profile();
-bool has_compute(Arguments const& args)
-{ return args.local_compute || !args.pool_broker.empty(); }
 
 struct Backend
 {
@@ -786,6 +786,7 @@ struct Backend
         uint64_t const bound = fragment_bound(identity.params) / sizeof(uint64_t);
         std::optional<group_grow::CompactMemberReceiver> receiver;
         uint64_t received_count = 0;
+        bool deltas_checked = false;
         auto const plot_id = identity.params.get_plot_params_for_index(index).get_plot_id().data();
         group_grow::WorkerCancellation cancel;
         cancel.stop = stop;
@@ -824,7 +825,7 @@ struct Backend
             require(attempt < UINT64_MAX, "pool task attempt exhausted"); task.attempt = ++attempt;
             try
             {
-                acquire_pool_client()->generate(k, uint8_t(identity.params.get_strength()), plot_id,
+                deltas_checked = acquire_pool_client()->generate(k, uint8_t(identity.params.get_strength()), plot_id,
                     receive, cancel, task);
                 break;
             }
@@ -849,7 +850,7 @@ struct Backend
         check_cancel(args);
         require(receiver.has_value(), "remote producer did not deliver a member");
         group_grow::CodecScheduler::Lease compute(cpu_scheduler.get(), 1, [cancel] { cancel.check(); });
-        auto result = receiver->finish();
+        auto result = receiver->finish(deltas_checked);
         pool_members.fetch_add(1);
         if (args.member_storage == "raw")
         {
@@ -1137,6 +1138,15 @@ struct Producer
         return sum(product(count, sum(member, ordered)), product(tasks,
             sum(pending, sizeof(std::future<group_grow::Member>) + 2 * sizeof(uint64_t) + 256)));
     }
+    // Keep the admitted batch (including an older checkpoint) when a prefix
+    // cache would exceed its grant. The engine can hash the members at append.
+    uint64_t pool_hash_bytes(size_t count, uint64_t receiving, uint64_t retained) const
+    {
+        if (args.member_storage != "compact") return 0;
+        uint64_t const peak = sum(sum(fixed, retained), sum(backend.retained(), receiving));
+        uint64_t const bytes = group_grow::MemberBatchHash::memory_bytes(count);
+        return peak <= budget && bytes <= budget - peak ? bytes : 0;
+    }
     uint64_t contribution_bytes(group_grow::Config const& config, uint16_t count) const
     {
         return sum(group_grow::ExternalEngine::contribution_input_memory_bytes(config, count),
@@ -1344,7 +1354,8 @@ struct Producer
 
     size_t fill_pool(std::vector<group_grow::Member>& values, uint16_t first, size_t wanted,
                      uint64_t other_retained, std::string const& progress,
-                     std::function<bool()> const& stop, std::atomic<bool> const* stopped = nullptr)
+                     std::function<bool()> const& stop, std::atomic<bool> const* stopped = nullptr,
+                     group_grow::MemberBatchHash* hash = nullptr)
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         size_t const before = values.size();
@@ -1371,6 +1382,7 @@ struct Producer
         constexpr uint64_t completed_metadata = sizeof(std::pair<size_t const, group_grow::Member>) + 4 * sizeof(void*);
         uint64_t completed_bytes = 0;
         size_t scheduled = before;
+        size_t next_hash = before;
         bool accepting = true;
         fill_stop = FillStop::full;
         while (accepting || !pending.empty())
@@ -1413,6 +1425,14 @@ struct Producer
                 in_flight = sum(in_flight, allocation); ++scheduled; made_progress = true;
             }
             if (scheduled == wanted) accepting = false;
+            // Hash the ordered prefix while outstanding workers produce its successors.
+            // The futures never borrow the hash or the controller's member vector.
+            for (; hash && next_hash < values.size(); ++next_hash)
+            {
+                auto check = [&] { check_cancel(args); require(!stopped || !stopped->load(), "pool generation cancelled"); };
+                group_grow::CodecScheduler::Lease compute(backend.cpu_scheduler.get(), 1, check);
+                hash->append(values[next_hash].view(), check);
+            }
             uint64_t const actual = sum(sum(sum(sum(sum(fixed, other_retained), resident(values)),
                 completed_bytes), in_flight), backend.retained());
             require(actual <= budget, "remote members exceed the owner RAM admission");
@@ -1534,11 +1554,8 @@ struct Producer
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (has_compute(args))
         {
-            // Packed network members use the engine's existing digest path;
-            // the local producer's ordered prefix cache is not populated.
-            require(!hash, "pool producer cannot populate a compact-builder hash cache");
             backend.initialize(args, identity, sum(fixed, other_retained), false);
-            return fill_pool(values, first, wanted, other_retained, progress, stop);
+            return fill_pool(values, first, wanted, other_retained, progress, stop, nullptr, hash);
         }
 #endif
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
@@ -4030,6 +4047,17 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     require(!saved.pending || saved.target_members <= maximum,
             "pending transaction membership exceeds requested limit or available fixtures");
     Producer producer{identity, fixture, *backend, args, args.max_ram, fixed, fixed};
+    bool hash_members = compact && !has_compute(args);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (has_compute(args) && compact && !engine.is_staging() &&
+        (pending_count || (engine.can_append() && after_recovery < maximum)))
+    {
+        uint64_t const receiving = producer.pool_receive_bytes(saved.old_members, batch_cap);
+        uint64_t const bytes = producer.pool_hash_bytes(batch_cap, receiving, inherited_bytes);
+        fixed = producer.fixed = sum(fixed, bytes);
+        hash_members = bytes != 0;
+    }
+#endif
     producer.admit_engine({});
     if (input_required && inherited) { inherited->clear(); inherited_bytes = 0; }
     if (inherited && !inherited->members.empty())
@@ -4084,7 +4112,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     else if (engine.needs_regeneration())
     {
         std::vector<group_grow::Member> incoming;
-        auto hash = compact && !has_compute(args) ? std::make_unique<group_grow::MemberBatchHash>(batch_cap) : nullptr;
+        auto hash = hash_members ? std::make_unique<group_grow::MemberBatchHash>(batch_cap) : nullptr;
         MemberLease borrowed;
         incoming.reserve(pending_count);
         require(incoming.capacity() <= batch_cap, "member container exceeds admitted capacity");
@@ -4152,7 +4180,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         std::vector<group_grow::Member> incoming;
         std::unique_ptr<group_grow::MemberBatchHash> hash;
         prefetched.take(incoming, hash, size_t(wanted), batch_cap);
-        if (compact && !has_compute(args) && (!engine.is_staging() || metrics.members + wanted == maximum) && !hash && incoming.empty())
+        if (hash_members && !hash && incoming.empty() && (!engine.is_staging() || metrics.members + wanted == maximum))
             hash = std::make_unique<group_grow::MemberBatchHash>(batch_cap);
         MemberLease borrowed;
         std::unique_ptr<group_grow::ExternalEngine::ContributionInput> contribution_input;
@@ -6304,7 +6332,7 @@ void farming_requested(Arguments const& args, group_grow::FarmingConfig const& s
     require(!args.group_members || args.group_members == saved.group_members_override,
         "--group-members differs from the saved farming plan");
     require(!args.meta || (saved.fixed_meta && *args.meta == saved.meta_group_override),
-        "--meta-group differs from the saved farming plan");
+        "--collection differs from the saved farming plan");
     if (args.farming_profile)
     {
         auto contextual = args;
@@ -8772,7 +8800,7 @@ void append_replot_arguments(std::vector<std::string>& command, Arguments const&
     if (!args.devices.empty()) command.insert(command.end(), {"--devices", args.devices});
     else if (args.backend != "cpu") command.insert(command.end(), {"--device", std::to_string(args.device)});
     if (args.tier != "auto") command.insert(command.end(), {"--tier", args.tier});
-    if (args.meta) command.insert(command.end(), {"--meta-group", std::to_string(*args.meta)});
+    if (args.meta) command.insert(command.end(), {"-g", std::to_string(*args.meta)});
     if (args.construction != "auto") command.insert(command.end(), {"--construction", args.construction});
     for (auto const& [key, value] : args.compute_settings) command.insert(command.end(), {key, value});
     for (auto const& path : args.temporary) command.insert(command.end(), {"--temp-dir", file_io::path_text(path)});
@@ -10962,7 +10990,7 @@ FarmingJointAssessment farming_joint_assessment(Arguments const& args)
             service.group_members_override = result.config.group_members_override;
             service.objective = result.config.objective;
             require(service == result.config,
-                "joint assessment requires matching saved harvester, plot and meta service configuration");
+                "joint assessment requires matching saved harvester, plot and collection service configuration");
         }
         for (auto const& previous : result.sources)
         {
@@ -12166,7 +12194,7 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
             }
             if (args.verbose)
                 out << "    Forecast file shape: " << d.layout.group_members << " members/file; " << d.layout.families
-                    << " identity families, " << d.layout.meta_slots << " meta slots; storage resource " << d.resource
+                    << " identity families, " << d.layout.meta_slots << " collection slots; storage resource " << d.resource
                     << "\n    Storage model: " << json_estimate(d.storage.read_bytes_per_second) << " B/s, "
                     << json_estimate(d.storage.read_latency_seconds) << " s latency, " << d.storage.read_concurrency
                     << " concurrent reads; " << d.sealed_files << " sealed files, " << d.extents.size() << " admitted files\n";
@@ -12977,7 +13005,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         };
         std::atomic<bool> cancel_generation{false};
         group_grow::NotifiedFuture<Generated> generating;
-        uint64_t receiving_bytes = 0;
+        uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
         // A producer can still own provisional scratch or its member vector.
         // Join before any of those fields, or the engine, are destroyed.
         ~Task()
@@ -13341,6 +13369,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         {
             uint64_t members;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            bytes = sum(bytes, d->pending->pool_hash_bytes);
             if (d->pending->generating.valid()) members = d->pending->receiving_bytes;
             else
 #endif
@@ -15103,14 +15132,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 { d.pending.reset(); blocked(ControllerWait::producer_memory); continue; }
                 task.members.reserve(wanted);
                 task.receiving_bytes = producer.pool_receive_bytes(first, wanted);
-                uint64_t const reserved = fixed;
+                if (!d.engine->is_staging() && !select_merged)
+                    task.pool_hash_bytes = producer.pool_hash_bytes(wanted, task.receiving_bytes, other_held);
+                if (task.pool_hash_bytes) task.hash = std::make_unique<group_grow::MemberBatchHash>(wanted);
+                uint64_t const reserved = sum(fixed, task.pool_hash_bytes);
                 auto* const pending = &task;
                 task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, wanted, other_held, reserved]
                 {
                     Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved};
                     producer.defer_pool_history = true;
                     auto const generated = producer.fill_pool(pending->members, first, wanted, other_held,
-                        file_io::path_text(d.path) + ": generating pool member ", {}, &pending->cancel_generation);
+                        file_io::path_text(d.path) + ": generating pool member ", {}, &pending->cancel_generation,
+                        pending->hash.get());
                     require(generated && (!d.needs_resume || pending->members.size() == wanted),
                         "saved destination batch exceeds pool generation admission");
                     producer.admit_engine(pending->members);

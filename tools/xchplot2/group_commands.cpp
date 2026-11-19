@@ -108,7 +108,8 @@ void command_help_all(std::string_view command)
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";
     std::cout <<
         "  -k, --k N                 default 28 for farming; even 18..26 for testing\n"
-        "  -s, --strength N          default 2\n";
+        "  -s, --strength N          default 2\n"
+        "  -g, --collection N        collection number (0..255)\n";
     if (command == "grow") std::cout <<
         "  --max-members N           total members in the existing file\n"
         "  -r, --resume              recover interrupted work before growing (always enabled)\n";
@@ -302,6 +303,7 @@ void command_help(std::string_view command, bool all)
         "                           End path lists with another option or -- before positional destinations.\n"
         "  -k, --k N                 plot size, default 28\n"
         "  -s, --strength N          plot strength, default 2\n"
+        "  -g, --collection N        collection number (0..255)\n"
         "  --group-members auto|N    automatic layout or a member limit per file\n"
         "  --capacity-bytes SIZE     budget per filesystem, e.g. 500G\n"
         "  --leave-free SIZE         leave this space free, default 64M; also --headroom-bytes\n"

@@ -4128,23 +4128,23 @@ def check_compute(binary, root):
                         "--generation-threads", 1, "--backend", "cpu"], "worker")
         pool.wait_listener(worker, worker_port)
         common = ["plot", "-k", 18, "-n", 1, "-f", FARMER, "--pool-ph", POOL,
-                  "--group-members", 3, "--batch-members", 2, "--backend", "cpu",
-                  "--construction", "staged", "--max-host-ram", "512M", "--workers", 2,
+                  "--group-members", 3, "--backend", "cpu", "--max-host-ram", "512M", "--workers", 2,
                   "--window-bytes", "64K", "--checkpoint-bytes", "64K", "--quiet"]
+        staged = [*common, "--construction", "staged", "--batch-members", 2]
         owners = []
         for owner in ("owner-a", "owner-b"):
             cert, key = identities[owner]
             network = ["--compute-broker", endpoint, "--compute-owner-id", owner,
                        "--compute-ca", ca, "--compute-cert", cert, "--compute-key", key,
                        "--compute-inflight", 2, "--compute-codec-ram", 0, "--compute-timeout-ms", 120000]
-            owners.append((owner, network, start([*common, "-S", SEED, "-o", root / owner, *network], owner)))
+            owners.append((owner, network, start([*staged, "-S", SEED, "-o", root / owner, *network], owner)))
         paths = []
         for owner, network, process in owners:
             path = Path(process.finish().strip())
             assert path.is_file() and header(path)[3] == 3
             paths.append(path)
             scoped = hashlib.sha256(b"xchplot2-pool-storage-owner-v1" + bytes.fromhex(SEED) + owner.encode()).hexdigest()
-            result = pool.run([binary, *common, "-S", scoped, "-o", root / (owner + "-local"), "--config", os.devnull])
+            result = pool.run([binary, *staged, "-S", scoped, "-o", root / (owner + "-local"), "--config", os.devnull])
             local = Path(result.stdout.strip())
             assert digest(local) == digest(path), "remote group differs from local construction"
             result = pool.run([binary, "verify", path, "--full", "--trials", 100, "--config", os.devnull])
@@ -4152,6 +4152,12 @@ def check_compute(binary, root):
             assert proof and int(proof[1]) > 0
         assert header(paths[0])[0] != header(paths[1])[0], "owners reused a group identity"
         print("PASS two simultaneous plotting owners share one compute worker, byte parity and full proofs", flush=True)
+        fresh = [binary, *common, "--construction", "incremental", "--batch-members", 3,
+                 "-S", SEED, "-o", root / "remote recovered", *network, "--config", os.devnull]
+        pool.run(fresh, point="direct-committed", code=86)
+        recovered = Path(pool.run([*fresh, "--resume"]).stdout.strip())
+        assert digest(recovered) == digest(local), "recovered packed batch differs from local construction"
+        print("PASS interrupted packed compute batch recovers to the ordinary group bytes", flush=True)
         baseline, destination, scratch = (root / name for name in ("capacity reference", "remote capacity", "remote scratch"))
         for directory in (baseline, destination, scratch):
             directory.mkdir()

@@ -64,6 +64,7 @@ public:
     void u16(uint16_t value);
     void u32(uint32_t value);
     void u64(uint64_t value);
+    void words(std::span<uint64_t const> values);
     void bytes(std::span<uint8_t const> value);
     void string(std::string const& value);
     std::vector<uint8_t> const& data() const { return data_; }
@@ -82,6 +83,7 @@ public:
     uint16_t u16();
     uint32_t u32();
     uint64_t u64();
+    void words(std::span<uint64_t> values);
     std::span<uint8_t const> bytes(uint32_t limit);
     std::string string(uint32_t limit = 4096);
     void finish() const;

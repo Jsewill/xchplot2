@@ -191,6 +191,15 @@ void repartition_and_global_admission()
     args.pool_owner = "owner-repartition"; args.pool_ca = tls.ca_file; args.pool_cert = tls.cert_file; args.pool_key = tls.key_file;
     Backend backend; backend.cpu_scheduler = std::make_shared<CodecScheduler>(2);
     backend.initialize(args, requested, 0, false);
+    {
+        Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        uint64_t const receiving = producer.pool_receive_bytes(0, raw.size());
+        uint64_t const cache = MemberBatchHash::memory_bytes(raw.size());
+        producer.budget = producer.fixed + backend.retained() + receiving + cache;
+        require(producer.pool_hash_bytes(raw.size(), receiving, 0) == cache &&
+                producer.pool_hash_bytes(raw.size(), receiving, 1) == 0,
+            "optional hash cache exceeded the pooled batch grant");
+    }
     auto client = backend.acquire_pool_client();
     // Warm the real measured policy. A subsequent grouped request is legal
     // under advertised generation RAM but cannot fit this worker's codec cap.

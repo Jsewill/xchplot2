@@ -210,7 +210,7 @@ void reference_help()
         "  -S, --seed HEX             base seed (required for rollover/additional destinations)\n"
         "  --k EVEN                  18..28, default 28\n"
         "  --strength N              default 2\n"
-        "  --meta-group N            default 0\n"
+        "  -g, --collection N        collection number, default 0\n"
         "  -r, --resume              continue/recover an existing destination\n"
         "  --capacity-bytes N        logical destination cap; default filesystem capacity\n"
         "  --headroom-bytes N        filesystem bytes left free, default 67108864\n"
@@ -641,7 +641,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             }
             else if (key == "--k" || key == "-k") { result.k = number(value.c_str(), argv[i - 1]); result.k_set = true; }
             else if (key == "--strength" || key == "-s") { result.strength = number(value.c_str(), argv[i - 1]); result.strength_set = true; }
-            else if (key == "--meta-group" || key == "-g") { result.meta = number(value.c_str(), argv[i - 1]); result.meta_set = true; }
+            else if (key == "--collection" || key == "--meta-group" || key == "-g") { result.meta = number(value.c_str(), argv[i - 1]); result.meta_set = true; }
             else if (key == "--capacity-bytes")
             {
                 result.capacity = number(value.c_str(), argv[i - 1]);
@@ -979,7 +979,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--max-host-ram must be at least 16 MiB (16M)");
     require(!result.k || *result.k <= 255, "invalid k");
     require(!result.strength || *result.strength <= 255, "invalid strength");
-    require(!result.meta || *result.meta <= 255, "invalid meta group");
+    require(!result.meta || *result.meta <= 255, "invalid collection number");
     load_harvester_profile(result);
     resolve_group_devices(result);
     require(result.local_devices.empty() || (!result.replot &&
