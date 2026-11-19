@@ -35,6 +35,7 @@ namespace
 using Clock = std::chrono::steady_clock;
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
+enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
 enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker };
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
 { writer.string(endpoint.host); writer.u16(endpoint.port); writer.string(endpoint.server_name); }
@@ -297,10 +298,12 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
     }
     reader.finish(); return result;
 }
-uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task)
+uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task, uint32_t* slots)
 {
     auto writer = request(Operation::GenerationHint); write_session(writer, owner); write_task(writer, task); auto bytes = call(writer);
-    Reader reader(bytes); auto const result = reader.u32(); reader.finish(); return result;
+    Reader reader(bytes); auto const result = reader.u32(), parallel = reader.u32(); reader.finish();
+    if (slots) *slots = parallel;
+    return result;
 }
 void BrokerClient::cancel(OwnerSession const& owner, std::string const& task, uint64_t attempt)
 {
@@ -322,16 +325,20 @@ bool BrokerClient::retire_worker(std::string const& instance)
     auto writer = request(Operation::RetireWorker); writer.string(instance); auto bytes = call(writer); Reader reader(bytes);
     auto const idle = reader.u8(); require(idle <= 1, "invalid worker retirement flag"); reader.finish(); return idle;
 }
-bool BrokerClient::heartbeat(std::string const& instance, uint64_t revision)
+bool BrokerClient::heartbeat(std::string const& instance, uint64_t revision, std::optional<WorkerAdmission> admission)
 {
-    auto writer = request(Operation::Heartbeat); writer.string(instance); writer.u64(revision); auto bytes = call(writer);
+    auto writer = request(Operation::Heartbeat); writer.string(instance); writer.u64(revision);
+    writer.u8(admission ? uint8_t(*admission) : 0); auto bytes = call(writer);
     Reader reader(bytes); auto const current = reader.u8(); require(current <= 1, "invalid broker heartbeat flag");
     reader.finish(); return current;
 }
-bool BrokerClient::begin(Lease const& lease, std::string const& owner)
+bool BrokerClient::begin(Lease const& lease, std::string const& owner, bool* awaiting_admission)
 {
     auto writer = request(Operation::Begin); write_lease(writer, lease); writer.string(owner); auto bytes = call(writer);
-    Reader reader(bytes); auto const result = reader.u8(); require(result <= 1, "invalid broker begin flag"); reader.finish(); return result;
+    Reader reader(bytes); auto const result = BeginResult(reader.u8());
+    require(result <= BeginResult::AwaitingAdmission, "invalid broker begin result"); reader.finish();
+    if (awaiting_admission) *awaiting_admission = result == BeginResult::AwaitingAdmission;
+    return result == BeginResult::Running;
 }
 void BrokerClient::finish(Lease const& lease, std::optional<CapacityUpdate> const& update)
 {
@@ -1130,19 +1137,32 @@ struct BrokerServer::Impl
             require(identity == lease.worker_identity && direct_owner == lease.owner_identity, "lease peer identity mismatch");
             auto& job = lease_job(lease);
             auto worker = workers.find(identity);
-            bool const accepted = job.state == State::Granted && active_owner(job) && worker != workers.end() &&
-                worker->second.offer.instance == lease.worker_instance && worker->second.offer.admission == WorkerAdmission::Accepting;
-            if (accepted) { job.state = State::Running; job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms); }
-            response.u8(accepted); break;
+            auto result = BeginResult::Stale;
+            if (job.state == State::Granted && active_owner(job) && worker != workers.end() &&
+                worker->second.offer.instance == lease.worker_instance)
+            {
+                if (worker->second.offer.admission != WorkerAdmission::Accepting) result = BeginResult::AwaitingAdmission;
+                else
+                {
+                    result = BeginResult::Running; job.state = State::Running;
+                    job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms);
+                }
+            }
+            response.u8(uint8_t(result)); break;
         }
         case Operation::Heartbeat:
         {
-            auto instance = reader.string(64); auto revision = reader.u64(); reader.finish();
-            require(identifier(instance, 64) && revision, "invalid worker heartbeat");
+            auto instance = reader.string(64); auto revision = reader.u64(); auto const admission = reader.u8(); reader.finish();
+            require(identifier(instance, 64) && revision && admission <= uint8_t(WorkerAdmission::Drained), "invalid worker heartbeat");
             auto worker = workers.find(identity);
             bool const current = worker != workers.end() && worker->second.offer.instance == instance &&
                 worker->second.offer.capacity_revision == revision;
-            if (current) worker->second.seen = Clock::now();
+            if (current)
+            {
+                worker->second.seen = Clock::now();
+                if (admission && WorkerAdmission(admission) != worker->second.offer.admission)
+                { worker->second.offer.admission = WorkerAdmission(admission); schedule(); }
+            }
             response.u8(current); break;
         }
         case Operation::Renew:
@@ -1216,14 +1236,26 @@ struct BrokerServer::Impl
             auto session = read_session(reader); auto task = read_task(reader); reader.finish(); (void)owner(identity, session);
             require(task.kind == Kind::GenerateCpu || task.kind == Kind::GenerateGpu || task.kind == Kind::GenerateAny,
                 "generation hint requires a generation task");
-            Job job; job.requested = std::move(task); uint32_t maximum = 0;
+            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0;
             for (auto const& [identity, worker] : workers)
+            {
+                auto const& capacity = worker.offer.capacity;
+                job.requested.work_units = 1;
+                auto candidate = eligible(job, identity, worker, capacity);
+                if (!candidate) continue;
+                auto const& cost = candidate->resources;
+                uint32_t parallel = capacity.slots / std::max(1u, cost.slots);
+                parallel = std::min(parallel, capacity.cpu_threads / std::max(1u, cost.cpu_threads));
+                if (cost.host_bytes) parallel = uint32_t(std::min<uint64_t>(parallel, capacity.host_bytes / cost.host_bytes));
+                if (cost.gpu_bytes) parallel = uint32_t(std::min<uint64_t>(parallel, capacity.gpu_bytes / cost.gpu_bytes));
+                slots += std::min(UINT32_MAX - slots, parallel);
                 for (uint32_t count = max_generation_batch_members; count > maximum; --count)
                 {
                     job.requested.work_units = count;
-                    if (eligible(job, identity, worker, worker.offer.capacity)) { maximum = count; break; }
+                    if (eligible(job, identity, worker, capacity)) { maximum = count; break; }
                 }
-            response.u32(maximum); break;
+            }
+            response.u32(maximum); response.u32(slots); break;
         }
         default: throw std::runtime_error("unknown broker operation");
         }

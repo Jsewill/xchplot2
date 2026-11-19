@@ -1183,6 +1183,23 @@ void packing_checkpoints(fs::path const& root, Members input, ExternalConfig con
     require(confidence.select(established, ceiling, 64 * ceiling) == trial,
         "sustained current-size evidence did not qualify a material checkpoint trial");
 
+    PackingCheckpointHistory ordinary;
+    ordinary.add({current, 1000, 50});
+    auto const candidate = ordinary.select(current, 16 * mib, 32 * mib, true);
+    require(candidate == 16 * mib, "fresh output missed the lowest predicted time within its admitted ceiling");
+    ordinary.add({candidate, 8000, 1500}); ordinary.select(candidate, ceiling, candidate, true);
+    ordinary.add({candidate, 8000, 1500});
+    require(ordinary.select(candidate, ceiling, candidate, true) == current,
+        "fresh output retained a slower measured interval");
+
+    PackingCheckpointHistory terminal;
+    terminal.add({256 * mib, 1000, 400, 0, 256 * mib});
+    require(terminal.select(256 * mib, ceiling, 3 * established, true) == ceiling,
+        "fresh output excluded a faster interval that could finish the group");
+    terminal.add({3 * established, 9000, 400, 0, ceiling, true});
+    require(terminal.fastest_completed_interval() == ceiling,
+        "matching fresh groups could not reuse the faster completed terminal interval");
+
     auto const directory = root / "packing-checkpoints"; fs::create_directory(directory);
     auto cfg = config(); cfg.checkpoint_bytes = 4096;
     cfg.memory_limit_bytes = ExternalEngine::memory_bytes(18, cfg, ext, uint16_t(input.size()));

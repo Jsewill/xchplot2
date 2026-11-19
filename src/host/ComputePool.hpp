@@ -9,7 +9,7 @@
 
 namespace group_grow::pool
 {
-inline constexpr uint32_t protocol_version = 6;
+inline constexpr uint32_t protocol_version = 7;
 inline constexpr size_t max_retry_failures = 16;
 inline constexpr uint32_t max_generation_batch_members = 8;
 inline constexpr size_t max_generation_profiles = 512;
@@ -241,7 +241,7 @@ public:
     std::optional<Lease> acquire(OwnerSession const&, Task const&);
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
-    uint32_t generation_hint(OwnerSession const&, Task const&);
+    uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr);
     void cancel(OwnerSession const&, std::string const& task_id, uint64_t attempt);
     // Only the worker renews Running work; unused grants have a fixed TTL.
     void renew(Lease const&);
@@ -254,12 +254,12 @@ public:
     bool retire_worker(std::string const& instance);
     // Refresh only a matching live instance/revision. A false response needs
     // full registration; it never revives an expired or replaced process.
-    bool heartbeat(std::string const& instance, uint64_t capacity_revision);
+    bool heartbeat(std::string const& instance, uint64_t capacity_revision, std::optional<WorkerAdmission> admission = {});
     void worker_admission(std::string const& instance, WorkerAdmission);
     BrokerStatusPage status(StatusRequest const& = {});
     // Worker calls begin before admitting work and compares the direct TLS
     // owner's certificate identity. Only that worker can finish running work.
-    bool begin(Lease const&, std::string const& direct_owner_identity);
+    bool begin(Lease const&, std::string const& direct_owner_identity, bool* awaiting_admission = nullptr);
     void finish(Lease const&, std::optional<CapacityUpdate> const& update = {});
     // Owner reports successful receipt and validation, independently of local
     // durable plot commit. Failure to report must not discard accepted data.

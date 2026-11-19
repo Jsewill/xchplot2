@@ -39,6 +39,8 @@ struct WorkerChunkInput
     std::span<std::span<uint64_t const> const> new_members;
 };
 using WorkerPackedSink = std::function<void(PackedFragmentTile const&, uint64_t total_count)>;
+using WorkerFreshManifest = std::function<void(uint64_t payload_bound, uint64_t largest_chunk,
+    std::array<uint8_t, 32> const& members_digest)>;
 using WorkerContributionSink = std::function<void(uint64_t ordinal,
     std::span<uint8_t const> encoded, uint16_t members)>;
 // Borrowed spans remain valid only during the callback. A transport frame is
@@ -63,6 +65,7 @@ struct WorkerGenerationTiming
 {
     uint64_t worker_ns = 0, send_ns = 0, frame_wait_ns = 0, receiver_ns = 0;
 };
+struct WorkerGenerationCapacity { uint32_t batch = 0, slots = 0; };
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
@@ -213,6 +216,9 @@ public:
     void generate_local(uint8_t k, uint8_t strength,
         std::array<uint8_t, 32> const&, WorkerPackedSink const&, WorkerCancellation = {},
         pool::Kind = pool::Kind::GenerateAny, std::function<void(WorkerTaskAdmission const&)> const& = {});
+    void generate_packed_local(uint8_t, uint8_t, std::span<std::array<uint8_t, 32> const>,
+        WorkerPackedSink const&, WorkerCancellation, pool::Kind,
+        std::function<void(WorkerTaskAdmission const&)> const&);
     void contributions_local(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const>, WorkerContributionSink const&,
         WorkerCancellation = {}, pool::Kind = pool::Kind::GenerateAny,
@@ -278,10 +284,12 @@ public:
     // True only if this client checked all packed fields and their narrow deltas on receipt.
     bool generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& plot_id,
                   WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
+    bool generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> plot_ids,
+        WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
-        WorkerContributionWindowSink const& = {});
+        WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {});
     // Outage fallback shares the same admission ceiling as broker tasks. The
     // embedding owner records fallback completions separately from pool stats.
     void generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const&,
@@ -296,6 +304,7 @@ public:
     bool local_available() const;
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
+    WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
     unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;
     WorkerGenerationEstimate generation_estimate(uint8_t k, uint8_t strength, bool contributions,

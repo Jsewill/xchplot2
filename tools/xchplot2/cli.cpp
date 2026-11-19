@@ -1299,7 +1299,7 @@ std::vector<std::string> group_arguments(std::vector<std::string> const& input)
             (key.starts_with("--") && key.ends_with("-bytes")) ||
             key == "--compute-offer-ram" || key == "--compute-offer-vram" || key == "--compute-codec-ram") {
             if (++i == input.size()) throw std::invalid_argument(key + " requires a size");
-            if (key == "--compute-codec-ram" && input[i] == "auto") {
+            if ((key == "--compute-codec-ram" || key == "--checkpoint-bytes") && input[i] == "auto") {
                 result.insert(result.end(), {key, "auto"}); continue;
             }
             uint64_t bytes = 0;
@@ -2978,6 +2978,7 @@ _xchplot2() {
         --compute-local|--discovery|--io-overlap|--cache-release) COMPREPLY=( $(compgen -W "on off" -- "$cur") ); return 0 ;;
         --backend|--compute-offer-backend) COMPREPLY=( $(compgen -W "auto cpu gpu" -- "$cur") ); return 0 ;;
         --construction)    COMPREPLY=( $(compgen -W "auto incremental staged merged external" -- "$cur") ); return 0 ;;
+        --checkpoint-bytes) COMPREPLY=( $(compgen -W "auto" -- "$cur") ); return 0 ;;
         --alternative)     COMPREPLY=( $(compgen -W "memory eligible-groups deadline cpu-cores lookup-workers capacity" -- "$cur") ); return 0 ;;
         --replot-verification) COMPREPLY=( $(compgen -W "structural sampled strict" -- "$cur") ); return 0 ;;
         --replot-confirmation) COMPREPLY=( $(compgen -W "directory file" -- "$cur") ); return 0 ;;
@@ -3144,7 +3145,7 @@ _xchplot2() {
         '--temp-capacity-bytes[Temporary storage limit per filesystem]:value:' \
         '--member-storage[Temporary member storage format]:value:' \
         '--window-bytes[I/O window size in bytes]:value:' \
-        '--checkpoint-bytes[Target bytes between recovery checkpoints]:value:' \
+        '--checkpoint-bytes[Bytes between recovery checkpoints (default auto)]:size:(auto)' \
         '--io-overlap[I/O overlap]:value:' \
         '--generation-overlap[Overlap generation with construction]:value:' \
         '--cache-release[Release clean file cache]:value:' \
@@ -3353,7 +3354,7 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' 
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l temp-capacity-bytes -r -d 'Temporary storage limit per filesystem'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l member-storage -r -d 'Temporary member storage format'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l window-bytes -r -d 'I/O window size in bytes'
-complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l checkpoint-bytes -r -d 'Target bytes between recovery checkpoints'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l checkpoint-bytes -r -a 'auto' -d 'Bytes between recovery checkpoints (default auto)'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l io-overlap -r -d 'I/O overlap'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l generation-overlap -r -d 'Overlap generation with construction'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch' -l cache-release -r -d 'Release clean file cache'

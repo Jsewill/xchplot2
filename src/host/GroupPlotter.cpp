@@ -779,6 +779,63 @@ struct Backend
             }, cpu_scheduler);
     }
 
+    static uint64_t fresh_receive_bytes(Arguments const& args)
+    {
+        return sum(product(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)), 2),
+            group_grow::fresh_group_window_chunks * sizeof(std::span<uint8_t const>) + 4096);
+    }
+    bool full_remote_group(Identity const& identity, size_t count)
+    {
+        if (count < 2 || count > group_grow::pool::max_generation_batch_members) return false;
+        auto const hint = acquire_pool_client()->generation_capacity(identity.params.get_k(), identity.params.get_strength());
+        return hint.slots == 1 && count <= hint.batch;
+    }
+
+    std::optional<group_grow::AppendResult> stream_fresh_group(group_grow::Engine& engine,
+        Identity const& identity, uint16_t count, Arguments const& args, uint64_t& generation_elapsed, std::atomic<bool> const* stop = nullptr)
+    {
+        auto const started = std::chrono::steady_clock::now();
+        auto client = acquire_pool_client();
+        auto const k = uint8_t(identity.params.get_k()), strength = uint8_t(identity.params.get_strength());
+        std::vector<std::array<uint8_t, 32>> ids;
+        for (uint16_t i = 0; i < count; ++i) ids.push_back(identity.params.get_plot_params_for_index(i).get_plot_id().data());
+        group_grow::WorkerCancellation cancel;
+        cancel.stop = stop; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        try
+        {
+            auto result = engine.append_fresh_stream(count, fragment_bound(identity.params) / sizeof(uint64_t),
+                [&](auto const& begin, auto const& append)
+                {
+                    auto manifest = [&](uint64_t bytes, uint64_t largest, std::array<uint8_t, 32> const& digest)
+                    {
+                        generation_elapsed = group_grow::elapsed_ns(started);
+                        if (!begin(bytes, largest, digest)) throw group_grow::WorkerTaskDeclined();
+                    };
+                    auto window = [&](uint64_t ordinal, std::span<std::span<uint8_t const> const> chunks, uint16_t n)
+                    {
+                        check_cancel(args); require(n == count, "fresh worker group membership changed");
+                        append(ordinal, chunks);
+                        uint64_t bytes = 0; for (auto chunk : chunks) bytes += chunk.size_bytes();
+                        progress_received(progress, bytes);
+                    };
+                    auto chunk = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t n)
+                    { window(ordinal, {&bytes, 1}, n); };
+                    client->contributions(k, strength, ids, chunk, cancel, {}, window, manifest);
+                });
+            if (result)
+            {
+                pool_contribution_members.fetch_add(count);
+                for (uint16_t i = 0; i < count; ++i) progress_generated(progress);
+            }
+            return result;
+        }
+        catch (group_grow::WorkerTaskDeclined const&) {}
+        catch (group_grow::pool::UnsupportedResources const&) {}
+        catch (group_grow::pool::TransientTransport const&) { pool_retries.fetch_add(1); }
+        catch (group_grow::pool::StaleLease const&) { pool_retries.fetch_add(1); }
+        check_cancel(args); return std::nullopt;
+    }
+
     group_grow::Member generate_pool(Identity const& identity, uint16_t index, Arguments const& args,
                                     std::atomic<bool> const* stop = nullptr)
     {
@@ -1378,11 +1435,65 @@ struct Producer
         } drain{cancelled, pending};
         auto client = backend.acquire_pool_client();
         auto const k = uint8_t(identity.params.get_k()), strength = uint8_t(identity.params.get_strength());
+        if (args.member_storage == "compact" && args.generation_overlap && !stop && wanted - before > 1)
+        {
+            auto const hint = client->generation_capacity(k, strength);
+            while (hint.slots == 1 && hint.batch > 1 && wanted - values.size() > 1)
+            {
+                size_t const start = values.size();
+                size_t n = std::min<size_t>(hint.batch, wanted - start);
+                uint64_t const held = sum(sum(sum(fixed, backend.retained()), other_retained), resident(values));
+                while (n > 1 && sum(held, pool_receive_bytes(uint16_t(first + start), n)) > budget) --n;
+                if (n < 2) break;
+                std::vector<std::array<uint8_t, 32>> ids;
+                for (size_t i = start; i < start + n; ++i)
+                    ids.push_back(identity.params.get_plot_params_for_index(uint16_t(first + i)).get_plot_id().data());
+                group_grow::WorkerCancellation cancel;
+                cancel.stop = stopped; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+                std::vector<std::unique_ptr<group_grow::CompactMemberReceiver>> received; received.reserve(n);
+                bool checked = false, complete = false;
+                try
+                {
+                    checked = client->generate_packed(k, strength, ids, [&](auto const& tile, uint64_t count)
+                    {
+                        check_cancel(args);
+                        group_grow::CodecScheduler::Lease cpu(backend.cpu_scheduler.get(), 1, [cancel] { cancel.check(); });
+                        require(count && count <= fragment_bound(identity.params) / sizeof(uint64_t), "invalid packed batch member count");
+                        if (!tile.boundaries.empty())
+                        {
+                        require(received.size() < n, "unexpected packed batch member");
+                        received.push_back(std::make_unique<group_grow::CompactMemberReceiver>(k, size_t(count), false));
+                    }
+                    require(!received.empty(), "packed batch has no member prelude");
+                    received.back()->append(tile);
+                    progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
+                }, cancel);
+                complete = true;
+            }
+            catch (group_grow::pool::UnsupportedResources const&) {}
+            catch (group_grow::pool::TransientTransport const&) { backend.pool_retries.fetch_add(1); }
+            catch (group_grow::pool::StaleLease const&) { backend.pool_retries.fetch_add(1); }
+            if (!complete) break;
+                require(received.size() == n, "truncated packed batch");
+                for (auto& receiver : received)
+                {
+                    auto check = [&] { check_cancel(args); cancel.check(); };
+                    group_grow::CodecScheduler::Lease cpu(backend.cpu_scheduler.get(), 1, check);
+                    values.push_back(receiver->finish(checked));
+                    if (hash) hash->append(values.back().view(), check);
+                    progress_generated(backend.progress);
+                }
+                auto const bytes = pool_receive_bytes(uint16_t(first + start), n);
+                generation_peak = std::max(generation_peak, bytes);
+                peak = std::max(peak, sum(held, bytes));
+                backend.pool_members.fetch_add(n);
+            }
+        }
         uint64_t in_flight = product(pending.capacity(), sizeof(Pending));
         constexpr uint64_t completed_metadata = sizeof(std::pair<size_t const, group_grow::Member>) + 4 * sizeof(void*);
         uint64_t completed_bytes = 0;
-        size_t scheduled = before;
-        size_t next_hash = before;
+        size_t scheduled = values.size();
+        size_t next_hash = values.size();
         bool accepting = true;
         fill_stop = FillStop::full;
         while (accepting || !pending.empty())
@@ -2296,6 +2407,7 @@ group_grow::Config configuration(Arguments const& args, uint64_t capacity, uint6
     config.cpu_scheduler = scheduler;
     config.remote_encoder = remote;
     config.checkpoint_bytes = args.checkpoint_bytes;
+    config.automatic_checkpoints = !args.checkpoint_set;
     config.io_overlap = args.io_overlap;
     config.release_cache = args.cache_release;
     config.private_output = true;
@@ -2452,6 +2564,28 @@ struct Construction
         if (external && !demand_history) demand_history = shared_history;
         refresh_history();
     }
+    void seed_checkpoint(bool streamed)
+    {
+        if (!shared_history || !incremental || !config.automatic_checkpoints) return;
+        std::lock_guard lock(shared_history->mutex);
+        incremental->seed_checkpoint(shared_history->fresh_checkpoint_bytes[size_t(streamed)]);
+    }
+    void remember_checkpoint(bool streamed)
+    {
+        if (!shared_history || !incremental || !incremental->fastest_checkpoint()) return;
+        std::lock_guard lock(shared_history->mutex);
+        shared_history->fresh_checkpoint_bytes[size_t(streamed)] = incremental->fastest_checkpoint();
+    }
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    std::optional<group_grow::AppendResult> stream_fresh(Backend& backend, Identity const& requested,
+        uint16_t count, Arguments const& args, uint64_t& elapsed, std::atomic<bool> const* stop = nullptr)
+    {
+        seed_checkpoint(true);
+        auto result = backend.stream_fresh_group(*incremental, requested, count, args, elapsed, stop);
+        if (result) { remember_checkpoint(true); observe_shape(result->result); }
+        return result;
+    }
+#endif
     unsigned staging_workers(unsigned workers)
     {
         if (!demand_history) return workers / 2;
@@ -2571,7 +2705,7 @@ struct Construction
         else incremental->consumed(std::move(callback));
     }
     std::string_view mode() const { return external ? "external" : merged ? "merged" : staged ? "staged" : "incremental"; }
-    uint64_t selected_checkpoint_bytes() const { return std::max(config.checkpoint_bytes, external_checkpoint_bytes); }
+    uint64_t selected_checkpoint_bytes() const { return incremental ? incremental->checkpoint_bytes() : std::max(config.checkpoint_bytes, external_checkpoint_bytes); }
     bool can_select() const
     { return automatic && !merge_reserve_failed && incremental && !identity().pending && (identity().header.group_size || history.shapes.count); }
     bool can_append() const { return external ? external->can_append() : merged ? merged->can_append() : !staged || staged->can_append(); }
@@ -2905,6 +3039,7 @@ struct Construction
         auto prior = incremental->stats(); auto const old_bytes = identity().bytes;
         auto begin = std::chrono::steady_clock::now();
         group_grow::AppendResult result;
+        seed_checkpoint(false);
         try { result = incremental->append(members, hash, reject_window && config.window_bytes >= window_limit); }
         catch (group_grow::WindowBudgetError const&)
         {
@@ -2929,6 +3064,7 @@ struct Construction
             result.result.peak_file_bytes = std::max(sum(result.result.peak_file_bytes, remaining_metadata_bytes), peak_file_bytes);
             result.result.workspace_bytes = std::max(sum(result.result.workspace_bytes, remaining_metadata_bytes), workspace_bytes);
         }
+        if (result.accepted && result.fresh_single_pass) remember_checkpoint(false);
         return result;
     }
     group_grow::Result finish()
@@ -4189,6 +4325,42 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         uint16_t prepared_members = 0;
         (void)producer.can_borrow(); // Initialize the backend before reporting it.
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (backend->mode == "pool" && args.io_overlap && args.generation_overlap && engine.incremental && !engine.identity().pending && !metrics.members &&
+            incoming.empty() && wanted == maximum && backend->full_remote_group(identity, wanted) &&
+            sum(sum(sum(fixed, backend->retained()), prefetched.resident_bytes()), Backend::fresh_receive_bytes(args)) <= args.max_ram)
+        {
+            uint64_t elapsed = 0;
+            auto streamed = engine.stream_fresh(*backend, identity, uint16_t(wanted), args, elapsed);
+            if (streamed)
+            {
+                backend->generation_ns = sum(backend->generation_ns, elapsed);
+                backend->generated_members += wanted; backend->generation_history.add(wanted, elapsed);
+                producer.peak = std::max(producer.peak, sum(sum(fixed, backend->retained()), Backend::fresh_receive_bytes(args)));
+            }
+            if (!streamed && engine.identity().pending)
+            {
+                incoming.reserve(wanted);
+                auto generated = producer.fill(incoming, 0, size_t(wanted), prefetched.resident_bytes(), hash.get(), &borrowed,
+                    "regenerating interrupted pool batch ");
+                require(generated == wanted, "interrupted fresh group exceeds recovery admission");
+                auto result = engine.resume(incoming, hash.get());
+                streamed = group_grow::AppendResult{true, true, result.final_bytes, result.peak_file_bytes, {}, result};
+                metrics.recovered = true;
+            }
+            if (streamed)
+            {
+                auto const& result = streamed->result;
+                metrics.generated_members += wanted; metrics.max_batch_members = wanted;
+                metrics.members = result.members; metrics.final_bytes = result.final_bytes;
+                metrics.peak_file_bytes = std::max(metrics.peak_file_bytes, result.peak_file_bytes);
+                metrics.workspace_bytes = std::max(metrics.workspace_bytes, result.workspace_bytes);
+                metrics.attempted_final_bytes = streamed->attempted_final_bytes;
+                metrics.attempted_peak_bytes = streamed->attempted_peak_bytes;
+                ++metrics.batches; ++metrics.fresh_single_pass_batches;
+                progress.assembled(metrics.members); print_progress(args, metrics.members);
+                continue;
+            }
+        }
         if (backend->mode == "pool" && engine.external && engine.can_append() && incoming.empty())
         {
             uint16_t count = uint16_t(wanted);
@@ -8786,7 +8958,8 @@ void append_replot_arguments(std::vector<std::string>& command, Arguments const&
     if (!profile.empty()) command.insert(command.end(), {"--harvester", file_io::path_text(profile)});
     command.insert(command.end(), {"--k", std::to_string(config.k), "--strength", std::to_string(config.strength),
         "--headroom-bytes", std::to_string(args.headroom), "--batch-members", std::to_string(args.batch), "--destination-temp", args.destination_temp,
-        "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", std::to_string(args.checkpoint_bytes), "--member-storage", args.member_storage,
+        "--window-bytes", std::to_string(args.window), "--checkpoint-bytes", args.checkpoint_set ? std::to_string(args.checkpoint_bytes) : "auto",
+        "--member-storage", args.member_storage,
         "--io-overlap", args.io_overlap ? "on" : "off", "--generation-overlap", args.generation_overlap_auto ? "auto" : args.generation_overlap ? "on" : "off",
         "--cache-release", args.cache_release ? "on" : "off"});
     auto limit = [&](char const* option, uint64_t value, uint64_t omitted)
@@ -12989,8 +13162,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         std::unique_ptr<group_grow::ExternalEngine::ContributionInput> contribution_input;
         uint64_t contribution_bytes = 0;
         uint64_t original_member_bytes = 0;
-        uint16_t prepared_members = 0;
-        uint64_t prepared_read_accounted = 0;
+        uint16_t prepared_members = 0, fresh_members = 0;
+        uint64_t prepared_read_accounted = 0, fresh_generation_ns = 0;
         MemberLease lease;
         std::optional<group_grow::ScratchPool::IoLease> io;
         std::unique_ptr<group_grow::MemberBatchHash> hash;
@@ -13026,6 +13199,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         Metrics metrics;
         std::unique_ptr<Task> pending;
         std::future<void> ready;
+        bool fresh_declined = false;
         size_t writer = 0, owner = 0, scratch_owner = 0;
         std::unique_ptr<GroupSuccessor> successor;
         size_t successor_target = 0, prefunded_rows = 0;
@@ -14255,6 +14429,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 case Work::append:
                 {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                    if (task->fresh_members)
+                    {
+                        auto result = d.engine->stream_fresh(*backend, d.requested, task->fresh_members,
+                            args, task->fresh_generation_ns, &task->cancel_generation);
+                        if (result) task->appended = *result;
+                        break;
+                    }
+#endif
                     bool reject_window = false;
                     if (farm && farm->state.capacity_fill)
                     {
@@ -14768,6 +14951,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             if (task.work == Work::append)
             {
+                if (task.fresh_members && !task.appended.accepted)
+                {
+                    d.fresh_declined = true;
+                    if (d.engine->identity().pending)
+                    { d.saved = d.engine->identity(); d.needs_resume = true; d.recover_count = task.fresh_members; }
+                    d.pending.reset(); progress = true; continue;
+                }
                 auto const& result = task.appended;
                 if (task.prepared_input)
                 {
@@ -14820,9 +15010,16 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 {
                     accept(d, result.result); ++d.metrics.batches;
                     if (task.prepared_input || task.contribution_input) ++d.metrics.stream_input_batches;
-                    size_t const committed = task.prepared_input || task.contribution_input ? task.prepared_members : task.members.size();
+                    if (task.fresh_members)
+                    {
+                        d.metrics.generated_members += task.fresh_members;
+                        backend->generated_members += task.fresh_members;
+                        backend->generation_ns = sum(backend->generation_ns, task.fresh_generation_ns);
+                        backend->generation_history.add(task.fresh_members, task.fresh_generation_ns);
+                    }
+                    size_t const committed = task.fresh_members ? task.fresh_members : task.prepared_input || task.contribution_input ? task.prepared_members : task.members.size();
                     d.metrics.max_batch_members = std::max<uint64_t>(d.metrics.max_batch_members, committed);
-                    if (!task.prepared_input && !task.contribution_input)
+                    if (!task.fresh_members && !task.prepared_input && !task.contribution_input)
                         d.observed_member_storage = (task.original_member_bytes + committed - 1) / committed;
                     if (result.fresh_single_pass) ++d.metrics.fresh_single_pass_batches;
                 }
@@ -14878,9 +15075,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 }
             }
             candidate.tight_capacity = member_bytes * (d.metrics.members + 1) > d.capacity_limit;
-            if (d.engine && d.engine->is_staging() && d.metrics.members && pack_at > d.metrics.members &&
-                (!writers[d.writer] || !writers[d.writer]->busy()))
-                candidate.members_to_pack = uint16_t(pack_at - d.metrics.members);
+            if (pack_at > d.metrics.members && (!writers[d.writer] || !writers[d.writer]->busy()))
+            {
+                if (d.engine && d.engine->is_staging() && d.metrics.members)
+                    candidate.members_to_pack = uint16_t(pack_at - d.metrics.members);
+                else if (backend->mode == "pool" && (!d.engine || d.engine->incremental))
+                    candidate.members_to_pack = uint16_t(std::min<uint64_t>(pack_at - d.metrics.members,
+                        d.batch_cap ? d.batch_cap : args.batch));
+            }
             if (d.engine && !d.engine->staged)
             {
                 d.engine->refresh_history();
@@ -14898,6 +15100,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (backend->mode == "pool") member_ns = backend->pool_estimate(d.requested, bool(d.engine->external),
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), std::max(uint16_t(1), d.batch_cap)).member_ns;
 #endif
+                if (candidate.members_to_pack != UINT16_MAX && member_ns > 0)
+                    candidate.time_to_write = member_ns * candidate.members_to_pack;
                 auto const work = group_grow::construction_execution_work(forecast, observed,
                     member_ns * (forecast.members > d.metrics.members ? forecast.members - d.metrics.members : 0),
                     d.engine->is_staging(), bool(d.scratch), args.io_overlap);
@@ -15051,9 +15255,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 // Price only simultaneous generation until packing is measured.
                 auto const forecast = backend->pool_estimate(d.requested, bool(d.engine->external) && !select_merged,
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(wanted));
-                if (forecast.receivers)
+                auto const offered = backend->acquire_pool_client()->generation_capacity(
+                    d.requested.params.get_k(), d.requested.params.get_strength()).slots;
+                unsigned const receivers = offered && forecast.receivers ? std::min(offered, forecast.receivers) :
+                    std::max(offered, forecast.receivers);
+                if (receivers)
                 {
-                    total.pool_receiving_destinations = forecast.receivers;
+                    total.pool_receiving_destinations = receivers;
                     total.pool_generation_member_ns = forecast.member_ns;
                     auto const receiving = std::count_if(destinations.begin(), destinations.end(), [&](auto const& other)
                     {
@@ -15061,7 +15269,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             other->requested.params.get_k() == d.requested.params.get_k() &&
                             other->requested.params.get_strength() == d.requested.params.get_strength();
                     });
-                    if (receiving >= forecast.receivers) { blocked(ControllerWait::generation_order); continue; }
+                    if (receiving >= receivers) { blocked(ControllerWait::generation_order); continue; }
                 }
             }
 #endif
@@ -15080,6 +15288,23 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             uint64_t const other_held = retained() - resident(task.members);
             bool const writing = std::any_of(writers.begin(), writers.end(), [](auto const& writer) { return writer && writer->busy(); });
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            // Keep the GPU feeding a waiting drive. Once the other drives have
+            // their members, this one can stream directly alongside their writes.
+            bool const other_generation = std::any_of(destinations.begin(), destinations.end(), [&](auto const& other)
+            {
+                return other.get() != &d && !other->complete && !other->awaiting_extent && !other->pending &&
+                    !other->ready.valid() && !other->needs_finish && other->metrics.stop_reason.empty() &&
+                    other->metrics.members < other->maximum;
+            });
+            if (backend->mode == "pool" && args.io_overlap && args.generation_overlap && !other_generation && !d.fresh_declined && d.engine->incremental && !first && !d.needs_resume &&
+                !has_prefetched && !select_merged && wanted == d.maximum && backend->full_remote_group(d.requested, wanted) &&
+                sum(sum(sum(fixed, backend->retained()), other_held), Backend::fresh_receive_bytes(args)) <= args.max_ram)
+            {
+                task.contribution_bytes = Backend::fresh_receive_bytes(args);
+                total.peak_modeled_bytes = std::max(total.peak_modeled_bytes, sum(sum(fixed, retained()), backend->retained()));
+                task.fresh_members = uint16_t(wanted); task.fill_stop = Producer::FillStop::full;
+                (void)submit(d); scheduled_generation(index); break;
+            }
             if (backend->mode == "pool" && d.engine->external && !d.needs_resume && !has_prefetched && !select_merged && wanted)
             {
                 uint16_t count = uint16_t(std::min(uint64_t(wanted), uint64_t(65535)));

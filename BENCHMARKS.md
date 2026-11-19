@@ -271,6 +271,48 @@ one three-member group. The mean time until both groups were published fell
 from 51.4 s to 46.0 s across two runs per build. Each drive's file matched
 across builds, and every run used zero scratch bytes.
 
+#### Streaming a fresh group to HDD
+
+On November 19, 2026, the same RTX 4090 and 10 GbE connection ran the
+three-member k=28 workload with one worker slot, comparing the streaming
+build with `48f679f`. For one destination the worker encoded the complete
+group in file order. The owner validated incoming chunks and started writing
+them while the rest of the group was still in transit.
+
+| Workload | Previous per member | Streaming per member | Previous elapsed | Streaming elapsed | Less time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| One HDD, 3 members | 10.64 s | 6.68 s | 31.93 s | 20.05 s | 37.2% |
+| Two HDDs, 6 members | 7.67 s | 5.53 s | 46.01 s | 33.16 s | 27.9% |
+
+Per-member time divides wall time from launch to the last publication by the
+total members published across all drives. Times are means of two runs per
+configuration with no untimed plotting warmup. The files matched the previous build's
+SHA-256 on each destination and all runs used zero scratch. Full proof checks
+passed for the single-drive output and both paired outputs.
+
+The default checkpoint setting and explicit `--checkpoint-bytes auto`
+published in 20.10 s and 20.01 s. Both selected a 4 GiB target after the
+first measured interval and finished the 2,983,531,299-byte file with three
+checkpoints. Fixed-target comparisons on the same drive averaged 21.61 s
+at 256 MiB, 20.11 s at 1 GiB, 20.26 s at 2 GiB, and 19.88 s at 4 GiB
+(two runs each). Four additional automatic runs on the same streaming path
+ranged from 19.87 s to 20.31 s.
+
+During the receive, validate, and write phase, the owner delivered 235.2 MB/s
+of final plot data. An independent 2 GiB sequential direct write with
+`fdatasync` measured 240.9 MB/s on that drive. One-second block and network
+counters showed substantial disk writes by eight seconds from launch while
+data was still arriving. Assuming 2.2 s to produce each member, producing
+all three and then writing the file at the measured sequential rate would
+take 18.98 s before scheduling and publication overhead.
+
+With two drives the worker sent three packed members to the first destination
+in one lease. That drive encoded and wrote its group locally while the worker
+produced the second group in file order. Both HDDs wrote concurrently. Their
+combined peak over a one-second sample was 528 MB/s in the first run and
+508 MB/s in the second. Peak receive traffic on the 10 GbE interface was
+3.92 Gb/s and 3.93 Gb/s, respectively.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

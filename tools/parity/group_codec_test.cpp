@@ -1199,7 +1199,67 @@ void indexed_members()
             offset += count;
         }
     }
-    for (auto const* path : {"/serial.gplot", "/staged.gplot"})
+    {
+        std::ifstream input(name + "/fresh.gplot", std::ios::binary);
+        std::vector<uint8_t> file((std::istreambuf_iterator<char>(input)), {});
+        Header header; std::memcpy(&header, file.data(), sizeof(header));
+        size_t const start = sizeof(header) + header.memo_length;
+        auto payload = std::span<uint8_t const>(file).subspan(start, header.chunk_index_offset - start);
+        ChunkCodec codec(k, config.codec_bytes);
+        std::vector<std::span<uint8_t const>> encoded;
+        size_t largest = 0;
+        while (!payload.empty())
+        {
+            auto const length = codec.scan(encoded.size(), payload, header.group_size);
+            encoded.push_back(payload.first(length)); payload = payload.subspan(length);
+            largest = std::max(largest, length);
+        }
+        uint64_t bound = 0; for (auto const& member : members) bound = std::max<uint64_t>(bound, member.size());
+        auto cfg = config; cfg.checkpoint_bytes = 8192;
+        for (bool interrupt : {false, true})
+        {
+            auto const path = name + (interrupt ? "/stream-resumed.gplot" : "/stream.gplot");
+            {
+                Engine engine(path, cfg, false, identity); engine.confirm_identity();
+                auto refused = engine.append_fresh_stream(header.group_size, bound, [&](auto const& begin, auto const&)
+                {
+                    require(!begin(cfg.capacity_bytes, cfg.window_bytes + 1, framed_digest(members)),
+                        "oversized streamed chunk bypassed ordinary window admission");
+                });
+                require(!refused && !engine.identity().pending && std::filesystem::file_size(path) == 0,
+                    "declined fresh manifest changed the destination");
+                auto receive = [&](auto const& begin, auto const& append)
+                {
+                    require(begin(header.chunk_index_offset - start, largest, framed_digest(members)), "stream admission failed");
+                    for (size_t i = 0; i < encoded.size(); ++i)
+                    {
+                        if (interrupt && i == encoded.size() / 2)
+                        {
+                            // A frame containing a valid chunk at a wrong ordinal must
+                            // leave the previous ordinary checkpoint recoverable.
+                            append(i + 1, std::span(encoded).subspan(i, 1));
+                            throw std::logic_error("unordered stream was accepted");
+                        }
+                        append(i, std::span(encoded).subspan(i, 1));
+                    }
+                };
+                if (interrupt)
+                {
+                    rejects([&] { (void)engine.append_fresh_stream(header.group_size, bound, receive); });
+                    require(engine.identity().pending && engine.stats().checkpoints > 1, "partial stream lost its durable prefix");
+                }
+                else require(engine.append_fresh_stream(header.group_size, bound, receive)->accepted, "fresh stream did not finish");
+            }
+            if (interrupt)
+            {
+                Engine engine(path, cfg, true); engine.confirm_identity();
+                auto changed = members; ++changed.front().front();
+                rejects([&] { engine.resume(changed); });
+                engine.resume(members);
+            }
+        }
+    }
+    for (auto const* path : {"/serial.gplot", "/staged.gplot", "/stream.gplot", "/stream-resumed.gplot"})
     {
         std::ifstream fresh(name + "/fresh.gplot", std::ios::binary);
         std::ifstream staged(name + path, std::ios::binary);

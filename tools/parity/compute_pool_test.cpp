@@ -1141,13 +1141,19 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
         workers.worker_records[0].capacity == offered.capacity && workers.worker_records[0].endpoint == offered.endpoint,
         "status confused broker reservations with registered worker capacity");
     worker.worker_admission(offered.instance, WorkerAdmission::Paused);
-    require(!worker.begin(*lease, lease->owner_identity), "paused broker admitted an unused grant");
+    bool awaiting_admission = false;
+    require(!worker.begin(*lease, lease->owner_identity, &awaiting_admission) && awaiting_admission,
+        "paused broker lost the live grant or admitted it prematurely");
     page = owner.status({StatusSection::Jobs}); bool found_paused = false;
     for (auto const& job : page.job_records) found_paused |= job.state == JobState::Queued && job.waiting == WaitReason::WorkerPaused;
     require(found_paused, "paused queue status omitted its reason");
     rejects([&] { owner.worker_admission(offered.instance, WorkerAdmission::Accepting); });
-    worker.worker_admission(offered.instance, WorkerAdmission::Accepting);
-    require(worker.begin(*lease, lease->owner_identity), "resumed broker did not admit existing grant");
+    require(worker.heartbeat(offered.instance, offered.capacity_revision, WorkerAdmission::Accepting),
+        "resumed worker heartbeat lost its registration");
+    require(worker.begin(*lease, lease->owner_identity, &awaiting_admission) && !awaiting_admission,
+        "resumed broker did not admit existing grant");
+    require(!worker.begin(*lease, lease->owner_identity, &awaiting_admission) && !awaiting_admission,
+        "a consumed grant was reported as waiting for admission");
     require(!worker.retire_worker(offered.instance), "idle rotation revoked running work");
     page = owner.status({StatusSection::Jobs}); require(page.running == 1 && page.queued == 1, "live status lost running work");
     // The diagnostic wire must never expose the private lease/session keys or

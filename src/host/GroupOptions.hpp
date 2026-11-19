@@ -87,7 +87,8 @@ struct GroupOptions : GroupComputeOptions
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024, temporary_capacity = 0;
     uint64_t window = 16 * 1024 * 1024, workers = 0, batch = 65535, max_members = 65535;
     uint64_t group_members = 0, max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
-    uint64_t checkpoint_bytes = 256 * 1024 * 1024, device = 0;
+    static constexpr uint64_t default_checkpoint_bytes = 256ull * 1024 * 1024;
+    uint64_t checkpoint_bytes = default_checkpoint_bytes, device = 0;
     std::string devices;
     std::vector<GroupLocalDevice> local_devices;
     bool local_compute = false;

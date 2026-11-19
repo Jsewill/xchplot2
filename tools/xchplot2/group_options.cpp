@@ -226,7 +226,7 @@ void reference_help()
         "  --tier T                  pool|plain|compact|minimal|tiny|pinned|auto, default auto\n"
         "  --member-storage raw|compact  retained member representation, default compact\n"
         "  --construction auto|incremental|staged|merged|external  assembly method, default auto\n"
-        "  --checkpoint-bytes N      fixed durability target; auto up to 268435456, merged 1073741824\n"
+        "  --checkpoint-bytes SIZE|auto  bytes between recovery checkpoints (default auto)\n"
         "  --io-overlap on|off        overlap encoding and file I/O, default on\n"
         "  --generation-overlap auto|on|off  overlap GPU/CPU work within admitted budgets, default auto\n"
         "  --cache-release on|off     release clean construction file cache, default on\n"
@@ -683,7 +683,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--farming-deadline-ms") result.farming_deadline_ms = number(value.c_str(), argv[i - 1]);
             else if (key == "--max-groups") { result.max_groups = number(value.c_str(), argv[i - 1]); result.max_groups_set = true; }
             else if (key == "--max-total-members") { result.max_total_members = number(value.c_str(), argv[i - 1]); result.max_total_members_set = true; }
-            else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str(), argv[i - 1]); result.checkpoint_set = true; }
+            else if (key == "--checkpoint-bytes")
+            {
+                result.checkpoint_set = value != "auto";
+                result.checkpoint_bytes = result.checkpoint_set ? number(value.c_str(), argv[i - 1]) :
+                    pos2gpu::GroupOptions::default_checkpoint_bytes;
+            }
             else if (key == "--backend") { result.backend = value; result.backend_set = true; result.devices.clear(); }
             else if (key == "--device") { result.device = number(value.c_str(), argv[i - 1]); result.device_set = true; result.devices.clear(); }
             else if (key == "--devices" || key == "-d")

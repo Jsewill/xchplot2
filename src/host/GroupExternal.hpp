@@ -561,14 +561,7 @@ inline void evict(int fd)
     (void)fd;
 #endif
 }
-inline void start_writeback(int fd, uint64_t offset, uint64_t bytes)
-{
-#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
-    (void)::sync_file_range(fd, off_t(offset), off_t(bytes), SYNC_FILE_RANGE_WRITE);
-#else
-    (void)fd; (void)offset; (void)bytes;
-#endif
-}
+
 inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats* stats = nullptr, IOContext context = {})
 {
     while (!bytes.empty())
@@ -1942,7 +1935,7 @@ public:
                 // Start writeback while subsequent disks fill. finish()
                 // still verifies and synchronizes every completed extent.
                 if (!engine_.disk_workers_.empty() && !engine_.external_.io_governor)
-                    external_detail::start_writeback(file_->fd, 0, 0);
+                    file_io::start_writeback(file_->fd, 0, 0);
                 ++segment_; position_ = 0;
             }
         }
@@ -3562,7 +3555,7 @@ inline void ExternalEngine::pack(Members members)
                     // Keep the output spindle writing while the next chunks
                     // are packed. The checkpoint still syncs data and index.
                     if (writeback_window && (offset + writing_window.size()) % writeback_window == 0)
-                        external_detail::start_writeback(fd_, offset, writing_window.size());
+                        file_io::start_writeback(fd_, offset, writing_window.size());
                 });
             }
             else { write_target(window_offset, output_window); output_window.clear(); }

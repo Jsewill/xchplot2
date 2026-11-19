@@ -1190,7 +1190,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     target_compile_features(xchplot2_group_gpu PRIVATE cxx_std_20)
     target_link_libraries(xchplot2_group_gpu PRIVATE pos2_gpu_host)
     target_compile_definitions(pos2_pr118_grow_worker_host PRIVATE GROW_GPU_BACKEND=1)
-    target_link_libraries(pos2_pr118_grow_worker_host PRIVATE pos2_gpu_host)
+    target_link_libraries(pos2_pr118_grow_worker_host PRIVATE pos2_gpu_host pos2_keygen)
 
     add_library(xchplot2_groups STATIC src/host/GroupPlotter.cpp src/host/ComputeSession.cpp
         $<TARGET_OBJECTS:xchplot2_group_gpu>)

@@ -4284,7 +4284,8 @@ def check_automatic_compute(binary, root):
         assert all(snapshot(states[name]) == saved for name, saved in before.items()), "saved review started compute services"
 
         # No worker or dedicated broker is running: a normal plot still works.
-        made = run("first", *plot, "--max-host-ram", "512M", "-S", SEED, "-o", directory / "local")
+        made = run("first", *plot, "--max-host-ram", "512M", "--checkpoint-bytes", "auto",
+                   "-S", SEED, "-o", directory / "local")
         output = Path(made.stdout.strip())
         assert output.is_file() and header(output)[3] == 1 and not made.stderr
         profile = (states["first"] / "xchplot2/compute/profile").read_text(encoding="utf-8").splitlines()

@@ -728,11 +728,15 @@ receive slot for another group using shared compute.
 
 `--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
-and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
-`--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.
-These options override the automatic choices. On known HDDs, automatic
-incremental construction can increase the checkpoint interval up to 1 GiB when
-completed work on that drive shows a benefit, within the same memory budget.
+and clean-cache release. `--window-bytes SIZE` sets the I/O window size.
+
+`--checkpoint-bytes auto` is the default. Ordinary construction measures
+the time per durable byte and the time spent flushing each interval. During
+the first group it can try a target up to 4 GiB when that target predicts
+a shorter time to finish within available filesystem headroom. It returns
+to the previous interval if completed trials show a slowdown.
+Later fresh groups can reuse results from the same drive and construction
+settings in that run. `--checkpoint-bytes SIZE` fixes the interval.
 Longer intervals can require more work to be repeated after interruption.
 
 Construction checkpoints are private. New records require a compatible format,
@@ -1740,13 +1744,21 @@ frames after first output and time consuming frames, including scratch writes.
 Send and receive waits include backpressure and can overlap. After three
 completed samples for a matching plot size, strength and result type, the
 owner can compare generation batch sizes and choose how many destinations
-receive concurrently. With an older peer the owner uses the existing task
-timings. The full execution forecast also needs measured packing and storage
-costs for the destination.
-While those timings are incomplete, the scheduler favors a partially filled
-group that can start packing soon on an idle drive. Observed member sizes
-help it serve destinations with room before probing nearly full ones.
-A repeatedly deferred destination still gets a turn.
+receive concurrently. When detailed timings are unavailable, the owner uses
+whole-task timings. The full execution forecast also needs measured packing
+and storage costs for the destination.
+The scheduler prioritizes the next batch that can start an idle output drive.
+Compatible worker slots and measured transfer rates limit concurrent receivers.
+Observed member sizes help it serve destinations with room before probing
+nearly full ones. A repeatedly deferred destination still gets a turn.
+
+When the pool offers one compatible generation slot, a fresh fixed-size group
+that fits one lease can arrive as encoded chunks in file order. The destination
+validates the chunks, starts disk writeback during transfer, and publishes
+after the complete stream and index are durable. A saved prefix can resume
+with another compatible producer. When other drives still need members, the
+worker can send consecutive packed members under one lease and overlap GPU
+generation with delivery.
 
 Near the output limit, external construction receives uncertain compressed
 members individually. The planner can reserve extra scratch for these
@@ -1875,10 +1887,10 @@ agree. Source-build identity is diagnostic provenance. Generation and codec
 eligibility are checked separately; incompatible work is not scheduled.
 Compatible releases can be rolled through workers without rebuilding every
 machine together. A wire-protocol change requires upgrading brokers, workers
-and plotting hosts together. This version uses compute protocol 6 and does not
-interoperate with protocol 5. Drain workers and wait for `drained` before
-replacing services. Preserve the saved enrollment directory, restart services,
-then run `compute resume` on the drained workers to accept new tasks.
+and plotting hosts together. This version uses compute protocol 7. Drain
+workers and wait for `drained` before replacing services. Preserve the saved
+enrollment directory, restart services, then run `compute resume` on the
+drained workers to accept new tasks.
 
 ### Background workers and brokers
 

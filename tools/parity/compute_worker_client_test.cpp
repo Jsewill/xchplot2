@@ -495,15 +495,23 @@ void temporary_worker_refusal()
     WorkerChunkInput chunk{0, {}, 0, {}, {&region, 1}};
     ChunkCodec codec(18, uint64_t(1) << 20);
     auto expected = codec.encode(0, {}, 0, {&region, 1});
+    pool::BrokerClient worker_control(offer.broker, tls);
+    auto const instance = service.status().instance;
     for (bool local : {false, true})
     {
-        bool refuse = false;
+        bool refuse = false, delayed_pause = false;
         WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
         config.owner_id = local ? "local-refusal-owner" : "remote-refusal-owner";
         config.local_service = local ? &service : nullptr;
         // Pause after the broker grants the lease, before the worker accepts
         // it. This deterministically exercises a temporary admission refusal.
-        config.selected = [&](auto const&) { if (std::exchange(refuse, false)) service.control(WorkerControl::Pause); };
+        config.selected = [&](auto const&)
+        {
+            if (std::exchange(refuse, false)) service.control(WorkerControl::Pause);
+            // Deliver the old paused snapshot after resume and after the
+            // broker grants the retry. The local worker is already accepting.
+            if (std::exchange(delayed_pause, false)) worker_control.worker_admission(instance, pool::WorkerAdmission::Paused);
+        };
         WorkerClient client(config);
         for (unsigned kind = 0; kind < 3; ++kind)
         {
@@ -535,7 +543,7 @@ void temporary_worker_refusal()
             try { request(); } catch (pool::TransientTransport const&) { rejected = true; }
             require(rejected && !output && !service.status().accepted_tasks,
                 "paused worker did not refuse the granted task before execution");
-            service.control(WorkerControl::Resume); ++task.attempt;
+            service.control(WorkerControl::Resume); ++task.attempt; delayed_pause = true;
             try { request(); }
             catch (std::exception const& error)
             { throw std::runtime_error("retry after temporary worker refusal failed: " + std::string(error.what())); }

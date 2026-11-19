@@ -143,7 +143,7 @@ void command_help_all(std::string_view command)
         "  --construction auto|incremental|staged|merged|external\n"
         "  --member-storage compact|raw  temporary member storage format\n"
         "  --window-bytes N          I/O window size in bytes\n"
-        "  --checkpoint-bytes N      target bytes between recovery checkpoints\n"
+        "  --checkpoint-bytes SIZE|auto  bytes between recovery checkpoints (default auto)\n"
         "  --io-overlap on|off --generation-overlap auto|on|off --cache-release on|off\n";
     if (command != "grow") std::cout <<
         "  --harvester local|FILE    use this harvester or import its saved profile\n"

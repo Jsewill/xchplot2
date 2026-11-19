@@ -141,6 +141,7 @@ struct SharedConstructionHistory
     // Its bounded trial survives a fresh group only in this physical context
     // and with the same actual grant; foreground timings stay local.
     ExternalBatchHistory successor_batches;
+    std::array<uint64_t, 2> fresh_checkpoint_bytes{};
     unsigned successor_batch_workers = 0;
     ConstructionHistory snapshot()
     { std::lock_guard lock(mutex); return history; }
@@ -252,13 +253,13 @@ struct ExecutionReady
     bool known = false;
     uint16_t members_to_pack = UINT16_MAX;
     bool tight_capacity = false;
+    long double time_to_write = 0;
 };
 
 // A cold compact-input trial compares whole durable cohorts in this run.
 // Completed appends cannot establish this result: their final pack is still
 // outstanding. Owners, physical-context tokens and group membership must match
 // the ordinary cohort, and an incomplete comparison never becomes a win.
-inline long double construction_margin(size_t observations);
 class StreamingInputCohort
 {
 public:
@@ -382,10 +383,15 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
     bool const all_tight = std::all_of(ready.begin(), ready.end(), [](auto const& item) { return item.tight_capacity; });
     bool const measured = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
         { return item.known || (!all_tight && item.tight_capacity); });
+    bool const timed_writes = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
+        { return item.members_to_pack == UINT16_MAX || item.time_to_write > 0 || (!all_tight && item.tight_capacity); });
     return std::min_element(ready.begin(), ready.end(), [&](auto const& a, auto const& b)
     {
         if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
-        return measured ? a.remaining > b.remaining : a.members_to_pack < b.members_to_pack;
+        if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
+            a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
+        if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
+        return measured && a.remaining > b.remaining;
     })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
@@ -496,7 +502,6 @@ inline long double construction_cost(ConstructionCost const& work, Config const&
     // physical throughput sample. Codec work includes joining and encoding.
     return io + (config.io_overlap ? std::max(parallel, serial) : parallel + serial) + work.syncs * rates.sync;
 }
-inline long double construction_margin(size_t observations) { return observations >= 4 ? 0.10L : 0.15L; }
 
 // Compare actual CPU occupancy only after sustained completed observations.
 // Storage syscall wall time never substitutes for a missing thread CPU clock.
@@ -534,108 +539,6 @@ inline unsigned external_staging_workers(unsigned workers, ConstructionHistory c
 // A long external pack can observe its destination only while finalizing.
 // Keep completed intervals local to that invocation; scratch contribution
 // timings and a previous process cannot stand in for target checkpoints.
-struct PackingCheckpointHistory
-{
-    static constexpr uint64_t forecast_bytes = 1024ull * 1024 * 1024;
-    static constexpr uint64_t maximum_bytes = 4 * forecast_bytes;
-    struct Sample { uint64_t bytes, elapsed_ns, checkpoint_ns, codec_ns = 0; };
-    std::array<Sample, 8> samples{};
-    size_t count = 0, next = 0;
-    uint64_t trial_from = 0, trial_bytes = 0, learned_ceiling = maximum_bytes;
-    long double trial_baseline = 0;
-    std::array<long double, 3> trial_rates{};
-    size_t trial_count = 0, trial_baseline_count = 0;
-    static uint64_t memory_bytes()
-    {
-        return sizeof(PackingCheckpointHistory) + 2 * sizeof(std::array<long double, 8>) +
-            sizeof(std::array<uint64_t, 8>);
-    }
-    void add(Sample sample)
-    {
-        if (!sample.bytes || !sample.elapsed_ns || sample.checkpoint_ns > sample.elapsed_ns) return;
-        samples[next] = sample; next = (next + 1) % samples.size();
-        count = std::min(count + 1, samples.size());
-    }
-    // Called once after each accepted add, so each completed trial interval
-    // contributes exactly one observation.
-    uint64_t select(uint64_t current, uint64_t ceiling, uint64_t remaining)
-    {
-        if (!count || !remaining) return current;
-        auto active_rate = [](Sample const& sample)
-        { return static_cast<long double>(std::max(sample.elapsed_ns - sample.checkpoint_ns, sample.codec_ns)) / sample.bytes; };
-        auto completed_rate = [&](Sample const& sample)
-        { return active_rate(sample) + static_cast<long double>(sample.checkpoint_ns) / sample.bytes; };
-        if (trial_bytes)
-        {
-            // Larger dirty ranges need not have constant checkpoint latency.
-            // Price completed end-to-end intervals, including reclamation,
-            // before keeping a larger replay and retained-scratch frontier.
-            auto const& sample = samples[(next + samples.size() - 1) % samples.size()];
-            if (sample.bytes < trial_bytes) return current;
-            trial_rates[trial_count++] = completed_rate(sample);
-            if (trial_count < trial_rates.size()) return current;
-            std::sort(trial_rates.begin(), trial_rates.end());
-            bool const accepted = trial_rates[trial_rates.size() / 2] <
-                trial_baseline * (1 - construction_margin(trial_baseline_count));
-            trial_bytes = 0; trial_count = 0;
-            if (!accepted) { learned_ceiling = trial_from; return trial_from; }
-        }
-        ceiling = std::min({ceiling, maximum_bytes, learned_ceiling});
-        if (current >= ceiling) return current;
-        bool const trial = current >= forecast_bytes;
-        if (trial)
-        {
-            // Extrapolate only one geometric step, and keep enough work for
-            // completed trial intervals. Short tails retain their frontier.
-            ceiling = std::min(ceiling, current * 2);
-            if (remaining / ceiling <= trial_rates.size()) return current;
-        }
-        else ceiling = std::min(ceiling, forecast_bytes);
-        std::array<long double, 8> streaming{}, checkpoint{};
-        size_t observations = 0;
-        for (size_t i = 0; i < count; ++i)
-        {
-            auto const& sample = samples[i];
-            if (trial && sample.bytes < current) continue;
-            // A pending encoder can use checkpoint waits. Keep completed
-            // codec work as a floor rather than treating all of it as free.
-            // Codec counters arrive per joined window; short intervals have
-            // coarse attribution, so this remains a forecast with a margin.
-            streaming[observations] = active_rate(sample);
-            checkpoint[observations++] = sample.checkpoint_ns;
-        }
-        // A median-sized baseline prevents one unusually slow checkpoint
-        // from justifying a larger retained-scratch and replay frontier.
-        if (!observations || (trial && observations < trial_rates.size())) return current;
-        auto median = [&](auto& values)
-        {
-            std::sort(values.begin(), values.begin() + observations);
-            return (values[(observations - 1) / 2] + values[observations / 2]) / 2;
-        };
-        long double const active = remaining * median(streaming), latency = median(checkpoint);
-        auto cost = [&](uint64_t bytes)
-        { return active + std::ceil(static_cast<long double>(remaining) / bytes) * latency; };
-        long double const original = cost(current); auto best_cost = original; uint64_t best = current;
-        std::array<uint64_t, 8> const candidates{4ull * 1024 * 1024, 16ull * 1024 * 1024,
-            64ull * 1024 * 1024, 256ull * 1024 * 1024, 512ull * 1024 * 1024,
-            forecast_bytes, current, ceiling};
-        for (auto bytes : candidates) if (bytes > current && bytes <= ceiling && cost(bytes) < best_cost)
-        { best_cost = cost(bytes); best = bytes; }
-        if (best_cost >= original * (1 - construction_margin(observations))) return current;
-        if (trial)
-        {
-            // Keep the baseline's actual total rather than a model that
-            // treats every future checkpoint as the same fixed latency.
-            observations = 0;
-            for (size_t i = 0; i < count; ++i) if (samples[i].bytes >= current)
-                streaming[observations++] = completed_rate(samples[i]);
-            trial_baseline = median(streaming); trial_baseline_count = observations;
-            trial_from = current; trial_bytes = best;
-        }
-        return best;
-    }
-};
-
 inline bool four_input_candidate(Config const& config, bool nonrotating, bool known_device,
                                  uint64_t window_limit, size_t observations)
 {

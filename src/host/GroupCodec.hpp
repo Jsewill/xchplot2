@@ -232,6 +232,8 @@ struct EncodedChunk
     uint16_t members;
 };
 
+inline constexpr size_t fresh_group_window_chunks = 1024;
+
 struct ChunkInput
 {
     uint64_t ordinal;
@@ -1189,7 +1191,12 @@ private:
             uint64_t estimate = ChunkCodec::estimate_base();
             for (size_t i = begin; i < end; ++i)
             {
-                if (summary_only) continue;
+                if (summary_only)
+                {
+                    if (!chunks[i].old_chunk.empty())
+                        estimate = std::max(estimate, ChunkCodec::estimate_work(k_, chunks[i].old_chunk.size(), 0));
+                    continue;
+                }
                 uint64_t incoming = 0;
                 for (size_t member_index = 0; member_index < chunks[i].new_members.size(); ++member_index)
                 {
@@ -1212,7 +1219,7 @@ private:
                 group_tools::require(chunk <= UINT64_MAX - estimate, "group window estimate overflow");
                 estimate += chunk;
             }
-            if (!summary_only) codecs_[task]->prepare(estimate);
+            if (!summary_only || estimate > ChunkCodec::estimate_base()) codecs_[task]->prepare(estimate);
             if (!summary_only) blocks_.push_back({begin, end, {}});
         }
         std::vector<std::future<void>> pending;
@@ -1245,7 +1252,14 @@ private:
                     auto const& chunk = chunks[i];
                     if (summary_only)
                     {
-                        group_tools::require(chunk.old_chunk.empty() && !chunk.old_members && chunk.contributions.empty(),
+                        if (!chunk.old_chunk.empty())
+                        {
+                            group_tools::require(chunk.old_members && chunk.new_members.empty() && chunk.contributions.empty(),
+                                "invalid encoded summary input");
+                            summaries[i] = codec.inspect(chunk.ordinal, chunk.old_chunk, chunk.old_members).summary;
+                            continue;
+                        }
+                        group_tools::require(!chunk.old_members && chunk.contributions.empty(),
                                              "fresh summary has old group input");
                         summaries[i] = ChunkCodec::fresh_summary(k_, chunk.ordinal, chunk.new_members);
                         continue;

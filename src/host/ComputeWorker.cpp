@@ -43,8 +43,8 @@ using group_tools::require;
 using Clock = std::chrono::steady_clock;
 constexpr uint64_t mib = uint64_t(1) << 20;
 constexpr size_t max_broker_routes = 8;
-enum class Operation : uint8_t { Packed = 1, Contributions = 2, Encode = 3 };
-enum class DataKind : uint8_t { Prelude = 1, Boundaries = 2, Words = 3, Contributions = 4, Encoded = 5 };
+enum class Operation : uint8_t { Packed = 1, Contributions = 2, Encode = 3, Fresh = 4 };
+enum class DataKind : uint8_t { Prelude = 1, Boundaries = 2, Words = 3, Contributions = 4, Encoded = 5, FreshManifest = 6 };
 enum class WorkerError : uint8_t { Permanent = 0, Unsupported = 1, Transport = 2, Stale = 3 };
 void write_worker_status(pool::Writer& out, WorkerStatus const& value)
 {
@@ -593,7 +593,6 @@ struct WorkerService::Impl
         Clock::time_point seen = Clock::now();
         Clock::time_point admitted = Clock::now(), rotation_attempt{};
         uint64_t revision = 0;
-        pool::WorkerAdmission admission = pool::WorkerAdmission::Accepting;
         Registration(pool::Endpoint address, pool::TlsOptions const& tls)
             : endpoint(std::move(address)), routes{endpoint}, client(endpoint, tls, 1) {}
     };
@@ -726,6 +725,7 @@ struct WorkerService::Impl
                     GpuProducerOptions options; options.device_id = config.device;
                     options.tier = config.tier; options.max_vram_bytes = config.capacity.gpu_bytes;
                     options.host_threads = config.generation_threads;
+                    options.member_overlap = options.compact_transfer = options.preserve_match_scratch = true;
                     try { gpu_profiles.emplace(k, GpuProducer::preflight(k, 2, options)); }
                     catch (pos2gpu::InsufficientVramError const&) {}
                 }
@@ -851,6 +851,25 @@ struct WorkerService::Impl
         if (selected) return selected->client;
         throw pool::StaleLease("worker does not recognize the lease's broker epoch");
     }
+    void begin_assigned(pool::BrokerClient& broker, pool::Lease const& lease, std::string const& owner, WorkerCancellation cancel)
+    {
+        for (;;)
+        {
+            cancel.check();
+            bool awaiting_admission = false;
+            if (broker.begin(lease, owner, &awaiting_admission)) return;
+            if (!awaiting_admission) throw pool::StaleLease("worker rejected stale lease");
+            {
+                std::lock_guard lock(admission_mutex);
+                if (admission != pool::WorkerAdmission::Accepting)
+                    throw pool::TransientTransport("worker is not accepting new work");
+            }
+            // A delayed pause can reach the broker after local resume. Let
+            // the next heartbeat reconcile it, then recheck the original grant.
+            heartbeat_ready.notify_all();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
     void refresh_brokers()
     {
         auto addresses = config.brokers;
@@ -916,19 +935,17 @@ struct WorkerService::Impl
             {
                 pool::Endpoint address, advertised_endpoint;
                 uint64_t revision;
-                pool::WorkerAdmission previous_admission;
                 { std::lock_guard lock(brokers_mutex); address = broker->endpoint; advertised_endpoint = broker->advertised_endpoint;
-                  revision = broker->revision; previous_admission = broker->admission; }
+                  revision = broker->revision; }
                 auto client = broker->client.with_deadline(Clock::now() + std::chrono::milliseconds(config.broker_refresh_ms));
                 auto value = offer();
                 if (value.endpoint.host == "0.0.0.0" || value.endpoint.host == "::")
                     value.endpoint.host = pool::local_address(address);
                 if (revision == value.capacity_revision && value.endpoint == advertised_endpoint &&
-                    client.heartbeat(instance, value.capacity_revision))
+                    client.heartbeat(instance, value.capacity_revision, value.admission))
                 {
-                    if (previous_admission != value.admission) client.worker_admission(instance, value.admission);
                     std::lock_guard lock(brokers_mutex); broker->seen = Clock::now(); broker->healthy = true;
-                    broker->admission = value.admission; return;
+                    return;
                 }
                 if (!advertised_endpoint.host.empty() && value.endpoint != advertised_endpoint)
                 {
@@ -952,13 +969,13 @@ struct WorkerService::Impl
                         registered.route_cursor = registered.routes.size() - 1;
                     }
                     registered.seen = Clock::now(); registered.healthy = true;
-                    registered.revision = value.capacity_revision; registered.admission = value.admission;
+                    registered.revision = value.capacity_revision;
                     registered.advertised_endpoint = value.endpoint;
                     std::erase(brokers, broker); return;
                 }
                 broker->epoch = std::move(epoch); broker->revision = value.capacity_revision;
                 broker->identity = peer; broker->node_id = node;
-                broker->admission = value.admission; broker->advertised_endpoint = value.endpoint;
+                broker->advertised_endpoint = value.endpoint;
                 broker->seen = Clock::now(); broker->healthy = true;
             }
             catch (...)
@@ -1128,11 +1145,11 @@ struct WorkerService::Impl
     void generation(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
         WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
         WorkerCancellation cancel, bool use_gpu, bool task_slot = true, pool::Resources const* grant = nullptr,
-        std::function<void(WorkerTaskAdmission const&)> const& admit = {})
+        std::function<void(WorkerTaskAdmission const&)> const& admit = {}, WorkerFreshManifest const& manifest = {})
     {
         cancel = cancellation(cancel); cancel.check();
         require(!ids.empty() && ids.size() <= config.max_batch_members &&
-            (!packed_sink || ids.size() == 1), "worker generation batch exceeds configured limit");
+            (bool(packed_sink) != bool(contribution_sink)), "worker generation batch exceeds configured limit");
         auto const bound = fragment_count_bound(k, strength);
         uint64_t const raw_bytes = multiply(bound, sizeof(uint64_t));
         uint64_t const indexes = multiply(boundary_bytes(k), ids.size());
@@ -1165,6 +1182,9 @@ struct WorkerService::Impl
         {
             uint64_t task_retained = 0;
             uint64_t generated_retained = 0;
+            bool delivered_packed = false;
+            std::vector<Member> compact;
+            std::unique_ptr<MemberBatchHash> hash;
             std::vector<std::vector<uint64_t>> owned;
             std::vector<std::span<uint64_t const>> members; members.reserve(ids.size());
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
@@ -1182,7 +1202,8 @@ struct WorkerService::Impl
                     gpu.reset();
                     GpuProducerOptions options; options.device_id = config.device; options.tier = gpu_profiles.at(k).tier;
                     options.max_vram_bytes = grant ? grant->gpu_bytes : config.capacity.gpu_bytes;
-                    options.host_threads = threads;
+                    options.host_threads = std::max(1u, threads - 1);
+                    options.member_overlap = options.compact_transfer = options.preserve_match_scratch = true;
                     CpuWork compute(offered_cpu, scheduler.get(), cancel, threads);
                     try { gpu = std::make_unique<GpuProducer>(k, strength, options); }
                     catch (std::exception const& error) { throw pool::UnsupportedResources(error.what()); }
@@ -1194,8 +1215,40 @@ struct WorkerService::Impl
                     throw pool::UnsupportedResources("GPU generation model exceeds leased host memory");
                 memory.resize(peak > gpu_retained.bytes ? peak - gpu_retained.bytes : indexes);
                 task_retained = gpu_retained.bytes;
+                if ((packed_sink || manifest) && threads > 1 && gpu->compact_transfer_available())
+                {
+                    // The ordered consumer owns one CPU permit for framing. The
+                    // GPU thread may wait for that consumer before its next sort.
+                    std::shared_future<uint64_t> output;
+                    std::optional<CompactMemberReceiver> receiver;
+                    size_t words = 0;
+                    if (manifest) { compact.reserve(ids.size()); hash = std::make_unique<MemberBatchHash>(ids.size()); }
+                    try
+                    {
+                        for (auto const& id : ids)
+                        {
+                            cancel.check();
+                            CpuWork compute(offered_cpu, scheduler.get(), cancel, threads - 1);
+                            output = gpu->generate_packed_into_async(id, [&](auto const& tile, uint64_t count)
+                            {
+                                cancel.check();
+                                require(count <= bound, "worker GPU output exceeds admitted fragment bound");
+                                if (packed_sink) { packed_sink(tile, count); return; }
+                                CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                                if (!tile.boundaries.empty())
+                                { receiver.emplace(k, size_t(count), true, hash.get()); words = 0; }
+                                receiver->append(tile); words += tile.words.size();
+                                if (words == (count * (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS) + 63) / 64)
+                                { compact.push_back(receiver->finish()); receiver.reset(); }
+                            });
+                        }
+                        output.get();
+                    }
+                    catch (...) { if (output.valid()) output.wait(); throw; }
+                    delivered_packed = true;
+                }
                 owned.reserve(ids.size());
-                for (auto const& id : ids)
+                if (!delivered_packed) for (auto const& id : ids)
                 {
                     cancel.check();
                     CpuWork compute(offered_cpu, scheduler.get(), cancel, threads);
@@ -1230,61 +1283,140 @@ struct WorkerService::Impl
                     members.push_back(owned.back());
                 }
             }
-            if (packed_sink) packed(k, members.front(), packed_sink, cancel);
+            if (packed_sink)
+            { for (auto raw : members) packed(k, raw, packed_sink, cancel); }
             else
             {
                 size_t const chunks = size_t(PlotGroupFile::getChunkCountForK(k));
-                std::vector<std::vector<uint32_t>> boundaries;
-                boundaries.reserve(members.size()); uint64_t actual_raw = 0, maximum_work = 0;
+                std::vector<Member> views;
+                std::vector<FragmentBoundaries> boundaries;
+                uint64_t resident = 0, maximum_work = 0, payload = 0, largest = 0;
+                auto const count = ids.size();
+                if (compact.empty())
                 {
-                    CpuWork compute(offered_cpu, scheduler.get(), cancel);
-                    unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
                     for (auto raw : members)
                     {
+                        CpuWork cpu(offered_cpu, scheduler.get(), cancel);
                         require(raw.size() <= UINT32_MAX && std::is_sorted(raw.begin(), raw.end()), "invalid worker generation output");
-                        actual_raw = add(actual_raw, multiply(raw.size(), sizeof(uint64_t)));
-                        std::vector<uint32_t> index(chunks + 1); size_t cursor = 0;
+                        views.push_back(Member::borrowed(raw));
+                        auto& index = boundaries.emplace_back(); index.reset(chunks, raw.size());
+                        size_t cursor = 0;
                         for (size_t c = 0; c < chunks; ++c)
-                        { index[c] = uint32_t(cursor); while (cursor < raw.size() && (raw[cursor] >> width) == c) ++cursor; }
-                        index.back() = uint32_t(cursor); require(cursor == raw.size(), "out-of-range worker member");
-                        boundaries.push_back(std::move(index));
-                    }
-                    for (size_t c = 0; c < chunks; ++c)
-                    {
-                        uint64_t count = 0; for (auto const& index : boundaries) count = add(count, index[c + 1] - index[c]);
-                        maximum_work = std::max(maximum_work, ChunkCodec::estimate_work(k, 0, count));
+                        {
+                            index.set(c, cursor);
+                            while (cursor < raw.size() && (raw[cursor] >> (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS)) == c) ++cursor;
+                        }
+                        require(cursor == raw.size(), "out-of-range worker member"); index.set(chunks, cursor);
+                        if (!use_gpu || count > 1) resident = add(resident, raw.size_bytes());
                     }
                 }
+                else for (auto const& member : compact) resident = add(resident, member.storage_bytes());
+                Members const source(compact.empty() ? views : compact);
+                require(source.size() == count, "worker generation lost a batch member");
+                auto regions = [&](size_t chunk, FragmentRegion* result)
+                {
+                    uint64_t symbols = 0;
+                    for (size_t m = 0; m < count; ++m)
+                    {
+                        auto view = source[m];
+                        result[m] = view.compact() ? view.region(chunk) :
+                            view.region(chunk, boundaries[m][chunk], boundaries[m][chunk + 1] - boundaries[m][chunk]);
+                        symbols += result[m].size();
+                    }
+                    return symbols;
+                };
+                {
+                    CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                    std::vector<FragmentRegion> row(count);
+                    for (size_t c = 0; c < chunks; ++c)
+                    {
+                        if (!(c % contribution_window_chunks)) cancel.check();
+                        maximum_work = std::max(maximum_work, ChunkCodec::estimate_work(k, 0, regions(c, row.data())));
+                        if (manifest)
+                        {
+                            uint64_t const bytes = ChunkCodec::fresh_bound(k, c, row);
+                            payload = add(payload, bytes); largest = std::max(largest, bytes);
+                        }
+                    }
+                }
+                auto reserve_codec = [&](uint64_t bytes)
+                {
+                    auto const needed = add(add(add(resident, indexes), bytes), generated_retained);
+                    if (grant && needed > add(grant->host_bytes, use_gpu ? prior_retained : 0))
+                        throw pool::UnsupportedResources("initial contribution codec exceeds leased host memory");
+                    auto const dynamic = needed > task_retained ? needed - task_retained : indexes;
+                    if (dynamic > memory.bytes) memory.resize(dynamic);
+                };
                 if (maximum_work > config.max_task_bytes)
                     throw pool::UnsupportedResources("initial contribution codec exceeds configured task scratch limit");
-                // A borrowed singleton already lives in the producer. Owning
-                // batches retain their vectors beside its persistent tables.
-                auto const owned_raw = use_gpu && ids.size() == 1 ? 0 : actual_raw;
-                uint64_t const needed = add(add(add(owned_raw, indexes), maximum_work), generated_retained);
-                if (grant && needed > add(grant->host_bytes, use_gpu ? prior_retained : 0))
-                    throw pool::UnsupportedResources("initial contribution codec exceeds leased host memory");
-                auto const dynamic_needed = needed > task_retained ? needed - task_retained : indexes;
-                if (dynamic_needed > memory.bytes) memory.resize(dynamic_needed);
-                auto codec = [&]
+                if (!manifest)
                 {
-                    CpuWork compute(offered_cpu, scheduler.get(), cancel);
-                    return ChunkCodec(k, maximum_work, scheduler);
-                }();
-                std::vector<std::span<uint64_t const>> regions; regions.reserve(members.size());
-                for (size_t c = 0; c < chunks; ++c)
-                {
-                    cancel.check();
-                    std::span<uint8_t const> bytes;
+                    reserve_codec(maximum_work);
+                    ChunkCodec codec(k, maximum_work, scheduler);
+                    std::vector<FragmentRegion> row(count);
+                    for (size_t c = 0; c < chunks; ++c)
                     {
-                        CpuWork compute(offered_cpu, scheduler.get(), cancel);
-                        regions.clear();
-                        for (size_t m = 0; m < members.size(); ++m)
-                            regions.push_back(members[m].subspan(boundaries[m][c], boundaries[m][c + 1] - boundaries[m][c]));
-                        uint64_t count = 0; for (auto const region : regions) count = add(count, region.size());
-                        codec.prepare(ChunkCodec::estimate_work(k, 0, count));
-                        bytes = codec.encode(c, {}, 0, regions);
+                        cancel.check();
+                        std::span<uint8_t const> bytes;
+                        {
+                            CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                            codec.prepare(ChunkCodec::estimate_work(k, 0, regions(c, row.data())));
+                            bytes = codec.encode(c, {}, 0, row);
+                        }
+                        cancel.check(); contribution_sink(c, bytes, uint16_t(count));
                     }
-                    cancel.check(); contribution_sink(c, bytes, uint16_t(members.size()));
+                }
+                else
+                {
+                    auto max_window = fresh_group_window_chunks;
+                    unsigned lanes = threads;
+                    auto overhead = [&] { return ParallelEncoder::memory_bytes(lanes) +
+                        max_window * (sizeof(ChunkInput) + sizeof(uint64_t) + count * sizeof(FragmentRegion)) +
+                        MemberBatchHash::memory_bytes(count) + member_digest_words * sizeof(uint64_t); };
+                    while (lanes > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) --lanes;
+                    while (max_window > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) max_window /= 2;
+                    if (add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes)
+                        throw pool::UnsupportedResources("fresh group codec exceeds configured task scratch limit");
+                    uint64_t const scratch = config.max_task_bytes - overhead();
+                    reserve_codec(config.max_task_bytes);
+                    std::array<uint8_t, 32> digest;
+                    { CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                      digest = members_digest(k, source, hash.get(), [&] { cancel.check(); }); }
+                    manifest(payload, largest, digest);
+                    ParallelEncoder encoder(k, lanes, scratch, scheduler);
+                    size_t const per_lane = size_t(std::min<uint64_t>(max_window,
+                        (scratch / lanes - ChunkCodec::estimate_base()) / std::max<uint64_t>(1, maximum_work - ChunkCodec::estimate_base())));
+                    size_t const window = std::min<size_t>(max_window, lanes * per_lane);
+                    std::vector<FragmentRegion> rows(count * window);
+                    std::vector<ChunkInput> tasks(window);
+                    std::vector<uint64_t> sizes(window);
+                    for (size_t first = 0; first < chunks;)
+                    {
+                        cancel.check();
+                        size_t const n = std::min(chunks - first, window);
+                        std::span<EncodedBlock const> blocks;
+                        {
+                            CpuAdmission::Lease offered(offered_cpu, lanes, cancel);
+                            for (size_t i = 0; i < n; ++i)
+                            {
+                                auto* row = rows.data() + i * count;
+                                regions(first + i, row);
+                                tasks[i] = {first + i, {}, 0, MemberRegions(row, count)};
+                            }
+                            blocks = encoder.encode(std::span(tasks).first(n), std::span(sizes).first(n));
+                        }
+                        for (auto const& block : blocks)
+                        {
+                            size_t offset = 0;
+                            for (size_t i = block.begin; i < block.end; ++i)
+                            {
+                                cancel.check();
+                                contribution_sink(first + i, block.bytes.subspan(offset, size_t(sizes[i])), uint16_t(count));
+                                offset += size_t(sizes[i]);
+                            }
+                        }
+                        first += n;
+                    }
                 }
             }
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
@@ -1435,7 +1567,7 @@ struct WorkerService::Impl
             broker = control_for(*lease);
             auto active = broker->with_deadline(cancel.deadline);
             accepted.emplace(*this);
-            if (!active.begin(*lease, channel.peer_identity())) throw pool::StaleLease("worker rejected stale lease");
+            begin_assigned(active, *lease, channel.peer_identity(), cancel);
             begun = true;
             Renewal renewal(active, *lease, cancelled, renewal_failure, [&]
             {
@@ -1445,7 +1577,7 @@ struct WorkerService::Impl
             auto task_slot = budget->acquire(0, true, cancel);
             auto const operation = Operation(in.u8()); uint8_t const k = in.u8(), strength = in.u8();
             require(k == lease->task.k && strength == lease->task.strength, "worker parameters differ from lease");
-            if (operation == Operation::Packed || operation == Operation::Contributions)
+            if (operation == Operation::Packed || operation == Operation::Contributions || operation == Operation::Fresh)
             {
                 require(lease->task.kind != pool::Kind::Pack, "packing lease cannot generate members");
                 auto const count = in.u16(); require(count && count <= config.max_batch_members && count == lease->task.work_units,
@@ -1511,9 +1643,16 @@ struct WorkerService::Impl
                     CpuWork compute(offered_cpu, scheduler.get(), cancel);
                     output.u64(ordinal); output.u16(members); output.bytes(bytes);
                 };
+                auto manifest = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
+                {
+                    pool::Writer out(config.tls.max_frame_bytes);
+                    out.u8(uint8_t(DataKind::FreshManifest)); out.u64(payload); out.u64(largest); out.bytes(digest);
+                    cancel.check(); output_started = true; send(pool::Message::Data, out.data());
+                };
                 auto const start = Clock::now();
                 generation(k, strength, ids, operation == Operation::Packed ? WorkerPackedSink(packed_sink) : WorkerPackedSink{},
-                    operation == Operation::Contributions ? WorkerContributionSink(contribution_sink) : WorkerContributionSink{}, cancel, use_gpu, false, &lease->task.resources);
+                    operation != Operation::Packed ? WorkerContributionSink(contribution_sink) : WorkerContributionSink{},
+                    cancel, use_gpu, false, &lease->task.resources, {}, operation == Operation::Fresh ? WorkerFreshManifest(manifest) : WorkerFreshManifest{});
                 flush();
                 processing = Clock::now() - start - sending;
             }
@@ -1735,8 +1874,7 @@ void WorkerService::generate_assigned(pool::Lease const& lease,
     auto control = impl_->control_for(lease);
     auto active = control.with_deadline(cancel.deadline);
     Impl::Acceptance accepted(*impl_);
-    if (!active.begin(lease, pool::certificate_identity(impl_->config.tls.cert_file)))
-        throw pool::StaleLease("local worker rejected stale lease");
+    impl_->begin_assigned(active, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
     std::exception_ptr renewal_failure;
     try
     {
@@ -1783,8 +1921,7 @@ void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t 
     cancel = impl_->cancellation(cancel); auto control = impl_->control_for(lease);
     auto active = control.with_deadline(cancel.deadline);
     Impl::Acceptance accepted(*impl_);
-    if (!active.begin(lease, pool::certificate_identity(impl_->config.tls.cert_file)))
-        throw pool::StaleLease("local worker rejected stale lease");
+    impl_->begin_assigned(active, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
     std::exception_ptr renewal_failure;
     try
     {
@@ -1804,9 +1941,15 @@ void WorkerService::generate_local(uint8_t k, uint8_t strength, std::array<uint8
     WorkerPackedSink const& sink, WorkerCancellation cancel, pool::Kind kind,
     std::function<void(WorkerTaskAdmission const&)> const& admit)
 {
+    generate_packed_local(k, strength, {&id, 1}, sink, cancel, kind, admit);
+}
+void WorkerService::generate_packed_local(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
+    WorkerPackedSink const& sink, WorkerCancellation cancel, pool::Kind kind,
+    std::function<void(WorkerTaskAdmission const&)> const& admit)
+{
     require(kind != pool::Kind::GenerateGpu || impl_->gpu_enabled, "local GPU generation was not offered");
     Impl::Acceptance accepted(*impl_);
-    impl_->generation(k, strength, {&id, 1}, sink, {}, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
+    impl_->generation(k, strength, ids, sink, {}, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
 }
 void WorkerService::contributions_local(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, pool::Kind kind,
@@ -2133,6 +2276,8 @@ struct WorkerClient::Impl
     worker_detail::TaskRegistry task_states;
     mutable std::mutex planning_mutex;
     worker_detail::GenerationPlanning planning;
+    struct CapacityHint { uint8_t k = 0, strength = 0; Clock::time_point expires{}; WorkerGenerationCapacity value; };
+    CapacityHint generation_capacity;
     explicit Impl(WorkerClientConfig options) : config(std::move(options)), broker(config.broker, config.tls),
         generation_admission(0, config.max_active_generation, 0), planning(config.task_timeout_ms)
     {
@@ -2249,7 +2394,7 @@ struct WorkerClient::Impl
         try
         {
             auto local = local_service(); require(bool(local), "local-only compute executor is unavailable");
-            if (packed_sink) local->generate_local(k, strength, ids.front(), [&](PackedFragmentTile const& tile, uint64_t count)
+            if (packed_sink) local->generate_packed_local(k, strength, ids, [&](PackedFragmentTile const& tile, uint64_t count)
                 { output(); packed_sink(tile, count); }, cancel, config.generation_kind, admission);
             else local->contributions_local(k, strength, ids, [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
                 { output(); contribution_sink(ordinal, bytes, members); }, cancel, config.generation_kind, admission);
@@ -2296,7 +2441,7 @@ struct WorkerClient::Impl
             auto const boundary = first_output == Clock::time_point{} ? end : first_output;
             result.execution_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(boundary - selected_at).count());
             result.transfer_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - boundary).count());
-            result.contributions = operation == Operation::Contributions; result.generation = generation;
+            result.contributions = operation == Operation::Contributions || operation == Operation::Fresh; result.generation = generation;
             result.worker_slots = worker_slots;
             return result;
         }
@@ -2306,7 +2451,7 @@ struct WorkerClient::Impl
             if (completed)
             {
                 if (operation == Operation::Packed) impl.generations.fetch_add(1);
-                else if (operation == Operation::Contributions) impl.contributions.fetch_add(1);
+                else if (operation == Operation::Contributions || operation == Operation::Fresh) impl.contributions.fetch_add(1);
                 else impl.codecs.fetch_add(1);
             }
             else
@@ -2390,8 +2535,15 @@ struct WorkerClient::Impl
         try
         {
             try { submit(false); } catch (pool::StaleOwnerSession const&) { submit(true); }
+            auto next_hint = Clock::now();
             while (!lease)
             {
+                if (work_units > 1 && (operation == Operation::Fresh || operation == Operation::Packed) && Clock::now() >= next_hint)
+                {
+                    if (control.generation_hint(session, task) < work_units)
+                        throw pool::UnsupportedResources("no current worker can admit this generation batch");
+                    next_hint = Clock::now() + std::chrono::seconds(1);
+                }
                 cancel.check(); std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 try { lease = control.acquire(session, task); }
                 catch (pool::StaleOwnerSession const&) { submit(true); }
@@ -2448,16 +2600,17 @@ struct WorkerClient::Impl
     bool generate_once(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity,
-                  WorkerContributionWindowSink const& contribution_window)
+                  WorkerContributionWindowSink const& contribution_window, WorkerFreshManifest const& manifest)
     {
         cancel = cancellation(cancel); auto const count_bound = fragment_count_bound(k, strength);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members &&
-            (!packed_sink || ids.size() == 1), "invalid compute generation batch");
+            (bool(packed_sink) != bool(contribution_sink)), "invalid compute generation batch");
         uint64_t const host = worker_cpu_task_bytes(k, strength, ids.size(), config.max_task_bytes);
         auto connection = connect(config.generation_kind, k, strength, ids.size(), host,
-            packed_sink ? Operation::Packed : Operation::Contributions, identity, cancel);
+            packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions, identity, cancel);
         if (connection->local_direct)
         {
+            if (manifest) { connection->declined = true; throw WorkerTaskDeclined(); }
             connection->logical_input_bytes = multiply(ids.size(), sizeof(ids.front()));
             auto first_output = [&]
             { if (connection->first_output == Clock::time_point{}) connection->first_output = Clock::now(); };
@@ -2484,16 +2637,25 @@ struct WorkerClient::Impl
         auto compute = cpu_lease(cancel);
         pool::Writer request(config.tls.max_frame_bytes); pool::write_lease(request, connection->lease);
         request.u32(remaining_timeout(cancel));
-        request.u8(uint8_t(packed_sink ? Operation::Packed : Operation::Contributions)); request.u8(k); request.u8(strength); request.u16(uint16_t(ids.size()));
+        request.u8(uint8_t(packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions)); request.u8(k); request.u8(strength); request.u16(uint16_t(ids.size()));
         for (auto const& id : ids) request.bytes(id); connection->input_bytes = request.data().size();
         compute.reset(); connection->channel.send(pool::Message::Work, request.data());
         uint64_t total = 0, expected_boundaries = 0, expected_words = 0, received_words = 0, next_chunk = 0;
+        std::vector<std::span<uint8_t const>> chunks;
+        if (contribution_sink) chunks.resize(manifest ? fresh_group_window_chunks : contribution_window_chunks);
         PackedMemberValidation validation; std::vector<uint32_t> boundaries; std::vector<uint64_t> words;
-        bool prelude = false, delivered_prelude = false;
+        bool prelude = false, delivered_prelude = false, narrow_deltas = true;
+        size_t started = 0; bool received_manifest = false;
         unsigned __int128 packed_bits = 0;
         unsigned available_bits = 0;
         uint64_t decoded = 0, previous = 0;
         size_t decoded_chunk = 0;
+        auto complete_member = [&]
+        {
+            require(delivered_prelude && received_words == expected_words && decoded == total && packed_bits == 0,
+                "compute result member is truncated or has nonzero padding");
+            narrow_deltas &= !(validation.flags & PackedMemberValidation::wide_delta);
+        };
         for (;;)
         {
             cancel.check(); auto const before = Clock::now(); auto frame = connection->channel.receive();
@@ -2521,16 +2683,18 @@ struct WorkerClient::Impl
                     { connection->generation.worker_ns = work; connection->generation.send_ns = sending; }
                 }
                 end.finish();
-                if (packed_sink) require(delivered_prelude && received_words == expected_words && decoded == total && packed_bits == 0,
-                    "compute result member is truncated or has nonzero padding");
+                if (packed_sink) { require(started == ids.size(), "compute batch is truncated"); complete_member(); }
                 else require(next_chunk == PlotGroupFile::getChunkCountForK(k), "compute contributions are truncated");
                 compute.reset(); connection->delivered();
-                return packed_sink && !(validation.flags & PackedMemberValidation::wide_delta);
+                return packed_sink && narrow_deltas;
             }
             pool::Reader input(frame.payload); auto const type = DataKind(input.u8());
             if (type == DataKind::Prelude)
             {
-                require(bool(packed_sink) && !prelude, "unexpected compute member prelude");
+                require(bool(packed_sink) && started < ids.size(), "unexpected compute member prelude");
+                if (started++) complete_member();
+                delivered_prelude = false; received_words = decoded = previous = 0; decoded_chunk = available_bits = 0;
+                packed_bits = 0; boundaries.clear();
                 total = input.u64(); validation.checked_count = input.u64(); validation.flags = input.u32(); expected_boundaries = input.u64(); input.finish();
                 require(total <= count_bound && total <= UINT32_MAX && expected_boundaries == PlotGroupFile::getChunkCountForK(k) + 1,
                     "compute member exceeds public parameter bound");
@@ -2576,10 +2740,20 @@ struct WorkerClient::Impl
                 }
                 compute.reset(); packed_sink({{}, words, {}}, total); received_words += count;
             }
+            else if (type == DataKind::FreshManifest)
+            {
+                require(manifest && !received_manifest && !next_chunk, "unexpected fresh group manifest");
+                auto const payload = input.u64(), largest = input.u64(); auto const value = input.bytes(32); input.finish();
+                std::array<uint8_t, 32> digest{};
+                require(value.size() == digest.size(), "invalid fresh group digest");
+                std::copy(value.begin(), value.end(), digest.begin()); compute.reset();
+                try { manifest(payload, largest, digest); }
+                catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
+                received_manifest = true;
+            }
             else if (type == DataKind::Contributions)
             {
-                require(bool(contribution_sink), "unexpected compute contribution stream");
-                std::array<std::span<uint8_t const>, contribution_window_chunks> chunks;
+                require(contribution_sink && (!manifest || received_manifest), "unexpected compute contribution stream");
                 while (input.remaining())
                 {
                     uint64_t const first = next_chunk;
@@ -2608,23 +2782,24 @@ struct WorkerClient::Impl
     bool generate(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity,
-                  WorkerContributionWindowSink const& contribution_window = {})
+                  WorkerContributionWindowSink const& contribution_window = {}, WorkerFreshManifest const& manifest = {})
     {
         cancel = cancellation(cancel);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members,
             "invalid compute generation batch");
         GenerationLease admission(*this, ids.size(), cancel);
+        if (config.local_only && manifest) throw WorkerTaskDeclined();
         if (config.local_only) { generate_private(k, strength, ids, packed_sink, contribution_sink, cancel); return false; }
         if (identity.task_id.empty()) identity.task_id = pool::random_token();
         for (unsigned failed = 0;; ++failed)
         {
-            try { return generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window); }
+            try { return generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window, manifest); }
             catch (pool::UnsupportedResources const&)
             {
                 // A refused batch may need a different shape. Its owner must
                 // split it under new identities rather than silently changing
                 // the body of this logical task or waiting on excluded offers.
-                if ((contribution_sink && ids.size() > 1) || failed >= pool::max_retry_failures) throw;
+                if (ids.size() > 1 || failed >= pool::max_retry_failures) throw;
                 cancel.check();
             }
         }
@@ -2642,10 +2817,13 @@ bool WorkerClient::local_available() const
 bool WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
 { return impl_->generate(k, strength, {&id, 1}, sink, {}, cancel, std::move(identity)); }
+bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
+    WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity)
+{ return impl_->generate(k, strength, ids, sink, {}, cancel, std::move(identity)); }
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
-    WorkerContributionWindowSink const& window)
-{ impl_->generate(k, strength, ids, {}, sink, cancel, std::move(identity), window); }
+    WorkerContributionWindowSink const& window, WorkerFreshManifest const& manifest)
+{ impl_->generate(k, strength, ids, {}, sink, cancel, std::move(identity), window, manifest); }
 void WorkerClient::generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
     WorkerPackedSink const& sink, WorkerCancellation cancel)
 {
@@ -2761,30 +2939,43 @@ WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t st
     return impl_->planning.estimate(k, strength, impl_->config.generation_kind, contributions, active, batch);
 }
 uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_bytes; }
+WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength) const
+{
+    if (impl_->config.local_only) return {};
+    {
+        std::lock_guard lock(impl_->planning_mutex);
+        auto const& hint = impl_->generation_capacity;
+        if (hint.k == k && hint.strength == strength && Clock::now() < hint.expires) return hint.value;
+    }
+    WorkerGenerationCapacity result;
+    try
+    {
+        WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(250);
+        auto control = impl_->broker.with_deadline(cancel.deadline);
+        pool::OwnerSession session;
+        {
+            auto lock = impl_->sequence_lock(cancel);
+            if (impl_->owner.token.empty())
+            { impl_->owner = control.open_owner(impl_->config.owner_id, impl_->config.ephemeral_owner); impl_->task_states.reset(); }
+            session = impl_->owner;
+        }
+        pool::Task prototype; prototype.compatibility = impl_->config.compatibility;
+        prototype.kind = impl_->config.generation_kind; prototype.k = k; prototype.strength = strength;
+        prototype.resources.cpu_threads = impl_->config.generation_threads;
+        result.batch = control.generation_hint(session, prototype, &result.slots);
+    }
+    catch (std::exception const&) {} // An optional hint never owns the actual lease.
+    std::lock_guard lock(impl_->planning_mutex);
+    impl_->generation_capacity = {k, strength, Clock::now() + std::chrono::seconds(1), result};
+    return result;
+}
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {
     (void)parameters(k, strength); if (!maximum) return 0;
-    if (impl_->config.local_only) return 1;
-    unsigned value;
-    { std::lock_guard lock(impl_->planning_mutex); value = impl_->planning.suggested(k, strength, impl_->config.generation_kind).batch; }
-    // Hints share the control pool and use a short optional deadline. Failure
-    // leaves the learned bounded policy usable during a broker outage.
-    try
-    {
-        WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
-        pool::OwnerSession session;
-        { auto lock = impl_->sequence_lock(cancel); session = impl_->owner; }
-        if (!session.token.empty())
-        {
-            pool::Task prototype; prototype.compatibility = impl_->config.compatibility;
-            prototype.kind = impl_->config.generation_kind; prototype.k = k; prototype.strength = strength;
-            prototype.resources.cpu_threads = impl_->config.generation_threads;
-            auto const hint = impl_->broker.with_deadline(cancel.deadline).generation_hint(session, prototype);
-            value = hint ? std::min(value, hint) : 1;
-        }
-    }
-    catch (...) { value = 1; }
-    return std::max(1u, std::min({maximum, value, unsigned(pool::max_generation_batch_members)}));
+    auto const hint = generation_capacity(k, strength);
+    std::lock_guard lock(impl_->planning_mutex);
+    auto const learned = impl_->planning.suggested(k, strength, impl_->config.generation_kind).batch;
+    return std::max(1u, std::min({maximum, learned, unsigned(hint.batch)}));
 }
 unsigned WorkerClient::suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const
 {

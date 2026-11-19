@@ -563,6 +563,39 @@ void network(char const* ca, char const* cert, char const* key)
     require(next_chunk == PlotGroupFile::getChunkCountForK(18) && largest_window > 1,
         "TLS contribution windows were truncated or never coalesced");
 
+    {
+        auto const hint = client.generation_capacity(18, 2);
+        require(hint.batch >= 2 && hint.slots == 1, "generation hint ignored the single available CPU");
+        std::array ids{id, id}; ids[1][0] ^= 1;
+        std::array reference{expected, worker_original_reference(18, 2, ids[1])};
+        std::vector<std::unique_ptr<CompactMemberReceiver>> incoming;
+        bool checked = client.generate_packed(18, 2, ids, [&](PackedFragmentTile const& tile, uint64_t total)
+        {
+            if (!tile.boundaries.empty()) incoming.push_back(std::make_unique<CompactMemberReceiver>(18, size_t(total), false));
+            incoming.back()->append(tile);
+        });
+        require(incoming.size() == reference.size(), "packed lease lost a member");
+        for (size_t i = 0; i < incoming.size(); ++i)
+            require(unpack(incoming[i]->finish(checked)) == reference[i], "packed lease changed member order or content");
+        size_t ordinal = 0; uint64_t size = 0, peak = 0, budget = 0, largest = 0;
+        auto receive = [&](uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count)
+        {
+            require(budget && chunk == ordinal++ && count == ids.size(), "fresh lease lost its manifest or chunk order");
+            auto inspected = codec.inspect(chunk, bytes, count);
+            require(inspected.summary.symbols, "empty fresh contribution");
+            size += bytes.size(); peak = std::max<uint64_t>(peak, bytes.size());
+        };
+        client.contributions(18, 2, ids, receive, {}, {}, {},
+            [&](uint64_t payload, uint64_t max_chunk, auto const& digest)
+            {
+                require(!budget && digest == members_digest(18, Members(reference), nullptr, [] {}),
+                    "fresh lease changed the recovery digest");
+                budget = payload; largest = max_chunk;
+            });
+        require(ordinal == PlotGroupFile::getChunkCountForK(18) && size <= budget && peak <= largest,
+            "fresh lease exceeded its storage bound");
+    }
+
     // A stalled consumer retains memory but relinquishes application compute.
     pool::BrokerClient controller(options.broker, tls); auto owner = controller.open_owner("stalled-worker-test");
     pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(); task.kind = pool::Kind::GenerateCpu;

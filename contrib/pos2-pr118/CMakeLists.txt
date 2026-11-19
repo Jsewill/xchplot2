@@ -114,7 +114,7 @@ if(TARGET pos2_pr118_grow)
         target_link_libraries(${target} PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
     endforeach()
 endif()
-foreach(target pos2_pr118_grow_pool_owner_test pos2_pr118_grow_worker_test
+foreach(target pos2_pr118_grow_worker_host pos2_pr118_grow_pool_owner_test pos2_pr118_grow_worker_test
                pos2_pr118_grow_worker_client_test compute_compatibility_test)
     if(TARGET ${target})
         add_dependencies(${target} pos2_pr118_keygen)
