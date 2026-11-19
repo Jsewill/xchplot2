@@ -675,16 +675,20 @@ It also measures simultaneous transfers to account for shared storage paths.
 The plotter reads ahead and flushes extents on separate spindles concurrently.
 During final packing it retries reads deferred by a busy disk before the
 current reader buffer runs out. The RAM grant bounds the read cache and the
-number of outstanding transfers. On striped HDD scratch, the planner can
-retain additional runs when the cache provides 16 MiB per reader after
-reserving space for disk queues. This can eliminate an intermediate scratch
-read and rewrite.
+number of outstanding transfers. A single scratch HDD can also read ahead
+while an independent HDD writes the plot. Packing enables this when the
+cache can hold the queue and at least 2 MiB per retained run. On striped
+HDD scratch, the planner can retain additional runs when the cache provides
+16 MiB per reader after reserving space for disk queues. This can eliminate
+an intermediate scratch read and rewrite.
 Partitions and alternate paths to one drive share its bandwidth. Resuming a
 plot uses the scratch locations and capacities saved in its checkpoint.
 
 On Linux, an independent output HDD can start writing completed ranges while
-the plotter prepares the next chunks. The packing checkpoint synchronizes the
-output and index before releasing consumed scratch.
+the plotter prepares the next chunks. The packer aligns these writes to page
+boundaries so appending the next chunk can proceed while the disk is busy.
+The packing checkpoint synchronizes the output and index before releasing
+consumed scratch.
 
 When a compute worker supplies compressed contributions, the plotting host
 validates their chunks as they arrive. It reuses the consecutive prefix in
@@ -703,7 +707,16 @@ checkpoints require a build that supports resident final batches; completed
 plots retain the ordinary v2 format.
 
 Writers sharing a physical drive serialize their I/O. Independent drives can
-progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
+progress together within the shared RAM and CPU limits. With I/O overlap
+enabled, external jobs on independent output HDDs can share a codec worker.
+Before timings are available, a producer that can overlap generation with I/O
+can open additional HDDs when the current batch still fits in RAM. The planner
+divides scratch bandwidth among them.
+With completed measurements it chooses the concurrency with the shortest
+projected completion time. A group in its final HDD pack can also free a
+receive slot for another group using shared compute.
+
+`--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
 and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
 `--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.

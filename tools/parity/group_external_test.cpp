@@ -1466,6 +1466,28 @@ void pipeline_barriers(fs::path const& root, ExternalConfig const& ext)
       require(engine.append(input).accepted, "barrier reference did not fit"); }
     auto const expected = contents(root / "barrier-reference");
     auto cfg = config(); cfg.workers = 1; cfg.io_overlap = true;
+    {
+        auto odd = cfg; ++odd.window_bytes; odd.checkpoint_bytes = odd.window_bytes + 73;
+        auto const path = root / "partial-writeback-window";
+        complete(path, input, ext, false, odd);
+        require(expected.size() > 2 * odd.checkpoint_bytes && contents(path) == expected,
+            "packing across unaligned window and checkpoint boundaries changed canonical bytes");
+    }
+    {
+        auto single = ext; single.scratch.resize(1);
+        auto const source = storage_device(single.scratch.front().directory), target = storage_device(root);
+        bool const independent = source.rotating && target.rotating && external_detail::independent_packing_io(target, {&source, 1});
+        for (uint64_t window : {cfg.window_bytes, uint64_t(8 * 1024 * 1024)})
+        {
+            auto options = cfg; options.window_bytes = window;
+            single.bandwidth = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+            auto const path = root / ("single-scratch-" + std::to_string(window));
+            auto const stats = complete(path, input, single, false, options);
+            require(stats.merge_inputs == 2 && contents(path) == expected &&
+                (single.bandwidth->bandwidth(source) > 0) == (independent && window > cfg.window_bytes),
+                "single HDD read-ahead exceeded its cache or changed the packed output");
+        }
+    }
     std::vector<FragmentRegion> regions;
     for (size_t member = 0; member < input.size(); ++member) regions.push_back(input[member].region(0));
     ChunkCodec codec(18, cfg.codec_bytes);

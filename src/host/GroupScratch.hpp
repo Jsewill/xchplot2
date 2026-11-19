@@ -510,11 +510,18 @@ private:
         std::vector<Candidate> disks;
         size_t waiting = 1;
         std::vector<size_t> outputs;
-        for (auto const& other : owners_) if (other.id != owner && other.output)
+        for (auto const& other : owners_) if (other.id != owner && other.output && (other.io || !other.external.scratch.empty()))
+            outputs.push_back(other.output->root);
+        // A queued file behind the same spindle will use that writer later.
+        // Reserve the remaining slots for destinations that can run alongside it.
+        for (auto const& other : owners_)
         {
-            if (other.io || !other.external.scratch.empty()) outputs.push_back(other.output->root);
-            else if (waiting < open_slots)
-            { outputs.push_back(other.output->root); ++waiting; }
+            if (waiting >= open_slots) break;
+            if (other.id == owner || !other.output || other.io || !other.external.scratch.empty()) continue;
+            auto const& target = roots_[other.output->root].value.device;
+            if (overlap(destination, target) || std::any_of(outputs.begin(), outputs.end(),
+                [&](size_t output) { return overlap(roots_[output].value.device, target); })) continue;
+            outputs.push_back(other.output->root); ++waiting;
         }
         for (size_t i : order)
         {

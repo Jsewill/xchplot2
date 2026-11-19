@@ -2799,6 +2799,13 @@ void destination_admission()
     auto memory = [](unsigned workers, uint16_t batch)
     { return 256 * mib + workers * mib + uint64_t(batch) * 4096; };
     auto neutral = [](size_t active, unsigned, uint16_t) { return 1.0L / active; };
+    auto packing = [&](size_t writers, size_t limit, uint64_t bytes)
+    { return destination_plan(bytes, metadata, 0, 0, 3, 1, 1, 1, memory, neutral, limit, writers); };
+    require(packing(0, 0, budget).active == 1 && packing(1, 0, budget).active == 2 &&
+        packing(2, 0, budget).active == 3 && packing(0, 1, budget).active == 1 &&
+        packing(1, 1, budget).active == 2 &&
+        packing(2, 0, metadata + 2 * memory(1, 1)).active == 2,
+        "packing writers did not share a codec worker within the RAM and receiver limits");
     auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
     require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
         "many destinations did not activate a bounded useful subset");
@@ -2879,11 +2886,11 @@ void execution_planning()
         lanes.push_back({work, i});
     }
     auto memory = [](unsigned, uint16_t batch) { return mib + uint64_t(batch) * 4096; };
-    auto select = [&](size_t resources)
+    auto select = [&](size_t resources, unsigned workers = 24)
     {
-        return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), 24, 16, 1, memory,
-            [&](size_t active, unsigned workers, uint16_t)
-            { return pipeline_execution_estimate(lanes, active, 24, workers, resources, true).completion; });
+        return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), workers, 16, 1, memory,
+            [&](size_t active, unsigned grant, uint16_t)
+            { return pipeline_execution_estimate(lanes, active, workers, grant, resources, true).completion; }, lanes.size());
     };
     auto const producer_bound = select(lanes.size());
     require(producer_bound.active == 1,
@@ -2891,8 +2898,9 @@ void execution_planning()
     for (auto& lane : lanes) { lane.work.generation = 1; lane.work.destination = 1000; }
     auto const independent = select(lanes.size());
     require(independent.active > 1, "independent measured outputs did not admit useful overlap");
+    require(select(lanes.size(), 1).active > 1, "one shared codec worker serialized independent measured HDDs");
     for (auto& lane : lanes) lane.destination = 0;
-    require(select(1).active == 1, "partitions multiplied one physical output's execution capacity");
+    require(select(1).active == 1 && select(1, 1).active == 1, "partitions multiplied one physical output's execution capacity");
     for (size_t i = 0; i < lanes.size(); ++i)
     {
         lanes[i].destination = i; lanes[i].scratch = {{lanes.size(), 1}};

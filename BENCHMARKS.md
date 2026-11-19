@@ -186,6 +186,66 @@ Both runs packed all 11 inputs directly. Packing took 77.8 s with the previous
 read-ahead schedule and 72.2 s when the packer retried deferred reads each
 window, with one run per setting.
 
+#### Packing onto independent output HDDs
+
+Three k=28, strength-2 groups each had 11 members staged on four dedicated
+scratch HDDs and a separate output HDD. The same public `batch --resume`
+command finished the three groups under a shared 24 GiB RAM budget. Timing
+starts at resume and ends after publication. Member generation, staging and
+subsequent hash verification fall outside this interval.
+
+| Shared codec workers | Previous time | Updated time | Previous finished MB/s | Updated finished MB/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 160.1 s | 97.8 s | 204 | 334 |
+| 8 | 56.0 s | 47.5 s | 583 | 687 |
+
+With one codec worker, the previous planner wrote one destination at a time.
+The updated planner wrote all three concurrently. With eight workers both
+planners used all three writers. The update aligned the buffered output writes
+and averaged 716 MB/s of physical scratch reads and 687 MB/s of physical
+output writes. This finished one member every 1.44 s. A producer supplying
+one of these members every 2.2 s needs 450 MB/s of finished output. The three
+SHA-256 digests matched at both worker counts. Each configuration had one
+timed run.
+
+Two direct-I/O trials on the same disks paced scratch reads to the plotter's
+measured read/write ratio. Each output wrote 2 GiB sequentially. Counting
+finished bytes through the last device completion gave 743–744 MB/s across
+three outputs. The eight-worker pack reached 92.4% of that rate.
+
+With one output HDD, four scratch HDDs and eight workers, a separate
+12-member k=28 group packed at 216 MB/s before the change and 241 MB/s
+afterward. Both builds produced the same 11,876,141,735-byte file. A
+direct-write prototype with an additional 16 MiB buffer per writer packed
+this file in 48.4–48.8 s. The buffered implementation took 49.4 s using
+the two output windows already covered by the RAM grant.
+
+Using the same 15 HDDs, seven outputs shared eight scratch drives. One
+output had two dedicated scratch drives and the other six had one each.
+With 16 workers, a 16 MiB I/O window and 24 GiB of RAM, the previous build
+published seven six-member k=28 groups in 49.0 s (849 MB/s). The updated
+build took 34.3 and 35.7 s (1,167–1,214 MB/s), or 0.82–0.85 s per member.
+All seven files matched across builds and passed full-proof checks.
+
+The two final direct-I/O trials yielded 1,572 MB/s at the same per-disk
+traffic mix. Packing reached 74–77% of that sequential rate. Block-device
+counters averaged 1,210–1,255 MB/s of scratch reads and 1,163–1,206 MB/s
+of output writes across the two plotting runs. The HBA negotiated PCIe 3.0
+x4, which carries up to 3.94 GB/s in each direction before transaction
+overhead.
+
+Before enabling read-ahead on individual scratch HDDs, the updated planner
+and aligned writer reached 1,006 MB/s with a 16 MiB window and 906 MB/s
+with a 64 MiB window on those seven groups. A separate six-member group
+using one scratch HDD and one output HDD packed at 180 MB/s with synchronous
+refills and 188 MB/s with the ordered read-ahead queue.
+
+For a fresh, CPU-bound comparison, one worker generated and packed three
+eight-member k=24 groups. The previous build took 216.5 s and the final
+build took 216.2 s. All three files matched across builds. The planner keeps
+its ordinary concurrency during unmeasured CPU generation and can open
+independent HDDs for final packing.
+
 ### Group size, build time and reader latency
 
 Each size had one fresh build with the same group identity, HDD and 8 GiB

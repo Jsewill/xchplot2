@@ -497,6 +497,14 @@ void rotating_bandwidth(fs::path const& directory)
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
 
+    ScratchPool queued(disks, 0);
+    require(queued.try_reserve_output(0, first, unit) && queued.try_reserve_output(1, first, unit) &&
+        queued.try_reserve_output(2, disks.front(), unit), "queued physical output admission failed");
+    queued.seal_recovery();
+    auto parallel = queued.grant(0, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 2);
+    require(parallel && parallel->striped && queued.io_compatible(0, 2) && !queued.io_compatible(0, 1),
+        "a queued file on the same output took the scratch bandwidth of an independent writer");
+
     for (auto const [limit, tight, readers] : {std::tuple{24u, false, 16u}, {6u, false, 6u}, {24u, true, 4u}})
     {
         Config work; work.memory_limit_bytes = 4ull << 30;

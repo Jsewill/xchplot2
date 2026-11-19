@@ -3414,13 +3414,14 @@ struct DestinationPlan
 template<class Memory, class Cost>
 DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t generation,
     uint64_t member_bytes, size_t drive_groups, unsigned workers, uint16_t maximum,
-    uint16_t minimum, Memory memory, Cost cost, size_t active_limit = 0)
+    uint16_t minimum, Memory memory, Cost cost, size_t active_limit = 0, size_t packing_writers = 0)
 {
     DestinationPlan best;
     if (fixed >= budget || generation > budget - fixed) return best;
     uint64_t const room = budget - fixed - generation;
     long double best_cost = std::numeric_limits<long double>::infinity();
-    for (size_t active = 1; active <= std::min(drive_groups, active_limit ? active_limit : size_t(workers)); ++active)
+    size_t const lanes = std::min(drive_groups, (active_limit ? active_limit : workers) + packing_writers);
+    for (size_t active = 1; active <= lanes; ++active)
     {
         unsigned share = std::max(1u, unsigned(workers / active));
         // The next producer peak includes its own returned member. Every
@@ -13455,20 +13456,27 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             use_stream_input = input_required = true;
             if (!admit_producer(memory(1, minimum))) return blocked(ControllerWait::producer_memory);
         }
-        size_t unfinished_groups = 0;
         std::vector<bool> seen(writer_count, false);
-        for (auto const& other : destinations) if (!other->complete && !seen[other->writer])
-        { seen[other->writer] = true; ++unfinished_groups; }
-        size_t const receiving_lanes = pooled_generation ? size_t(args.pool_inflight) : 0;
-        if (pooled_generation)
+        size_t packing_writers = 0;
+        bool only_packing = args.io_overlap;
+        if (args.io_overlap) for (auto const& other : destinations) if (!other->complete)
         {
-            // Remote receivers can make progress independently even when
-            // their final outputs share one ordered physical writer.
-            unfinished_groups = size_t(std::count_if(destinations.begin(), destinations.end(),
-                [](auto const& other) { return !other->complete; }));
+            bool const packing = other->scratch && devices[other->owner].rotating &&
+                (other->needs_finish || (other->pending && other->pending->packing()));
+            if (!packing) only_packing = false;
+            if (packing && !seen[other->writer] && (other->engine || other.get() == &d))
+            { seen[other->writer] = true; ++packing_writers; }
         }
+        // A remote receiver can progress even when its final output shares
+        // a writer. Count independent physical writers for local generation.
+        size_t unfinished_groups = pooled_generation ? 0 : packing_writers;
+        for (auto const& other : destinations) if (!other->complete && (pooled_generation || !seen[other->writer]))
+        { seen[other->writer] = true; ++unfinished_groups; }
+        // A packing HDD needs no new member. Its codec work still acquires
+        // shared permits, and its output still uses the ordered physical writer.
+        size_t const receiving_lanes = pooled_generation ? size_t(args.pool_inflight) : 0;
         auto const shared_fixed = sum(sum(metadata, histories.memory_bytes()), pool_memory);
-        uint64_t storage = input_required ? 0 :
+        uint64_t storage = input_required || only_packing ? 0 :
             d.observed_member_storage ? d.observed_member_storage : member_storage_bound(args, d.requested);
         uint16_t const maximum = uint16_t(std::max<uint64_t>(minimum,
             std::min(args.batch, d.maximum - d.metrics.members)));
@@ -13523,13 +13531,33 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return projected.known ? projected.completion : std::numeric_limits<long double>::infinity();
         };
         auto neutral = [](size_t count, unsigned, uint16_t) { return 1.0L / count; };
-        auto plan = destination_plan(args.max_ram, shared_fixed, generation, storage,
-            unfinished_groups, workers, maximum, minimum, memory, neutral, receiving_lanes);
-        // Every physical destination must have matched completed observations.
-        // Unknown contexts keep ordinary exact RAM/topology admission.
-        if (plan.active && std::isfinite(cost(plan.active, plan.workers, plan.batch)))
-            if (auto priced = destination_plan(args.max_ram, shared_fixed, generation, storage,
-                unfinished_groups, workers, maximum, minimum, memory, cost, receiving_lanes); priced.active) plan = priced;
+        auto select_plan = [&](uint64_t reserved)
+        {
+            auto plan = destination_plan(args.max_ram, reserved, generation, storage, unfinished_groups,
+                workers, maximum, minimum, memory, neutral, receiving_lanes, packing_writers);
+            if (!plan.active) return plan;
+            bool const external = d.scratch || (!d.guard && fresh_roots && (args.construction == "external" ||
+                (args.construction == "auto" && (input_required || plan.batch < d.maximum))));
+            bool const parallel_hdd = !pooled_generation && external && args.io_overlap && devices[d.owner].rotating;
+            size_t const limit = parallel_hdd ? unfinished_groups : (receiving_lanes ? receiving_lanes : workers) + packing_writers;
+            if (std::isfinite(cost(plan.active, plan.workers, plan.batch)))
+            {
+                auto priced = destination_plan(args.max_ram, reserved, generation, storage, unfinished_groups,
+                    workers, maximum, minimum, memory, cost, limit);
+                if (priced.active) return priced;
+            }
+            // Before timings are available, reserve parallel scratch for an
+            // overlapping producer without shrinking its batch. CPU generation
+            // uses the codec worker budget itself.
+            if (parallel_hdd && plan.active < limit && (!needs_generation || backend->generation_overlap))
+            {
+                auto wider = destination_plan(args.max_ram, reserved, generation, storage, unfinished_groups,
+                    workers, maximum, plan.batch, memory, neutral, limit);
+                if (wider.active > plan.active) return wider;
+            }
+            return plan;
+        };
+        auto plan = select_plan(shared_fixed);
         if (!plan.active) return false;
         // Saved roots only recover their existing jobs. Fresh roots come from
         // explicit directories and the enabled destination policy.
@@ -13561,18 +13589,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         }
                         use_stream_input = false;
                     }
-                    if (admitted)
-                        external_plan = destination_plan(args.max_ram, sum(sum(metadata, histories.memory_bytes()), pool_memory),
-                            generation, storage, unfinished_groups, workers, maximum, minimum, memory,
-                            neutral, receiving_lanes);
-                    if (external_plan.active)
-                    {
-                        plan = external_plan;
-                        if (std::isfinite(cost(plan.active, plan.workers, plan.batch)))
-                            if (auto priced = destination_plan(args.max_ram,
-                                sum(sum(metadata, histories.memory_bytes()), pool_memory), generation, storage,
-                                unfinished_groups, workers, maximum, minimum, memory, cost, receiving_lanes); priced.active) plan = priced;
-                    }
+                    if (admitted) external_plan = select_plan(sum(sum(metadata, histories.memory_bytes()), pool_memory));
+                    if (external_plan.active) plan = external_plan;
                     else
                     {
                         (void)defer();

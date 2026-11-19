@@ -396,6 +396,14 @@ private:
             multiply(external.scratch.size(), sizeof(OrderedWriter) + sizeof(Stats) + 1024 +
                 2 * max_runs * (sizeof(ExecutionIO) + sizeof(std::future<void>) + 256)));
     }
+    void start_disk_workers(std::vector<size_t> groups, size_t lanes)
+    {
+        disk_lanes_ = std::move(groups); queue_bytes_ = scratch_queue_bytes(external_);
+        for (auto const& device : scratch_devices_)
+            if (external_.bandwidth) external_.bandwidth->register_device(device);
+        for (size_t i = 0; i < lanes; ++i)
+            disk_workers_.push_back(std::make_unique<OrderedWriter>([] {}));
+    }
     static uint64_t checkpoint_buffer_bytes(ExternalConfig const& external);
     static uint64_t phase_base_memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
                                             MemoryPhase phase, uint16_t batch_members);
@@ -1604,16 +1612,9 @@ inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalC
         auto const lanes = *std::max_element(groups.begin(), groups.end()) + 1;
         // Fund native queues, per-reader futures and segment index lists from
         // the existing read window. A tightly budgeted resume stays serial.
-        uint64_t const queues = scratch_queue_bytes(external_);
         if (lanes > 1 &&
             std::all_of(scratch_devices_.begin(), scratch_devices_.end(), [](auto const& d) { return d.rotating; }))
-        {
-            disk_lanes_ = std::move(groups); queue_bytes_ = queues;
-            for (auto const& device : scratch_devices_)
-                if (external_.bandwidth) external_.bandwidth->register_device(device);
-            for (size_t i = 0; i < lanes; ++i)
-                disk_workers_.push_back(std::make_unique<OrderedWriter>([] {}));
-        }
+            start_disk_workers(std::move(groups), lanes);
         else scratch_devices_.clear();
     }
     {
@@ -1995,6 +1996,7 @@ private:
 class ExternalEngine::Reader
 {
 public:
+    static constexpr size_t minimum_prefetch_bytes = 2 * 1024 * 1024;
     Reader(ExternalEngine& engine, Run const& run, size_t active = 0, uint64_t start = UINT64_MAX,
            char const* role = "contribution", uint64_t* activity = nullptr, uint64_t buffer_bytes = 0)
         : engine_(engine), run_(run), position_(start == UINT64_MAX ? run.consumed : start), read_position_(position_), role_(role), activity_(activity),
@@ -2008,7 +2010,7 @@ public:
         // A compact member cursor can stop in the middle of a shared run.
         // Only packet streams own the whole remaining range. Queue contiguous
         // extents into the existing cache and consume them in logical order.
-        if (!engine_.disk_workers_.empty() && !buffer_bytes && buffer_.size() >= 2 * 1024 * 1024)
+        if (!engine_.disk_workers_.empty() && !buffer_bytes && buffer_.size() >= minimum_prefetch_bytes)
         {
             block_ = size_t(std::min<uint64_t>(engine_.external_.segment_bytes, buffer_.size() / 2));
             pending_.reads.resize(std::min(2 * engine_.disk_workers_.size(), buffer_.size() / block_));
@@ -3416,6 +3418,35 @@ inline void ExternalEngine::pack(Members members)
         require(!file_io::resize_file(fd_, file_io::Offset(output_bytes_)), "cannot discard uncommitted external output tail");
         external_detail::reserve_file(fd_, final_bound_, io_context("final_output", &execution_destination_));
     }
+    bool const overlap = config_.io_overlap && packing_work_ <= config_.codec_bytes / 2;
+    bool output_overlap = overlap;
+    size_t writeback_window = 0;
+    if (output_overlap)
+    {
+        auto const target = storage_device(file_io::native_path(path_).parent_path());
+        for (auto const& root : roots_)
+        {
+            auto const source = storage_device(file_io::native_path(root.path));
+            if (!external_detail::independent_packing_io(target, {&source, 1})) { output_overlap = false; break; }
+            // One scratch spindle can refill its readers while the codec and
+            // independent output run. Fund its queue from the shared cache.
+            if (roots_.size() == 1 && runs_.size() > 1 && disk_workers_.empty() &&
+                source.rotating && target.rotating && !external_.io_governor)
+            {
+                auto const queues = scratch_queue_bytes(external_);
+                if (queues <= config_.window_bytes / 2 &&
+                    (read_buffer_bytes(identity_.header.k, config_, external_) - queues) / runs_.size() >= Reader::minimum_prefetch_bytes)
+                { scratch_devices_.push_back(source); start_disk_workers({0}, 1); }
+            }
+        }
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+        if (output_overlap && target.rotating && !external_.io_governor)
+        {
+            auto const page = file_io::page_size();
+            if (page > 0) writeback_window = size_t(config_.window_bytes) / size_t(page) * size_t(page);
+        }
+#endif
+    }
     std::vector<std::unique_ptr<Reader>> readers;
     for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
     stats_.max_active_runs = std::max<uint64_t>(stats_.max_active_runs, readers.size());
@@ -3424,7 +3455,6 @@ inline void ExternalEngine::pack(Members members)
         runs_.size() * sizeof(uint64_t) + members.size() * sizeof(FragmentRegion);
     uint64_t const limit = std::min({chunks, uint64_t(65536), config_.window_bytes / std::max(uint64_t(1), packing_source_bytes_),
         uint64_t(UINT16_MAX) / std::max(uint64_t(1), packet_count_), std::max<uint64_t>(1, config_.window_bytes / task_bytes)});
-    bool const overlap = config_.io_overlap && packing_work_ <= config_.codec_bytes / 2;
     uint64_t const budget = overlap ? config_.codec_bytes / 2 : config_.codec_bytes;
     unsigned const workers = unsigned(std::max<uint64_t>(1, std::min({uint64_t(config_.workers),
         budget / packing_work_, limit})));
@@ -3460,18 +3490,6 @@ inline void ExternalEngine::pack(Members members)
     }
     std::vector<size_t> released_segments(runs_.size(), 0); std::vector<uint64_t> released_bytes(runs_.size(), 0);
     std::vector<uint8_t> output_window; output_window.reserve(size_t(config_.window_bytes));
-    bool output_overlap = overlap;
-    bool output_writeback = false;
-    if (output_overlap)
-    {
-        auto const target = storage_device(file_io::native_path(path_).parent_path());
-        for (auto const& root : roots_)
-        {
-            auto const source = storage_device(file_io::native_path(root.path));
-            if (!external_detail::independent_packing_io(target, {&source, 1})) { output_overlap = false; break; }
-        }
-        output_writeback = output_overlap && target.rotating && !external_.io_governor;
-    }
     std::vector<uint8_t> writing_window;
     if (output_overlap) writing_window.reserve(size_t(config_.window_bytes));
     Stats output_stats;
@@ -3508,7 +3526,8 @@ inline void ExternalEngine::pack(Members members)
                     auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, io_context("final_output", &output_service));
                     // Keep the output spindle writing while the next chunks
                     // are packed. The checkpoint still syncs data and index.
-                    if (output_writeback) external_detail::start_writeback(fd_, offset, writing_window.size());
+                    if (writeback_window && (offset + writing_window.size()) % writeback_window == 0)
+                        external_detail::start_writeback(fd_, offset, writing_window.size());
                 });
             }
             else { write_target(window_offset, output_window); output_window.clear(); }
@@ -3517,8 +3536,20 @@ inline void ExternalEngine::pack(Members members)
     };
     auto emit = [&](std::span<uint8_t const> bytes)
     {
-        if (bytes.size() > output_window.capacity() - output_window.size()) flush_output();
-        require(bytes.size() <= output_window.capacity(), "external canonical chunk exceeds output window");
+        require(bytes.size() <= config_.window_bytes, "external canonical chunk exceeds output window");
+        if (writeback_window)
+        {
+            // Fill to a file-offset boundary even after a short checkpoint
+            // flush. The next write then starts beyond the pages in writeback.
+            size_t room = size_t(writeback_window - output_bytes_ % writeback_window);
+            while (bytes.size() >= room)
+            {
+                output_window.insert(output_window.end(), bytes.begin(), bytes.begin() + room);
+                output_bytes_ += room; flush_output(); bytes = bytes.subspan(room);
+                room = writeback_window;
+            }
+        }
+        else if (bytes.size() > output_window.capacity() - output_window.size()) flush_output();
         output_window.insert(output_window.end(), bytes.begin(), bytes.end()); output_bytes_ += bytes.size();
     };
     uint64_t committed = output_bytes_;
