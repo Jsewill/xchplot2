@@ -276,7 +276,8 @@ public:
     // after local validation, exact capacity admission and a durable append.
     static uint64_t contribution_input_memory_bytes(Config const& config, uint16_t members);
     static uint64_t contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound);
-    std::unique_ptr<ContributionInput> prepare_contributions(uint16_t members, uint64_t fragment_bound);
+    std::unique_ptr<ContributionInput> prepare_contributions(uint16_t members, uint64_t fragment_bound,
+        uint64_t final_capacity = UINT64_MAX);
     AppendResult append(ContributionInput& input, uint16_t prefix = 0);
     AppendResult append(Members members);
     // The caller retains the last batch through packing. Its digest and the
@@ -2167,9 +2168,11 @@ public:
         for (auto const& segment : summary_.segments) bytes = grow_add(bytes, segment.capacity);
         return bytes;
     }
-    void append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
-    { append_chunks(member, chunk, {&bytes, 1}, count); }
-    void append_chunks(uint16_t member, uint64_t chunk,
+    // The owner reads this after the receive or sizing task joins.
+    uint64_t rejected_final_bytes() const { return minimum_final_ > final_capacity_ ? minimum_final_ : 0; }
+    bool append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
+    { return append_chunks(member, chunk, {&bytes, 1}, count); }
+    bool append_chunks(uint16_t member, uint64_t chunk,
         std::span<std::span<uint8_t const> const> chunks, uint16_t count = 1)
     {
         std::lock_guard lock(mutex_);
@@ -2204,9 +2207,19 @@ public:
                 if (entry.summarizing)
                 {
                     auto& summary = candidate_[size_t(ordinal)];
+                    auto const prior = final_capacity_ == UINT64_MAX ? 0 : minimum_chunk(summary);
                     summary.codec = ChunkCodec::combine(engine_->identity_.header.k, summary.codec,
                         inspected.summary, inspected.first, ordinal);
                     summary.bytes = grow_add(summary.bytes, bytes.size());
+                    if (final_capacity_ != UINT64_MAX)
+                    {
+                        minimum_final_ = grow_add(minimum_final_ - prior, minimum_chunk(summary));
+                        if (rejected_final_bytes())
+                        {
+                            engine_->check_summary_source(engine_->summary_run_);
+                            return false;
+                        }
+                    }
                 }
                 ++ordinal;
             }
@@ -2218,6 +2231,7 @@ public:
             entry.writer->value(packet); entry.writer->write(bytes);
         }
         entry.next += chunks.size(); entry.failed = false;
+        return true;
     }
     void finish_member(uint16_t member, uint16_t count = 1)
     {
@@ -2249,6 +2263,7 @@ public:
         {
             std::vector<Summary>().swap(candidate_); summarized_ = 0;
             for (auto& slot : members_) slot.summarizing = false;
+            if (final_capacity_ != UINT64_MAX) load_capacity_frontier();
         }
         for (uint16_t i = member; i < member + count; ++i)
         {
@@ -2277,10 +2292,21 @@ private:
         uint16_t owner = 0, count = 0;
         bool finished = false, failed = false, summarizing = false;
     };
-    ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound)
-        : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), members_(count),
+    ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound, uint64_t final_capacity)
+        : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), final_capacity_(final_capacity), members_(count),
           validator_(std::make_unique<ChunkCodec>(engine.identity_.header.k, engine.config_.codec_bytes, engine.config_.cpu_scheduler))
     { for (uint16_t member = 0; member < count; ++member) members_[member].owner = member; }
+    static uint64_t minimum_chunk(Summary const& summary)
+    { return summary.codec.symbols ? ChunkCodec::size_bounds(summary.codec).first : 0; }
+    void load_capacity_frontier()
+    {
+        candidate_ = engine_->take_summary();
+        // Appending a member preserves the previous delta stream and adds a
+        // nonnegative cost. Unseen chunks contribute only their durable lower
+        // bound. Omitting the index also keeps this valid for an ordinary file.
+        minimum_final_ = sizeof(Header) + engine_->identity_.memo.size();
+        for (auto const& summary : candidate_) minimum_final_ = grow_add(minimum_final_, minimum_chunk(summary));
+    }
     void reserve_group(uint16_t member, uint16_t count)
     {
         auto& entry = members_[member]; entry.failed = true;
@@ -2312,6 +2338,7 @@ private:
     ExternalEngine* engine_;
     uint16_t frontier_;
     uint64_t fragment_bound_;
+    uint64_t final_capacity_, minimum_final_ = 0;
     std::vector<MemberRecord> members_;
     Run summary_;
     // The existing staging workspace holds one candidate, in canonical member
@@ -2561,10 +2588,12 @@ inline uint64_t ExternalEngine::contribution_input_scratch_bytes(uint8_t k, uint
         multiply(chunks, POS2_FSE_compressBound(0) + sizeof(Packet) + 11));
     return grow_add(multiply(members, member), multiply(chunks, sizeof(Summary)));
 }
-inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepare_contributions(uint16_t members, uint64_t fragment_bound)
+inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepare_contributions(uint16_t members,
+    uint64_t fragment_bound, uint64_t final_capacity)
 {
     require(confirmed_ && can_append() && !prepared_ && !contributions_ && members && members <= UINT16_MAX - members_,
         "contribution input requires an idle confirmed staging engine"); check_paths();
+    require(members == 1 || final_capacity == UINT64_MAX, "capacity probes require one contribution member");
     if (members > max_runs || !fragment_bound || fragment_bound > UINT32_MAX) return {};
     require(grow_add(required_memory(members), contribution_input_memory_bytes(config_, members)) <= config_.memory_limit_bytes,
         "contribution input exceeds memory budget");
@@ -2583,7 +2612,7 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
         }
         if (!merge_range(first, count)) return {};
     }
-    auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound));
+    auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound, final_capacity));
     contributions_ = input.get();
     uint64_t const summary_bytes = multiply(PlotGroupFile::getChunkCountForK(identity_.header.k), sizeof(Summary));
     uint64_t const member_bytes = (contribution_input_scratch_bytes(identity_.header.k, members, fragment_bound) - summary_bytes) / members;
@@ -2599,7 +2628,8 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
     next_id_ = input->summary_.id + 1;
     // A restored checkpoint may only have an on-disk summary. Leave that
     // read to the admitted sizing pass on the destination writer.
-    if (!members_ || !summary_cache_.empty()) input->candidate_ = take_summary();
+    if (final_capacity != UINT64_MAX) input->load_capacity_frontier();
+    else if (!members_ || !summary_cache_.empty()) input->candidate_ = take_summary();
     return input;
 }
 inline uint64_t ExternalEngine::input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
@@ -2888,7 +2918,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     }
     final_bound = grow_add(final_bound, multiply(chunks, sizeof(uint64_t)));
     uint64_t peak = grow_add(final_bound, metadata_bytes(identity_.header.k, external_));
-    if (!fits || peak > config_.capacity_bytes)
+    if (!fits || peak > config_.capacity_bytes || final_bound > input.final_capacity_)
     {
         // Exact sizing can rescue a conservative bound, including the final
         // partial group. Inspect again while gathering the complete canonical
@@ -2914,6 +2944,11 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         }
         final_bound = grow_add(final_bound, grow_add(index_bits, 7) / 8);
         peak = grow_add(final_bound, metadata_bytes(identity_.header.k, external_));
+        if (fits && final_bound > input.final_capacity_)
+        {
+            input.minimum_final_ = final_bound;
+            return {false, false, final_bound, peak, "received contributions exceed final output capacity", {}};
+        }
         if (!fits || peak > config_.capacity_bytes)
             return {false, false, final_bound, peak, "received contributions exceed exact capacity or codec/window budget", {}};
     }

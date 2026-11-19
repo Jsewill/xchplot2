@@ -2917,8 +2917,14 @@ void execution_planning()
     require(execution_generation_order(ready) == 8, "generation did not start the longest measured downstream tail");
     ready.back().known = false;
     require(execution_generation_order(ready) == 7, "unknown consumers changed the safe rotating generation order");
+    ready[1].members_to_pack = 2; ready[2].members_to_pack = 1;
+    require(execution_generation_order(ready) == 9, "cold generation did not release the nearest packable group");
+    ready[2].tight_capacity = true;
+    require(execution_generation_order(ready) == 8, "speculative capacity probe delayed a fitting measured destination");
+    ready[1].tight_capacity = true;
+    require(execution_generation_order(ready) == 7, "speculative capacity probes displaced a fitting destination");
     ready.back().deferrals = ready.size();
-    require(execution_generation_order(ready) == 9, "measured generation order starved a deferred destination");
+    require(execution_generation_order(ready) == 9, "generation order starved a deferred capacity probe");
 
     Config cfg; cfg.capacity_bytes = 1000000000000ull; cfg.window_bytes = mib;
     cfg.checkpoint_bytes = 16 * mib; cfg.workers = 24; cfg.merge_inputs = 4;

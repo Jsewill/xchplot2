@@ -1,7 +1,9 @@
 #pragma once
 #include "host/ComputeNetwork.hpp"
+#include <array>
 #include <filesystem>
 #include <optional>
+#include <utility>
 
 namespace group_grow::pool
 {
@@ -57,4 +59,20 @@ void import_pool_renewal(PoolIdentity const&, std::filesystem::path const& repla
 std::vector<uint8_t> pool_policy(std::string const& directory);
 void accept_pool_policy(std::string const& directory, std::span<uint8_t const>);
 void check_pool_peer(std::string const& directory, std::string const& node, std::string const& certificate);
+// A channel has two fixed TLS identities. Check the saved files on every
+// transfer and verify both identities together whenever their policy changes.
+class ChannelMembership
+{
+public:
+    using Peer = std::pair<std::string, std::string>; // node ID and certificate fingerprint
+    ChannelMembership(std::string const& directory, Peer remote, Peer local);
+    void check();
+    std::vector<uint8_t> const& encoded() const { return encoded_; }
+    static uint64_t cache_bytes();
+private:
+    std::filesystem::path directory_;
+    std::array<Peer, 2> peers_;
+    std::string authority_pem_, policy_text_;
+    std::vector<uint8_t> encoded_;
+};
 } // namespace group_grow::pool

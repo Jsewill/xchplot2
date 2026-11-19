@@ -425,6 +425,16 @@ void assigned_local_and_fencing()
         "adaptive worker suggestions exceeded the caller's storage or RAM ceiling");
     config.local_service = nullptr; config.owner_id = "minimum-frame-wire-owner";
     WorkerClient wire(config); chunks = 0;
+    for (auto* owner : {&client, &wire})
+    {
+        auto const before = owner->stats(); bool received = false, declined = false;
+        try { owner->contributions(18, 3, {&id, 1}, [&](auto ordinal, auto, auto)
+            { require(!ordinal, "capacity probe missed its first chunk"); received = true; throw WorkerTaskDeclined(); }); }
+        catch (WorkerTaskDeclined const&) { declined = true; }
+        auto const after = owner->stats();
+        require(received && declined && after.failed_tasks == before.failed_tasks &&
+            after.completed_contributions == before.completed_contributions, "owner capacity stop penalized its worker");
+    }
     wire.contributions(18, 3, ids, [&](uint64_t ordinal, auto bytes, uint16_t members)
     { require(ordinal == chunks++ && !bytes.empty() && members == ids.size(), "minimum-frame contribution batch was truncated"); });
     require(chunks == PlotGroupFile::getChunkCountForK(18) && wire.stats().output_bytes,

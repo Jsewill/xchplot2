@@ -1502,7 +1502,7 @@ struct WorkerService::Impl
                         if (failpoint && std::string_view(failpoint) == "worker-contribution-paused") std::raise(SIGSTOP);
 #endif
                     }
-                    output = pool::Writer(config.tls.max_frame_bytes); output.u8(uint8_t(DataKind::Contributions));
+                    output.clear(); output.u8(uint8_t(DataKind::Contributions));
                 };
                 auto contribution_sink = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
                 {
@@ -2473,6 +2473,7 @@ struct WorkerClient::Impl
                     packed_sink ? WorkerPackedSink(packed) : WorkerPackedSink{},
                     contribution_sink ? WorkerContributionSink(contribution) : WorkerContributionSink{}, cancel);
             }
+            catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
             catch (pool::UnsupportedResources const&)
             { require(!connection->logical_output_bytes, "local worker rejected resources after partial output");
               connection->resource_rejected = true; throw; }
@@ -2589,8 +2590,12 @@ struct WorkerClient::Impl
                         chunks[count++] = bytes;
                     } while (contribution_window && input.remaining() && count < chunks.size());
                     compute.reset();
-                    if (contribution_window) contribution_window(first, {chunks.data(), count}, uint16_t(ids.size()));
-                    else contribution_sink(first, chunks[0], uint16_t(ids.size()));
+                    try
+                    {
+                        if (contribution_window) contribution_window(first, {chunks.data(), count}, uint16_t(ids.size()));
+                        else contribution_sink(first, chunks[0], uint16_t(ids.size()));
+                    }
+                    catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
                     compute = cpu_lease(cancel);
                 }
             }

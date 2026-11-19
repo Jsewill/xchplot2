@@ -420,6 +420,10 @@ xchplot2 status /disk/plots
 ```
 
 Completed plots and started groups retain their identities and reservations.
+If a destination fills while testing room for another group, an empty
+`.gplot.partial` can remain. Status and resume exclude that file from the
+pending and published group counts. Withdrawing its reservation releases
+the empty private file.
 Parameter changes start with later groups; resizing replaces only the unstarted
 forecast. File and member targets may be lowered below existing work; that
 stops future allocation while started files keep their original reservations.
@@ -1731,9 +1735,25 @@ Send and receive waits include backpressure and can overlap. After three
 completed samples for a matching plot size, strength and result type, the
 owner can compare generation batch sizes and choose how many destinations
 receive concurrently. With an older peer the owner uses the existing task
-timings. The full execution
-forecast also needs measured packing and storage costs for the destination.
-In construction JSON, `pool_timed_generation_tasks` counts measured tasks.
+timings. The full execution forecast also needs measured packing and storage
+costs for the destination.
+While those timings are incomplete, the scheduler favors a partially filled
+group that can start packing soon on an idle drive. Observed member sizes
+help it serve destinations with room before probing nearly full ones.
+A repeatedly deferred destination still gets a turn.
+
+Near the output limit, external construction receives uncertain compressed
+members individually. The planner can reserve extra scratch for these
+transfers. When the remaining member limit and a completed group of the
+same k and strength indicate the job should fit, it keeps the normal scratch
+reservation and can use packed batches. The owner stops a compressed transfer
+once locally validated chunks prove the candidate would exceed the final
+file allowance. If the bound is inconclusive, exact sizing can still admit
+the member. Previously accepted members remain eligible for publication.
+
+In construction JSON, `pool_partial_capacity_probes` counts compressed
+transfers stopped early for capacity. `pool_timed_generation_tasks` counts
+measured tasks.
 The destination scheduler reports its most recent generation estimate in
 `pool_generation_seconds_per_member` and its receiver count in
 `pool_receiving_destinations`. Both start at zero. The `phases` object gives
@@ -1925,6 +1945,25 @@ Embedded per-job brokers choose available ports. Use a persistent broker
 when a firewall rule requires a fixed port.
 The current build reads older compute profiles automatically. Newly saved
 profiles include listener ports and require a build that supports them.
+
+On a host with separate management and plotting links, the broker handles
+leases. The plotting host connects to the worker's advertised address for
+plot data. For example, with `10.10.10.2` on the plotting host and
+`10.10.10.1` on the GPU worker, these commands use the dedicated link.
+
+```bash
+# Plotting host
+xchplot2 compute broker --listen 10.10.10.2:18444 --discovery off
+# GPU worker
+xchplot2 compute worker --broker 10.10.10.2:18444 --listen 10.10.10.1:18445 \
+  --advertise 10.10.10.1:18445 --discovery off --backend gpu
+```
+
+Use `--compute-broker 10.10.10.2:18444` on the plotting job. An existing
+broker can also stay on its management address. In that case use its address
+for both broker options and keep the worker listener and advertisement on
+the dedicated link. The plotting host must be able to reach the advertised
+worker port.
 
 Firewalls must permit the chosen TCP listeners and UDP 5353 when discovery is
 enabled. On each machine, `compute firewall` prints commands for its saved

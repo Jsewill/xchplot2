@@ -2319,6 +2319,39 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         engine.finish(); require(contents(path) == reference, "exact contribution output differs");
     }
     {
+        auto const path = root / "contribution-capacity-probe";
+        uint16_t const prior = uint16_t(raw.size() - 1);
+        {
+            ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+            auto const reserved = engine.scratch_reserved_bytes();
+            auto input = engine.prepare_contributions(1, raw.front().size(), reference.size() / (raw.size() * 2));
+            require(bool(input), "capacity probe reservation rejected");
+            uint64_t chunk = 0;
+            while (chunk < chunks && input->append_chunk(0, chunk, encoded[0][size_t(chunk)])) ++chunk;
+            require(chunk && chunk + 1 < chunks && input->rejected_final_bytes() > reference.size() / (raw.size() * 2),
+                "oversized member was not stopped during transfer");
+            input.reset();
+            require(!engine.committed_member_count() && engine.scratch_reserved_bytes() == reserved,
+                "partial capacity probe changed the durable frontier or retained scratch");
+            require(engine.append(Members(raw).subspan(0, prior)).accepted, "capacity probe prefix rejected");
+        }
+        ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
+        {
+            auto input = engine.prepare_contributions(1, raw.back().size(), reference.size() - 1);
+            require(bool(input), "near-fit probe reservation rejected");
+            feed_member(*input, 0, prior); input->seal();
+            require(!engine.append(*input).accepted && input->rejected_final_bytes() == reference.size() &&
+                engine.committed_member_count() == prior, "exact-capacity refusal lost its proven final size");
+        }
+        auto input = engine.prepare_contributions(1, raw.back().size(), reference.size());
+        require(input && engine.committed_member_count() == prior, "capacity probe did not restore its prefix");
+        for (uint64_t chunk = 0; chunk < chunks / 2; ++chunk)
+            require(input->append_chunk(0, chunk, encoded.back()[size_t(chunk)]), "fitting partial member rejected");
+        input->reset_member(0); feed_member(*input, 0, prior); input->seal();
+        require(!input->rejected_final_bytes() && engine.append(*input).accepted, "exact-fit restarted probe rejected");
+        engine.finish(); require(contents(path) == reference, "capacity probe changed the exact-fit publication");
+    }
+    {
         auto const prefix_path = root / "contribution-prefix-reference";
         { Engine engine(prefix_path.string(), config(), false, initial_identity()); engine.confirm_identity();
           require(engine.append(Members(raw).subspan(0, 1)).accepted, "contribution prefix reference rejected"); }

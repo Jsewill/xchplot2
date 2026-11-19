@@ -250,6 +250,8 @@ struct ExecutionReady
     size_t index = 0, deferrals = 0;
     long double remaining = 0;
     bool known = false;
+    uint16_t members_to_pack = UINT16_MAX;
+    bool tight_capacity = false;
 };
 
 // A cold compact-input trial compares whole durable cohorts in this run.
@@ -374,11 +376,17 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
     auto oldest = std::max_element(ready.begin(), ready.end(), [](auto const& a, auto const& b)
         { return a.deferrals < b.deferrals; });
     if (oldest->deferrals >= ready.size()) return oldest->index;
-    // Preserve the rotating order until all competing consumers have usable
-    // evidence. Once measured, start the longest remaining downstream tail.
-    if (std::any_of(ready.begin(), ready.end(), [](auto const& item) { return !item.known; })) return ready.front().index;
-    return std::max_element(ready.begin(), ready.end(), [](auto const& a, auto const& b)
-        { return a.remaining < b.remaining; })->index;
+    // Delay speculative capacity probes while other drives can use a member.
+    // With cold timing, let an idle writer start packing a partially filled
+    // group. Equal candidates retain the caller's rotating order.
+    bool const all_tight = std::all_of(ready.begin(), ready.end(), [](auto const& item) { return item.tight_capacity; });
+    bool const measured = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
+        { return item.known || (!all_tight && item.tight_capacity); });
+    return std::min_element(ready.begin(), ready.end(), [&](auto const& a, auto const& b)
+    {
+        if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
+        return measured ? a.remaining > b.remaining : a.members_to_pack < b.members_to_pack;
+    })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
     size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap,

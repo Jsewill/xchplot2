@@ -246,6 +246,106 @@ build took 216.2 s. All three files matched across builds. The planner keeps
 its ordinary concurrency during unmeasured CPU generation and can open
 independent HDDs for final packing.
 
+#### Shared compute over a dedicated Ethernet link
+
+A GPU workstation and a storage host had separate 1 and 10 GbE links. With
+MTU 1500, four concurrent encrypted SSH streams carried 9.04 Gb/s of payload
+to the storage host and 9.08 Gb/s back. Each direction transferred 4 GiB.
+
+On the 1 GbE route, a fixed-seed `fill` generated a three-member k=28
+group on the remote GPU and published it on one HDD using four scratch
+HDDs. Both builds produced the same 2,983,126,302-byte file. Elapsed time
+includes generation, network transfer, assembly and publication.
+
+| Enrolled compute transport | Elapsed | Seconds per member | Highest five-second NIC receive rate |
+| --- | ---: | ---: | ---: |
+| Previous | 83.4 s | 27.8 | 0.51 Gb/s |
+| Updated | 57.0 s | 19.0 | 0.94 Gb/s |
+
+With twelve scratch HDDs and three output HDDs, the updated build published
+three three-member groups in 139.8 s, or 15.5 s per member. Its fastest
+five-second interval reached 0.97 Gb/s on the 1 GbE link. All three
+groups passed full-proof verification. The storage host received 9.98 GB.
+At the same bytes per member, a producer finishing one member every 2.2 s
+would require 4.03 Gb/s inbound and 452 MB/s of final plot writes, plus
+scratch I/O.
+
+On the same drives, a 5 GiB cap per output filesystem fit five members in
+two groups. Allowing up to nine members per destination took 305.0 s and
+generated 21 members to find and fill the available space. Repeating the
+fixed-seed job with `--max-groups 2 --max-total-members 5` took 239.1 s
+and generated 15 members. All six published files matched byte for byte.
+The known member limit saved 7.28 GB of traffic received by the storage host.
+
+The dedicated 10 GbE comparison kept the broker on the management network.
+Plot data went directly from one RTX 4090 worker slot to the storage host.
+Both builds used the same seed, three output HDDs, twelve scratch HDDs,
+24 GiB of owner RAM and a 5 GiB limit per output. Timings start at `fill`
+launch and end at publication and clean exit. File hashing, proof verification
+and the subsequent resume check ran outside that interval.
+
+| Capacity-limited fill, 15 published members | Previous planner | Updated planner |
+| --- | ---: | ---: |
+| Initial comparison | 221.1 s | 172.1 s |
+| Repeat with the final scratch reservation policy | 187.2 s | 167.3 s |
+| Seconds per published member on the repeat | 12.48 | 11.15 |
+| Complete members received | 21 | 15 |
+| Storage-host NIC receive bytes on the repeat | 24.53 GB | 19.42 GB |
+
+The updated planner stopped six transfers after the validated chunks proved
+the candidate could not fit. The repeat took 10.6% less wall time and
+received 20.8% fewer bytes. Worker generation still started for each probe.
+On the repeat, the highest five-second NIC receive rate was 1.77 Gb/s.
+Across the fifteen drives, the highest five-second read and write rates
+were 322 MB/s and 476 MB/s, respectively. For the 15 completed contributions,
+the worker reported 6.76 s per member processing generation and encoding,
+excluding sends.
+
+With the five-member limit supplied in advance, the same 15 members took
+130.9 s with the previous planner and 132.5 s with the final planner. Each
+received 17.25 GB. Reserving larger compressed-input runs for every rollover
+had taken 142.9 s in this control. With one three-member group per drive,
+the nine-member job took 106.7 s with the previous planner and 101.1 s
+with the final planner. Both received 9.98 GB. All six distinct output files
+matched the baseline SHA-256 hashes and passed full-proof verification.
+Resuming the capacity-limited fill generated zero additional members.
+
+The previous transport verified the signed membership registry repeatedly
+while receiving a frame. The update checks both authenticated identities
+against one verified registry and reuses that result while the trusted
+certificate and signed policy match. Two 512 MiB loopback transfers on
+the GPU workstation, with enrolled peers and 1 MiB frames, delivered
+1.1 Gb/s with the previous build and 18.9–22.1 Gb/s with the update.
+On the storage host, the updated transport delivered 7.4–7.7 Gb/s on one
+enrolled loopback connection and 13.9–14.7 Gb/s across two connections.
+
+Independent direct-I/O tests used unnamed temporary files on the mounted
+filesystems. The mixed workload ran for ten seconds. The all-read and
+all-write workloads ran for twelve seconds. Rates include the last write flush.
+
+| Load on the storage host | HDD reads (MB/s) | HDD writes (MB/s) | 10 GbE traffic during disk I/O |
+| --- | ---: | ---: | --- |
+| Eight readers and seven writers | 2,127 | 1,860 | Idle |
+| Eight readers and seven writers with inbound SSH | 2,125 | 1,856 | 9.79 Gb/s received |
+| Sixteen readers | 3,240 | — | Idle |
+| Sixteen readers with inbound SSH | 3,240 | — | 9.80 Gb/s received |
+| Sixteen writers | — | 3,328 | Idle |
+| Sixteen writers with outbound SSH | — | 3,329 | 9.84 Gb/s sent |
+
+Both SAS paths of every disk led to the same SAS3008 HBA. Its PCIe 3.0 x4
+link carries up to 3.94 GB/s in each direction before transaction overhead.
+The sixteen-drive runs reached 82.3% of that rate on reads and 84.5% on
+writes. The X540 NIC negotiated PCIe 2.0 x4. Their common upstream
+bridge negotiated PCIe 4.0 x4. NIC counters include protocol overhead.
+
+An eight-second sweep on the same filesystems measured where adding disks
+stopped increasing sustained bandwidth in one direction.
+
+| Active HDDs | 8 | 12 | 14 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| Read MB/s | 2,255 | 3,215 | 3,236 | 3,237 |
+| Write MB/s | 2,249 | 3,221 | 3,311 | 3,309 |
+
 ### Group size, build time and reader latency
 
 Each size had one fresh build with the same group identity, HDD and 8 GiB

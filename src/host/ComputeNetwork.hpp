@@ -67,7 +67,9 @@ public:
     void bytes(std::span<uint8_t const> value);
     void string(std::string const& value);
     std::vector<uint8_t> const& data() const { return data_; }
+    void clear() { data_.clear(); }
 private:
+    template <typename T> void integer(T value);
     void reserve(size_t bytes);
     uint32_t limit_;
     std::vector<uint8_t> data_;
@@ -85,6 +87,7 @@ public:
     void finish() const;
     size_t remaining() const { return data_.size() - position_; }
 private:
+    template <typename T> T integer();
     std::span<uint8_t const> take(size_t bytes);
     std::span<uint8_t const> data_;
     size_t position_ = 0;

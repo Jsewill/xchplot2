@@ -399,9 +399,16 @@ void Writer::reserve(size_t bytes)
     }
 }
 void Writer::u8(uint8_t value) { reserve(1); data_.push_back(value); }
-void Writer::u16(uint16_t value) { reserve(2); u8(uint8_t(value >> 8)); u8(uint8_t(value)); }
-void Writer::u32(uint32_t value) { reserve(4); u16(uint16_t(value >> 16)); u16(uint16_t(value)); }
-void Writer::u64(uint64_t value) { reserve(8); u32(uint32_t(value >> 32)); u32(uint32_t(value)); }
+template <typename T> void Writer::integer(T value)
+{
+    std::array<uint8_t, sizeof(T)> encoded;
+    reserve(encoded.size());
+    for (size_t i = encoded.size(); i > 0; --i) { encoded[i - 1] = uint8_t(value); value >>= 8; }
+    data_.insert(data_.end(), encoded.begin(), encoded.end());
+}
+void Writer::u16(uint16_t value) { integer(value); }
+void Writer::u32(uint32_t value) { integer(value); }
+void Writer::u64(uint64_t value) { integer(value); }
 void Writer::bytes(std::span<uint8_t const> value)
 {
     require(value.size() <= UINT32_MAX, "network blob is too large");
@@ -416,9 +423,15 @@ std::span<uint8_t const> Reader::take(size_t bytes)
     auto result = data_.subspan(position_, bytes); position_ += bytes; return result;
 }
 uint8_t Reader::u8() { return take(1)[0]; }
-uint16_t Reader::u16() { uint16_t const high = u8(); return uint16_t((high << 8) | u8()); }
-uint32_t Reader::u32() { uint32_t const high = u16(); return (high << 16) | u16(); }
-uint64_t Reader::u64() { uint64_t const high = u32(); return (high << 32) | u32(); }
+template <typename T> T Reader::integer()
+{
+    T value = 0;
+    for (uint8_t byte : take(sizeof(T))) value = T((value << 8) | byte);
+    return value;
+}
+uint16_t Reader::u16() { return integer<uint16_t>(); }
+uint32_t Reader::u32() { return integer<uint32_t>(); }
+uint64_t Reader::u64() { return integer<uint64_t>(); }
 std::span<uint8_t const> Reader::bytes(uint32_t limit)
 { uint32_t const size = u32(); require(size <= limit, "network blob exceeds its byte limit"); return take(size); }
 std::string Reader::string(uint32_t limit)
@@ -438,7 +451,8 @@ struct Channel::Impl
     TlsOptions options;
     Deadline creator_deadline = Deadline::max();
     std::string peer;
-    std::string peer_node, local_node, local_certificate;
+    std::string peer_node;
+    std::optional<ChannelMembership> membership;
     std::vector<uint8_t> sent_policy;
     bool policy_exchange = false;
     ~Impl() { if (ssl) SSL_free(ssl); if (fd != invalid_socket) close_socket(fd); }
@@ -447,7 +461,7 @@ struct Channel::Impl
         size_t position = 0;
         while (position < bytes.size())
         {
-            if (!options.membership_directory.empty() && !membership_exchange) check_membership();
+            if (membership) membership->check();
             check_deadline(until); size_t moved = 0;
             ERR_clear_error(); clear_socket_error();
             int const result = write ? SSL_write_ex(ssl, bytes.data() + position, bytes.size() - position, &moved) :
@@ -456,11 +470,6 @@ struct Channel::Impl
             else ssl_wait(ssl, result, until);
             transport_require(Clock::now() <= until, "network operation timed out");
         }
-    }
-    void check_membership() const
-    {
-        check_pool_peer(options.membership_directory, peer_node, peer);
-        check_pool_peer(options.membership_directory, local_node, local_certificate);
     }
     void policy_blob(bool write, Deadline until)
     {
@@ -483,40 +492,38 @@ struct Channel::Impl
     {
         std::unique_ptr<X509, decltype(&X509_free)> certificate(SSL_get1_peer_certificate(ssl), X509_free);
         peer_node = node_identity(certificate.get());
-        local_node = node_identity(SSL_get_certificate(ssl)); local_certificate = fingerprint(SSL_get_certificate(ssl));
         // Learn a newer signed policy before applying its revocations. A peer
         // cannot relax the pinned authority's policy, even with expired data.
         // An old local policy may reject a peer that has just rotated. Defer
         // membership checks only during this bounded signed-policy exchange.
-        membership_exchange = true;
-        try
+        bool const exchange = !options.membership_directory.empty() && !options.read_only_membership;
+        Writer offer(5); offer.u32(0x47504d34); offer.u8(exchange);
+        std::array<uint8_t, 5> remote{};
+        auto send_offer = [&] { transfer({const_cast<uint8_t*>(offer.data().data()), offer.data().size()}, true, until); };
+        if (server) { transfer(remote, false, until); send_offer(); }
+        else { send_offer(); transfer(remote, false, until); }
+        Reader input(remote); require(input.u32() == 0x47504d34, "incompatible network membership protocol");
+        auto saved = input.u8(); require(saved <= 1, "invalid network membership capability"); input.finish();
+        policy_exchange = saved && exchange;
+        if (policy_exchange)
         {
-            bool const exchange = !options.membership_directory.empty() && !options.read_only_membership;
-            Writer offer(5); offer.u32(0x47504d34); offer.u8(exchange);
-            std::array<uint8_t, 5> remote{};
-            auto send_offer = [&] { transfer({const_cast<uint8_t*>(offer.data().data()), offer.data().size()}, true, until); };
-            if (server) { transfer(remote, false, until); send_offer(); }
-            else { send_offer(); transfer(remote, false, until); }
-            Reader input(remote); require(input.u32() == 0x47504d34, "incompatible network membership protocol");
-            auto saved = input.u8(); require(saved <= 1, "invalid network membership capability"); input.finish();
-            policy_exchange = saved && exchange;
-            if (policy_exchange)
-            {
-                auto policy = pool_policy(options.membership_directory);
-                std::array<uint8_t, 32> local_digest{}, remote_digest{}; unsigned size = 0;
-                require(EVP_Digest(policy.data(), policy.size(), local_digest.data(), &size, EVP_sha256(), nullptr) == 1 && size == local_digest.size(),
-                    "cannot identify signed pool policy");
-                if (server) { transfer(remote_digest, false, until); transfer(local_digest, true, until); }
-                else { transfer(local_digest, true, until); transfer(remote_digest, false, until); }
-                if (local_digest != remote_digest) { policy_blob(!server, until); policy_blob(server, until); }
-                else sent_policy = std::move(policy);
-            }
+            auto policy = pool_policy(options.membership_directory);
+            std::array<uint8_t, 32> local_digest{}, remote_digest{}; unsigned size = 0;
+            require(EVP_Digest(policy.data(), policy.size(), local_digest.data(), &size, EVP_sha256(), nullptr) == 1 && size == local_digest.size(),
+                "cannot identify signed pool policy");
+            if (server) { transfer(remote_digest, false, until); transfer(local_digest, true, until); }
+            else { transfer(local_digest, true, until); transfer(remote_digest, false, until); }
+            if (local_digest != remote_digest) { policy_blob(!server, until); policy_blob(server, until); }
+            else sent_policy = std::move(policy);
         }
-        catch (...) { membership_exchange = false; throw; }
-        membership_exchange = false;
-        if (!options.membership_directory.empty()) check_membership();
+        if (!options.membership_directory.empty())
+        {
+            auto local = SSL_get_certificate(ssl);
+            membership.emplace(options.membership_directory, ChannelMembership::Peer{peer_node, peer},
+                ChannelMembership::Peer{node_identity(local), fingerprint(local)});
+            membership->check();
+        }
     }
-    bool membership_exchange = false;
 };
 Channel::Channel() = default;
 Channel::Channel(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -593,16 +600,15 @@ void Channel::send(Message type, std::span<uint8_t const> payload)
     require(bool(impl_), "network channel is closed");
     auto const until = operation_deadline(impl_->options);
     require(payload.size() <= impl_->options.max_frame_bytes && valid_message(uint16_t(type)) && type != Message::Policy, "invalid network frame");
-    if (!impl_->options.membership_directory.empty()) impl_->check_membership();
-    if (impl_->policy_exchange)
+    if (impl_->membership) impl_->membership->check();
+    if (impl_->policy_exchange && impl_->membership->encoded() != impl_->sent_policy)
     {
-        auto policy = pool_policy(impl_->options.membership_directory);
-        if (policy != impl_->sent_policy)
-        {
-            Writer update(12); update.u32(0x47504331); update.u16(1); update.u16(uint16_t(Message::Policy)); update.u32(uint32_t(policy.size()));
-            impl_->transfer({const_cast<uint8_t*>(update.data().data()), update.data().size()}, true, until);
-            impl_->transfer(policy, true, until); impl_->sent_policy = std::move(policy);
-        }
+        // transfer() refreshes membership between TLS records. Keep the
+        // announced bytes stable if another policy arrives during the write.
+        auto policy = impl_->membership->encoded();
+        Writer update(12); update.u32(0x47504331); update.u16(1); update.u16(uint16_t(Message::Policy)); update.u32(uint32_t(policy.size()));
+        impl_->transfer({const_cast<uint8_t*>(update.data().data()), update.data().size()}, true, until);
+        impl_->transfer(policy, true, until); impl_->sent_policy = std::move(policy);
     }
     Writer header(12); header.u32(0x47504331); header.u16(1); header.u16(uint16_t(type)); header.u32(uint32_t(payload.size()));
     // Control frames fit one TLS write without a heap allocation. Bulk frames
@@ -624,7 +630,7 @@ Frame Channel::receive()
     unsigned updates = 0;
     for (;;)
     {
-        if (!impl_->options.membership_directory.empty()) impl_->check_membership();
+        if (impl_->membership) impl_->membership->check();
         std::array<uint8_t, 12> header{};
         impl_->transfer(header, false, until);
         Reader reader(header);
@@ -635,8 +641,8 @@ Frame Channel::receive()
             (!policy || (impl_->policy_exchange && ++updates <= 4)), "invalid network frame type or size");
         Frame result{Message(type), std::vector<uint8_t>(bytes)};
         impl_->transfer(result.payload, false, until); check_deadline(until);
-        if (policy) { accept_pool_policy(impl_->options.membership_directory, result.payload); impl_->check_membership(); continue; }
-        if (!impl_->options.membership_directory.empty()) impl_->check_membership();
+        if (policy) { accept_pool_policy(impl_->options.membership_directory, result.payload); impl_->membership->check(); continue; }
+        if (impl_->membership) impl_->membership->check();
         return result;
     }
 }
@@ -702,7 +708,7 @@ uint64_t Channel::memory_bytes(uint32_t bytes)
     // size and depth are bounded in context(); reserve additional scratch for
     // the saved credential bundle, signed policy and member registry. This is
     // admission allowance, rather than a measurement of OpenSSL resident pages.
-    return uint64_t(bytes) + 4194304;
+    return uint64_t(bytes) + 4194304 + ChannelMembership::cache_bytes();
 }
 void Channel::close() noexcept { impl_.reset(); }
 struct Listener::Impl

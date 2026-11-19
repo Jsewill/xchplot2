@@ -1165,6 +1165,51 @@ def check_farm_returning_drives(run, command, verify, root):
     print("PASS missing and returning destinations preserve policy, healthy progress, identity and full proofs", flush=True)
 
 
+def check_empty_capacity_probe(run, root, keys, construction):
+    # An older external writer can leave its retired, empty private target at
+    # the first unused grant after a capacity stop. Preserve and guard it on
+    # resume without charging a pending group or counting a publication.
+    probe_dirs = [root / "probe capacity a", root / "probe capacity b"]
+    probe_scratch = root / "probe scratch"
+    for directory in [*probe_dirs, probe_scratch]:
+        directory.mkdir()
+    probe_options = ["-k", 18, *construction, "--construction", "external", "--compute", "off",
+                     "--batch-members", 1, "--group-members", 3, "--max-groups", 3,
+                     "--max-total-members", 9, "--capacity-bytes", 7000000, "--temp-dir", probe_scratch,
+                     "--temp-capacity-bytes", "64M", "-M", "2G", "--json"]
+    run("fill", *probe_dirs, *probe_options, *keys, "--seed", SEED)
+    before = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"]
+    closed = before[0]
+    assert closed["reason"] == "capacity" and closed["completed_files"] < closed["allocation_grant_files"]
+    placeholder = probe_dirs[0] / f"grow-group-{closed['completed_files']:020d}.gplot.partial"
+    if not placeholder.exists():
+        placeholder.touch()
+    stamp = placeholder.stat()
+    assert stamp.st_size == 0
+    run("plan", "--resume", probe_dirs[0], "--json")
+    resumed = json.loads(run("fill", "--resume", *probe_dirs, *probe_options).stdout.splitlines()[-1])
+    after = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"]
+    assert resumed["generated_members"] == 0
+    assert [(item["completed_files"], item["completed_members"], item["pending_files"]) for item in after] == [
+        (item["completed_files"], item["completed_members"], 0) for item in before]
+    assert placeholder.stat().st_ino == stamp.st_ino and placeholder.stat().st_size == 0
+    run("plan", probe_dirs[0], "--capacity-bytes", "16M", "--json")
+    unexpected = probe_dirs[0] / f"grow-group-{closed['allocation_grant_files']:020d}.gplot.partial"
+    unexpected.touch(exist_ok=False)
+    run("plan", "--resume", probe_dirs[0], "--json", code=2)
+    assert unexpected.stat().st_size == 0
+    unexpected.unlink()
+    placeholder.write_bytes(b"occupied")
+    run("plan", "--resume", probe_dirs[0], "--json", code=2)
+    assert placeholder.read_bytes() == b"occupied"
+    placeholder.write_bytes(b"")
+    run("retire", probe_dirs[0], "--destination", probe_dirs[0], "--quiet")
+    retired = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"][0]
+    assert retired["detached_reclaimed"] and retired["completed_members"] == closed["completed_members"]
+    assert not placeholder.exists()
+    print("PASS capacity-stop recovery, occupied target refusal and retirement of the withdrawn probe", flush=True)
+
+
 def check(binary, root, reference=None):
     counter = 0
 
@@ -1581,6 +1626,8 @@ def check(binary, root, reference=None):
     assert snapshot(capacity_dir, observations=False) == completed, "completed capacity fill retried or changed files"
     verify(capacity_path)
     print("PASS compression top-up, window-limited sealing and unchanged resume", flush=True)
+
+    check_empty_capacity_probe(run, root, keys, construction)
 
     output = root / "grouped files"
     plot = ["plot", "-k", 18, "-n", 2, *keys, "-o", output,
@@ -4090,9 +4137,9 @@ def check_compute(binary, root):
             network = ["--compute-broker", endpoint, "--compute-owner-id", owner,
                        "--compute-ca", ca, "--compute-cert", cert, "--compute-key", key,
                        "--compute-inflight", 2, "--compute-codec-ram", 0, "--compute-timeout-ms", 120000]
-            owners.append((owner, start([*common, "-S", SEED, "-o", root / owner, *network], owner)))
+            owners.append((owner, network, start([*common, "-S", SEED, "-o", root / owner, *network], owner)))
         paths = []
-        for owner, process in owners:
+        for owner, network, process in owners:
             path = Path(process.finish().strip())
             assert path.is_file() and header(path)[3] == 3
             paths.append(path)
@@ -4105,6 +4152,23 @@ def check_compute(binary, root):
             assert proof and int(proof[1]) > 0
         assert header(paths[0])[0] != header(paths[1])[0], "owners reused a group identity"
         print("PASS two simultaneous plotting owners share one compute worker, byte parity and full proofs", flush=True)
+        baseline, destination, scratch = (root / name for name in ("capacity reference", "remote capacity", "remote scratch"))
+        for directory in (baseline, destination, scratch):
+            directory.mkdir()
+        options = ["-k", 22, "-f", FARMER, "--pool-ph", POOL, "--group-members", 1, "--leave-free", 0,
+                   "--construction", "external", "--temp-dir", scratch, "--temp-capacity-bytes", "128M",
+                   "--window-bytes", "64K", "--checkpoint-bytes", "64K", "-M", "1G", "-j", 2,
+                   "--backend", "cpu", "--json", "--config", os.devnull]
+        pool.run([binary, "fill", baseline, *options, "--seed", scoped, "--compute", "off",
+                  "--capacity-bytes", "64M", "--max-groups", 1, "--max-total-members", 1])
+        reference, = baseline.rglob("*.gplot")
+        result = pool.run([binary, "fill", destination, *options, "--seed", SEED, *network, "--compute-local", "off",
+                           "--capacity-bytes", reference.stat().st_size * 3 // 2, "--max-groups", 2, "--max-total-members", 2])
+        report = json.loads(result.stdout.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == report["pool_partial_capacity_probes"] == 1, report
+        plot, = destination.rglob("*.gplot")
+        assert digest(plot) == digest(reference)
+        print("PASS remote capacity probes preserve the published prefix across group rollover", flush=True)
     finally:
         for process in reversed(processes):
             process.stop()

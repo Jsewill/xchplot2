@@ -106,6 +106,8 @@ GenerationProfile profile(Kind kind, uint64_t host = 1024, uint64_t gpu = 2048)
 void codecs()
 {
     Writer writer(128); writer.u8(0xab); writer.u16(0xcdef); writer.u32(0x12345678); writer.u64(0x0123456789abcdef);
+    require(writer.data() == std::vector<uint8_t>{0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}, "wire integer byte order changed");
     writer.string("hello"); Reader reader(writer.data());
     require(reader.u8() == 0xab && reader.u16() == 0xcdef && reader.u32() == 0x12345678 &&
         reader.u64() == 0x0123456789abcdef && reader.string() == "hello", "wire integer round trip changed"); reader.finish();
