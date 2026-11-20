@@ -719,12 +719,25 @@ plots retain the ordinary v2 format.
 Writers sharing a physical drive serialize their I/O. Independent drives can
 progress together within the shared RAM and CPU limits. With I/O overlap
 enabled, external jobs on independent output HDDs can share a codec worker.
-Before timings are available, a producer that can overlap generation with I/O
-can open additional HDDs when the current batch still fits in RAM. The planner
-divides scratch bandwidth among them.
-With completed measurements it chooses the concurrency with the shortest
-projected completion time. A group in its final HDD pack can also free a
-receive slot for another group using shared compute.
+Before timing data are available, automatic construction tries to keep a
+complete fresh HDD group in RAM when the batch limit permits. It sizes the
+initial set of destinations using available generator slots and allows
+another group to receive members while an independent HDD is writing.
+With measured generation and storage costs it chooses the concurrency with
+the shortest projected completion time.
+
+The farm plan assigns final output to each destination. During `fill`, a
+queued output on its own HDD filesystem can lend its available space to
+active groups under the temporary-space policy. External construction
+stripes runs across eligible scratch HDDs using the available
+bandwidth. If the packer's RAM requirements reduce how many groups can run
+together, the planner can give their freed scratch bandwidth to the groups
+that fit. With shared compute, another group can receive compressed
+contributions directly to scratch during a final pack. Its receive buffers
+and the workspace for ordinary recovery must fit the RAM budget.
+After the scratch is released, the same disk can take its turn
+writing a final plot. The planner rechecks free space above `--leave-free`
+at that handoff. Saved scratch grants and the farming limits still apply.
 
 `--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
@@ -2042,7 +2055,11 @@ are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
 lists standalone task, thread, window and transport limits.
 Optional encoding probes back off after repeated failures while local encoding
-continues. When a window spans several network requests, the owner compares
+continues. The owner passes the remaining time for a codec window to the
+broker. If that time runs out before a worker starts, the broker releases
+the reservation so generation can use the slot. Older brokers use their
+configured lease timeout for an abandoned reservation.
+When a window spans several network requests, the owner compares
 local encoding with each worker's total time per byte across its share of that
 window. Plotting JSON distinguishes calibration attempts, declined or failed
 codec windows and unavailable windows, and retains the latest bounded failure

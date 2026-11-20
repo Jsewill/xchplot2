@@ -121,6 +121,7 @@ struct ExternalConfig
 class ExternalEngine
 {
 public:
+    static constexpr size_t max_runs = 64;
     ExternalEngine(std::string path, Config config, ExternalConfig external,
                    bool resume = false, std::optional<Identity> initial = {});
     ~ExternalEngine();
@@ -322,7 +323,7 @@ private:
     static_assert(sizeof(Packet) == 8);
     struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
     static constexpr uint64_t segment_header_bytes = 64;
-    static constexpr size_t max_runs = 64, max_roots = 1024;
+    static constexpr size_t max_roots = 1024;
     std::string path_, work_, token_;
     std::string producer_build_ = GROW_IDENTITY;
     bool legacy_checkpoint_ = false;

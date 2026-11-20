@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <stdexcept>
 #include <utility>
@@ -36,7 +37,7 @@ using Clock = std::chrono::steady_clock;
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, AcquireTimed };
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
 { writer.string(endpoint.host); writer.u16(endpoint.port); writer.string(endpoint.server_name); }
 Endpoint read_endpoint(Reader& reader)
@@ -178,6 +179,7 @@ struct BrokerClient::Connections
     std::mutex mutex;
     std::condition_variable changed;
     ControlMetrics metrics;
+    std::atomic<bool> legacy_acquire{false};
     Endpoint endpoint;
     uint64_t route_revision = 1;
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
@@ -287,8 +289,24 @@ void BrokerClient::close_owner(OwnerSession const& session)
 { auto writer = request(Operation::CloseOwner); write_session(writer, session); auto bytes = call(writer); Reader(bytes).finish(); }
 std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const& task)
 {
-    auto writer = request(Operation::Acquire); write_session(writer, owner); write_task(writer, task);
-    std::string peer, node; auto bytes = call(writer, &peer, &node);
+    bool const timed = task.kind == Kind::Pack && tls_.deadline != Clock::time_point::max() && !connections_->legacy_acquire.load();
+    auto writer = request(timed ? Operation::AcquireTimed : Operation::Acquire);
+    write_session(writer, owner); write_task(writer, task);
+    if (timed)
+    {
+        auto const left = std::chrono::ceil<std::chrono::milliseconds>(tls_.deadline - Clock::now()).count();
+        if (left <= 0) throw TransientTransport("broker control request timed out");
+        writer.u32(uint32_t(std::min<int64_t>(left, UINT32_MAX)));
+    }
+    std::string peer, node; std::vector<uint8_t> bytes;
+    try { bytes = call(writer, &peer, &node); }
+    catch (std::runtime_error const& error)
+    {
+        // An older broker rejects the operation before submitting any work.
+        // Never replay an ambiguous transport failure.
+        if (!timed || std::string_view(error.what()) != "compute broker: unknown broker operation") throw;
+        connections_->legacy_acquire.store(true); return acquire(owner, task);
+    }
     Reader reader(bytes); auto const present = reader.u8(); require(present <= 1, "invalid broker grant flag");
     std::optional<Lease> result; if (present)
     {
@@ -474,7 +492,7 @@ struct BrokerServer::Impl
         Task requested;
         std::optional<Lease> lease;
         State state = State::Queued;
-        Clock::time_point expires, touched;
+        Clock::time_point expires, touched, start_by = Clock::time_point::max();
         Clock::time_point created = Clock::now();
         bool observed = false;
         struct Failure { std::string worker, instance; Kind kind; };
@@ -517,7 +535,8 @@ struct BrokerServer::Impl
             // An owner's deadline can also prevent its final Cancel request.
             // Polls keep queued work alive; abandoned requests must become
             // evictable and stop consuming grants when workers return.
-            if ((reserved(job) && now >= job.expires) ||
+            if (((job.state == State::Queued || job.state == State::Granted) && now >= job.start_by) ||
+                (reserved(job) && now >= job.expires) ||
                 (job.state == State::Queued && now - job.touched >= std::chrono::milliseconds(options.lease_ms)))
             { job.state = State::Expired; job.touched = now; }
         }
@@ -973,8 +992,17 @@ struct BrokerServer::Impl
             owners.erase(key); schedule(); break;
         }
         case Operation::Acquire:
+        case Operation::AcquireTimed:
         {
-            auto session = read_session(reader); auto task = read_task(reader); reader.finish();
+            auto session = read_session(reader); auto task = read_task(reader);
+            auto start_by = Clock::time_point::max();
+            if (operation == Operation::AcquireTimed)
+            {
+                auto const remaining = reader.u32();
+                require(task.kind == Kind::Pack && remaining, "invalid codec start deadline");
+                start_by = Clock::now() + std::chrono::milliseconds(remaining);
+            }
+            reader.finish();
             auto& source = owner(identity, session);
             require(identifier(task.task_id, 256) && identifier(task.compatibility, 256) && task.attempt && task.sequence && task.work_units &&
                 task.k >= 18 && task.k <= 28 && !(task.k & 1) && task.strength <= 32 && task.resources.slots &&
@@ -1014,12 +1042,13 @@ struct BrokerServer::Impl
                     require(job.failures.size() < max_retry_failures, "task retry capacity is exhausted");
                     if (reserved(job)) { response.u8(0); return response; }
                     job.requested = task; job.lease.reset(); job.state = State::Queued; job.observed = false;
+                    job.start_by = Clock::time_point::max();
                 }
                 else require(task == job.requested, "stale or changed task attempt");
                 require(job.state == State::Queued || job.state == State::Granted, "task needs a new attempt");
                 job.touched = Clock::now();
             }
-            schedule(); auto& job = it->second;
+            auto& job = it->second; job.start_by = std::min(job.start_by, start_by); schedule();
             response.u8(job.state == State::Granted); if (job.state == State::Granted) write_lease(response, *job.lease); break;
         }
         case Operation::Cancel:

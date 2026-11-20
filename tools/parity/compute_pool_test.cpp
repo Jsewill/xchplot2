@@ -1054,6 +1054,68 @@ void queued_expiry(BrokerOptions options, TlsOptions const& owner_tls,
         rejects([&] { (void)owner.acquire(session, task("abandoned")); });
     }
 }
+void codec_start_deadline(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
+{
+    using namespace std::chrono_literals;
+    options.lease_ms = 10000;
+    RunningBroker running(options);
+    BrokerClient owner(running.server.endpoint(), owner_tls), worker(running.server.endpoint(), worker_tls);
+    auto session = owner.open_owner("codec-deadline");
+    worker.register_worker(offer("one-slot", 49003));
+    auto first = pack_task("unclaimed"), second = pack_task("queued", 2);
+    auto until = std::chrono::steady_clock::now() + 500ms;
+    auto timed = owner.with_deadline(until);
+    auto unclaimed = timed.acquire(session, first);
+    require(unclaimed && !timed.acquire(session, second), "codec requests did not occupy and queue for one slot");
+    auto generate = task("next-member", 3);
+    require(!owner.acquire(session, generate), "generation bypassed a live codec grant");
+    std::this_thread::sleep_until(until + 100ms);
+    auto available = owner.acquire(session, generate);
+    require(available && !worker.begin(*unclaimed, unclaimed->owner_identity) &&
+        worker.begin(*available, available->owner_identity), "abandoned codec requests blocked the next member");
+    worker.finish(*available);
+    ++first.attempt;
+    until = std::chrono::steady_clock::now() + 500ms;
+    auto retry = owner.with_deadline(until).acquire(session, first);
+    require(retry && worker.begin(*retry, retry->owner_identity), "fresh codec attempt inherited an expired start deadline");
+    std::this_thread::sleep_until(until + 100ms);
+    require(!owner.acquire(session, task("while-running", 4)), "codec start deadline released a running worker");
+    worker.renew(*retry); worker.finish(*retry);
+}
+void legacy_codec_acquire(BrokerOptions options, TlsOptions const& owner_tls)
+{
+    Listener listener({"127.0.0.1", 0}, options.tls);
+    BrokerClient client(listener.endpoint(), owner_tls);
+    auto peer = std::async(std::launch::async, [&]
+    {
+        auto channel = listener.accept(2000);
+        uint8_t legacy = 0;
+        for (unsigned i = 0; i < 4; ++i)
+        {
+            auto frame = channel.receive(); Reader reader(frame.payload);
+            require(frame.type == Message::Control && reader.u32() == protocol_version, "invalid acquire request");
+            auto const operation = reader.u8();
+            if (!i) legacy = operation;
+            Writer response;
+            if (i == 1)
+            {
+                require(operation != legacy, "bounded codec used the legacy operation");
+                response.u8(1); response.string("unknown broker operation"); channel.send(Message::Error, response.data());
+            }
+            else
+            {
+                require(operation == legacy, "legacy broker capability was not retained");
+                response.u8(0); channel.send(Message::Reply, response.data());
+            }
+        }
+    });
+    OwnerSession session{"owner", "session", "epoch", 1};
+    auto task = pack_task("legacy-codec");
+    require(!client.acquire(session, task), "legacy queue response returned a grant");
+    auto timed = client.with_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    require(!timed.acquire(session, task) && !timed.acquire(session, task), "legacy codec fallback changed the grant");
+    peer.get();
+}
 void automatic_lifecycle(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
 {
     options.max_owners = 1; options.lease_ms = 500;
@@ -1291,6 +1353,8 @@ int main() try
     stale_delivery(options, a_tls, tls(ca, wa));
     compact_heartbeat(options, a_tls, tls(ca, wa));
     queued_expiry(options, a_tls, b_tls, tls(ca, wa));
+    codec_start_deadline(options, a_tls, tls(ca, wa));
+    legacy_codec_acquire(options, a_tls);
     automatic_lifecycle(options, a_tls, tls(ca, wa));
     restart(options, a_tls, tls(ca, wa));
     live_status(options, a_tls, tls(ca, wa));

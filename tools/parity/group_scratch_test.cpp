@@ -81,6 +81,8 @@ void saved_capacity(fs::path const& directory)
     require(pool.try_reserve_output(1, target, unit), "second output reservation failed"); pool.seal_recovery();
     require(!pool.try_reserve_output(0, target, 19 * unit, 5 * unit), "saved output reservation was silently reduced");
     require(!pool.grant(1, 6 * unit, 6 * unit, unit, 2), "saved scratch's remaining physical obligation was not retained");
+    require(pool.available_for_output(2, scratch, true) == pool.available_for_output(2, scratch),
+        "a future output counted preserved scratch as reclaimable capacity");
     rejected([&] { pool.cancel(0); }, "saved ownership could be cancelled before durable cleanup");
     pool.release_scratch_after_cleanup(0);
     auto next = pool.grant(1, 80 * unit, 80 * unit, unit, 2);
@@ -111,6 +113,8 @@ void saved_only_roots(fs::path const& directory)
     ExternalConfig saved{{{saved_root.directory, 20 * unit}}, unit, 2};
     std::array<uint64_t, 1> occupied{unit}; pool.restore(0, saved, occupied);
     std::array<fs::path, 1> allowed{enabled.directory}; pool.restrict_grants(allowed); pool.seal_recovery();
+    require(pool.offers_scratch(enabled.device.filesystem) && !pool.offers_scratch(saved_root.device.filesystem) &&
+        !pool.offers_scratch(target.device.filesystem), "queued outputs lent space outside the fresh scratch policy");
     require(pool.try_io(0).has_value(), "restricting fresh grants blocked saved scratch recovery");
     auto next = pool.grant(1, 20 * unit, unit, unit, 2, true);
     require(next && next->scratch.size() == 1 && next->scratch[0].directory == enabled.directory,
@@ -504,6 +508,25 @@ void rotating_bandwidth(fs::path const& directory)
     auto parallel = queued.grant(0, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 2);
     require(parallel && parallel->striped && queued.io_compatible(0, 2) && !queued.io_compatible(0, 1),
         "a queued file on the same output took the scratch bandwidth of an independent writer");
+
+    ScratchPool farm(disks, 0);
+    for (size_t i = 0; i < disks.size(); ++i)
+        require(farm.try_reserve_output(i, disks[i], i ? 0 : 80 * unit), "farm output registration failed");
+    farm.seal_recovery();
+    auto paired = farm.grant(0, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 2);
+    require(paired && paired->scratch.size() == 1 && farm.io_compatible(0, 1),
+        "a second eligible output lost its independent writer or scratch bandwidth");
+    farm.release_scratch_after_cleanup(0);
+    auto scratch = farm.grant(0, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 1);
+    require(scratch && scratch->striped && scratch->scratch.size() == 3 &&
+        farm.available_for_output(1, disks[1]) == 80 * unit && farm.available_for_output(1, disks[1], true) == 100 * unit &&
+        !farm.io_compatible(0, 1) && !farm.try_reserve_output(1, disks[1], 100 * unit),
+        "idle output disks failed to lend scratch exclusively to a striped farm group");
+    farm.release_after_cleanup(0, unit);
+    require(farm.try_reserve_output(1, disks[1], 100 * unit), "cleaned scratch could not become a full output");
+    auto rotated = farm.grant(1, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 1);
+    require(rotated && rotated->scratch.size() == 3 && check(*rotated, 0, 20 * unit),
+        "a completed output could not contribute scratch to the next group");
 
     for (auto const [limit, tight, readers] : {std::tuple{24u, false, 16u}, {6u, false, 6u}, {24u, true, 4u}})
     {

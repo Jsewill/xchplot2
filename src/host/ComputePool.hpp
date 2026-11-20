@@ -222,6 +222,8 @@ struct BrokerStatusPage
 // increasing sequences. Retry keeps task_id/sequence/body and raises attempt.
 // Queued tasks expire after a lease interval without a matching acquire poll;
 // a later retry needs a newer attempt, as for an expired grant.
+// For a deadline-bound codec request, supporting brokers also expire queued
+// and unclaimed work at that deadline. Running work follows the usual lease.
 class BrokerClient
 {
 public:

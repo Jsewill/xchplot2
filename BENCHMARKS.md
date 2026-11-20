@@ -313,6 +313,109 @@ combined peak over a one-second sample was 528 MB/s in the first run and
 508 MB/s in the second. Peak receive traffic on the 10 GbE interface was
 3.92 Gb/s and 3.93 Gb/s, respectively.
 
+#### More output HDDs with one GPU worker
+
+On November 19, 2026, `fill` at `2e41083` ran on up to 16 independent
+output HDDs with one RTX 4090 worker slot, 10 GbE, eight plotting CPU
+workers and a 32 GiB plotting RAM budget. Each drive received one fresh
+three-member k=28 group with automatic construction and checkpointing.
+Each table entry is the mean of two runs without an untimed plotting warmup.
+Seconds per member include launch through publication of the last group.
+
+| Output HDDs | Members published per run | Mean seconds per published member |
+| ---: | ---: | ---: |
+| 1 | 3 | 6.68 |
+| 2 | 6 | 5.53 |
+| 3 | 9 | 5.33 |
+| 4 | 12 | 5.48 |
+| 8 | 24 | 5.61 |
+| 16 | 48 | 16.36 |
+
+Through eight HDDs the groups used zero scratch. At 16, automatic
+construction selected external storage on the output HDDs. The worker
+sent one contribution per task, compared with three members per task on
+eight drives. To produce 47.73 GB of plots, the 16 disks recorded 108.3 GB
+of writes and 49.56 GB of reads per run. The highest one-second samples
+were 588 MB/s of aggregate disk writes and 1.92 Gb/s of inbound traffic.
+The same 16 drives sustained 3,328 MB/s in the independent sequential
+write test.
+
+A fixed-work comparison placed eight groups on each of two HDDs. Across
+two runs, those drives published 48 members at 6.15 s/member with zero
+scratch. The default 16-drive layout took 2.66 times as long for the
+same number of members.
+
+With all 16 HDDs and `--destination-temp off`, one additional run took
+6.61 s/member, 59.6% less time than the 16-drive default. Incremental
+construction grew partial groups one member at a time. The drives recorded
+47.8 GB of reads and 96.5 GB of writes. All 16 files matched the SHA-256
+digests of the full-proof-verified outputs from the default run.
+
+#### Rotating output and scratch roles during `fill`
+
+On the same 16 HDDs, a planner based on `2e41083` used the single advertised
+GPU worker slot when choosing the initial set of output groups. The workload,
+32 GiB plotting RAM budget, and farming limits matched the preceding test.
+Each filesystem had a 1 GiB free-space reserve. Elapsed time starts at
+launch and ends at publication. Each build published one three-member
+k=28 group on each drive. Live harvester lookup latency was unmeasured.
+
+| Planner | Runs | Seconds to first group | Seconds per published member | Disk reads per run | Disk writes per run |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `2e41083` | 2 | 98.9 | 16.36 | 49.56 GB | 108.3 GB |
+| Worker-aware HDD admission | 2 | 38.0 | 5.23 | 0 GB | 48.10 GB |
+| Final build with bounded codec reservations | 1 | 47.8 | 5.26 | 0 GB | 48.10 GB |
+
+Times and byte counts are means where two runs are shown. The revised
+planner wrote the groups directly to their destinations. All 16 files
+matched the corresponding SHA-256 digests from the full-proof checks
+in each run. Disk counters cover plotting through process exit. Hashing
+and verification took place afterward.
+
+In the final run the highest one-second samples were 536 MB/s combined
+disk writes and 3.89 Gb/s inbound Ethernet. The independent array
+write test reached 3,328 MB/s. Thirteen generation batches started
+while a destination writer was active.
+
+The 48 members occupied 47.73 GB. At a production time of 2.2 s/member,
+the destinations would have to sustain about 452 MB/s of final writes.
+The single-HDD direct-write reference was 241 MB/s. At that speed at
+least two independent destination writers are needed to keep up, even
+with all scratch reads and encoding overlapped. At the measured 208 MB/s
+for encoding and durably writing on one HDD, two such writers would deliver
+416 MB/s if each sustained that rate.
+
+At 4 GiB, the same worker filled eight HDDs with 24 members using disk
+scratch. The choice of destinations affected the first publication and
+the total fill time differently.
+
+| Eight-HDD layout | Runs | Seconds to first group | Seconds per published member |
+| --- | ---: | ---: | ---: |
+| `2e41083`, three scratch HDDs for seven groups and seven for one | 1 | 43.9 | 13.33 |
+| One destination with seven scratch HDDs per group | 1 | 41.1 | 13.45 |
+| Two destinations with three scratch HDDs each | 2 | 51.8 | 9.78 |
+
+The two-destination runs took 9.81 and 9.76 s/member. Each started ten
+generation batches during a destination write and published a group on
+each of the eight HDDs. The other two layouts started every generation
+batch while the writers were idle. Both final runs matched all eight
+full-proof-checked reference files. During testing an abandoned encoding
+request kept the only GPU slot reserved while a generation task waited.
+The final broker expires unclaimed encoding requests at the window's deadline.
+
+With four HDDs, a 4 GiB run put two groups on each destination for the
+same 24 members. Each group used one scratch HDD. All four drives
+published their first group before any published a second. The final
+build took 14.34 s/member, compared with 9.78 s/member on eight drives.
+All eight groups on the four drives passed full-proof verification.
+A four-drive trial with single-member batches earlier in development
+took 13.94 s/member. Each four-drive configuration ran once.
+
+In the two eight-HDD runs, the single worker spent 6.85 s/member generating
+and encoding compressed contributions, excluding time sending them. In
+the final 32 GiB run it spent 1.43 s/member on that counter and transferred
+three members per task. Worker time and storage time overlap.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

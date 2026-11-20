@@ -2820,6 +2820,29 @@ void destination_admission()
         independent, 32, 16, 1, memory, [](size_t active, unsigned, uint16_t batch) { return (batch < 16 ? 10000.0L : 1.0L) / active; });
     require(expensive_rewrites.active < bounded.active && expensive_rewrites.batch == 16,
         "observed rewrite costs did not favor fewer larger batches");
+    auto hdd = [&](uint64_t room, bool whole)
+    {
+        return destination_plan(room * mib, 0, 0, mib, 4, 4, 3, 1,
+            [](unsigned, uint16_t) { return mib; }, neutral, 4, 0, whole);
+    };
+    auto const partial = hdd(7, false), together = hdd(7, true), limited = hdd(2, true);
+    require(partial.active == 4 && partial.batch == 1 && together.active == 2 && together.batch == 3 &&
+        limited.active == 1 && limited.batch == 2 && hdd(15, true).active == 4,
+        "fresh HDD admission failed to fit whole groups or fall back within the RAM budget");
+    auto const whole_workers = destination_plan(5 * mib, 0, 0, mib, 1, 8, 3, 1,
+        [](unsigned grant, uint16_t) { return grant * mib; }, neutral, 1, 0, true);
+    require(whole_workers.workers == 3 && whole_workers.batch == 3,
+        "whole-group HDD admission discarded a fitting intermediate worker grant");
+    for (auto room : {9 * mib, 10 * mib})
+    {
+        auto const owning = destination_plan(room, 0, 3 * mib, 3 * mib, 2, 4, 2, 1,
+            [](unsigned, uint16_t) { return 2 * mib; }, neutral, 1, 1);
+        auto const recoverable = admitted_batch_cap(2, 1, room - 3 * mib, 3 * mib, [](uint16_t) { return 2 * mib; });
+        auto const receiving = destination_plan(room, 0, 3 * mib, 0, 2, 4, recoverable, owning.batch,
+            [](unsigned, uint16_t count) { return 2 * mib + count * (mib / 8); }, neutral, 1, 1);
+        require(owning.active * owning.batch == 2 && receiving.active == 2 && receiving.batch == 2,
+            "bounded receivers lost a fitting parallel HDD or its recoverable batch");
+    }
     devices.back().drives.clear(); groups = writer_groups(devices);
     auto const unknown = destination_plan(budget, metadata, generation, member,
         *std::max_element(groups.begin(), groups.end()) + 1, 32, 64, 1, memory, neutral);

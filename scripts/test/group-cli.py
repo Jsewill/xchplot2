@@ -4111,6 +4111,11 @@ def check_compute(binary, root):
     endpoint, worker_endpoint = f"127.0.0.1:{broker_port}", f"127.0.0.1:{worker_port}"
     processes = []
 
+    def verify(path, trials):
+        result = pool.run([binary, "verify", path, "--full", "--trials", trials, "--config", os.devnull])
+        proof = re.search(r"(\d+) full proofs validated", (result.stdout + result.stderr).lower())
+        assert proof and int(proof[1]) > 0
+
     def start(args, name):
         process = pool.Process([binary, *args, "--config", os.devnull], root / (name + ".log"))
         processes.append(process)
@@ -4147,9 +4152,7 @@ def check_compute(binary, root):
             result = pool.run([binary, *staged, "-S", scoped, "-o", root / (owner + "-local"), "--config", os.devnull])
             local = Path(result.stdout.strip())
             assert digest(local) == digest(path), "remote group differs from local construction"
-            result = pool.run([binary, "verify", path, "--full", "--trials", 100, "--config", os.devnull])
-            proof = re.search(r"(\d+) full proofs validated", (result.stdout + result.stderr).lower())
-            assert proof and int(proof[1]) > 0
+            verify(path, 100)
         assert header(paths[0])[0] != header(paths[1])[0], "owners reused a group identity"
         print("PASS two simultaneous plotting owners share one compute worker, byte parity and full proofs", flush=True)
         fresh = [binary, *common, "--construction", "incremental", "--batch-members", 3,
@@ -4175,6 +4178,17 @@ def check_compute(binary, root):
         plot, = destination.rglob("*.gplot")
         assert digest(plot) == digest(reference)
         print("PASS remote capacity probes preserve the published prefix across group rollover", flush=True)
+        wide = common.copy()
+        wide[wide.index("--group-members") + 1] = 65
+        wide[wide.index("--max-host-ram") + 1] = "1G"
+        wide[wide.index("--window-bytes") + 1] = "1M"
+        wide[wide.index("--checkpoint-bytes") + 1] = "32M"
+        path = Path(pool.run([binary, *wide, "--construction", "external", "--temp-dir", scratch,
+                              "--batch-members", 65, "-S", SEED, "-o", root / "wide contributions",
+                              *network, "--compute-local", "off", "--config", os.devnull], timeout=360).stdout.strip())
+        assert header(path)[3] == 65
+        verify(path, 16)
+        print("PASS external compute groups spanning the contribution run limit", flush=True)
     finally:
         for process in reversed(processes):
             process.stop()

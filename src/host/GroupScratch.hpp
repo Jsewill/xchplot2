@@ -81,6 +81,12 @@ public:
     }
     void bind_runtime(ExternalConfig& external) const
     { external.io_governor = io_governor_; external.bandwidth = bandwidth_; }
+    bool offers_scratch(std::string const& filesystem) const
+    {
+        std::lock_guard lock(mutex_);
+        return std::any_of(roots_.begin(), roots_.end(), [&](Root const& root)
+            { return root.grantable && root.value.device.filesystem == filesystem; });
+    }
     std::vector<StorageDevice> scratch_devices(uint64_t owner) const
     {
         std::lock_guard lock(mutex_);
@@ -127,7 +133,7 @@ public:
                             uint64_t allocated = 0, bool saved = false)
     { return try_reserve_output(owner, ScratchRoot::inspect(file_io::native_path(directory)), peak, allocated, saved); }
 
-    uint64_t available_for_output(uint64_t owner, ScratchRoot directory)
+    uint64_t available_for_output(uint64_t owner, ScratchRoot directory, bool after_fresh_scratch = false)
     {
         std::lock_guard lock(mutex_);
         size_t const root = add_root(std::move(directory), false);
@@ -137,10 +143,16 @@ public:
             require(entry->output->root == root, "destination reservation directory changed");
             room = grow_add(room, entry->output->peak);
         }
+        // A queued farm output may wait for temporary grants made by this
+        // run. Restored grants can belong to preserved or offline jobs.
+        if (after_fresh_scratch) for (auto const& entry : owners_) if (!entry.restored)
+            for (size_t i = 0; i < entry.roots.size(); ++i)
+                if (roots_[entry.roots[i]].filesystem == roots_[root].filesystem)
+                    room = grow_add(room, entry.external.scratch[i].capacity_bytes);
         return room;
     }
-    uint64_t available_for_output(uint64_t owner, std::filesystem::path const& directory)
-    { return available_for_output(owner, ScratchRoot::inspect(file_io::native_path(directory))); }
+    uint64_t available_for_output(uint64_t owner, std::filesystem::path const& directory, bool after_fresh_scratch = false)
+    { return available_for_output(owner, ScratchRoot::inspect(file_io::native_path(directory)), after_fresh_scratch); }
 
     void restore(uint64_t owner, ExternalConfig const& external, std::span<uint64_t const> allocated)
     {
