@@ -639,10 +639,11 @@ struct Backend
             uint8_t(identity.params.get_strength()), contributions, active, batch);
     }
 
-    unsigned pool_receivers(Identity const& identity, unsigned measured)
+    unsigned pool_receivers(Identity const& identity, unsigned measured, unsigned* offered_slots = nullptr)
     {
         auto const offered = acquire_pool_client()->generation_capacity(identity.params.get_k(),
             identity.params.get_strength()).slots;
+        if (offered_slots) *offered_slots = offered;
         return offered && measured ? std::min(offered, measured) : std::max(offered, measured);
     }
 
@@ -15622,7 +15623,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 // Price only simultaneous generation until packing is measured.
                 auto const forecast = backend->pool_estimate(d.requested, d.pool_encoded && !select_merged,
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(wanted));
-                unsigned const receivers = backend->pool_receivers(d.requested, forecast.receivers);
+                unsigned offered_slots = 0;
+                unsigned const receivers = backend->pool_receivers(d.requested, forecast.receivers, &offered_slots);
                 if (receivers)
                 {
                     total.pool_receiving_destinations = receivers;
@@ -15633,7 +15635,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             other->requested.params.get_k() == d.requested.params.get_k() &&
                             other->requested.params.get_strength() == d.requested.params.get_strength();
                     });
-                    if (receiving >= receivers) { blocked(ControllerWait::generation_order); continue; }
+                    // A scratch receiver also provisions and flushes its local runs. Queue one
+                    // admitted successor so those waits do not leave a single worker idle.
+                    bool const queue = offered_slots == 1 && receiving == 1 && contribution_members && d.pool_encoded &&
+                        args.io_overlap && args.generation_overlap && args.pool_inflight > 1 &&
+                        (!args.disk_io || !args.disk_io->status().pressured);
+                    if (receiving >= receivers && !queue) { blocked(ControllerWait::generation_order); continue; }
                 }
             }
 #endif

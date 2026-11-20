@@ -655,6 +655,29 @@ void expired_cleanup()
         pending.get();
         require(completed, "expired direct task did not leave its shared CPU gate");
         following(controller, 1);
+
+        // An issued grant can reach the worker with only a few milliseconds
+        // left. Delay Begin's reply past that deadline on an already open route.
+        auto session = controller.open_owner("short-codec-execution");
+        pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
+        payload.u16(0); payload.u16(1); payload.u32(fragments.size()); payload.words(fragments);
+        pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack);
+        task.kind = pool::Kind::Pack; task.k = 18; task.strength = 2; task.chunk_count = 1;
+        task.work_units = payload.data().size(); task.max_output_bytes = 4096;
+        task.resources = {1, 1, task.work_units * 20 + ChunkCodec::estimate_work(18, 0, 0), 0};
+        auto lease = controller.acquire(session, task); require(bool(lease), "short codec task was not granted");
+        auto channel = pool::Channel::connect(lease->endpoint, tls, lease->worker_identity);
+        pool::Writer request(tls.max_frame_bytes); pool::write_lease(request, *lease);
+        request.u32(25); request.u8(uint8_t(Operation::Encode)); request.u8(18); request.u8(2);
+        request.u64(task.work_units); request.u64(task.max_output_bytes);
+        broker.stop.store(true); broker.thread.join(); broker.stop.store(false);
+        broker.thread = std::thread([&] { std::this_thread::sleep_for(std::chrono::milliseconds(55)); broker.server.serve(broker.stop); });
+        channel.send(pool::Message::Work, request.data()); channel.send(pool::Message::Data, payload.data());
+        bool emitted = false;
+        try { emitted = channel.receive().type != pool::Message::Error; }
+        catch (pool::TransientTransport const&) {} // The expired data channel may already have closed.
+        require(!emitted, "delayed broker acknowledgement extended codec execution");
+        following(controller, 1);
         service.stop();
     }
 }

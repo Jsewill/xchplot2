@@ -719,6 +719,41 @@ groups streamed directly to their destinations with zero scratch. The
 twelve members took 88.12 s with the existing writer and 88.76 s with
 experimental read-ahead. Automatic read-ahead applies to staged contributions.
 
+#### Pooled construction with a memory-limited GPU worker
+
+The storage host and RTX 4090 worker each had a 4 GiB plotting RAM budget.
+The worker had one slot, eight CPU threads and a 15 GiB GPU allowance.
+Three-member k=28 groups used the same seed and 10 GbE link as the
+read-ahead measurements above.
+
+The previous worker requested 4.14 GiB of task RAM for the first member.
+With 2.70 GiB available after service reservations, the broker kept that
+request queued. Reusing the pinned GPU output lowered the initial task
+reservation to 2.11 GiB. Subsequent singleton tasks requested 80.0 MiB
+while the worker retained its pinned buffers.
+
+Both planners used the updated worker. The updated planner allowed a second
+destination to queue a compressed batch while the first flushed scratch.
+Each planner ran once per drive count, in reverse order on sixteen drives.
+Times run from launch through the last durable publication. Two HDDs served
+as destinations at a time.
+
+| Plotting HDDs | Peak scratch HDDs | Members | Previous planner (s/member) | Updated planner (s/member) |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 6 | 24 | 7.18 | 6.93 |
+| 16 | 14 | 48 | 6.65 | 6.67 |
+
+Queueing cut the eight-drive time by 3.37%. The sixteen-drive pair showed
+no end-to-end gain. At the same 24-member endpoint the updated sixteen-drive
+fill averaged 7.14 s/member. Across all 48 members, GPU generation took
+3.19 s/member. Worker processing and sending together took 5.03 s/member,
+leaving 1.64 s/member outside the active worker. The plotting HDDs averaged
+155 MB/s read and 335 MB/s written. The 10 GbE interface received 1.33 Gb/s.
+
+Every output matched its full-proof-checked reference by SHA-256. During
+the two updated fills, the harvester farmed 1,164 plots on six separate HDDs.
+It completed 51 challenges with eligible plots. The longest took 0.6231 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

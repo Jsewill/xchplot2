@@ -1849,7 +1849,10 @@ A standalone worker adapts to its available CPU affinity and host RAM, with one
 task slot and automatic CPU/GPU selection. Saved or explicit limits remain
 caps. Automatic GPU allocation uses available VRAM at startup with the backend's
 required safety allowance; it does not infer spare GPU compute time from free
-memory. A plotting job partitions its host budget between the embedded service, local work,
+memory. A GPU worker can encode the last member of a batch directly from its
+pinned output buffer. Its host RAM reservation includes separate raw copies
+only for earlier members and accounts for retained GPU buffers across tasks.
+A plotting job partitions its host budget between the embedded service, local work,
 construction and optional remote encoding, honoring saved offered limits.
 A worker registers with up to 128 brokers by default. Save another limit with
 `compute configure --max-brokers N`, or override it with
@@ -2061,6 +2064,9 @@ the machine's stable key namespace.
 controls the optional encoding partition (`0` disables it), and
 `--compute-timeout-ms N` / `--compute-socket-timeout-ms N` bound task and socket
 waits. The defaults are one hour per task and 30 seconds per socket operation.
+If a task expires during admission, a short control deadline lets the worker
+receive the broker's acknowledgement and release the slot. The original
+deadline still bounds execution.
 `--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
@@ -2079,6 +2085,9 @@ configured CPU pool and reuses the existing network buffer. When staging
 encoded contributions on scratch storage, the owner budgets one additional
 frame per concurrent receiver. It can read that frame while validating and
 writing the previous chunks. A single-CPU owner consumes each frame inline.
+When the pool offers one generation slot, a second destination can queue its next
+compressed batch while the first destination flushes scratch. Both batches
+must fit the owner's resource limits. Disk pressure suppresses this overlap.
 
 With multiple rotating destinations, automatic selection starts with the
 available worker and storage bandwidth. When a writer has more groups to
