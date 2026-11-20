@@ -860,6 +860,40 @@ partially written byte when appending each delta field reduced median
 elapsed time from 0.651 s to 0.529 s (18.8%) across four runs per build.
 Both builds reproduced the source bytes for every chunk.
 
+#### Scheduling GPU workers on different network links
+
+Each `fill` published 48 k=28 members in 16 three-member groups on
+separate plotting HDDs. The storage host and each GPU worker had a
+4 GiB plotting RAM budget. The RTX 4090 used 10 GbE. The RX 6700 XT
+used 1 GbE with temporary SSH forwarding. The harvester had 17,886 v1
+plots loaded on separate drives. Automatic construction used up to 14
+scratch HDDs and admitted two active destinations. Times include
+generation, transfer, scratch assembly and durable publication. The
+updated executable ran first with the 4090 alone and then with both GPUs.
+The repeat reversed that order.
+
+| GPU workers | Previous (s/member) | Updated (s/member) | Repeat (s/member) | Updated mean (s/member) |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 4090 | 6.01 | 5.89 | 5.62 | 5.76 |
+| RTX 4090 and RX 6700 XT | 7.55 | 5.97 | 6.22 | 6.09 |
+
+The updated two-worker fills took 19.3% less time per member on average
+than the previous two-worker run.
+The 4090 alone was faster in both comparisons.
+With both GPUs, the previous scheduler issued 48 single-member leases.
+In each updated two-GPU fill, the scheduler delivered 46 members in
+16 pipelined leases and the other two in single-member leases. The
+Radeon produced three members in the first fill and five in the repeat.
+All 16 groups matched the controls byte for byte, and a fresh check of
+every group in the first two-GPU fill validated 742 full proofs.
+
+In the first two-GPU fill, the storage host's highest five-second receive rates
+were 0.98 Gb/s on 1 GbE and 3.75 Gb/s on 10 GbE. The plotting HDDs averaged
+173 MB/s of reads and 353 MB/s of writes, with a five-second peak of
+973 MB/s combined. Final packing remained the longest measured storage phase.
+Across the two updated two-GPU fills the harvester completed 63 challenges
+with eligible plots. The longest took 6.07 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
