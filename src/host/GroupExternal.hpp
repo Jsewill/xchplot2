@@ -2183,18 +2183,15 @@ public:
         if (!chunk) entry.summarizing = member == summarized_ && !candidate_.empty();
         {
             ThreadCpuTimer timing(engine_->contribution_cpu_);
+            auto const inspected_window = inspect_window(chunk, chunks, count);
             CodecScheduler::Lease compute(engine_->config_.cpu_scheduler.get(), 1,
                 [&] { engine_->config_.check_running(); });
             uint64_t ordinal = chunk;
             for (auto const bytes : chunks)
             {
                 engine_->config_.check_running();
-                require(bytes.size() > 1 && bytes.size() <= UINT32_MAX && bytes.size() <= engine_->config_.window_bytes,
-                    "contribution input exceeds its receive window");
-                auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, bytes.size(), 0);
-                require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
-                validator_->prepare(work);
-                auto const inspected = validator_->inspect(ordinal, bytes, count);
+                auto const inspected = inspected_window.empty() ? inspect_chunk(ordinal, bytes, count) :
+                    inspected_window[size_t(ordinal - chunk)];
                 require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
                     "contribution input exceeds its admitted fragment count");
                 entry.symbols += inspected.summary.symbols;
@@ -2219,10 +2216,21 @@ public:
             }
         }
         if (!entry.writer) entry.writer = std::make_unique<Writer>(*engine_, entry.run, "contribution", true);
+        // Copy complete packets under one CPU permit. Return it before any
+        // buffer flush, including a packet that straddles two disk writes.
+        std::optional<CodecScheduler::Lease> copying;
         for (auto const bytes : chunks)
         {
             Packet const packet{uint16_t(frontier_ + member), count, uint32_t(bytes.size())};
-            entry.writer->value(packet); entry.writer->write(bytes);
+            if (sizeof(packet) + bytes.size() > entry.writer->room())
+            {
+                copying.reset();
+                entry.writer->value(packet); entry.writer->write(bytes);
+                continue;
+            }
+            if (!copying) copying.emplace(engine_->config_.cpu_scheduler.get());
+            entry.writer->value_unflushed(packet); entry.writer->write_unflushed(bytes);
+            if (!entry.writer->room()) { copying.reset(); entry.writer->flush(); }
         }
         entry.next += chunks.size(); entry.failed = false;
         return true;
@@ -2274,7 +2282,7 @@ public:
             std::all_of(members_.begin(), members_.end(), [&](auto const& member)
             { auto const& owner = members_.at(member.owner); return owner.count && owner.finished && !owner.failed; }),
             "contribution input is incomplete");
-        validator_.reset(); sealed_ = true; grow_failpoint("external-contribution-input-sealed");
+        release_parallel_validator(); validator_.reset(); sealed_ = true; grow_failpoint("external-contribution-input-sealed");
     }
 private:
     friend class ExternalEngine;
@@ -2288,8 +2296,76 @@ private:
     };
     ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound, uint64_t final_capacity)
         : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), final_capacity_(final_capacity), members_(count),
+          scalar_budget_(engine.config_.codec_bytes),
           validator_(std::make_unique<ChunkCodec>(engine.identity_.header.k, engine.config_.codec_bytes, engine.config_.cpu_scheduler))
     { for (uint16_t member = 0; member < count; ++member) members_[member].owner = member; }
+    static size_t max_inspection_chunks(Config const& config)
+    {
+        if (!config.io_overlap || !config.cpu_scheduler || config.workers == 1) return 0;
+        return size_t(std::min<uint64_t>(fresh_group_window_chunks,
+            config.window_bytes / (sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection))));
+    }
+    void reset_validator(uint64_t bytes)
+    {
+        validator_.reset();
+        validator_ = std::make_unique<ChunkCodec>(engine_->identity_.header.k, bytes, engine_->config_.cpu_scheduler);
+        scalar_budget_ = bytes;
+    }
+    void release_parallel_validator()
+    {
+        if (parallel_validator_)
+        { engine_->contribution_cpu_.add(parallel_validator_->cpu_time()); parallel_validator_.reset(); }
+    }
+    uint64_t inspection_work(size_t size) const
+    {
+        require(size > 1 && size <= UINT32_MAX && size <= engine_->config_.window_bytes,
+            "contribution input exceeds its receive window");
+        auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, size, 0);
+        require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
+        return work;
+    }
+    ChunkCodec::Inspection inspect_chunk(uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t count)
+    {
+        auto const work = inspection_work(bytes.size());
+        if (!validator_ || work > scalar_budget_) { release_parallel_validator(); reset_validator(engine_->config_.codec_bytes); }
+        validator_->prepare(work);
+        return validator_->inspect(ordinal, bytes, count);
+    }
+    std::span<ChunkCodec::Inspection const> inspect_window(uint64_t first,
+        std::span<std::span<uint8_t const> const> chunks, uint16_t count)
+    {
+        auto const& cfg = engine_->config_;
+        auto const limit = max_inspection_chunks(cfg);
+        // Capacity probes can decline partway through a window. Small windows
+        // also cost less to inspect inline than to submit to the worker pool.
+        if (final_capacity_ != UINT64_MAX || chunks.size() < 64 || chunks.size() > limit ||
+            !cfg.cpu_scheduler->can_overlap()) return {};
+        auto const budget = cfg.codec_bytes / 2;
+        {
+            CodecScheduler::Lease compute(cfg.cpu_scheduler.get(), 1, [&] { cfg.check_running(); });
+            size_t largest = 0;
+            for (auto bytes : chunks) largest = std::max(largest, bytes.size());
+            auto const work = inspection_work(largest);
+            auto const lanes = unsigned(std::min<uint64_t>({cfg.workers, cfg.cpu_scheduler->workers(),
+                chunks.size() / 32, budget / work}));
+            if (lanes < 2 || (parallel_validator_ && work > budget / parallel_validator_->workers())) return {};
+            if (!parallel_validator_)
+            {
+                reset_validator(cfg.codec_bytes - budget);
+                parallel_validator_ = std::make_unique<ParallelEncoder>(engine_->identity_.header.k, lanes, budget, cfg.cpu_scheduler);
+            }
+            inspection_tasks_.reserve(limit); inspected_.reserve(limit);
+            inspection_tasks_.clear();
+            for (auto bytes : chunks)
+            {
+                require(bytes.size() > 1, "contribution input exceeds its receive window");
+                inspection_tasks_.push_back({first++, bytes, count, {}});
+            }
+            inspected_.resize(chunks.size());
+        }
+        parallel_validator_->inspect(inspection_tasks_, inspected_);
+        return inspected_;
+    }
     static uint64_t minimum_chunk(Summary const& summary)
     { return summary.codec.symbols ? ChunkCodec::size_bounds(summary.codec).first : 0; }
     void load_capacity_frontier()
@@ -2339,7 +2415,11 @@ private:
     // order. Streams that start out of order stay on the bounded reread path.
     std::vector<Summary> candidate_;
     uint16_t summarized_ = 0;
+    uint64_t scalar_budget_;
     std::unique_ptr<ChunkCodec> validator_;
+    std::unique_ptr<ParallelEncoder> parallel_validator_;
+    std::vector<ChunkInput> inspection_tasks_;
+    std::vector<ChunkCodec::Inspection> inspected_;
     mutable std::mutex mutex_;
     bool sealed_ = false;
 };
@@ -2554,7 +2634,7 @@ inline void ExternalEngine::release_prepared() noexcept
 inline void ExternalEngine::release_contributions() noexcept
 {
     auto* input = std::exchange(contributions_, nullptr); if (!input) return;
-    input->validator_.reset();
+    input->release_parallel_validator(); input->validator_.reset();
     for (auto& member : input->members_) member.writer.reset();
     try
     {
@@ -2570,7 +2650,8 @@ inline uint64_t ExternalEngine::contribution_input_memory_bytes(Config const& co
     // Codec scratch and the append's candidate summary use the existing
     // exclusive engine workspace. Concurrent producers additionally retain
     // one bounded writer each; their transport frames belong to the caller.
-    return grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec),
+    auto const inspection = multiply(ContributionInput::max_inspection_chunks(config), sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection));
+    return grow_add(grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec), inspection),
         multiply(members, grow_add(config.window_bytes, sizeof(ContributionInput::MemberRecord) + sizeof(Writer))));
 }
 inline uint64_t ExternalEngine::contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)

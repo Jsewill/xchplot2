@@ -226,6 +226,8 @@ void reference_help()
         "  --tier T                  pool|plain|compact|minimal|tiny|pinned|auto, default auto\n"
         "  --member-storage raw|compact  retained member representation, default compact\n"
         "  --construction auto|incremental|staged|merged|external  assembly method, default auto\n"
+        "  --compute-output auto|packed|encoded  preferred pooled generation output\n"
+        "  --compute-writers auto|N  active pooled HDD destinations, subject to admission\n"
         "  --checkpoint-bytes SIZE|auto  bytes between recovery checkpoints (default auto)\n"
         "  --io-overlap on|off        overlap encoding and file I/O, default on\n"
         "  --generation-overlap auto|on|off  overlap GPU/CPU work within admitted budgets, default auto\n"

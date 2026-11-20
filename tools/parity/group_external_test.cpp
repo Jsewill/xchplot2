@@ -2158,12 +2158,13 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         bool rejected = false; try { action(); } catch (std::runtime_error const&) { rejected = true; }
         require(rejected, "invalid contribution input was accepted");
     };
-    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset)
+    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width = 17)
     {
         for (uint64_t chunk = 0; chunk < chunks;)
         {
-            std::array<std::span<uint8_t const>, 17> window;
-            size_t const count = size_t(std::min<uint64_t>(window.size(), chunks - chunk));
+            std::array<std::span<uint8_t const>, 128> window;
+            require(width && width <= window.size(), "invalid contribution test window");
+            size_t const count = size_t(std::min<uint64_t>(width, chunks - chunk));
             for (size_t i = 0; i < count; ++i) window[i] = encoded[offset + member][size_t(chunk) + i];
             input.append_chunks(member, chunk, {window.data(), count}); chunk += count;
         }
@@ -2293,23 +2294,35 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
     {
         auto const path = root / "contribution-member-retry";
-        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        std::array<std::span<uint8_t const>, 128> window;
+        for (size_t i = 0; i < window.size(); ++i) window[i] = encoded[0][i];
+        std::vector<uint64_t> dense(300);
+        for (size_t i = 0; i < dense.size(); ++i) dense[i] = i * (range / dense.size());
+        uint16_t const peers = uint16_t(raw.size() - 1);
+        std::vector<FragmentRegion> regions(peers, FragmentRegion{std::span<uint64_t const>(dense)});
+        auto const large = codec.encode(0, {}, 0, regions);
+        auto cfg = config(); cfg.io_overlap = true; cfg.cpu_scheduler = std::make_shared<CodecScheduler>(cfg.workers);
+        cfg.codec_bytes = ChunkCodec::estimate_work(18, large.size(), 0);
+        require(ChunkCodec::estimate_work(18, window.front().size(), 0) <= cfg.codec_bytes / 4,
+            "mixed-width contribution fixture cannot use two validation workers");
+        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
         require(bool(input), "contribution retry reservation rejected");
         uint64_t const reserved = input->reserved_bytes();
-        for (uint64_t chunk = 0; chunk < 7; ++chunk) input->append_chunk(0, chunk, encoded[0][size_t(chunk)]);
-        input->reset_member(0);
+        // One large packet from the other stream needs the full codec grant.
+        require(input->append_chunks(0, 0, window) && input->append_chunk(1, 0, large, peers),
+            "contribution validator could not return its worker scratch to a large chunk");
+        input->reset_member(1, peers); input->reset_member(0);
         // A peer finishing its run returns unused scratch. Check this reset
         // before launching the peers that overlap the next failed attempt.
         require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
         std::vector<std::future<void>> pending;
         for (uint16_t member = 1; member < input->size(); ++member)
             pending.push_back(std::async(std::launch::async, [&, member] { feed_member(*input, member, 0); }));
-        auto invalid = encoded[0][1]; invalid.push_back(0);
-        std::array<std::span<uint8_t const>, 2> window{encoded[0][0], invalid};
+        auto invalid = encoded[0][window.size() - 1]; invalid.push_back(0); window.back() = invalid;
         rejects([&] { input->append_chunks(0, 0, window); });
         rejects([&] { input->append_chunk(0, 0, encoded[0][0]); });
-        input->reset_member(0); feed_member(*input, 0, 0);
+        input->reset_member(0); feed_member(*input, 0, 0, window.size());
         for (auto& future : pending) future.get();
         input->seal(); rejects([&] { input->reset_member(0); });
         require(engine.append(*input).accepted, "restarted contribution input rejected");

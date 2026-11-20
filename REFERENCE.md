@@ -701,7 +701,11 @@ The packing checkpoint synchronizes the output and index before releasing
 consumed scratch.
 
 When a compute worker supplies compressed contributions, the plotting host
-validates their chunks as they arrive. It reuses the consecutive prefix in
+validates their chunks as they arrive. With I/O overlap and spare CPU
+workers it can check a window of independent chunks in parallel within
+the codec RAM budget. A capacity probe checks chunks in order so it can
+stop receiving as soon as the next member cannot fit.
+The plotting host reuses the consecutive prefix in
 member order for conservative sizing. An out-of-order suffix is read from
 scratch. Tight capacity still triggers exact sizing against the saved runs.
 With compute sharing disabled (`--compute off`), external construction can
@@ -2054,6 +2058,35 @@ waits. The defaults are one hour per task and 30 seconds per socket operation.
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
 lists standalone task, thread, window and transport limits.
+
+For pooled construction, `--compute-output auto|packed|encoded` selects the
+preferred form of worker output. Packed members can stream directly into
+temporary HDD space as bounded tiles. Encoded output carries compressed
+contributions, or a complete fresh group when the worker and destination can
+admit it. Near the destination's space limit the owner can probe with a single
+compressed member. Recovery follows the saved construction transaction.
+
+With I/O and generation overlap enabled, an owner with multiple CPU workers
+can validate a packed tile while receiving the next frame. This uses the
+configured CPU pool and reuses the existing network buffer. A single-CPU
+owner validates each tile inline.
+
+With multiple rotating destinations, automatic selection starts with the
+available worker and storage bandwidth. When a writer has more groups to
+produce, it samples independent writer counts and both output forms through
+durable publication. Its last pass can reuse those measurements. When
+the worker slots for whole-group streams are occupied, another destination
+can receive packed members and assemble them on the storage host.
+When the disk I/O governor reports farming pressure, the planner limits
+new pooled HDD work to one active destination and suspends writer trials.
+`--compute-writers N` requests up to N active pooled HDD destinations for
+a repeatable comparison. The default is `auto`. The plotting JSON includes
+the peak active destinations, packed members streamed to scratch and fresh
+groups received from workers. Set `POS2GPU_PHASE_TIMING=1` on the worker to
+see member generation and chunk encoding wall times. Packed GPU generation
+can overlap its output callback, so its generation time includes backpressure
+from the receiver.
+
 Optional encoding probes back off after repeated failures while local encoding
 continues. The owner passes the remaining time for a codec window to the
 broker. If that time runs out before a worker starts, the broker releases

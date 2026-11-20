@@ -2,6 +2,7 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -117,6 +118,9 @@ public:
                            std::chrono::steady_clock::time_point connect_deadline = std::chrono::steady_clock::time_point::max());
     void send(Message, std::span<uint8_t const> payload);
     Frame receive();
+    // Reuse one frame allocation. The caller can publish completed work on
+    // this thread before TLS has to wait for the peer to make progress.
+    void receive(Frame& frame, std::function<void()> const& before_wait = {});
     // Shorten future operations on an exclusively owned channel; never extend
     // a deadline already imposed by its creator or an earlier task boundary.
     void set_deadline(std::chrono::steady_clock::time_point);

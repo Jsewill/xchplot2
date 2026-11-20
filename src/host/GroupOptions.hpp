@@ -31,7 +31,8 @@ struct GroupComputeOptions
     std::function<void()> compute_admit_session;
     std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
     std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
-    std::string pool_offer_backend = "cpu";
+    std::string pool_offer_backend = "cpu", pool_output = "auto";
+    unsigned pool_writers = 0;
     uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
     uint64_t pool_offer_ram_limit = 0, pool_offer_cpu_limit = 0, pool_offer_vram_limit = 0;
     uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;

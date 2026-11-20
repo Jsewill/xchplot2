@@ -171,6 +171,7 @@ void command_help_all(std::string_view command)
         "  --compute-broker HOST:PORT --compute-owner-id ID\n"
         "  --compute-ca FILE --compute-cert FILE --compute-key FILE\n"
         "  --compute-inflight N --compute-codec-ram auto|N\n"
+        "  --compute-output auto|packed|encoded --compute-writers auto|N\n"
         "  --compute-timeout-ms N --compute-socket-timeout-ms N --compute-frame-bytes N\n"
         "  --compute-listen HOST:PORT --compute-advertise HOST:PORT\n"
         "  --compute-offer-ram N --compute-offer-cpus N --compute-offer-vram N\n"

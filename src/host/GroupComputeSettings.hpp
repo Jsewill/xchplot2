@@ -46,6 +46,17 @@ inline bool set_group_compute_setting(GroupOptions& args, std::string key, std::
     else if (key == "--compute-offer-cpus") args.pool_offer_cpus = args.pool_offer_cpu_limit = integer();
     else if (key == "--compute-offer-vram") args.pool_offer_vram = args.pool_offer_vram_limit = integer();
     else if (key == "--compute-offer-slots") args.pool_offer_slots = integer();
+    else if (key == "--compute-output")
+    {
+        profile_require(value == "auto" || value == "packed" || value == "encoded", "--compute-output requires auto, packed or encoded");
+        args.pool_output = value;
+    }
+    else if (key == "--compute-writers")
+    {
+        auto const count = value == "auto" ? 0 : integer();
+        profile_require(value == "auto" || (count && count <= 1024), "--compute-writers requires auto or 1 to 1024");
+        args.pool_writers = unsigned(count);
+    }
     else if (key == "--compute-inflight") args.pool_inflight = integer();
     else if (key == "--compute-timeout-ms") args.pool_timeout_ms = integer();
     else if (key == "--compute-socket-timeout-ms") args.pool_socket_timeout_ms = integer();

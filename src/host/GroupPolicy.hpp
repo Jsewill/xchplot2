@@ -84,6 +84,128 @@ struct GenerationHistory
     }
 };
 
+// Compare complete waves of like-sized groups on rotating destinations. A wave
+// starts before the first generation request and ends after its last publication.
+// This charges transfer, temporary I/O and contention across overlapping writers.
+class PoolPublicationHistory
+{
+public:
+    struct Shape { unsigned k, strength, members; bool operator==(Shape const&) const = default; };
+    struct Choice { size_t width; bool encoded, trial; };
+    bool observed(Shape shape) const { return shape == shape_; }
+    Choice select(Shape shape, size_t available, size_t initial, unsigned fixed_width, std::string_view output,
+                  bool initial_encoded = true, bool allow_trial = true) const
+    {
+        require(available && initial, "empty pooled publication candidate");
+        if (live_ && shape == shape_ && current_.width <= available) return current_;
+        auto ordinary = std::min(available, fixed_width ? size_t(fixed_width) : initial);
+        if (!fixed_width && ordinary > 3) ordinary = std::bit_floor(ordinary);
+        Choice best{ordinary, output == "auto" ? initial_encoded : output == "encoded", false};
+        long double fastest = std::numeric_limits<long double>::infinity();
+        auto measured = [&](size_t width) -> Result const*
+        {
+            if (shape != shape_) return nullptr;
+            auto it = std::find_if(results_.begin(), results_.end(), [&](auto const& r) { return r.width == width; });
+            return it == results_.end() ? nullptr : &*it;
+        };
+        auto candidate = [&](size_t width) -> std::optional<Choice>
+        {
+            auto const* result = measured(width);
+            for (bool encoded : {initial_encoded, !initial_encoded})
+            {
+                if ((output == "packed" && encoded) || (output == "encoded" && !encoded)) continue;
+                if (fixed_width && output != "auto") return Choice{width, encoded, false};
+                if (!result || !result->tried[encoded])
+                {
+                    if (allow_trial) return Choice{width, encoded, true};
+                    continue;
+                }
+                auto const time = result->times[encoded].member_ns();
+                if (time && time < fastest) { fastest = time; best = {width, encoded, false}; }
+            }
+            return {};
+        };
+        if (auto choice = candidate(ordinary)) return *choice;
+        if (fixed_width) return best;
+        auto next_width = [](size_t n) { return n < 4 ? n + 1 : n * 2; };
+        auto rate = [&](size_t width, bool encoded)
+        {
+            auto const* result = measured(width);
+            return result ? result->times[encoded].member_ns() : 0.L;
+        };
+        // Try another independent writer while either output form still gains
+        // throughput. A source-limited encoded stream need not stop the owner
+        // from testing a wider packed pipeline.
+        size_t previous = 0;
+        for (size_t width = ordinary; width < available;)
+        {
+            if (previous)
+            {
+                bool improving = false;
+                for (bool encoded : {true, false})
+                {
+                    auto const before = rate(previous, encoded), after = rate(width, encoded);
+                    if (before && after && after < before) improving = true;
+                }
+                if (!improving) break;
+            }
+            auto const next = std::min(next_width(width), available);
+            if (auto choice = candidate(next)) return *choice;
+            previous = width; width = next;
+        }
+        for (size_t width = 1; width < ordinary; width = next_width(width))
+            if (auto choice = candidate(width)) return *choice;
+        return best;
+    }
+    bool begin(Shape shape, Choice choice, uint64_t now)
+    {
+        // Enroll one wave. Other groups can start on idle writers while its
+        // last member is being published, including during calibration.
+        if (live_ && (shape != shape_ || choice.width != current_.width || choice.encoded != current_.encoded ||
+            finished_ || live_ >= current_.width)) return false;
+        if (!choice.trial && (shape != shape_ || std::none_of(results_.begin(), results_.end(),
+            [&](auto const& r) { return r.width == choice.width && r.times[choice.encoded].count; }))) return false;
+        if (!live_)
+        {
+            if (shape != shape_) { results_ = {}; shape_ = shape; }
+            current_ = choice; started_ = now; members_ = 0; finished_ = false; valid_ = true;
+        }
+        ++live_; return true;
+    }
+    void publish(uint64_t members, uint64_t now, bool comparable)
+    {
+        require(live_, "unmatched pooled publication");
+        valid_ &= comparable && members == shape_.members;
+        members_ = grow_add(members_, members); finished_ = true;
+        if (--live_) return;
+        auto it = std::find_if(results_.begin(), results_.end(),
+            [&](auto const& r) { return !r.width || r.width == current_.width; });
+        if (it == results_.end())
+        {
+            // Preserve the normal search widths when a shrinking destination
+            // set introduces a succession of distinct tail widths.
+            it = std::find_if(results_.begin(), results_.end(), [](auto const& r)
+                { return r.width != 3 && !std::has_single_bit(r.width); });
+            if (it == results_.end()) return;
+            *it = {};
+        }
+        it->width = current_.width; it->tried[current_.encoded] = true;
+        // Admission can run out of RAM or independent spindles before a
+        // cohort fills. Its time does not describe the requested width.
+        if (valid_ && members_ == current_.width * shape_.members && now > started_)
+            it->times[current_.encoded].add(members_, now - started_);
+    }
+private:
+    struct Result { size_t width = 0; bool tried[2]{}; GenerationHistory times[2]; };
+    // 1, 2, 3 and powers of two through the 1024-destination limit, or an
+    // explicit writer count trimmed to the remaining destinations.
+    std::array<Result, 16> results_{};
+    Shape shape_{}; Choice current_{};
+    size_t live_ = 0;
+    uint64_t started_ = 0, members_ = 0;
+    bool finished_ = false, valid_ = false;
+};
+
 // Keep the two external batch candidates together, including their baseline
 // observations when subsequent samples all use the smaller batch.
 struct ExternalBatchHistory

@@ -20,6 +20,46 @@ template <typename Operation> void rejects(Operation&& operation)
     require(rejected, "worker accepted an invalid or over-budget operation");
 }
 
+void packed_word_validation()
+{
+    std::array<uint32_t, 7> boundaries{0, 0, 7, 7, 19, 73, 73};
+    for (uint8_t k = 18; k <= 28; k += 2)
+    {
+        unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
+        std::vector<uint64_t> fields(boundaries.back());
+        for (size_t chunk = 1; chunk < boundaries.size(); ++chunk)
+            for (size_t i = boundaries[chunk - 1]; i < boundaries[chunk]; ++i)
+                fields[i] = 17 * (i - boundaries[chunk - 1]);
+        auto pack = [&]
+        {
+            std::vector<uint64_t> words((fields.size() * width + 63) / 64);
+            for (size_t i = 0; i < fields.size(); ++i)
+                for (unsigned b = 0; b < width; ++b)
+                    if (fields[i] & (uint64_t(1) << b))
+                        words[(i * width + b) / 64] |= uint64_t(1) << ((i * width + b) % 64);
+            return words;
+        };
+        auto check = [&](std::span<uint64_t const> words, size_t tile, bool wide = false)
+        {
+            PackedWordValidation state;
+            for (size_t i = 0; i < words.size(); i += tile)
+                state.append(k, wide, boundaries, i, words.subspan(i, std::min(tile, words.size() - i)));
+            return state.complete(k, fields.size());
+        };
+        auto words = pack();
+        for (size_t tile = 1; tile <= words.size(); ++tile)
+            require(check(words, tile), "packed stream failed at a word or empty chunk boundary");
+        require(!check(std::span(words).first(words.size() - 1), 1), "packed stream accepted a truncated tile");
+        words.back() |= uint64_t(1) << 63;
+        require(!check(words, 1), "packed stream accepted nonzero padding");
+        fields.back() = 0;
+        rejects([&] { check(pack(), 1, true); });
+        fields.back() = fields[fields.size() - 2] + uint64_t(72 - k) * (178ull << (k - 8));
+        rejects([&] { check(pack(), 1); });
+        require(check(pack(), 1, true), "packed stream rejected an allowed wide delta");
+    }
+}
+
 void scoped_threads()
 {
     auto const original = worker_detail::cpu_threads();
@@ -111,7 +151,7 @@ void generation()
     ChunkCodec codec(18, uint64_t(1) << 20);
     std::array<std::array<uint8_t, 32>, 2> ids{id, id};
     size_t first = 0;
-    service.contributions_local(18, 2, ids, [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+    auto check_contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
     {
         require(ordinal == next_chunk++ && members == ids.size(), "worker contribution order or batch membership changed");
         size_t last = first;
@@ -122,7 +162,14 @@ void generation()
         auto const canonical = codec.encode(ordinal, {}, 0, regions);
         require(std::ranges::equal(bytes, canonical), "worker coencoded contribution differs from canonical codec");
         first = last;
-    });
+    };
+    service.contributions_local(18, 2, ids, check_contribution);
+    require(next_chunk == PlotGroupFile::getChunkCountForK(18) && first == expected.size(), "serial contribution stream was truncated");
+    next_chunk = first = 0;
+    auto parallel_options = options; parallel_options.generation_threads = 2;
+    parallel_options.available_resources = [capacity = options.capacity](uint32_t) { return capacity; };
+    WorkerService parallel(parallel_options);
+    parallel.contributions_local(18, 2, ids, check_contribution);
     require(next_chunk == PlotGroupFile::getChunkCountForK(18) && first == expected.size(), "worker contribution stream was truncated");
     uint64_t maximum_chunk = 0, chunk_count = 0, previous_chunk = UINT64_MAX;
     for (auto value : expected)
@@ -496,14 +543,37 @@ void network(char const* ca, char const* cert, char const* key)
     std::array<uint8_t, 32> id{}; id.fill(0x71);
     worker_detail::CpuLimit limit(1);
     auto expected = worker_original_reference(18, 2, id);
-    auto collect = [&]
+    auto collect_from = [&](WorkerClient& source)
     {
         std::unique_ptr<CompactMemberReceiver> receiver;
-        client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t total)
-        { if (!receiver) receiver = std::make_unique<CompactMemberReceiver>(18, size_t(total)); receiver->append(tile); });
+        auto const caller = std::this_thread::get_id();
+        source.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t total)
+        {
+            require(caller == std::this_thread::get_id(), "packed delivery changed caller threads");
+            if (!receiver) receiver = std::make_unique<CompactMemberReceiver>(18, size_t(total));
+            receiver->append(tile);
+        });
         return unpack(receiver->finish());
     };
+    auto collect = [&] { return collect_from(client); };
     require(collect() == expected, "leased TLS worker compact stream differs from reference");
+    for (bool overlap : {false, true})
+    {
+        auto serial = client_options; serial.owner_id += overlap ? "-one-cpu" : "-serial";
+        serial.packed_receive_overlap = overlap;
+        if (overlap) serial.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+        WorkerClient other(serial);
+        require(collect_from(other) == expected, "serial packed receive changed member content");
+    }
+    unsigned interrupted_tiles = 0;
+    try
+    {
+        client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t)
+        { if (!tile.words.empty()) { ++interrupted_tiles; throw std::runtime_error("stop packed delivery"); } });
+    }
+    catch (std::runtime_error const& error)
+    { require(std::string(error.what()) == "stop packed delivery", "packed receive lost the sink failure"); }
+    require(interrupted_tiles == 1, "packed receive repeated an interrupted delivery");
     auto a = std::async(std::launch::async, collect), b = std::async(std::launch::async, collect);
     require(a.get() == expected && b.get() == expected, "concurrent owner tasks lost deterministic output");
     auto collect_local = [&]
@@ -776,7 +846,7 @@ void offered_cpus()
 }
 int main(int argc, char** argv)
 {
-    try { scoped_threads(); budget(); fitted_broker_budget(); retained_budget(); chunk_headers(); renewal_errors(); offered_cpus(); generation(); if (argc == 4) network(argv[1], argv[2], argv[3]);
+    try { scoped_threads(); packed_word_validation(); budget(); fitted_broker_budget(); retained_budget(); chunk_headers(); renewal_errors(); offered_cpus(); generation(); if (argc == 4) network(argv[1], argv[2], argv[3]);
         else if (argc == 2 && std::string_view(argv[1]) == "--network")
         { pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "worker-ca");
           auto identity = pool_test::issue(directory.path, "worker-host", &ca);

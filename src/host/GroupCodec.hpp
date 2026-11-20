@@ -158,6 +158,7 @@ public:
     CodecScheduler(CodecScheduler const&) = delete;
     CodecScheduler& operator=(CodecScheduler const&) = delete;
     unsigned workers() const { return unsigned(jobs_.size()); }
+    bool can_overlap() const { return workers() > 1 && !current_; }
 
     std::future<void> submit(std::function<void()> operation)
     {
@@ -1139,10 +1140,19 @@ public:
         (void)run(chunks, {}, false, false, summaries, true);
     }
 
+    // Ordered inspections also retain the first decoded value for joining
+    // the received member's summary to the owner's existing chunk.
+    void inspect(std::span<ChunkInput const> chunks, std::span<ChunkCodec::Inspection> inspected)
+    {
+        group_tools::require(inspected.size() == chunks.size(), "codec inspection output mismatch");
+        (void)run(chunks, {}, false, false, {}, true, inspected);
+    }
+
 private:
     std::span<EncodedBlock const> run(std::span<ChunkInput const> chunks,
                                     std::span<uint64_t> sizes, bool retain_previous, bool size_only,
-                                    std::span<ChunkSummary> summaries = {}, bool summary_only = false)
+                                    std::span<ChunkSummary> summaries = {}, bool summary_only = false,
+                                    std::span<ChunkCodec::Inspection> inspected = {})
     {
         std::lock_guard run(run_mutex_);
         group_tools::require(summary_only || sizes.size() == chunks.size(), "codec size output mismatch");
@@ -1256,10 +1266,12 @@ private:
                         {
                             group_tools::require(chunk.old_members && chunk.new_members.empty() && chunk.contributions.empty(),
                                 "invalid encoded summary input");
-                            summaries[i] = codec.inspect(chunk.ordinal, chunk.old_chunk, chunk.old_members).summary;
+                            auto const result = codec.inspect(chunk.ordinal, chunk.old_chunk, chunk.old_members);
+                            if (inspected.empty()) summaries[i] = result.summary;
+                            else inspected[i] = result;
                             continue;
                         }
-                        group_tools::require(!chunk.old_members && chunk.contributions.empty(),
+                        group_tools::require(inspected.empty() && !chunk.old_members && chunk.contributions.empty(),
                                              "fresh summary has old group input");
                         summaries[i] = ChunkCodec::fresh_summary(k_, chunk.ordinal, chunk.new_members);
                         continue;

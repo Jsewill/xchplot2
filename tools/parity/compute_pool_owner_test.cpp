@@ -259,6 +259,20 @@ void repartition_and_global_admission()
     auto const prefix_reference = directory.path / "packed-reference.gplot";
     { Engine engine(prefix_reference.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(Members(raw).subspan(0, 3)).accepted, "packed owner reference did not fit"); }
+    {
+        auto const scratch = directory.path / "packed-scratch"; fs::create_directory(scratch);
+        auto const path = directory.path / "packed-external.gplot";
+        ExternalConfig external{{{scratch.string(), uint64_t(256) << 20}}, 65536, 2};
+        ExternalEngine engine(path.string(), cfg, external, false, initial); engine.confirm_identity();
+        Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        require(!prepare_pool_input(engine, cfg, requested, 3, 1), "packed input bypassed the exact capacity probe");
+        auto input = prepare_pool_input(engine, cfg, requested, 3, cfg.capacity_bytes);
+        require(input && producer.fill_pool_input(*input, 0, 0, producer.packed_input_bytes(cfg, 3)) == 3 &&
+            input->sealed() && engine.append(*input).accepted, "bounded packed scratch receive did not append");
+        input.reset(); engine.finish();
+        require(backend.pool_scratch_packed_members == 3 && contents(path) == contents(prefix_reference),
+            "packed scratch changed the canonical group");
+    }
     GroupPrefetch prefetched;
     Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20, 0};
     require(prefetch_group(prefetched, producer, requested, 0, 3, 0,

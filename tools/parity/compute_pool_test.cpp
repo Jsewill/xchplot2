@@ -235,6 +235,29 @@ void cn_only(TlsOptions const& server_tls, TlsOptions const& client_tls)
 }
 void task_deadlines(TlsOptions server_tls, TlsOptions client_tls)
 {
+    // A queued tile must reach its caller while the peer is idle. Time spent
+    // delivering it is local work, including when it exceeds the socket timeout.
+    {
+        auto local = client_tls; local.timeout_ms = 500;
+        Listener listener({"127.0.0.1", 0}, server_tls);
+        std::promise<void> delivered; auto signal = delivered.get_future();
+        auto peer = std::async(std::launch::async, [&]
+        {
+            auto channel = listener.accept(3000);
+            require(signal.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+                "packed delivery waited for the following frame");
+            channel.send(Message::Reply, {});
+        });
+        auto channel = Channel::connect(listener.endpoint(), local);
+        Frame frame;
+        channel.receive(frame, [&]
+        {
+            delivered.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        });
+        require(frame.type == Message::Reply && frame.payload.empty(), "packed delivery lost the following frame");
+        peer.get();
+    }
     using Clock = std::chrono::steady_clock;
     server_tls.timeout_ms = client_tls.timeout_ms = 3000;
     server_tls.max_frame_bytes = client_tls.max_frame_bytes = 1048576;

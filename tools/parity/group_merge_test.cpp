@@ -3050,6 +3050,56 @@ void execution_planning()
     mixed[0].parallel_scratch = true;
     mixed[0].scratch.front().transfer_ns = 4000;
     require(stripe(0) == 4002, "a fall in available scratch bandwidth left the execution estimate unchanged");
+    PoolPublicationHistory publications;
+    PoolPublicationHistory::Shape const shape{28, 2, 3};
+    auto choose = [&] { return publications.select(shape, 2, 2, 2, "auto"); };
+    auto first = choose();
+    require(first.encoded && first.trial && publications.begin(shape, first, 10) &&
+        publications.begin(shape, choose(), 12) && !publications.begin(shape, choose(), 13), "pooled trial did not fill two writers");
+    publications.publish(3, 20, true);
+    require(!publications.begin(shape, choose(), 21) && choose().encoded, "first publication ended a live pooled trial");
+    publications.publish(3, 80, true);
+    auto second = choose();
+    require(!second.encoded && second.trial && publications.begin(shape, second, 100) &&
+        publications.begin(shape, choose(), 110), "packed control did not use the same writer width");
+    publications.publish(3, 140, true); publications.publish(3, 150, true);
+    require(!choose().encoded && !choose().trial, "pooled output ignored the last durable publication");
+    require(publications.select(shape, 2, 2, 0, "auto").width == 1, "automatic writers skipped the narrower control");
+    require(publications.begin(shape, choose(), 200) && publications.begin(shape, choose(), 210) &&
+        !publications.begin(shape, choose(), 215), "steady-state sample enrolled an extra writer");
+    publications.publish(3, 400, true); publications.publish(3, 500, true);
+    require(choose().encoded, "publication policy ignored a slower completed wave");
+    auto different = publications.select({28, 2, 8}, 2, 2, 2, "auto");
+    require(different.trial && different.encoded, "pooled timings leaked into a different group shape");
+
+    PoolPublicationHistory scaling;
+    for (auto const& [width, encoded, per_member] : std::array<std::tuple<size_t, bool, unsigned>, 6>{
+        {{2, false, 30}, {2, true, 12}, {3, false, 20}, {3, true, 16}, {4, false, 18}, {4, true, 19}}})
+    {
+        auto trial = scaling.select(shape, 5, 2, 0, "auto", false);
+        require(trial.width == width && trial.encoded == encoded, "pooled scaling did not compare like writer widths");
+        for (size_t i = 0; i < width; ++i) require(scaling.begin(shape, trial, 0), "could not enroll scaling trial");
+        for (size_t i = 0; i < width; ++i) scaling.publish(3, width * 3 * per_member, true);
+    }
+    require(scaling.select(shape, 5, 2, 0, "auto", false).width == 5,
+        "improving packed transfers did not test the remaining physical writer");
+
+    PoolPublicationHistory limited;
+    auto limited_choice = [&] { return limited.select(shape, 2, 2, 2, "auto"); };
+    require(limited.begin(shape, limited_choice(), 10), "could not start partial publication trial");
+    limited.publish(3, 11, true);
+    require(limited.begin(shape, limited_choice(), 20) && limited.begin(shape, limited_choice(), 21),
+        "could not start complete publication trial");
+    limited.publish(3, 40, true); limited.publish(3, 50, true);
+    require(!limited_choice().encoded, "partial cohort was timed as two independent writers");
+    auto const last = limited.select(shape, 2, 2, 0, "auto", true, false);
+    require(limited.observed(shape) && !last.trial && last.width == 2 && !last.encoded,
+        "the final pass started an unneeded trial instead of reusing its measured winner");
+    PoolPublicationHistory cold;
+    auto const once = cold.select(shape, 4, 2, 0, "auto", false, false);
+    require(!cold.observed(shape) && !once.trial && !once.encoded && once.width == 2,
+        "a one-pass fill replaced the unmeasured startup plan");
+
     StreamingInputCohort cohort(3);
     require(cohort.stream_allowed(0) && !cohort.stream_allowed(1), "cold compact input split an existing cohort");
     cohort.admit(0, 98, 10, true, 100); cohort.admit(1, 48, 11, false, 110);

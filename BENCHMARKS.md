@@ -416,6 +416,242 @@ and encoding compressed contributions, excluding time sending them. In
 the final 32 GiB run it spent 1.43 s/member on that counter and transferred
 three members per task. Worker time and storage time overlap.
 
+#### Worker assembly and destination writer count
+
+Four empty HDDs on the storage host each received a three-member k=28 group.
+The owner had 32 GiB of plotting RAM and eight plotting threads. One RTX 4090
+worker with eight CPU threads sent the same seeded plots over dedicated
+10 GbE. All six runs used three-member batches and wrote the same four files.
+Each row is a single run. Timing starts at process launch and ends after the
+owner reports durable publication. The timestamps were sampled every 50 ms.
+Worker phase timing was enabled for the fixed-format comparisons.
+
+| Active destination writers | Worker output | First group (s) | Full fill (s/member across 12 members) |
+| ---: | --- | ---: | ---: |
+| 1 | Whole encoded group | 19.2 | 6.57 |
+| 2 | Whole encoded group | 38.2 | 6.35 |
+| 3 | Whole encoded group | 57.4 | 7.24 |
+| 1 | Packed members | 27.7 | 9.54 |
+| 2 | Packed members | 29.5 | 7.40 |
+| 3 | Packed members | 47.0 | 6.34 |
+
+Three writers helped when the owner assembled packed members. For whole-group
+worker assembly, two writers gave the shortest fill and one writer published
+the first group earliest. All outputs matched previously full-proof-verified
+files by SHA-256, and a fresh full-proof check ran for each configuration.
+
+After the first publication, a separate reference reader opened one of the
+new groups and looked up a fresh challenge every 9.375 seconds. Across these
+six fills, the 37 open-plus-lookup times had a median of 66.37 ms and a
+maximum of 119.9 ms. All finished within the farming model's eight-second
+deadline. The reader shared the host page cache with the writer. The live
+harvester had zero plots during these tests.
+
+On eight empty HDDs with a 4 GiB owner budget, both scratch formats used
+the same two-writer limit, single-member batches, seed and 24 members.
+The packed receiver wrote fragment tiles directly to temporary HDD space.
+Disk traffic below sums the physical block counters on the eight drives
+through process exit, including the concurrent reference reader. Transferred
+bytes come from the owner's compute protocol counters. GB are decimal.
+
+| Scratch input | Seconds per published member | GB received/member | GB read from HDDs/member | GB written to HDDs/member |
+| --- | ---: | ---: | ---: | ---: |
+| Worker-encoded contributions | 10.17 | 1.058 | 1.034 | 2.249 |
+| Packed fragments | 10.67 | 1.158 | 2.191 | 3.411 |
+
+The packed format increased transfer size and added a scratch write and
+read before compression. Compressed contributions finished the fill 12
+seconds earlier. All eight files matched across formats. The 10 GbE
+interface averaged 0.871 Gb/s receiving encoded contributions and
+0.908 Gb/s receiving packed fragments. Their highest five-second rates
+were 1.77 and 1.94 Gb/s, respectively. At one new member every 2.2 s,
+these payload sizes would supply an average of 3.85 or 4.21 Gb/s from
+one GPU, before network overhead.
+
+With one group per drive and both choices set to `auto`, the planner used
+two active destinations and three scratch HDDs per group, with six scratch
+HDDs in use at peak. All 24 members arrived as compressed contributions.
+The first group was durable in 62.33 s and the last in 244.88 s, or
+10.20 s/member.
+
+On the same compressed-scratch workload, using eight codec lanes on the
+worker reduced encoding wall time from 2.431 to 1.154 s/member. Member
+generation kept its eight-thread grant in both runs and averaged 2.183
+and 2.233 s/member, respectively. The time to
+publish all 24 members changed from 10.23 to 10.17 s/member. Each setting
+ran once. The faster codec freed worker time, with little change in the
+time to finish this HDD workload.
+
+With 16 empty HDDs, a 32 GiB owner budget and one three-member group per
+drive, automatic construction published its first group in 32.29 s and
+its last in 254.46 s, or 5.30 s/member. For a common endpoint across
+versions, process exit after the final sync took 257.78 s (5.37 s/member)
+with the previous build and 255.11 s (5.31 s/member) with the updated
+build. Both runs used the same 48 members with GPU phase timing disabled.
+The difference was 1.03% in one run per build.
+
+The updated planner admitted up to four destinations, received 45 packed
+members and one complete three-member group, and used zero HDD scratch.
+Thirteen generation batches overlapped a destination write. Inbound
+Ethernet averaged 1.81 Gb/s and peaked at 3.73 Gb/s over five seconds.
+Aggregate disk writes averaged 189 MB/s and peaked at 549 MB/s over
+one second. The independent 16-drive sequential test reached 3,328 MB/s.
+
+A four-HDD fill with two groups per drive exercised writer selection across
+successive groups. With the same 32 GiB budget, automatic construction
+received 21 packed members and one complete three-member group. The first
+group was durable at 45.6 s and the last at 154.97 s, or 6.46 s/member.
+Across the three automatic fills on four, eight and 16 drives, all 56
+reference-reader lookups completed within the eight-second deadline. The
+longest open and lookup took 129.51 ms.
+
+#### Plot construction alongside live v1 farming
+
+Gigahorse 2.7.4.giga37 harvested 1,164 k32 C29 plots on six HDDs while
+`xchplot2 fill` wrote seeded three-member k=28 groups to the empty HDDs.
+Both sets of drives used the same SAS3008 HBA. One RTX 4090 supplied the
+members over 10 GbE. GPU phase timing was off for the RAM runs and on
+for the scratch runs, matching the empty-farm comparisons. Plotting time
+starts at launch and ends when the final group is durable. Harvester times
+cover challenges with at least one eligible plot whose lookup started
+and finished within the measurement window. The idle window immediately
+preceded the 16-HDD RAM fill and matched its duration through process exit.
+
+| Plotting workload | Published members | Seconds/member | Eligible challenges | Median lookup (s) | 95th percentile (s) | Longest lookup (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Idle | — | — | 27 | 0.490 | 3.51 | 3.76 |
+| 16 HDDs, 32 GiB RAM | 48 | 5.26 | 26 | 0.504 | 3.24 | 3.67 |
+| Same RAM fill, 4 MiB socket receive buffer | 48 | 5.61 | 28 | 0.503 | 3.18 | 3.35 |
+| 8 HDDs, 4 GiB RAM, one-member scratch batches | 24 | 9.89 | 25 | 0.532 | 0.914 | 3.24 |
+| Same scratch fill, default batch size | 24 | 9.81 | 23 | 0.560 | 3.29 | 3.44 |
+
+All 102 eligible challenges during plotting finished within the farming
+model's eight-second deadline. Gigahorse logged six quality-fetch errors
+during startup and zero in the timed windows. Each plotting row represents
+one complete fill. The 95th percentile uses the nearest rank. Every
+published group matched its full-proof-checked reference by SHA-256.
+After plotting, Gigahorse's standalone reader verified 13 full proofs
+from eight challenges against one of the mounted C29 plots.
+
+The 16-HDD RAM fill took 5.30 s/member in the earlier empty-farm run.
+During live farming it averaged 1.83 Gb/s inbound and 190 MB/s of writes
+across the plotting HDDs. All six farm HDDs recorded physical reads.
+A separate build requested a 4 MiB socket receive buffer for incoming
+generation results. It published the first group in 29.89 s and the last
+in 269.35 s. With the system default those times were 47.69 s and 252.52 s.
+The GPU worker was identical. Automatic scheduling used 15 packed tasks
+and one whole-group task with the default buffer, and 28 packed tasks
+with the larger buffer. Across sampled transfers of at least 1 GB, Linux
+TCP counters attributed 99.2% of sender busy time to the peer's receive-window
+limit with the default and 98.2% with the larger buffer.
+
+Both 4 GiB fills used two destinations and three scratch disks per group.
+With default batching, one construction batch held two members. The
+worker still delivered all 24 compressed contributions individually.
+The first group was durable in 52.40 s with default batching and 59.82 s
+with the one-member cap. Both runs included ten timed-out remote codec
+calibration attempts. Generation completed on the GPU worker in both.
+
+#### Packed worker results during live farming
+
+The storage host received the same seeded three-member k=28 groups over
+10 GbE while Gigahorse farmed the six C29 HDDs. The updated receiver can
+validate one packed tile on the owner's CPU pool while reading the next
+frame. The control used the preceding receiver. Both used one RTX 4090
+worker slot on the plotting workstation. Gigahorse's recompute server ran
+on the storage host's RTX 3070. Times end at durable publication of the
+last group.
+
+| Plotting workload | Members | Control (s/member) | Updated (s/member) | Control fill (s) | Updated fill (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 HDDs, 32 GiB, automatic writers and output | 48 | 5.35 | 4.92 | 256.56 | 236.37 |
+| 4 HDDs, one writer, three scratch HDDs, one packed member per batch | 12 | 18.36 | 18.16 | 220.33 | 217.89 |
+| 8 HDDs, 4 GiB, automatic writers and compressed scratch | 24 | 9.80 | 9.80 | 235.20 | 235.30 |
+
+The 16-HDD runs assembled 45 packed members in RAM and received one
+complete three-member group. The control used 24 generation tasks and the
+updated build used 16. Owner processing of received data fell from 63.6 to
+31.3 s across all tasks. Average Ethernet receive throughput rose from
+1.80 to 1.95 Gb/s and the highest five-second rate rose from 3.71 to
+4.73 Gb/s. Writes across the plotting drives averaged 187.1 and 202.9 MB/s
+respectively. Before frame reuse was limited to packed output, the same
+fill took 235.83 s (4.91 s/member). In that run Linux attributed 99.3%
+of sender busy time on the sampled bulk transfers to the receiver-window
+limit.
+
+The four-HDD comparison held the task shape fixed. Each build sent the
+same 12 packed members in 12 tasks. Owner processing fell from 13.1 to
+5.6 s, while the whole fill shortened by 2.44 s.
+
+The 4 GiB runs used two writers and six scratch drives. All 24 members
+arrived as compressed contributions, which use a separate receive path.
+The table compares runs with identical broker monitoring. Two earlier
+development builds took 10.63 and 10.68 s/member. Each had a gap of about
+36 s between two consecutive GPU member starts. The monitored control
+and final builds both kept that interval below 14 s. Both took
+9.80 s/member on the compressed-scratch path. All published groups
+matched their full-proof-checked references by SHA-256.
+
+Gigahorse completed all 175 eligible challenges observed across these
+seven fills within the eight-second farming deadline. The longest took
+3.57 s. During the final 16-HDD fill, one-second GPU samples averaged 5.5%
+utilization on the farming RTX 3070 and 43.2% on the plotting RTX 4090.
+Both GPUs reached 100% in individual samples. This measurement covers
+1,164 v1 plots on six farm drives, with separate GPUs for the two workloads.
+
+#### Compressed scratch with a 4 GiB owner
+
+The storage host built three-member k=28 groups on the empty HDDs while
+Gigahorse harvested 1,164 C29 plots on six separate HDDs sharing the HBA.
+One RTX 4090 worker delivered compressed contributions over 10 GbE. The
+owner had 4 GiB of plotting RAM, eight CPU workers and automatic scratch,
+batch and destination selection.
+
+The planner used two destinations at a time, with three scratch drives per
+destination on eight HDDs and seven per destination on sixteen. Each row
+compares one control fill and one updated fill under similar GPU load.
+Timing starts at launch and ends when the last group is durable.
+
+| Plotting HDDs | Members | Control (s/member) | Updated (s/member) | Reduction in elapsed time |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 24 | 10.77 | 8.77 | 18.6% |
+| 16 | 48 | 10.52 | 8.18 | 22.3% |
+
+At the same 24-member endpoint, the updated sixteen-drive fill took
+8.36 s/member. Generation on eight drives averaged 3.26 s/member in
+the control and 3.29 s/member in the updated build. An earlier control
+under lighter GPU load generated a member in 2.14 s and published one
+in 9.84 s on average.
+
+On sixteen HDDs, the worker spent 30.2 s encoding contributions, down from
+58.1 s. The storage host spent 72.6 s processing incoming contributions,
+down from 189.0 s. The worker's generation phase averaged 3.22 s/member
+in the updated build and 3.24 s/member in the control while other GPU
+workloads were active. Optional remote encoding probes timed out on the
+single-slot worker in both builds and final packing ran on the storage
+host. The updated fill averaged 126 MB/s of physical reads and 275 MB/s
+of physical writes across the plotting HDDs and 1.08 Gb/s received on
+the NIC. Its best five-second intervals reached 341 MB/s read, 525 MB/s
+written and 1.77 Gb/s received.
+
+Every published group matched its full-proof-checked reference by SHA-256.
+During the two updated fills, Gigahorse completed 64 challenges with
+eligible plots. The longest lookup took 0.87 s. All six farm HDDs served
+reads during both fills.
+
+In the eight-HDD control, each published member accounted for 1.03 GB of
+physical reads, 2.24 GB of physical writes and 0.994 GB of final plot.
+Sustaining one member every 2.2 s at that traffic mix would require
+470 MB/s of reads and 1,018 MB/s of writes, including 452 MB/s of final
+output, plus 3.85 Gb/s of worker application payload. With two independent
+destinations that is 226 MB/s of final writes per HDD. At the 241 MB/s
+measured on one output HDD above, final writes alone take 4.13 s/member on
+one drive, or 2.06 s/member if two can each sustain that rate. The independent
+15-HDD test below sustained 2,127 MB/s read and 1,860 MB/s written
+simultaneously. Those rates used eight read-only and seven write-only
+spindles. The complete plotting workload also generates, validates and
+checkpoints each group.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

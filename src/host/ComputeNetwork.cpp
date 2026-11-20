@@ -26,9 +26,11 @@
 #include <openssl/x509v3.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
@@ -356,13 +358,16 @@ std::string node_identity(X509* certificate)
     }
     throw std::runtime_error("authenticated network TLS connection failed");
 }
-void ssl_wait(SSL* ssl, int result, Deadline until)
+void ssl_wait(SSL* ssl, int result, Deadline const& until, std::function<void()> const& before_wait = {})
 {
     int const error_number = socket_error();
     int const error = SSL_get_error(ssl, result);
     auto socket = SocketHandle(reinterpret_cast<uintptr_t>(BIO_get_data(SSL_get_rbio(ssl))));
-    if (error == SSL_ERROR_WANT_READ) { wait_fd(socket, POLLIN, until); return; }
-    if (error == SSL_ERROR_WANT_WRITE) { wait_fd(socket, POLLOUT, until); return; }
+    if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+    {
+        if (before_wait) before_wait();
+        wait_fd(socket, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, until); return;
+    }
     ssl_failure(ssl, result, error, error_number);
 }
 void handshake(SSL* ssl, bool server, Deadline until)
@@ -399,8 +404,22 @@ void Writer::reserve(size_t bytes)
     }
 }
 void Writer::u8(uint8_t value) { reserve(1); data_.push_back(value); }
+static uint64_t swap_word(uint64_t value)
+{
+#ifdef _MSC_VER
+    return _byteswap_uint64(value);
+#else
+    return __builtin_bswap64(value);
+#endif
+}
 template <typename T> static void encode_integer(uint8_t* bytes, T value)
 {
+    if constexpr (sizeof(T) == 8 && std::endian::native == std::endian::little)
+    {
+        auto word = swap_word(value);
+        std::memcpy(bytes, &word, sizeof(word));
+        return;
+    }
     for (size_t i = sizeof(T); i > 0; --i) { bytes[i - 1] = uint8_t(value); value >>= 8; }
 }
 template <typename T> void Writer::integer(T value)
@@ -419,6 +438,11 @@ void Writer::words(std::span<uint64_t const> values)
     size_t const start = data_.size();
     reserve(values.size_bytes());
     data_.resize(start + values.size_bytes());
+    // Baseline x86 has BSWAP. Clang's SSE2 shuffles cost more until SSSE3
+    // provides a byte shuffle for the whole vector. The same applies on read.
+#if defined(__clang__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__SSSE3__)
+#pragma clang loop vectorize(disable)
+#endif
     for (size_t i = 0; i < values.size(); ++i)
         encode_integer(data_.data() + start + i * sizeof(uint64_t), values[i]);
 }
@@ -438,6 +462,12 @@ std::span<uint8_t const> Reader::take(size_t bytes)
 uint8_t Reader::u8() { return take(1)[0]; }
 template <typename T> static T decode_integer(uint8_t const* bytes)
 {
+    if constexpr (sizeof(T) == 8 && std::endian::native == std::endian::little)
+    {
+        uint64_t word;
+        std::memcpy(&word, bytes, sizeof(word));
+        return swap_word(word);
+    }
     T value = 0;
     for (size_t i = 0; i < sizeof(T); ++i) value = T((value << 8) | bytes[i]);
     return value;
@@ -449,6 +479,9 @@ uint64_t Reader::u64() { return integer<uint64_t>(); }
 void Reader::words(std::span<uint64_t> values)
 {
     auto const bytes = take(values.size_bytes());
+#if defined(__clang__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__SSSE3__)
+#pragma clang loop vectorize(disable)
+#endif
     for (size_t i = 0; i < values.size(); ++i)
         values[i] = decode_integer<uint64_t>(bytes.data() + i * sizeof(uint64_t));
 }
@@ -476,7 +509,7 @@ struct Channel::Impl
     std::vector<uint8_t> sent_policy;
     bool policy_exchange = false;
     ~Impl() { if (ssl) SSL_free(ssl); if (fd != invalid_socket) close_socket(fd); }
-    void transfer(std::span<uint8_t> bytes, bool write, Deadline until)
+    void transfer(std::span<uint8_t> bytes, bool write, Deadline const& until, std::function<void()> const& before_wait = {})
     {
         size_t position = 0;
         while (position < bytes.size())
@@ -487,7 +520,7 @@ struct Channel::Impl
             int const result = write ? SSL_write_ex(ssl, bytes.data() + position, bytes.size() - position, &moved) :
                 SSL_read_ex(ssl, bytes.data() + position, bytes.size() - position, &moved);
             if (result == 1) { transport_require(moved, "network transfer made no progress"); position += moved; }
-            else ssl_wait(ssl, result, until);
+            else ssl_wait(ssl, result, until, before_wait);
             transport_require(Clock::now() <= until, "network operation timed out");
         }
     }
@@ -645,25 +678,40 @@ void Channel::send(Message type, std::span<uint8_t const> payload)
 }
 Frame Channel::receive()
 {
+    Frame frame; receive(frame); return frame;
+}
+void Channel::receive(Frame& frame, std::function<void()> const& before_wait)
+{
     require(bool(impl_), "network channel is closed");
-    auto const until = operation_deadline(impl_->options);
+    auto until = operation_deadline(impl_->options);
+    bool published = false;
+    std::function<void()> publish;
+    if (before_wait) publish = [&]
+    {
+        if (published) return;
+        auto const start = Clock::now(); before_wait(); published = true;
+        // Local delivery consumes no socket budget. The task deadline still applies.
+        until += std::min(Clock::now() - start, impl_->options.deadline - until);
+    };
     unsigned updates = 0;
     for (;;)
     {
         if (impl_->membership) impl_->membership->check();
         std::array<uint8_t, 12> header{};
-        impl_->transfer(header, false, until);
+        impl_->transfer(header, false, until, publish);
         Reader reader(header);
         require(reader.u32() == 0x47504331 && reader.u16() == 1, "incompatible network frame protocol");
         auto const type = reader.u16(); auto const bytes = reader.u32(); reader.finish();
         bool const policy = Message(type) == Message::Policy;
         require(valid_message(type) && bytes <= (policy ? 262144 : impl_->options.max_frame_bytes) &&
             (!policy || (impl_->policy_exchange && ++updates <= 4)), "invalid network frame type or size");
-        Frame result{Message(type), std::vector<uint8_t>(bytes)};
-        impl_->transfer(result.payload, false, until); check_deadline(until);
-        if (policy) { accept_pool_policy(impl_->options.membership_directory, result.payload); impl_->membership->check(); continue; }
+        frame.type = Message(type);
+        if (bytes > frame.payload.capacity()) std::vector<uint8_t>().swap(frame.payload);
+        frame.payload.resize(bytes);
+        impl_->transfer(frame.payload, false, until, publish); check_deadline(until);
+        if (policy) { accept_pool_policy(impl_->options.membership_directory, frame.payload); impl_->membership->check(); continue; }
         if (impl_->membership) impl_->membership->check();
-        return result;
+        return;
     }
 }
 void Channel::set_deadline(std::chrono::steady_clock::time_point until)

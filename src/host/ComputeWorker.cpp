@@ -43,9 +43,27 @@ using group_tools::require;
 using Clock = std::chrono::steady_clock;
 constexpr uint64_t mib = uint64_t(1) << 20;
 constexpr size_t max_broker_routes = 8;
+constexpr size_t initial_contribution_window_chunks = 64;
 enum class Operation : uint8_t { Packed = 1, Contributions = 2, Encode = 3, Fresh = 4 };
 enum class DataKind : uint8_t { Prelude = 1, Boundaries = 2, Words = 3, Contributions = 4, Encoded = 5, FreshManifest = 6 };
 enum class WorkerError : uint8_t { Permanent = 0, Unsupported = 1, Transport = 2, Stale = 3 };
+// ParallelEncoder already owns contiguous encoded chunks and their sizes until
+// the next window. Local consumers borrow individual chunks from the same block.
+using ContributionBlockSink = std::function<void(uint64_t, std::span<uint64_t const>,
+    std::span<uint8_t const>, uint16_t)>;
+ContributionBlockSink individual_contributions(WorkerContributionSink sink, WorkerCancellation cancel)
+{
+    if (!sink) return {};
+    return [sink = std::move(sink), cancel](uint64_t first, std::span<uint64_t const> sizes,
+        std::span<uint8_t const> bytes, uint16_t members)
+    {
+        for (auto size : sizes)
+        {
+            cancel.check(); sink(first++, bytes.first(size_t(size)), members);
+            bytes = bytes.subspan(size_t(size));
+        }
+    };
+}
 void write_worker_status(pool::Writer& out, WorkerStatus const& value)
 {
     out.string(value.identity); out.string(value.node_id); out.string(value.instance); out.u8(uint8_t(value.admission));
@@ -69,6 +87,56 @@ WorkerStatus read_worker_status(pool::Reader& in)
     value.broker_transport_bytes = in.u64(); auto const saturated = in.u8(); require(saturated <= 1, "invalid worker saturation flag");
     value.broker_saturated = saturated; value.hardware = pool::read_worker_hardware(in); in.finish(); return value;
 }
+// Validate packed values in chunk order while retaining just the last word
+// for the one field that may straddle two network frames.
+struct PackedWordValidation
+{
+    uint64_t decoded = 0, previous = 0, last_word = 0;
+    size_t decoded_chunk = 0;
+
+    void append(uint8_t k, bool wide, std::span<uint32_t const> boundaries,
+        uint64_t first_word, std::span<uint64_t const> words)
+    {
+        unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
+        uint64_t const mask = (uint64_t(1) << width) - 1;
+        uint64_t const maximum_delta = uint64_t(72 - k) * (178ull << (k - 8));
+        uint64_t const first_bit = first_word * 64;
+        uint64_t const end = std::min<uint64_t>(boundaries.back(), (first_bit + words.size() * uint64_t(64)) / width);
+        uint64_t bit = decoded * width;
+        auto accept = [&](uint64_t value)
+        {
+            require(value >= previous && (wide || value - previous < maximum_delta),
+                "compute member payload is unsorted or has an invalid delta summary");
+            previous = value; ++decoded; bit += width;
+        };
+        while (decoded < end)
+        {
+            // Monotone boundaries end at total. Empty chunks consume no fields.
+            while (decoded == boundaries[decoded_chunk + 1]) { ++decoded_chunk; previous = 0; }
+            uint64_t const chunk_end = std::min<uint64_t>(end, boundaries[decoded_chunk + 1]);
+            if (bit < first_bit)
+            {
+                unsigned const carry = unsigned(first_bit - bit);
+                accept(((last_word >> (64 - carry)) | (words.front() << carry)) & mask);
+            }
+            while (decoded < chunk_end)
+            {
+                size_t const word = size_t((bit - first_bit) / 64);
+                unsigned const shift = unsigned(bit % 64);
+                uint64_t value = words[word] >> shift;
+                if (shift + width > 64) value |= words[word + 1] << (64 - shift);
+                accept(value & mask);
+            }
+        }
+        last_word = words.back();
+    }
+    bool complete(uint8_t k, uint64_t total) const
+    {
+        unsigned const used = unsigned(total * (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS) % 64);
+        return decoded == total && (!used || !(last_word >> used));
+    }
+};
+
 class TaskCancelled : public std::runtime_error
 {
 public:
@@ -1143,7 +1211,7 @@ struct WorkerService::Impl
     }
 
     void generation(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
-        WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
+        WorkerPackedSink const& packed_sink, ContributionBlockSink const& contribution_sink,
         WorkerCancellation cancel, bool use_gpu, bool task_slot = true, pool::Resources const* grant = nullptr,
         std::function<void(WorkerTaskAdmission const&)> const& admit = {}, WorkerFreshManifest const& manifest = {})
     {
@@ -1180,6 +1248,10 @@ struct WorkerService::Impl
         auto memory = budget->acquire(dynamic_peak, task_slot, cancel);
         auto execute = [&]
         {
+            static bool const profile = [] { auto v = std::getenv("POS2GPU_PHASE_TIMING"); return v && *v == '1'; }();
+            auto const start = profile ? Clock::now() : Clock::time_point{};
+            Clock::duration encoding{};
+            unsigned codec_lanes = 0;
             uint64_t task_retained = 0;
             uint64_t generated_retained = 0;
             bool delivered_packed = false;
@@ -1283,6 +1355,7 @@ struct WorkerService::Impl
                     members.push_back(owned.back());
                 }
             }
+            auto const generated = profile ? Clock::now() : Clock::time_point{};
             if (packed_sink)
             { for (auto raw : members) packed(k, raw, packed_sink, cancel); }
             else
@@ -1330,7 +1403,7 @@ struct WorkerService::Impl
                     std::vector<FragmentRegion> row(count);
                     for (size_t c = 0; c < chunks; ++c)
                     {
-                        if (!(c % contribution_window_chunks)) cancel.check();
+                        if (!(c % initial_contribution_window_chunks)) cancel.check();
                         maximum_work = std::max(maximum_work, ChunkCodec::estimate_work(k, 0, regions(c, row.data())));
                         if (manifest)
                         {
@@ -1349,7 +1422,26 @@ struct WorkerService::Impl
                 };
                 if (maximum_work > config.max_task_bytes)
                     throw pool::UnsupportedResources("initial contribution codec exceeds configured task scratch limit");
-                if (!manifest)
+                auto max_window = manifest ? fresh_group_window_chunks : initial_contribution_window_chunks;
+                unsigned lanes = threads;
+                auto const row_bytes = sizeof(ChunkInput) + sizeof(uint64_t) + count * sizeof(FragmentRegion);
+                auto overhead = [&] { return ParallelEncoder::memory_bytes(lanes) +
+                    max_window * row_bytes +
+                    (manifest ? MemberBatchHash::memory_bytes(count) + member_digest_words * sizeof(uint64_t) : 0); };
+                while (lanes > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) --lanes;
+                while (max_window > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) max_window /= 2;
+                if (!manifest && lanes > 1)
+                {
+                    // Amortize codec queue and output handoffs using spare task RAM.
+                    // Each lane retains its tables and one coalesced output block.
+                    auto const tables = ChunkCodec::estimate_base();
+                    auto const fixed = add(ParallelEncoder::memory_bytes(lanes), multiply(tables, lanes));
+                    auto const room = config.max_task_bytes - std::min(config.max_task_bytes, fixed);
+                    auto const per_lane = room / lanes / add(row_bytes, maximum_work - tables);
+                    max_window = std::max(max_window, size_t(std::min<uint64_t>(contribution_window_chunks, per_lane * lanes)));
+                }
+                codec_lanes = lanes;
+                if (!manifest && lanes == 1)
                 {
                     reserve_codec(maximum_work);
                     ChunkCodec codec(k, maximum_work, scheduler);
@@ -1360,29 +1452,28 @@ struct WorkerService::Impl
                         std::span<uint8_t const> bytes;
                         {
                             CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                            auto const begin = profile ? Clock::now() : Clock::time_point{};
                             codec.prepare(ChunkCodec::estimate_work(k, 0, regions(c, row.data())));
                             bytes = codec.encode(c, {}, 0, row);
+                            if (profile) encoding += Clock::now() - begin;
                         }
-                        cancel.check(); contribution_sink(c, bytes, uint16_t(count));
+                        uint64_t const size = bytes.size();
+                        cancel.check(); contribution_sink(c, {&size, 1}, bytes, uint16_t(count));
                     }
                 }
                 else
                 {
-                    auto max_window = fresh_group_window_chunks;
-                    unsigned lanes = threads;
-                    auto overhead = [&] { return ParallelEncoder::memory_bytes(lanes) +
-                        max_window * (sizeof(ChunkInput) + sizeof(uint64_t) + count * sizeof(FragmentRegion)) +
-                        MemberBatchHash::memory_bytes(count) + member_digest_words * sizeof(uint64_t); };
-                    while (lanes > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) --lanes;
-                    while (max_window > 1 && add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes) max_window /= 2;
                     if (add(multiply(maximum_work, lanes), overhead()) > config.max_task_bytes)
                         throw pool::UnsupportedResources("fresh group codec exceeds configured task scratch limit");
                     uint64_t const scratch = config.max_task_bytes - overhead();
                     reserve_codec(config.max_task_bytes);
-                    std::array<uint8_t, 32> digest;
-                    { CpuWork cpu(offered_cpu, scheduler.get(), cancel);
-                      digest = members_digest(k, source, hash.get(), [&] { cancel.check(); }); }
-                    manifest(payload, largest, digest);
+                    if (manifest)
+                    {
+                        std::array<uint8_t, 32> digest;
+                        { CpuWork cpu(offered_cpu, scheduler.get(), cancel);
+                          digest = members_digest(k, source, hash.get(), [&] { cancel.check(); }); }
+                        manifest(payload, largest, digest);
+                    }
                     ParallelEncoder encoder(k, lanes, scratch, scheduler);
                     size_t const per_lane = size_t(std::min<uint64_t>(max_window,
                         (scratch / lanes - ChunkCodec::estimate_base()) / std::max<uint64_t>(1, maximum_work - ChunkCodec::estimate_base())));
@@ -1397,6 +1488,7 @@ struct WorkerService::Impl
                         std::span<EncodedBlock const> blocks;
                         {
                             CpuAdmission::Lease offered(offered_cpu, lanes, cancel);
+                            auto const begin = profile ? Clock::now() : Clock::time_point{};
                             for (size_t i = 0; i < n; ++i)
                             {
                                 auto* row = rows.data() + i * count;
@@ -1404,21 +1496,23 @@ struct WorkerService::Impl
                                 tasks[i] = {first + i, {}, 0, MemberRegions(row, count)};
                             }
                             blocks = encoder.encode(std::span(tasks).first(n), std::span(sizes).first(n));
+                            if (profile) encoding += Clock::now() - begin;
                         }
                         for (auto const& block : blocks)
                         {
-                            size_t offset = 0;
-                            for (size_t i = block.begin; i < block.end; ++i)
-                            {
-                                cancel.check();
-                                contribution_sink(first + i, block.bytes.subspan(offset, size_t(sizes[i])), uint16_t(count));
-                                offset += size_t(sizes[i]);
-                            }
+                            cancel.check();
+                            contribution_sink(first + block.begin, std::span(sizes).subspan(block.begin, block.end - block.begin),
+                                block.bytes, uint16_t(count));
                         }
                         first += n;
                     }
                 }
             }
+            if (profile)
+                std::fprintf(stderr, "[worker-generation] mode=%s members=%zu lanes=%u generation_ms=%.3f encode_ms=%.3f\n",
+                    packed_sink ? "packed" : manifest ? "fresh" : "contributions", ids.size(), codec_lanes,
+                    std::chrono::duration<double, std::milli>(generated - start).count(),
+                    std::chrono::duration<double, std::milli>(encoding).count());
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
             if (use_gpu)
             {
@@ -1636,12 +1730,21 @@ struct WorkerService::Impl
                     }
                     output.clear(); output.u8(uint8_t(DataKind::Contributions));
                 };
-                auto contribution_sink = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+                auto contribution_sink = [&](uint64_t first, std::span<uint64_t const> sizes,
+                    std::span<uint8_t const> bytes, uint16_t members)
                 {
-                    require(bytes.size() + 32 <= config.tls.max_frame_bytes, "worker contribution exceeds transport frame");
-                    if (output.data().size() + bytes.size() + 14 > config.tls.max_frame_bytes) flush();
-                    CpuWork compute(offered_cpu, scheduler.get(), cancel);
-                    output.u64(ordinal); output.u16(members); output.bytes(bytes);
+                    // Charge serialization once per borrowed block or frame.
+                    // Release the CPU to other tasks while the socket drains.
+                    std::optional<CpuWork> compute;
+                    for (auto size : sizes)
+                    {
+                        require(size + 32 <= config.tls.max_frame_bytes, "worker contribution exceeds transport frame");
+                        if (output.data().size() + size + 14 > config.tls.max_frame_bytes)
+                        { compute.reset(); flush(); }
+                        if (!compute) compute.emplace(offered_cpu, scheduler.get(), cancel);
+                        output.u64(first++); output.u16(members); output.bytes(bytes.first(size_t(size)));
+                        bytes = bytes.subspan(size_t(size));
+                    }
                 };
                 auto manifest = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
                 {
@@ -1651,7 +1754,7 @@ struct WorkerService::Impl
                 };
                 auto const start = Clock::now();
                 generation(k, strength, ids, operation == Operation::Packed ? WorkerPackedSink(packed_sink) : WorkerPackedSink{},
-                    operation != Operation::Packed ? WorkerContributionSink(contribution_sink) : WorkerContributionSink{},
+                    operation != Operation::Packed ? ContributionBlockSink(contribution_sink) : ContributionBlockSink{},
                     cancel, use_gpu, false, &lease->task.resources, {}, operation == Operation::Fresh ? WorkerFreshManifest(manifest) : WorkerFreshManifest{});
                 flush();
                 processing = Clock::now() - start - sending;
@@ -1884,10 +1987,10 @@ void WorkerService::generate_assigned(pool::Lease const& lease,
         auto checked_packed = [&](PackedFragmentTile const& tile, uint64_t total)
         { cancel.check(); running.check(); packed(tile, total); };
         auto checked_contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
-        { cancel.check(); running.check(); contributions(ordinal, bytes, members); };
+        { cancel.check(); contributions(ordinal, bytes, members); };
         impl_->generation(lease.task.k, lease.task.strength, ids,
             packed ? WorkerPackedSink(checked_packed) : WorkerPackedSink{},
-            contributions ? WorkerContributionSink(checked_contribution) : WorkerContributionSink{},
+            contributions ? individual_contributions(checked_contribution, running) : ContributionBlockSink{},
             running, lease.task.kind == pool::Kind::GenerateGpu, true, &lease.task.resources);
         cancel.check(); running.check();
     }
@@ -1957,7 +2060,9 @@ void WorkerService::contributions_local(uint8_t k, uint8_t strength, std::span<s
 {
     require(kind != pool::Kind::GenerateGpu || impl_->gpu_enabled, "local GPU generation was not offered");
     Impl::Acceptance accepted(*impl_);
-    impl_->generation(k, strength, ids, {}, sink, cancel, kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
+    cancel = impl_->cancellation(cancel);
+    impl_->generation(k, strength, ids, {}, individual_contributions(sink, cancel), cancel,
+        kind != pool::Kind::GenerateCpu && impl_->gpu_enabled, true, nullptr, admit);
 }
 
 namespace worker_detail
@@ -2642,26 +2747,50 @@ struct WorkerClient::Impl
         compute.reset(); connection->channel.send(pool::Message::Work, request.data());
         uint64_t total = 0, expected_boundaries = 0, expected_words = 0, received_words = 0, next_chunk = 0;
         std::vector<std::span<uint8_t const>> chunks;
-        if (contribution_sink) chunks.resize(manifest ? fresh_group_window_chunks : contribution_window_chunks);
+        if (contribution_sink) chunks.resize(contribution_window ?
+            (manifest ? fresh_group_window_chunks : contribution_window_chunks) : 1);
         PackedMemberValidation validation; std::vector<uint32_t> boundaries; std::vector<uint64_t> words;
         bool prelude = false, delivered_prelude = false, narrow_deltas = true;
         size_t started = 0; bool received_manifest = false;
-        unsigned __int128 packed_bits = 0;
-        unsigned available_bits = 0;
-        uint64_t decoded = 0, previous = 0;
-        size_t decoded_chunk = 0;
+        PackedWordValidation checked_words;
+        auto validate_words = [&](uint64_t first_word)
+        { checked_words.append(k, validation.flags & PackedMemberValidation::wide_delta, boundaries, first_word, words); };
         auto complete_member = [&]
         {
-            require(delivered_prelude && received_words == expected_words && decoded == total && packed_bits == 0,
+            require(delivered_prelude && received_words == expected_words && checked_words.complete(k, total),
                 "compute result member is truncated or has nonzero padding");
             narrow_deltas &= !(validation.flags & PackedMemberValidation::wide_delta);
         };
+        bool const overlap = packed_sink && config.packed_receive_overlap &&
+            config.cpu_scheduler && config.cpu_scheduler->can_overlap();
+        pool::Frame packed_frame;
+        std::future<void> validating;
         for (;;)
         {
-            cancel.check(); auto const before = Clock::now(); auto frame = connection->channel.receive();
+            pool::Frame contribution_frame;
+            auto& frame = packed_sink ? packed_frame : contribution_frame;
+            auto const before = Clock::now();
+            uint64_t delivery_ns = 0;
+            if (validating.valid())
+            {
+                // Only the validator borrows words. The wire frame can be reused
+                // immediately. Deliver in order on the caller even if TLS stalls.
+                auto deliver = [&]
+                {
+                    if (!validating.valid()) return;
+                    auto const start = Clock::now();
+                    validating.get(); packed_sink({{}, words, {}}, total);
+                    delivery_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+                };
+                try { cancel.check(); connection->channel.receive(frame, deliver); }
+                catch (...) { deliver(); throw; }
+                deliver();
+            }
+            else { cancel.check(); connection->channel.receive(frame); }
             auto const received = Clock::now();
+            connection->generation.receiver_ns += delivery_ns;
             if (connection->first_output != Clock::time_point{})
-                connection->generation.frame_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(received - before).count();
+                connection->generation.frame_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(received - before).count() - delivery_ns;
             try { connection->check_frame(frame); }
             catch (pool::UnsupportedResources const&)
             { require(!connection->output_bytes, "compute worker rejected resources after partial output"); connection->resource_rejected = true; throw; }
@@ -2693,8 +2822,7 @@ struct WorkerClient::Impl
             {
                 require(bool(packed_sink) && started < ids.size(), "unexpected compute member prelude");
                 if (started++) complete_member();
-                delivered_prelude = false; received_words = decoded = previous = 0; decoded_chunk = available_bits = 0;
-                packed_bits = 0; boundaries.clear();
+                delivered_prelude = false; received_words = 0; checked_words = {}; boundaries.clear();
                 total = input.u64(); validation.checked_count = input.u64(); validation.flags = input.u32(); expected_boundaries = input.u64(); input.finish();
                 require(total <= count_bound && total <= UINT32_MAX && expected_boundaries == PlotGroupFile::getChunkCountForK(k) + 1,
                     "compute member exceeds public parameter bound");
@@ -2720,25 +2848,13 @@ struct WorkerClient::Impl
                 require(delivered_prelude, "compute words precede complete boundaries"); auto const count = input.u32();
                 require(count && count <= expected_words - received_words && uint64_t(count) * 8 <= input.remaining(), "compute word tile exceeds member");
                 words.resize(count); input.words(words); input.finish();
-                unsigned const width = k + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
-                uint64_t const range = uint64_t(1) << width;
-                uint64_t const maximum_delta = uint64_t(72 - k) * (178ull << (k - 8));
-                for (auto word : words)
+                auto const first_word = received_words; received_words += count;
+                if (overlap && received_words < expected_words)
                 {
-                    packed_bits |= static_cast<unsigned __int128>(word) << available_bits;
-                    available_bits += 64;
-                    while (available_bits >= width && decoded < total)
-                    {
-                        while (decoded_chunk + 1 < boundaries.size() && decoded >= boundaries[decoded_chunk + 1])
-                        { ++decoded_chunk; previous = uint64_t(decoded_chunk) * range; }
-                        require(decoded_chunk + 1 < boundaries.size(), "compute member payload exceeds boundaries");
-                        uint64_t const value = uint64_t(decoded_chunk) * range + (uint64_t(packed_bits) & (range - 1));
-                        require(value >= previous && ((validation.flags & PackedMemberValidation::wide_delta) || value - previous < maximum_delta),
-                            "compute member payload is unsorted or has an invalid delta summary");
-                        previous = value; ++decoded; packed_bits >>= width; available_bits -= width;
-                    }
+                    compute.reset();
+                    validating = config.cpu_scheduler->submit([&, first_word] { validate_words(first_word); });
                 }
-                compute.reset(); packed_sink({{}, words, {}}, total); received_words += count;
+                else { validate_words(first_word); compute.reset(); packed_sink({{}, words, {}}, total); }
             }
             else if (type == DataKind::FreshManifest)
             {

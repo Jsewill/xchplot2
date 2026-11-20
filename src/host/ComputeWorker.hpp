@@ -45,7 +45,7 @@ using WorkerContributionSink = std::function<void(uint64_t ordinal,
     std::span<uint8_t const> encoded, uint16_t members)>;
 // Borrowed spans remain valid only during the callback. A transport frame is
 // delivered in bounded windows without extending its lifetime or copying data.
-inline constexpr size_t contribution_window_chunks = 64;
+inline constexpr size_t contribution_window_chunks = 1024;
 using WorkerContributionWindowSink = std::function<void(uint64_t ordinal,
     std::span<std::span<uint8_t const> const> encoded, uint16_t members)>;
 struct WorkerTaskIdentity
@@ -257,6 +257,7 @@ struct WorkerClientConfig
     uint64_t max_task_bytes = pool::default_codec_task_bytes;
     unsigned task_timeout_ms = 3600000;
     std::shared_ptr<CodecScheduler> cpu_scheduler;
+    bool packed_receive_overlap = true;
     // The embedding owner keeps the service alive through every client call.
     WorkerService* local_service = nullptr;
     std::function<std::shared_ptr<WorkerService>()> local_service_provider;
