@@ -251,7 +251,7 @@ message(STATUS "XCHPLOT2_AES_ROUND=${XCHPLOT2_AES_ROUND}")
 # pin. The `if(NOT DEFINED ...)` guard lets a plain edit take effect on
 # reconfigure while still honouring user -D overrides.
 if(NOT DEFINED POS2_CHIP_GIT_TAG)
-    set(POS2_CHIP_GIT_TAG "ff89d3e61f4315311a7f975409a6433e67f699ff")
+    set(POS2_CHIP_GIT_TAG "077c692b51a32cde748e6a8f1ccefe5354c81fa8")
 endif()
 
 if(NOT DEFINED POS2_CHIP_DIR)

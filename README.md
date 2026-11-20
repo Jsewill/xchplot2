@@ -8,11 +8,10 @@ This is the **`cuda-only` branch**, using native CUDA for NVIDIA GPUs.
 The [`main` branch](https://github.com/Jsewill/xchplot2) uses
 SYCL/AdaptiveCpp for NVIDIA, AMD, and Intel.
 
-This build pins [pos2-chip 1.0.0](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.0).
-The new Feistel cipher and group format are incompatible with earlier plots;
-existing plots must be replotted and old job manifests cannot be resumed.
-Farmer integration is still in progress upstream; see the
-[compatibility notes](contrib/pos2-pr118/README.md).
+This build pins [pos2-chip 1.0.1](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.1).
+Plots and job manifests from 1.0.0 remain compatible. Experimental PoS2
+plots made before 1.0 require replotting with a new job manifest. For farmer support,
+see the [compatibility notes](contrib/pos2-pr118/README.md).
 
 An opt-in [grouped-job runner](contrib/pos2-pr118/README.md#experimental-grouped-jobs)
 supports experimental multi-member groups, shared keys, and resumable assembly.
