@@ -167,9 +167,16 @@ void generation()
     require(next_chunk == PlotGroupFile::getChunkCountForK(18) && first == expected.size(), "serial contribution stream was truncated");
     next_chunk = first = 0;
     auto parallel_options = options; parallel_options.generation_threads = 2;
-    parallel_options.available_resources = [capacity = options.capacity](uint32_t) { return capacity; };
+    std::atomic<unsigned> codec_cpus{2};
+    parallel_options.available_resources = [&, capacity = options.capacity](uint32_t)
+    { auto current = capacity; current.cpu_threads = codec_cpus.load(); return current; };
     WorkerService parallel(parallel_options);
-    parallel.contributions_local(18, 2, ids, check_contribution);
+    WorkerCancellation deadline; deadline.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    parallel.contributions_local(18, 2, ids, [&](auto ordinal, auto bytes, auto members)
+    {
+        if (!ordinal) codec_cpus.store(1);
+        check_contribution(ordinal, bytes, members);
+    }, deadline);
     require(next_chunk == PlotGroupFile::getChunkCountForK(18) && first == expected.size(), "worker contribution stream was truncated");
     uint64_t maximum_chunk = 0, chunk_count = 0, previous_chunk = UINT64_MAX;
     for (auto value : expected)

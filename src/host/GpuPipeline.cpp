@@ -394,7 +394,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                                         GpuBufferPool& pool,
                                         int pinned_index,
                                         GpuFragmentSink const* sink,
-                                        GpuDeviceFragmentOutput const* device_output)
+                                        GpuDeviceFragmentOutput const* device_output,
+                                        std::function<void()> const& acquire_pinned = {})
 {
 
     sycl::queue& q = sycl_backend::queue();
@@ -475,11 +476,24 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // on single-plot runs (only slot 0 gets allocated). See
     // GpuBufferPool::ensure_pinned header comment for rationale.
     uint64_t*       h_pinned_t3    = sink || device_output ? nullptr : pool.ensure_pinned(pinned_index);
-    // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
-    // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
-    // when bytes==0. Point them at d_sort_scratch (idle during match) to
-    // give the kernel a valid non-null handle.
-    void*           d_match_temp   = pool.d_sort_scratch;
+    // Match preparation uses the idle radix-sort scratch for coarse and fine
+    // offsets. A deeper index shortens scattered searches in the sorted table.
+    void* d_match_temp = pool.d_sort_scratch;
+    size_t match_bytes = pool.sort_scratch_bytes;
+    auto index_bits = [&](auto const& params, void* spare, size_t spare_bytes)
+    {
+        uint64_t const buckets = uint64_t(1) << (params.num_section_bits + params.num_match_key_bits);
+        d_match_temp = pool.d_sort_scratch; match_bytes = pool.sort_scratch_bytes;
+        // Some sort backends need little scratch. The Xs sort destination and
+        // the later permutation indices are idle during their respective matches.
+        if ((2 * buckets + 2) * sizeof(uint64_t) > match_bytes)
+        { d_match_temp = spare; match_bytes = spare_bytes; }
+        uint64_t const words = std::min<uint64_t>(match_bytes, 8u << 20) / sizeof(uint64_t);
+        int const desired = std::min(params.num_match_target_bits - 1, std::max(8, params.num_match_target_bits - 8));
+        int bits = 0;
+        while (bits < desired && buckets + 2 + (buckets << (bits + 1)) <= words) ++bits;
+        return bits;
+    };
 
     // Sort key/val arrays alias d_storage. Safe because Xs is fully consumed
     // by T1 match (stream-synchronised) before we enter T1 sort.
@@ -591,17 +605,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
-    size_t t1_temp_bytes = 0;
-    launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          nullptr, nullptr, d_count, cap,
-                          nullptr, &t1_temp_bytes, q);
-    // The queue is out-of-order: wait so the counter zeroing can't be
-    // scheduled after the match kernel that increments it.
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t1p.fine_bits = index_bits(t1p, pool.d_pair_b, pool.pair_b_bytes);
     int p_t1 = begin_phase("T1 match");
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           d_t1_meta, d_t1_mi, d_count, cap,
-                          d_match_temp, &t1_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t1);
 
     // No explicit sync: the next cudaMemcpy (non-async, default stream)
@@ -635,15 +643,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // No AoS struct anymore — saves 33 % of sorted-T1 bandwidth on both the
     // permute write and the match-kernel hot path.
     auto t2p = make_t2_params(cfg.k, cfg.strength);
-    size_t t2_temp_bytes = 0;
-    launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
-                          nullptr, nullptr, nullptr, d_count, cap,
-                          nullptr, &t2_temp_bytes, q);
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t2p.fine_bits = index_bits(t2p, d_vals_in, 2 * cap * sizeof(uint32_t));
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
                           d_t2_meta, d_t2_mi, d_t2_xbits, d_count, cap,
-                          d_match_temp, &t2_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t2);
 
     uint64_t t2_count = 0;
@@ -672,19 +676,13 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // d_keys_out now holds the T2 sorted match_info (T1's was overwritten by
     // the T2 sort above) — pass as the slim stream for binary search in T3.
     auto t3p = make_t3_params(cfg.k, cfg.strength);
-    size_t t3_temp_bytes = 0;
-    launch_t3_match(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          nullptr, t2_count,
-                          d_t3, d_count, cap,
-                          nullptr, &t3_temp_bytes, q);
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t3p.fine_bits = index_bits(t3p, d_vals_in, 2 * cap * sizeof(uint32_t));
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           d_keys_out, t2_count,
                           d_t3, d_count, cap,
-                          d_match_temp, &t3_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t3);
 
     uint64_t t3_count = 0;
@@ -709,6 +707,13 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     end_phase(p_t3_sort);
 
     // ---------- D2H ----------
+    // Only the D2H writes this host slot. Its prior consumer can keep
+    // reading while the next member generates and sorts on the device.
+    if (acquire_pinned) {
+        int const wait = begin_phase("pinned output wait");
+        acquire_pinned();
+        end_phase(wait);
+    }
     int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
     GpuPipelineResult result;
     result.t1_count = t1_count;
@@ -721,9 +726,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
         q.wait_and_throw();
     } else if (sink) {
         drain_fragment_sink(q, d_frags_out, t3_count, false, *sink);
-    } else if (t3_count > 0) {
-        q.memcpy(h_pinned_t3, d_frags_out, sizeof(uint64_t) * t3_count);
-        q.wait();
+    } else {
+        if (t3_count) q.memcpy(h_pinned_t3, d_frags_out, sizeof(uint64_t) * t3_count);
+        q.wait_and_throw();
     }
     end_phase(p_d2h);
 
@@ -755,9 +760,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
-                                   int pinned_index)
+                                   int pinned_index, std::function<void()> const& acquire_pinned)
 {
-    return run_gpu_pipeline_impl(cfg, pool, pinned_index, nullptr, nullptr);
+    return run_gpu_pipeline_impl(cfg, pool, pinned_index, nullptr, nullptr, acquire_pinned);
 }
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,

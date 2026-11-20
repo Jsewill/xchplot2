@@ -29,6 +29,7 @@ struct T3MatchParams {
     int num_section_bits;     // = (k < 28) ? 2 : (k - 26)
     int num_match_key_bits;   // = strength
     int num_match_target_bits;// = k - section_bits - match_key_bits
+    int fine_bits = 8;        // Number of high target bits indexed within each match bucket.
 };
 
 T3MatchParams make_t3_params(int k, int strength);

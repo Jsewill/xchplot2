@@ -35,6 +35,7 @@ struct T2MatchParams {
     int num_section_bits;     // = (k < 28) ? 2 : (k - 26)
     int num_match_key_bits;   // = strength for T2
     int num_match_target_bits;// = k - section_bits - match_key_bits
+    int fine_bits = 8;        // Number of high target bits indexed within each match bucket.
 };
 
 T2MatchParams make_t2_params(int k, int strength);

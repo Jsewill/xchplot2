@@ -101,6 +101,7 @@ struct WorkerOffer
     CodecLimits codec_limits;
     WorkerAdmission admission = WorkerAdmission::Accepting;
     WorkerHardware hardware;
+    uint32_t independent_k_mask = 0;
 };
 struct Task
 {
@@ -116,6 +117,9 @@ struct Task
     // Generation tasks leave both zero. Retries preserve these fields.
     uint32_t chunk_count = 0;
     uint64_t max_output_bytes = 0;
+    // Independently framed members share one generation slot and reuse its
+    // singleton working set. This output contract is bound to the lease.
+    bool independent_members = false;
     bool operator==(Task const&) const = default;
 };
 struct OwnerSession
@@ -243,7 +247,13 @@ public:
     std::optional<Lease> acquire(OwnerSession const&, Task const&);
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
-    uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr);
+    struct GenerationAvailability
+    {
+        uint32_t independent_batch = 0;
+        bool codec_available = true, concurrent_codec = true;
+    };
+    uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr,
+        GenerationAvailability* availability = nullptr, std::string const& codec = {});
     void cancel(OwnerSession const&, std::string const& task_id, uint64_t attempt);
     // Only the worker renews Running work; unused grants have a fixed TTL.
     void renew(Lease const&);

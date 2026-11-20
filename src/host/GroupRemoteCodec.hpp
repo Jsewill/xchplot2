@@ -144,7 +144,6 @@ public:
         // at most their measured cost, capped at 250 ms even when the normal
         // generation deadline is much longer. No asynchronous borrower can
         // outlive these source spans.
-        counters.calibration_attempts.fetch_add(1);
         std::optional<DispatchResult> result;
         try { result = dispatch(k, chunks, false, shape, local, true, std::min<uint64_t>(elapsed, 250000000)); }
         catch (...)
@@ -303,6 +302,12 @@ private:
                     reservation = std::make_shared<Reservation>(budget_, required); budget_->used += required;
                 }
                 cancel.check();
+                auto client = client_();
+                if (probe)
+                {
+                    if (!client->codec_probe_available(k, timeout_ns)) return {};
+                    counters.calibration_attempts.fetch_add(1);
+                }
                 std::vector<std::vector<WorkerContribution>> contributions(chunks.size());
                 std::vector<std::vector<std::vector<uint64_t>>> raw(chunks.size());
                 std::vector<std::vector<std::span<uint64_t const>>> views(chunks.size());
@@ -329,7 +334,6 @@ private:
                 uint64_t const validation_budget = reservation->bytes - fixed - multiply(max_output, 4) + ChunkCodec::estimate_base();
                 ChunkCodec inspector(k, validation_budget, scheduler_);
                 uint64_t delivered_bytes = 0;
-                auto client = client_();
                 std::vector<WorkerTaskObservation> completed;
                 WorkerTaskOptions options;
                 options.observe = [&](WorkerTaskObservation const& worker) { completed.push_back(worker); };

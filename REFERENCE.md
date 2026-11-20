@@ -2085,9 +2085,15 @@ configured CPU pool and reuses the existing network buffer. When staging
 encoded contributions on scratch storage, the owner budgets one additional
 frame per concurrent receiver. It can read that frame while validating and
 writing the previous chunks. A single-CPU owner consumes each frame inline.
-When the pool offers one generation slot, a second destination can queue its next
-compressed batch while the first destination flushes scratch. Both batches
-must fit the owner's resource limits. Disk pressure suppresses this overlap.
+With one compatible GPU slot and at least two worker CPU threads, the owner
+can send ready member requests from the same or different destinations in
+one lease. The GPU generates and sorts the next member while the worker
+encodes the preceding member. Both members use the same pinned output
+buffer in turn. Each receiver gets its own ordered compressed chunks.
+This works when the worker has RAM for only one raw member. Encoding can
+reduce its CPU thread count between windows as other work needs the host.
+The owner budgets each scratch receiver, and disk pressure limits queued destinations.
+Older compute peers use the existing generation paths.
 
 With multiple rotating destinations, automatic selection starts with the
 available worker and storage bandwidth. When a writer has more groups to
@@ -2099,13 +2105,18 @@ When the disk I/O governor reports farming pressure, the planner limits
 new pooled HDD work to one active destination and suspends writer trials.
 `--compute-writers N` requests up to N active pooled HDD destinations for
 a repeatable comparison. The default is `auto`. The plotting JSON includes
-the peak active destinations, packed members streamed to scratch and fresh
-groups received from workers. Set `POS2GPU_PHASE_TIMING=1` on the worker to
-see member generation and chunk encoding wall times. Packed GPU generation
+the peak active destinations, packed members streamed to scratch, fresh
+groups received from workers, and counts of independent contribution leases
+and members. Set `POS2GPU_PHASE_TIMING=1` on the worker to
+see member generation and chunk encoding wall times. For independent
+contributions, `pinned output wait` measures how long the preceding consumer
+holds the buffer before the device-to-host copy. Packed GPU generation
 can overlap its output callback, so its generation time includes backpressure
 from the receiver.
 
-Optional encoding probes back off after repeated failures while local encoding
+An optional remote encoding probe uses recent broker timings and available
+CPU and task slots to decide whether it can finish within the local encoding
+time. Probes back off after repeated failures while local encoding
 continues. The owner passes the remaining time for a codec window to the
 broker. If that time runs out before a worker starts, the broker releases
 the reservation so generation can use the slot. Older brokers use their

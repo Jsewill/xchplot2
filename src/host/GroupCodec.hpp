@@ -1121,9 +1121,9 @@ public:
     // all tasks are drained before propagating any failure, as in the writer.
     std::span<EncodedBlock const> encode(std::span<ChunkInput const> chunks,
                                         std::span<uint64_t> sizes, bool retain_previous = false,
-                                        std::span<ChunkSummary> summaries = {})
+                                        std::span<ChunkSummary> summaries = {}, size_t max_workers = SIZE_MAX)
     {
-        return run(chunks, sizes, retain_previous, false, summaries);
+        return run(chunks, sizes, retain_previous, false, summaries, false, {}, max_workers);
     }
 
     void measure(std::span<ChunkInput const> chunks, std::span<uint64_t> sizes,
@@ -1152,7 +1152,7 @@ private:
     std::span<EncodedBlock const> run(std::span<ChunkInput const> chunks,
                                     std::span<uint64_t> sizes, bool retain_previous, bool size_only,
                                     std::span<ChunkSummary> summaries = {}, bool summary_only = false,
-                                    std::span<ChunkCodec::Inspection> inspected = {})
+                                    std::span<ChunkCodec::Inspection> inspected = {}, size_t max_workers = SIZE_MAX)
     {
         std::lock_guard run(run_mutex_);
         group_tools::require(summary_only || sizes.size() == chunks.size(), "codec size output mismatch");
@@ -1192,7 +1192,8 @@ private:
         std::chrono::steady_clock::time_point submitted;
         if (remote_ && !size_only && !summary_only)
             submitted = std::chrono::steady_clock::now();
-        size_t const count = std::min(chunks.size(), codecs_.size());
+        group_tools::require(max_workers, "group encoding requires a CPU worker");
+        size_t const count = std::min({chunks.size(), codecs_.size(), max_workers});
         size_t const per_task = chunks.size() / count + (chunks.size() % count != 0);
         if (retain_previous) for (auto& codec : codecs_) codec->next_window();
         for (size_t task = 0, begin = 0; begin < chunks.size(); ++task, begin += per_task)

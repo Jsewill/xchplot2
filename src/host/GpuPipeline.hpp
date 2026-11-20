@@ -18,6 +18,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -223,7 +224,8 @@ GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg);
 // otherwise throws.
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
-                                   int pinned_index);
+                                   int pinned_index,
+                                   std::function<void()> const& acquire_pinned = {});
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
                                    GpuFragmentSink const& sink);

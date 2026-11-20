@@ -1376,13 +1376,20 @@ struct Producer
                 }
                 pending.erase(pending.begin() + slot); made_progress = true;
             }
-            size_t const concurrency = client->suggested_generation_concurrency(k, strength,
-                unsigned(std::min<uint64_t>(args.pool_inflight, input.size())));
+            auto const limit = unsigned(std::min<uint64_t>(args.pool_inflight, input.size()));
+            auto const width = client->independent_contribution_width(k, strength);
+            size_t const concurrency = std::min(limit, std::max(width,
+                client->suggested_generation_concurrency(k, strength, limit)));
             while (pending.size() < concurrency && scheduled < input.size())
             {
                 uint16_t const member = scheduled;
-                uint16_t const count = uint16_t(client->suggested_batch_members(k, strength,
-                    unsigned(input.size() - scheduled)));
+                unsigned const remaining = unsigned(input.size() - scheduled);
+                // Finish a ready destination's generation before mixing its tail
+                // with another destination. Its HDD can then pack during the
+                // next lease. A worker with room to coencode keeps its batch policy.
+                bool const separate = width > 1 && remaining > 1 && client->generation_capacity(k, strength).batch == 1;
+                uint16_t const count = uint16_t(separate ? std::min(width, remaining) :
+                    client->suggested_batch_members(k, strength, remaining));
                 require(count && count <= input.size() - scheduled, "invalid pool batch recommendation");
                 std::vector<std::array<uint8_t, 32>> plot_ids; plot_ids.reserve(count);
                 for (uint16_t offset = 0; offset < count; ++offset)
@@ -1391,7 +1398,7 @@ struct Producer
                     if (args.command.empty() || args.verbose) std::osyncstream(std::cerr) << progress << index << '\n';
                     plot_ids.push_back(identity.params.get_plot_params_for_index(index).get_plot_id().data());
                 }
-                pending.push_back(std::async(std::launch::async, [&, member, count, plot_ids = std::move(plot_ids)]
+                pending.push_back(std::async(std::launch::async, [&, member, count, separate, plot_ids = std::move(plot_ids)]
                 {
                     group_grow::WorkerCancellation cancel;
                     cancel.stop = &cancelled;
@@ -1399,17 +1406,21 @@ struct Producer
                     auto generate = [&](uint16_t slot, std::span<std::array<uint8_t, 32> const> ids)
                     {
                         uint16_t const members = uint16_t(ids.size());
-                        bool touched = false;
+                        bool const individual = separate && members > 1;
+                        uint16_t const per_chunk = individual ? 1 : members;
+                        auto const chunk_count = PlotGroupFile::getChunkCountForK(k);
+                        uint16_t touched = 0;
                         auto receive_window = [&](uint64_t ordinal,
                             std::span<std::span<uint8_t const> const> chunks, uint16_t received)
                         {
-                            require(received == members, "pool contribution membership changed during transfer");
+                            uint64_t const offset = individual ? ordinal / chunk_count : 0;
+                            require(received == per_chunk && offset < members, "pool contribution membership changed during transfer");
                             with_io(cancel, [&]
                             {
-                                touched = true; // append may claim its group before validation or I/O throws.
+                                touched = uint16_t(offset + per_chunk); // append can claim its group before throwing.
                                 uint64_t bytes = 0; for (auto chunk : chunks) bytes += chunk.size();
                                 progress_received(backend.progress, bytes);
-                                if (!input.append_chunks(slot, ordinal, chunks, received))
+                                if (!input.append_chunks(uint16_t(slot + offset), individual ? ordinal % chunk_count : ordinal, chunks, received))
                                     throw group_grow::WorkerTaskDeclined();
                             });
                         };
@@ -1419,8 +1430,19 @@ struct Producer
                         {
                             if (touched)
                             {
-                                with_io(cancel, [&] { input.reset_member(slot, members); });
-                                touched = false;
+                                with_io(cancel, [&] { for (uint16_t i = 0; i < touched; i += per_chunk)
+                                    input.reset_member(uint16_t(slot + i), per_chunk); });
+                                touched = 0;
+                            }
+                        };
+                        auto local = [&]
+                        {
+                            for (uint16_t i = 0; i < members; i += per_chunk)
+                            {
+                                cancel.check();
+                                client->contributions_local(k, strength, ids.subspan(i, per_chunk),
+                                    [&](uint64_t ordinal, auto bytes, uint16_t n) { receive(i * chunk_count + ordinal, bytes, n); }, cancel);
+                                backend.pool_local_fallbacks.fetch_add(1);
                             }
                         };
                         // This identity owns exactly this ordered plot-ID body.
@@ -1434,8 +1456,7 @@ struct Producer
                             reset(); backend.pool_retries.fetch_add(1);
                             if (client->local_available())
                             {
-                                cancel.check(); client->contributions_local(k, strength, ids, receive, cancel);
-                                backend.pool_local_fallbacks.fetch_add(1); return false;
+                                local(); return false;
                             }
                             Backend::wait_pool_retry(cancel, delay); return true;
                         };
@@ -1445,7 +1466,7 @@ struct Producer
                             require(attempt < UINT64_MAX, "pool task attempt exhausted"); task.attempt = ++attempt;
                             try
                             {
-                                client->contributions(k, strength, ids, receive, cancel, task, receive_window);
+                                client->contributions(k, strength, ids, receive, cancel, task, receive_window, {}, individual);
                                 break;
                             }
                             catch (group_grow::WorkerTaskDeclined const&) { throw; }
@@ -1461,8 +1482,7 @@ struct Producer
                                 // Repeating this exact batch cannot reduce its
                                 // codec scratch demand on the same executor.
                                 if (members > 1 || !client->local_available()) throw;
-                                cancel.check(); client->contributions_local(k, strength, ids, receive, cancel);
-                                backend.pool_local_fallbacks.fetch_add(1); break;
+                                local(); break;
                             }
                             catch (Interrupted const&) { throw; }
                             catch (std::exception const&)
@@ -1470,11 +1490,11 @@ struct Producer
                                 reset();
                                 if (++permanent_failures < 2) { backend.pool_retries.fetch_add(1); continue; }
                                 if (!client->local_available()) throw;
-                                cancel.check(); client->contributions_local(k, strength, ids, receive, cancel);
-                                backend.pool_local_fallbacks.fetch_add(1); break;
+                                local(); break;
                             }
                         }
-                        with_io(cancel, [&] { input.finish_member(slot, members); });
+                        with_io(cancel, [&] { for (uint16_t i = 0; i < members; i += per_chunk)
+                            input.finish_member(uint16_t(slot + i), per_chunk); });
                         progress_generated(backend.progress, members);
                     };
                     try { generate(member, plot_ids); }
@@ -5007,6 +5027,8 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
                       << ",\"pool_completed_codec_tasks\":" << wire.completed_codec
                       << ",\"pool_local_direct_tasks\":" << wire.local_tasks
                       << ",\"pool_task_elapsed_ns\":" << wire.task_elapsed_ns
+                      << ",\"pool_independent_contribution_tasks\":" << wire.independent_tasks
+                      << ",\"pool_independent_contribution_members\":" << wire.independent_members
                       << ",\"pool_timed_generation_tasks\":" << wire.timed_generation_tasks
                       << ",\"pool_receiving_destinations\":" << metrics.pool_receiving_destinations
                       << ",\"pool_generation_seconds_per_member\":" << double(metrics.pool_generation_member_ns / 1e9L)
@@ -13844,9 +13866,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             require(farm->feasible(), "cannot extend frozen farming layout: " + farm->infeasibility_reason());
         }
         bool fresh_scratch = false;
+        std::optional<group_grow::ScratchPool::IoLease> io;
         uint64_t prior_capacity = d.metrics.capacity_bytes;
         auto defer = [&]
         {
+            io.reset();
             if (fresh_scratch)
             {
                 scratch_pool->release_scratch_after_cleanup(d.scratch_owner); d.scratch.reset();
@@ -13971,6 +13995,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 unsigned slots = backend->pool_receivers(d.requested, forecast.receivers);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit);
+                if ((d.scratch || args.construction == "external") && !args.pool_writers)
+                    slots = std::max(slots, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
+                        d.requested.params.get_k(), d.requested.params.get_strength())));
                 startup_receivers = std::clamp(slots, 1u, limit);
             }
 #endif
@@ -14015,6 +14042,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return pool_publications[external].select(pool_shape, maximum,
                 std::max(size_t(1), startup_receivers + startup_writers), args.pool_writers, args.pool_output,
                 external || maximum == 1, allow_trial);
+        };
+        auto independent_input = [&]
+        {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            return pooled_generation && d.scratch && args.member_storage == "compact" && !owns_prefetch &&
+                !d.needs_resume && !d.needs_finish && args.pool_output != "packed" &&
+                (!tune_pool || pool_choice(true).encoded) &&
+                backend->acquire_pool_client()->independent_contribution_width(
+                    d.requested.params.get_k(), d.requested.params.get_strength()) > 1;
+#else
+            return false;
+#endif
         };
         auto estimate = [&](size_t count, unsigned grant, uint16_t batch)
         {
@@ -14090,12 +14129,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (fresh_hdd && d.scratch && backend->mode == "pool" && args.io_overlap && args.generation_overlap &&
                 !owns_prefetch && plan.batch <= group_grow::ExternalEngine::max_runs)
             {
-                // External receivers put compressed contributions straight on
-                // scratch. A batch must still fit an ordinary owner in recovery.
-                // Price bounded windows for parallel lanes, then check the
-                // chosen owner's actual workspace and fallback before opening it.
-                auto const recoverable = admitted_batch_cap(
-                    uint16_t(std::min<size_t>(maximum, group_grow::ExternalEngine::max_runs)), minimum,
+                // Sealed contributions checkpoint their own runs. The ordinary
+                // fallback below sizes its resident batch independently, so a
+                // streamed batch can span more members than fit in owner RAM.
+                auto const limit = uint16_t(std::min<size_t>(maximum, group_grow::ExternalEngine::max_runs));
+                auto const recoverable = independent_input() ? limit : admitted_batch_cap(limit, minimum,
                     args.max_ram - reserved - generation, storage, [&](uint16_t count) { return memory(1, count); });
                 if (recoverable >= plan.batch)
                 {
@@ -14324,8 +14362,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (fixed >= args.max_ram) return defer();
         uint64_t const available = args.max_ram - generation_fixed();
         if (other_held > available || generation > available - other_held) return defer();
+        bool const checked_contributions = independent_input();
+        uint64_t const resident_member = use_stream_input || checked_contributions ? 0 : storage;
         uint16_t const batch = admitted_batch_cap(std::min(maximum, plan.batch), minimum,
-            available - other_held - generation, use_stream_input ? 0 : storage,
+            available - other_held - generation, resident_member,
             [&](uint16_t n) { return memory(share, n); });
         if (!batch) return defer();
         uint64_t const lease = memory(share, batch);
@@ -14337,7 +14377,6 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
         auto options = args; options.workers = share;
-        std::optional<group_grow::ScratchPool::IoLease> io;
         if (scratch_pool)
         {
             io = scratch_pool->try_io(d.scratch_owner);
@@ -14352,7 +14391,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (farm && histories.memory_bytes() > history_before) ++history_contexts;
         fixed = sum(fixed, histories.memory_bytes() - history_before);
         auto generation_peak = [&](uint64_t workspace)
-        { return sum(sum(sum(generation_fixed(), workspace), sum(other_held, product(batch - 1, use_stream_input ? 0 : storage))), generation); };
+        { return sum(sum(sum(generation_fixed(), workspace), sum(other_held, product(batch - 1, resident_member))), generation); };
         auto transfer_peak = [&](uint64_t workspace)
         { return sum(sum(sum(fixed, workspace), held), backend->retained()); };
         if (std::max(generation_peak(memory(share, batch)), transfer_peak(memory(share, batch))) > args.max_ram) return defer();
@@ -15637,9 +15676,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     });
                     // A scratch receiver also provisions and flushes its local runs. Queue one
                     // admitted successor so those waits do not leave a single worker idle.
-                    bool const queue = offered_slots == 1 && receiving == 1 && contribution_members && d.pool_encoded &&
+                    bool const queue = offered_slots == 1 && contribution_members && d.pool_encoded &&
                         args.io_overlap && args.generation_overlap && args.pool_inflight > 1 &&
-                        (!args.disk_io || !args.disk_io->status().pressured);
+                        (!args.disk_io || !args.disk_io->status().pressured) &&
+                        receiving <= std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
+                            d.requested.params.get_k(), d.requested.params.get_strength()));
                     if (receiving >= receivers && !queue) { blocked(ControllerWait::generation_order); continue; }
                 }
             }

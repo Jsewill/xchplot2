@@ -754,6 +754,62 @@ Every output matched its full-proof-checked reference by SHA-256. During
 the two updated fills, the harvester farmed 1,164 plots on six separate HDDs.
 It completed 51 challenges with eligible plots. The longest took 0.6231 s.
 
+#### Overlapping GPU generation and encoding with the full farm online
+
+The harvester had 17,886 v1 plots loaded. Each fill wrote the same sixteen
+three-member k=28 groups on separate empty HDDs. The storage host and the
+single-slot RTX 4090 worker each had a 4 GiB plotting RAM budget. The
+automatic planner used two destinations and up to fourteen scratch HDDs.
+Times start at launch and end at durable publication.
+
+| 48 published members per fill | Previous (s/member) | Updated (s/member) | Previous first group (s) | Updated first group (s) |
+| --- | ---: | ---: | ---: | ---: |
+| First comparison | 7.10 | 6.32 | 42.90 | 33.22 |
+| Repeat | 6.93 | 6.28 | 44.05 | 33.87 |
+
+The updated fills took 10.2% less time per member across the two comparisons.
+Each used 16 GPU leases and 16 construction batches. The controls used 48
+leases and 47 batches. The GPU generated the next member while the CPU
+encoded the previous member from the pinned buffer. Scheduling a destination's
+members together let its HDD start packing earlier. Every group matched its
+reference by SHA-256. A fresh full-proof check of all 16 distinct groups
+validated 777 proofs.
+
+On the repeat the storage host averaged 164 MB/s of plotting-disk reads,
+336 MB/s of writes and 1.41 Gb/s inbound on 10 GbE. Its highest five-second
+receive rate was 3.80 Gb/s. The single worker spent 3.42 s/member servicing
+leases. The remaining 2.85 s/member includes admission, storage work between
+leases and the final publication. Gigahorse proof recomputation was active
+on both the plotting RTX 4090 and the storage host's RTX 3070.
+
+The harvester completed 64 challenges with eligible plots during the two
+updated fills. The longest took 5.16 s. A separate 351 s farming-only
+interval had 37 eligible challenges, with a maximum of 5.60 s. Across the
+two previous-build fills, one of 74 eligible challenges exceeded eight
+seconds, taking 9.05 s.
+
+With a three-writer cap, the 4 GiB owner still admitted two active
+destinations and published at 6.30 s/member. An eight-HDD fill with GPU
+phase timing enabled published 24 members at 6.82 s/member. Its GPU
+pipeline averaged 2.83 s/member, including 2.29 s in T1, T2 and T3 matching.
+
+At an assumed 2.2 s/member, these same files would require 452 MB/s of
+final writes and 3.85 Gb/s of compressed worker payload. At the measured
+241 MB/s single-HDD sequential write rate, final writes alone take
+4.13 s/member on one destination or an ideal 2.06 s/member across two.
+Scratch I/O, encoding and publication also have to fit within that interval.
+
+With four plotting HDDs, 32 GiB on the storage host and a 16 GiB worker,
+automatic construction used zero scratch in both builds. The previous build
+published twelve members at 6.13 s/member and the updated build at
+5.69 s/member. The first group arrived at 33.53 s and 46.21 s respectively.
+
+On local NVMe, each build also ran two four-member fills with GPU phase
+timing and an 8 GiB plotting RAM budget. The wider GPU match index reduced
+combined T2 and T3 matching from 1.97 to 1.40 s/member. Launch-to-exit
+times averaged 5.33 and 5.27 s/member respectively, with overlapping run
+times. All outputs matched the full-proof-checked reference files.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

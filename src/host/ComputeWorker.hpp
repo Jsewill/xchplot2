@@ -67,7 +67,12 @@ struct WorkerGenerationTiming
     // Time reading frames after first output, including reads overlapping the sink.
     uint64_t frame_read_ns = 0;
 };
-struct WorkerGenerationCapacity { uint32_t batch = 0, slots = 0; };
+struct WorkerGenerationCapacity
+{
+    uint32_t batch = 0, slots = 0;
+    pool::BrokerClient::GenerationAvailability availability;
+    uint64_t control_ns = 0;
+};
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
@@ -81,6 +86,7 @@ struct WorkerStats
     uint64_t peak_generation_members = 0, peak_active_generation = 0;
     uint64_t timed_generation_tasks = 0;
     WorkerGenerationTiming generation;
+    uint64_t independent_tasks = 0, independent_members = 0;
 };
 struct WorkerTaskObservation
 {
@@ -294,7 +300,7 @@ public:
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
-        WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {});
+        WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {}, bool independent = false);
     // Outage fallback shares the same admission ceiling as broker tasks. The
     // embedding owner records fallback completions separately from pool stats.
     void generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const&,
@@ -310,6 +316,8 @@ public:
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
+    unsigned independent_contribution_width(uint8_t k, uint8_t strength) const;
+    bool codec_probe_available(uint8_t k, uint64_t timeout_ns) const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
     unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;
     WorkerGenerationEstimate generation_estimate(uint8_t k, uint8_t strength, bool contributions,

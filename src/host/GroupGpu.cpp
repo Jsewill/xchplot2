@@ -583,6 +583,23 @@ GpuProducer::BorrowedFragments GpuProducer::generate_borrowed(std::array<uint8_t
     wall.complete = true;
     return borrowed;
 }
+void GpuProducer::generate_borrowed_into(std::array<uint8_t, 32> const& plot_id,
+    std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy)
+{
+    impl_->check_generation();
+    if (!impl_->pool || !consume) throw std::logic_error("borrowed output handoff requires a pooled GPU and a consumer");
+    OutputWallTimings wall(impl_->profile, "generation-borrowed", impl_->next_profile_member());
+    if (impl_->transfer) wall.slot_wait_ns += impl_->finish_output(wall.member);
+    impl_->release(impl_->transfer);
+    auto const result = pos2gpu::run_gpu_pipeline(impl_->config(plot_id), *impl_->pool, 0,
+        [&] { before_copy(); wall.slot_wait_ns += impl_->finish_output(wall.member); });
+    auto const fragments = result.fragments();
+    if (!result.t3_fragments_storage.empty() || fragments.size() > impl_->capacity)
+        throw std::logic_error("GPU producer returned invalid borrowed output");
+    impl_->handoff.launch([fragments, consume = std::move(consume)]
+    { consume(fragments); return uint64_t(fragments.size()); });
+    wall.complete = true;
+}
 uint64_t GpuProducer::generate_into(std::array<uint8_t, 32> const& plot_id,
     std::function<void(std::span<uint64_t const>, uint64_t)> const& consume)
 {

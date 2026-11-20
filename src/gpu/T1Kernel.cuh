@@ -30,6 +30,7 @@ struct T1MatchParams {
     int num_section_bits;     // = (k < 28) ? 2 : (k - 26)
     int num_match_key_bits;   // = 2 for T1
     int num_match_target_bits;// = k - section_bits - match_key_bits
+    int fine_bits = 8;        // Number of high target bits indexed within each match bucket.
 };
 
 // Compute the parameters from k and strength, mirroring ProofParams.

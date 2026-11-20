@@ -788,6 +788,37 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
     require(!owner.acquire(session, unavailable), "batch exceeded the worker profile maximum");
     owner.cancel(session, unavailable.task_id, unavailable.attempt);
 }
+void independent_members(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
+{
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
+    auto batch = offer("pinned-output", 49502);
+    batch.capacity = {2, 1, 1024, 2048}; batch.generation_threads = 2;
+    batch.capabilities |= capability(Kind::GenerateGpu);
+    auto model = profile(Kind::GenerateGpu); model.cpu_threads = model.resources.cpu_threads = 2; model.member_host_bytes = 1024; model.max_batch_members = 4;
+    batch.generation_profiles = {model};
+    worker.register_worker(batch);
+    auto session = owner.open_owner("independent-receivers");
+    auto request = task("separate-streams"); request.kind = Kind::GenerateGpu; request.work_units = 4; request.resources.cpu_threads = 2;
+    BrokerClient::GenerationAvailability availability;
+    uint32_t slots = 0;
+    auto hint = [&] { return owner.generation_hint(session, request, &slots, &availability, "test-format"); };
+    require(hint() == 1 && slots == 1 && !availability.independent_batch,
+        "an ordinary worker advertised an independent output slot");
+    worker.unregister_worker(batch.instance);
+    batch.independent_k_mask = 1u << model.k; worker.register_worker(batch);
+    require(hint() == 1 && availability.independent_batch == 4 && availability.codec_available && !availability.concurrent_codec,
+        "single-buffer capacity was charged for retained batch members");
+    request.independent_members = true;
+    auto grant = owner.acquire(session, request);
+    require(grant && grant->task.independent_members && grant->task.resources.host_bytes == 1024 &&
+        worker.begin(*grant, grant->owner_identity), "independent generation was not leased at singleton cost");
+    require(hint() == 1 && !availability.codec_available, "a busy single-slot worker attracted a codec probe");
+    auto altered = *grant; altered.task.independent_members = false;
+    rejects([&] { worker.finish(altered); });
+    worker.finish(*grant);
+    require(hint() == 1 && availability.codec_available, "codec capacity did not return after generation");
+}
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
 {
@@ -1372,6 +1403,7 @@ int main() try
     listen_interfaces(options, a_tls);
     mixed_backend_selection(options, a_tls, tls(ca, wa));
     batched_profiles(options, a_tls, tls(ca, wa));
+    independent_members(options, a_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);
     idle_lending_fairness(options, a_tls, b_tls, tls(ca, wa));

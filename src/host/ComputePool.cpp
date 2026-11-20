@@ -37,7 +37,8 @@ using Clock = std::chrono::steady_clock;
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, AcquireTimed };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, AcquireTimed, RegisterIndependent, GenerationAvailability };
+constexpr uint8_t independent_flag = 0x80;
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
 { writer.string(endpoint.host); writer.u16(endpoint.port); writer.string(endpoint.server_name); }
 Endpoint read_endpoint(Reader& reader)
@@ -52,13 +53,14 @@ Resources read_resources(Reader& reader)
 void write_task(Writer& writer, Task const& task)
 {
     writer.string(task.task_id); writer.string(task.compatibility); writer.u64(task.attempt); writer.u64(task.sequence); writer.u64(task.work_units);
-    writer.u8(uint8_t(task.kind)); writer.u8(task.k); writer.u8(task.strength); write_resources(writer, task.resources);
+    writer.u8(uint8_t(task.kind) | (task.independent_members ? independent_flag : 0)); writer.u8(task.k); writer.u8(task.strength); write_resources(writer, task.resources);
     writer.u32(task.chunk_count); writer.u64(task.max_output_bytes);
 }
 Task read_task(Reader& reader)
 {
     Task result; result.task_id = reader.string(256); result.compatibility = reader.string(256);
-    result.attempt = reader.u64(); result.sequence = reader.u64(); result.work_units = reader.u64(); result.kind = Kind(reader.u8());
+    result.attempt = reader.u64(); result.sequence = reader.u64(); result.work_units = reader.u64();
+    auto const kind = reader.u8(); result.kind = Kind(kind & ~independent_flag); result.independent_members = kind & independent_flag;
     result.k = reader.u8(); result.strength = reader.u8(); result.resources = read_resources(reader);
     result.chunk_count = reader.u32(); result.max_output_bytes = reader.u64(); return result;
 }
@@ -180,6 +182,7 @@ struct BrokerClient::Connections
     std::condition_variable changed;
     ControlMetrics metrics;
     std::atomic<bool> legacy_acquire{false};
+    std::atomic<bool> legacy_generation{false};
     Endpoint endpoint;
     uint64_t route_revision = 1;
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
@@ -201,7 +204,7 @@ void BrokerClient::reroute(Endpoint const& endpoint)
     std::lock_guard lock(connections_->mutex);
     if (connections_->endpoint == endpoint) return;
     require(connections_->route_revision != UINT64_MAX, "broker route revision exhausted");
-    connections_->endpoint = endpoint; ++connections_->route_revision;
+    connections_->endpoint = endpoint; ++connections_->route_revision; connections_->legacy_generation.store(false);
 }
 bool BrokerClient::shared() const noexcept { return connections_.use_count() != 1; }
 void BrokerClient::disconnect_idle()
@@ -316,10 +319,31 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
     }
     reader.finish(); return result;
 }
-uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task, uint32_t* slots)
+uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task, uint32_t* slots,
+    GenerationAvailability* availability, std::string const& codec)
 {
-    auto writer = request(Operation::GenerationHint); write_session(writer, owner); write_task(writer, task); auto bytes = call(writer);
-    Reader reader(bytes); auto const result = reader.u32(), parallel = reader.u32(); reader.finish();
+    bool const detailed = availability && !connections_->legacy_generation.load();
+    auto writer = request(detailed ? Operation::GenerationAvailability : Operation::GenerationHint);
+    write_session(writer, owner); write_task(writer, task); if (detailed) writer.string(codec);
+    std::vector<uint8_t> bytes;
+    try { bytes = call(writer); }
+    catch (std::runtime_error const& error)
+    {
+        if (!detailed || std::string_view(error.what()) != "compute broker: unknown broker operation") throw;
+        connections_->legacy_generation.store(true); return generation_hint(owner, task, slots, availability, codec);
+    }
+    Reader reader(bytes); auto const result = reader.u32(), parallel = reader.u32();
+    if (availability) *availability = {};
+    if (detailed)
+    {
+        availability->independent_batch = reader.u32();
+        auto const available = reader.u8();
+        require(availability->independent_batch <= max_generation_batch_members &&
+            (available == 0 || available == 1 || available == 3), "invalid worker availability");
+        availability->codec_available = available & 1;
+        availability->concurrent_codec = available & 2;
+    }
+    reader.finish();
     if (slots) *slots = parallel;
     return result;
 }
@@ -332,7 +356,16 @@ void BrokerClient::renew(Lease const& lease)
 { auto writer = request(Operation::Renew); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
 std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string* peer_identity, std::string* peer_node_id)
 {
-    auto writer = request(Operation::Register); write_offer(writer, offer); auto bytes = call(writer, peer_identity, peer_node_id);
+    bool const independent = offer.independent_k_mask && !connections_->legacy_generation.load();
+    auto writer = request(independent ? Operation::RegisterIndependent : Operation::Register); write_offer(writer, offer);
+    if (independent) writer.u32(offer.independent_k_mask);
+    std::vector<uint8_t> bytes;
+    try { bytes = call(writer, peer_identity, peer_node_id); }
+    catch (std::runtime_error const& error)
+    {
+        if (!independent || std::string_view(error.what()) != "compute broker: unknown broker operation") throw;
+        connections_->legacy_generation.store(true); return register_worker(offer, peer_identity, peer_node_id);
+    }
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
     require(!epoch.empty(), "broker registration omitted its epoch"); return epoch;
 }
@@ -459,12 +492,14 @@ struct BrokerServer::Impl
         uint8_t k, strength;
         uint32_t cpu_threads;
         std::string owner;
+        bool independent;
         struct Sample { DeliveryObservation observation; uint64_t units = 0; };
         std::array<Sample, 8> samples{};
         size_t count = 0, next = 0;
         uint64_t assigned = 0;
         bool matches(Task const& task, Kind selected, std::string const& source, uint32_t threads) const
-        { return owner == source && kind == selected && k == task.k && strength == task.strength && cpu_threads == threads; }
+        { return owner == source && kind == selected && k == task.k && strength == task.strength && cpu_threads == threads &&
+            independent == task.independent_members; }
         long double cost(uint64_t units) const
         {
             long double total = 0;
@@ -614,6 +649,9 @@ struct BrokerServer::Impl
         auto candidate = [&](Kind kind) -> std::optional<Candidate>
         {
             if (!(offer.capabilities & capability(kind))) return reject(WaitReason::UnsupportedKind);
+            if (task.independent_members && (kind != Kind::GenerateGpu || !(offer.independent_k_mask & (1u << task.k)) ||
+                (task.resources.cpu_threads ? task.resources.cpu_threads : offer.generation_threads) < 2))
+                return reject(WaitReason::UnsupportedKind);
             for (auto const& failure : job.failures)
                 if (failure.worker == identity && failure.instance == offer.instance &&
                     (failure.kind == kind || failure.kind == Kind::GenerateAny)) return reject(WaitReason::RetryExcluded);
@@ -631,7 +669,7 @@ struct BrokerServer::Impl
                 if (profile != offer.generation_profiles.end())
                 {
                     if (task.work_units > profile->max_batch_members) return reject(WaitReason::UnsupportedParameters);
-                    auto const extra = task.work_units - 1;
+                    auto const extra = task.independent_members ? 0 : task.work_units - 1;
                     if (profile->member_host_bytes && extra > (UINT64_MAX - profile->resources.host_bytes) / profile->member_host_bytes) return reject(WaitReason::HostCapacity);
                     auto const threads = demand.cpu_threads;
                     demand = profile->resources; demand.cpu_threads = threads;
@@ -692,9 +730,9 @@ struct BrokerServer::Impl
         {
             it = std::min_element(worker.histories.begin(), worker.histories.end(),
                 [](History const& a, History const& b) { return a.assigned < b.assigned; });
-            *it = History{selected, task.k, task.strength, threads, owner}; return *it;
+            *it = History{selected, task.k, task.strength, threads, owner, task.independent_members}; return *it;
         }
-        worker.histories.push_back(History{selected, task.k, task.strength, threads, owner});
+        worker.histories.push_back(History{selected, task.k, task.strength, threads, owner, task.independent_members});
         return worker.histories.back();
     }
     void schedule()
@@ -1012,6 +1050,7 @@ struct BrokerServer::Impl
                 (task.kind == Kind::Pack || task.work_units <= max_generation_batch_members), "invalid compute task");
             require((task.kind != Kind::GenerateCpu && task.kind != Kind::Pack) || !task.resources.gpu_bytes,
                     "CPU task cannot reserve GPU memory");
+            require(!task.independent_members || task.kind == Kind::GenerateGpu, "independent members require GPU generation");
             if (task.kind == Kind::Pack)
                 require(task.chunk_count && task.max_output_bytes && task.max_output_bytes <= UINT32_MAX &&
                     task.work_units <= UINT32_MAX && task.work_units >= codec_window_header_bytes &&
@@ -1067,8 +1106,19 @@ struct BrokerServer::Impl
             schedule(); break;
         }
         case Operation::Register:
+        case Operation::RegisterIndependent:
         {
-            auto offer = read_offer(reader); reader.finish();
+            auto offer = read_offer(reader);
+            if (operation == Operation::RegisterIndependent)
+            {
+                offer.independent_k_mask = reader.u32();
+                uint32_t supported = 0;
+                for (auto const& profile : offer.generation_profiles)
+                    if (profile.kind == Kind::GenerateGpu && profile.k <= 28) supported |= 1u << profile.k;
+                require(offer.independent_k_mask && !(offer.independent_k_mask & ~supported) &&
+                    (offer.capabilities & capability(Kind::GenerateGpu)), "independent members require a GPU profile");
+            }
+            reader.finish();
             require(identifier(offer.instance, 64) && identifier(offer.compatibility, 256) &&
                 (!(offer.capabilities & capability(Kind::Pack)) || identifier(offer.codec_compatibility, 256)) &&
                 offer.producer_build.size() <= 128 && !offer.endpoint.host.empty() &&
@@ -1107,7 +1157,7 @@ struct BrokerServer::Impl
             {
                 auto& saved = it->second.offer;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
-                    saved.capabilities == offer.capabilities &&
+                    saved.capabilities == offer.capabilities && saved.independent_k_mask == offer.independent_k_mask &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
                     "worker registration changed without a new instance");
                 require(saved.hardware.host == offer.hardware.host && saved.hardware.gpu_identity == offer.hardware.gpu_identity,
@@ -1261,16 +1311,32 @@ struct BrokerServer::Impl
             catch (StaleLease const& error) { throw StaleDelivery(error.what()); }
         }
         case Operation::GenerationHint:
+        case Operation::GenerationAvailability:
         {
-            auto session = read_session(reader); auto task = read_task(reader); reader.finish(); (void)owner(identity, session);
+            auto session = read_session(reader); auto task = read_task(reader);
+            bool const detailed = operation == Operation::GenerationAvailability;
+            auto const codec = detailed ? reader.string(256) : std::string{};
+            reader.finish(); (void)owner(identity, session);
             require(task.kind == Kind::GenerateCpu || task.kind == Kind::GenerateGpu || task.kind == Kind::GenerateAny,
                 "generation hint requires a generation task");
-            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0;
+            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0, independent = 0;
+            bool codec_available = false, concurrent_codec = false;
+            auto const free = detailed ? available() : Availability{};
             for (auto const& [identity, worker] : workers)
             {
                 auto const& capacity = worker.offer.capacity;
+                job.requested.independent_members = false;
+                bool const codec_room = detailed && worker.offer.admission == WorkerAdmission::Accepting && worker.offer.codec_compatibility == codec &&
+                    (worker.offer.capabilities & capability(Kind::Pack)) && free.at(identity).slots &&
+                    free.at(identity).cpu_threads && free.at(identity).host_bytes;
                 job.requested.work_units = 1;
                 auto candidate = eligible(job, identity, worker, capacity);
+                if (codec_room)
+                {
+                    codec_available = true;
+                    concurrent_codec |= !candidate || (capacity.slots > candidate->resources.slots &&
+                        capacity.cpu_threads > candidate->resources.cpu_threads && capacity.host_bytes > candidate->resources.host_bytes);
+                }
                 if (!candidate) continue;
                 auto const& cost = candidate->resources;
                 uint32_t parallel = capacity.slots / std::max(1u, cost.slots);
@@ -1283,8 +1349,19 @@ struct BrokerServer::Impl
                     job.requested.work_units = count;
                     if (eligible(job, identity, worker, capacity)) { maximum = count; break; }
                 }
+                if (detailed && job.requested.kind != Kind::GenerateCpu && worker.offer.independent_k_mask)
+                {
+                    job.requested.independent_members = true;
+                    for (uint32_t count = max_generation_batch_members; count > independent; --count)
+                    {
+                        job.requested.work_units = count;
+                        if (eligible(job, identity, worker, capacity, Kind::GenerateGpu)) { independent = count; break; }
+                    }
+                }
             }
-            response.u32(maximum); response.u32(slots); break;
+            response.u32(maximum); response.u32(slots);
+            if (detailed) { response.u32(independent); response.u8(uint8_t(codec_available) | (uint8_t(concurrent_codec) << 1)); }
+            break;
         }
         default: throw std::runtime_error("unknown broker operation");
         }

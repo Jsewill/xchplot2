@@ -39,8 +39,6 @@ T2MatchParams make_t2_params(int k, int strength)
 namespace {
 
 // Fine-bucket pre-index; see T3Kernel.cu for the scheme.
-constexpr int kT2FineBits = 8;
-
 // Shared parameter derivation so launch_t2_match, launch_t2_match_prepare,
 // and launch_t2_match_range all agree on bucket counts, offset layout,
 // and temp_storage sizing.
@@ -61,11 +59,14 @@ struct T2Derived {
 
 T2Derived derive_t2(T2MatchParams const& params)
 {
+    if (params.fine_bits < 0 || params.fine_bits > params.num_match_target_bits ||
+        params.num_section_bits + params.num_match_key_bits + params.fine_bits >= 32)
+        throw std::invalid_argument("invalid match index width");
     T2Derived d{};
     d.num_sections    = 1u << params.num_section_bits;
     d.num_match_keys  = 1u << params.num_match_key_bits;
     d.num_buckets     = d.num_sections * d.num_match_keys;
-    uint64_t const fine_count = 1ull << kT2FineBits;
+    uint64_t const fine_count = 1ull << params.fine_bits;
     d.fine_entries    = uint64_t(d.num_buckets) * fine_count + 1;
     d.bucket_bytes    = sizeof(uint64_t) * (d.num_buckets + 1);
     d.fine_bytes      = sizeof(uint64_t) * d.fine_entries;
@@ -105,7 +106,6 @@ void launch_t2_match_prepare(
     }
     if (*temp_bytes < d.temp_needed) throw std::invalid_argument("invalid argument to launch wrapper");
     if (!d_sorted_mi || !d_out_count) throw std::invalid_argument("invalid argument to launch wrapper");
-    if (params.num_match_target_bits <= kT2FineBits) throw std::invalid_argument("invalid argument to launch wrapper");
 
     auto* d_offsets      = reinterpret_cast<uint64_t*>(d_temp_storage);
     auto* d_fine_offsets = d_offsets + (d.num_buckets + 1);
@@ -116,7 +116,7 @@ void launch_t2_match_prepare(
         d.num_buckets, d_offsets, q);
     launch_t2_compute_fine_bucket_offsets(
         d_sorted_mi, d_offsets,
-        params.num_match_target_bits, kT2FineBits,
+        params.num_match_target_bits, params.fine_bits,
         d.num_buckets, d_fine_offsets, q);
     q.memset(d_out_count, 0, sizeof(uint64_t)).wait();
 }
@@ -171,7 +171,7 @@ void launch_t2_match_range(
         const_cast<uint64_t*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT2FineBits,
+        params.num_match_target_bits, params.fine_bits,
         d.target_mask, d.num_test_bits, d.num_info_bits, d.half_k,
         d_out_meta, d_out_mi, d_out_xbits, d_out_count,
         capacity, d.l_count_max,
@@ -229,7 +229,7 @@ void launch_t2_match_section_pair_split_range(
         const_cast<uint64_t*>(d_fine_offsets),
         d.num_match_keys, d.num_buckets,
         params.k, params.num_section_bits,
-        params.num_match_target_bits, kT2FineBits,
+        params.num_match_target_bits, params.fine_bits,
         d.target_mask, d.num_test_bits, d.num_info_bits, d.half_k,
         d_out_meta, d_out_mi, d_out_xbits, d_out_count,
         capacity, d.l_count_max,

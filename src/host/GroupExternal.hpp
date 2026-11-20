@@ -1215,6 +1215,7 @@ inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
         require(stamp(path).file == segment.stamp.file, "external written summary path was replaced");
         segment.stamp = stamp(path);
         if (config_.release_cache) external_detail::evict(file.fd);
+        return false; // reserve() already made this directory entry durable.
     });
     pending_summary_.bytes = end;
     grow_failpoint("external-summary-flushed");
@@ -1740,8 +1741,7 @@ template<class Operation> inline void ExternalEngine::scratch_segments(Run& run,
         std::array<bool, max_roots> touched{};
         for (auto& segment : run.segments)
         {
-            operation(segment, &stats_, &execution_scratch_);
-            touched[segment.root] = true;
+            if (operation(segment, &stats_, &execution_scratch_)) touched[segment.root] = true;
         }
         for (size_t i = 0; i < roots_.size(); ++i)
             if (touched[i]) sync_directory(roots_[i].path, io_context("directory", &execution_scratch_));
@@ -1761,8 +1761,10 @@ template<class Operation> inline void ExternalEngine::scratch_segments(Run& run,
         if (batch.indices.empty()) continue;
         batch.pending = disk_workers_[disk_lanes_[root]]->submit([&, root]
         {
-            for (size_t index : batch.indices) operation(run.segments[index], &batch.stats, &batch.io);
-            sync_directory(roots_[root].path, io_context("directory", &batch.io));
+            bool changed = false;
+            for (size_t index : batch.indices)
+                if (operation(run.segments[index], &batch.stats, &batch.io)) changed = true;
+            if (changed) sync_directory(roots_[root].path, io_context("directory", &batch.io));
         }, true);
     }
     for (auto& batch : batches) if (batch.pending.valid())
@@ -1859,6 +1861,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
                 "external reservation native handle changed");
             segment.stamp = current; roots_[segment.root].used += segment.capacity; charged[segment.ordinal] = 1;
             roots_[segment.root].peak = std::max(roots_[segment.root].peak, roots_[segment.root].used);
+            return true;
         });
     }
     catch (...)
@@ -1881,18 +1884,26 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
 inline void ExternalEngine::discard(Run const& run)
 {
     check_paths(); uint64_t end = 0;
+    std::array<bool, max_roots> changed{};
     for (auto const& segment : run.segments)
     {
         end += segment.bytes;
         std::string const path = segment_path(run, segment); file_io::Stat exists{};
         if (file_io::inspect_link(path.c_str(), &exists))
-        { require(errno == ENOENT && end <= run.consumed, "required external segment vanished"); continue; }
+        {
+            require(errno == ENOENT && end <= run.consumed, "required external segment vanished");
+            // A previous process may have stopped between unlink and the
+            // directory sync. Fence that directory before retiring its record.
+            if (!created_) changed[segment.root] = true;
+            continue;
+        }
         require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp, "external segment changed before reclamation");
         require(!file_io::unlink_file(path.c_str()), "cannot reclaim external segment");
         roots_[segment.root].used -= segment.capacity; stats_.reclaimed_bytes += segment.capacity;
-        grow_failpoint("external-segment-unlinked");
+        changed[segment.root] = true; grow_failpoint("external-segment-unlinked");
     }
-    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
+    for (size_t i = 0; i < roots_.size(); ++i)
+        if (changed[i]) sync_directory(roots_[i].path, io_context("directory", &execution_scratch_));
 }
 class ExternalEngine::Writer
 {
@@ -1977,7 +1988,7 @@ public:
             if (!segment.bytes)
             {
                 require(!file_io::unlink_file(path.c_str()), "cannot release unused external reservation");
-                engine_.roots_[segment.root].used -= segment.capacity; segment.capacity = 0; return;
+                engine_.roots_[segment.root].used -= segment.capacity; segment.capacity = 0; return true;
             }
             uint64_t const capacity = aligned(segment.bytes + segment_header_bytes, engine_.roots_[segment.root].alignment);
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
@@ -1994,6 +2005,7 @@ public:
             require(stamp.file == segment.stamp.file, "external completed segment was replaced");
             segment.stamp = stamp;
             if (engine_.config_.release_cache) external_detail::evict(file.fd);
+            return false;
         });
     }
 private:

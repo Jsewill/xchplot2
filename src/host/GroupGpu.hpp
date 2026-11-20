@@ -160,6 +160,10 @@ public:
     std::string const& tier() const;
     bool profile_enabled() const;
     BorrowedFragments generate_borrowed(std::array<uint8_t, 32> const& plot_id);
+    // before_copy releases compute permits before waiting for the prior
+    // consumer of the pinned slot. wait_for_output() drains the last callback.
+    void generate_borrowed_into(std::array<uint8_t, 32> const& plot_id,
+        std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy);
     // Tiles borrow alternating subwindows of the admitted pinned allocation
     // only until consume returns. The next device transfer can run concurrently.
     // The consumer must finish reading each tile synchronously; total_count is

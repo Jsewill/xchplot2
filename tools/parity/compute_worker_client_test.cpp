@@ -324,6 +324,85 @@ void network_deadlines()
     }
 }
 
+void independent_receivers()
+{
+    pool_test::Directory directory;
+    auto ca = pool_test::issue(directory.path, "receiver-ca");
+    auto identity = pool_test::issue(directory.path, "receiver-host", &ca);
+    auto tls = pool_test::tls(ca, identity); tls.max_frame_bytes = 1u << 20; tls.timeout_ms = 3000;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    RunningBroker broker(options);
+    pool::Listener peer({"127.0.0.1", 0}, tls);
+    pool::BrokerClient control(broker.server.endpoint(), tls);
+    pool::WorkerOffer offer; offer.endpoint = peer.endpoint(); offer.instance = pool::random_token();
+    offer.compatibility = worker_compatibility(); offer.capabilities = pool::capability(pool::Kind::GenerateGpu);
+    offer.generation_threads = 2; offer.independent_k_mask = 1u << 18;
+    offer.capacity = {2, 1, uint64_t(128) << 20, 1024};
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 2, offer.capacity, offer.capacity.host_bytes, 4}};
+    control.register_worker(offer);
+    WorkerClientConfig config; config.broker = broker.server.endpoint(); config.tls = tls;
+    config.owner_id = "independent-receivers"; config.generation_kind = pool::Kind::GenerateGpu;
+    config.contribution_read_ahead = true; config.max_active_generation = 3;
+    WorkerClient client(config);
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
+    auto worker = std::async(std::launch::async, [&]
+    {
+        for (unsigned count : {1u, 2u})
+        {
+            auto channel = peer.accept(10000); require(bool(channel), "missing independent receiver task");
+            auto frame = channel.receive(); pool::Reader request(frame.payload);
+            auto lease = pool::read_lease(request);
+            require(frame.type == pool::Message::Work && lease.task.work_units == count &&
+                lease.task.independent_members == (count > 1) && control.begin(lease, channel.peer_identity()),
+                "receiver cohort did not share its GPU lease");
+            (void)request.u32();
+            require(request.u8() == uint8_t(worker_detail::Operation::Contributions) && request.u8() == 18 &&
+                request.u8() == 2 && request.u16() == count, "invalid receiver cohort request");
+            pool::Writer out(tls.max_frame_bytes); out.u8(uint8_t(worker_detail::DataKind::Contributions));
+            for (unsigned i = 0; i < count; ++i)
+            {
+                auto const id = request.bytes(32);
+                for (uint64_t n = 0; n < chunks; ++n)
+                { out.u64(i * chunks + n); out.u16(1); out.bytes(id.first(1)); }
+            }
+            request.finish();
+            channel.send(pool::Message::Data, out.data()); control.finish(lease);
+            channel.send(pool::Message::End, {});
+        }
+    });
+    // Keep the first request in its receiver until the two independent
+    // callers are admitted. The shared frame crosses their member boundary.
+    std::promise<void> started;
+    auto run = [&](uint8_t tag)
+    {
+        WorkerCancellation cancel; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::array<uint8_t, 32> id{tag}; uint64_t next = 0;
+        try {
+            client.contributions(18, 2, {&id, 1}, [](auto, auto, auto) {}, cancel, {},
+                [&](uint64_t first, auto window, uint16_t members)
+                {
+                    require(first == next && members == 1 && window.size() <= chunks - next, "receiver window crossed a member");
+                    if (!tag && !next)
+                    {
+                        started.set_value();
+                        while (client.stats().peak_active_generation < 3)
+                        { cancel.check(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+                    }
+                    for (auto bytes : window) require(bytes.size() == 1 && bytes.front() == tag, "misrouted receiver data");
+                    next += window.size();
+                    if (tag == 1) throw WorkerTaskDeclined();
+                });
+        } catch (WorkerTaskDeclined const&) { require(tag == 1, "a full destination declined another member"); return; }
+        require(tag != 1 && next == chunks, "independent member was truncated or declined incorrectly");
+    };
+    auto ready = started.get_future();
+    auto first = std::async(std::launch::async, run, 0);
+    require(ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "initial receiver did not start");
+    auto full = std::async(std::launch::async, run, 1), writable = std::async(std::launch::async, run, 2);
+    worker.get(); first.get(); full.get(); writable.get();
+    require(client.stats().independent_members == 2, "receiver isolation bypassed the independent stream");
+}
+
 void assigned_local_and_fencing()
 {
     pool_test::Directory directory;
@@ -1204,7 +1283,7 @@ void status_inspection()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); network_deadlines(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }
