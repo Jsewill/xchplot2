@@ -3357,12 +3357,20 @@ bool WorkerClient::codec_probe_available(uint8_t k, uint64_t timeout_ns) const
     return hint.value.control_ns < timeout_ns && hint.value.availability.codec_available &&
         (!impl_->active_generation.load() || hint.value.availability.concurrent_codec);
 }
-unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strength) const
+unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members,
+    unsigned destinations) const
 {
     if (!impl_->config.contribution_read_ahead || impl_->config.max_active_generation < 2 ||
         impl_->config.local_only || impl_->config.generation_kind == pool::Kind::GenerateCpu) return 1;
     auto const hint = generation_capacity(k, strength);
-    return hint.slots == 1 ? std::max(1u, std::min(hint.availability.independent_batch, impl_->config.max_active_generation)) : 1;
+    if (!hint.slots || !ready_members) return 1;
+    auto const width = std::max(1u, std::min(hint.availability.independent_batch, impl_->config.max_active_generation));
+    // A lone slot can combine ready callers from different destinations. Share
+    // several slots among the ready destinations for this plot shape.
+    if (hint.slots == 1) return width;
+    auto const slots = std::min(hint.slots, impl_->config.max_active_generation);
+    auto const per_destination = 1 + (slots - 1) / std::max(1u, destinations);
+    return std::min(width, 1 + (ready_members - 1) / per_destination);
 }
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {

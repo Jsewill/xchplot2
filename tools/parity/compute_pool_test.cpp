@@ -792,7 +792,8 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
     require(!owner.acquire(session, unavailable), "batch exceeded the worker profile maximum");
     owner.cancel(session, unavailable.task_id, unavailable.attempt);
 }
-void independent_members(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
+void independent_members(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls,
+                         TlsOptions const& second_tls)
 {
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
@@ -822,6 +823,21 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     rejects([&] { worker.finish(altered); });
     worker.finish(*grant);
     require(hint() == 1 && availability.codec_available, "codec capacity did not return after generation");
+
+    BrokerClient second(endpoint, second_tls);
+    batch.instance = "ordinary-output"; batch.endpoint.port = 49503; batch.independent_k_mask = 0;
+    second.register_worker(batch);
+    request.independent_members = false;
+    require(hint() == 1 && slots == 2 && !availability.independent_batch,
+        "pool-wide batches stranded a worker that accepts singleton requests");
+    request.independent_members = true;
+    require(hint() == 1 && slots == 2 && availability.independent_batch == 4,
+        "a ready independent request lost its capable worker");
+    second.unregister_worker(batch.instance);
+    batch.independent_k_mask = 1u << model.k; batch.generation_profiles.front().max_batch_members = 2;
+    second.register_worker(batch); request.independent_members = false;
+    require(hint() == 1 && slots == 2 && availability.independent_batch == 2,
+        "the pool-wide width exceeded the smaller independent worker");
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
@@ -1407,7 +1423,7 @@ int main() try
     listen_interfaces(options, a_tls);
     mixed_backend_selection(options, a_tls, tls(ca, wa));
     batched_profiles(options, a_tls, tls(ca, wa));
-    independent_members(options, a_tls, tls(ca, wa));
+    independent_members(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);
     idle_lending_fairness(options, a_tls, b_tls, tls(ca, wa));

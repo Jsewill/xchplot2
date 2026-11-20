@@ -2090,10 +2090,14 @@ configured CPU pool and reuses the existing network buffer. When staging
 encoded contributions on scratch storage, the owner budgets one additional
 frame per concurrent receiver. It can read that frame while validating and
 writing the previous chunks. A single-CPU owner consumes each frame inline.
-With one compatible GPU slot and at least two worker CPU threads, the owner
-can send ready member requests from the same or different destinations in
-one lease. The GPU generates and sorts the next member while the worker
-encodes the preceding member. Both members use the same pinned output
+With a compatible GPU and at least two worker CPU threads, the owner can
+send several ready members in one lease. With multiple eligible slots, it
+shares them among ready destinations with the same k and strength.
+A single destination can spread its ready members across GPUs. With one slot,
+the owner can also combine requests from different destinations.
+The broker reports a batch width all eligible workers can serve.
+The GPU generates and sorts the next member while the worker encodes the
+preceding member. Both members use the same pinned output
 buffer in turn. Each receiver gets its own ordered compressed chunks.
 This works when the worker has RAM for only one raw member. Encoding can
 reduce its CPU thread count between windows as other work needs the host.

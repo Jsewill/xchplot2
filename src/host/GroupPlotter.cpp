@@ -1326,7 +1326,7 @@ struct Producer
     size_t fill_contributions(group_grow::ExternalEngine::ContributionInput& input, uint16_t first,
         uint64_t other_retained, uint64_t admitted, std::string const& progress,
         std::atomic<bool> const* stopped = nullptr,
-        ScratchIo const& acquire_io = {})
+        ScratchIo const& acquire_io = {}, unsigned destinations = 1)
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         auto const begin = std::chrono::steady_clock::now();
@@ -1377,16 +1377,15 @@ struct Producer
                 pending.erase(pending.begin() + slot); made_progress = true;
             }
             auto const limit = unsigned(std::min<uint64_t>(args.pool_inflight, input.size()));
-            auto const width = client->independent_contribution_width(k, strength);
+            auto const width = client->independent_contribution_width(k, strength, input.size(), destinations);
             size_t const concurrency = std::min(limit, std::max(width,
                 client->suggested_generation_concurrency(k, strength, limit)));
             while (pending.size() < concurrency && scheduled < input.size())
             {
                 uint16_t const member = scheduled;
                 unsigned const remaining = unsigned(input.size() - scheduled);
-                // Finish a ready destination's generation before mixing its tail
-                // with another destination. Its HDD can then pack during the
-                // next lease. A worker with room to coencode keeps its batch policy.
+                // Give each available lane an ordered part of this destination.
+                // A worker with room to coencode keeps its batch policy.
                 bool const separate = width > 1 && remaining > 1 && client->generation_capacity(k, strength).batch == 1;
                 uint16_t const count = uint16_t(separate ? std::min(width, remaining) :
                     client->suggested_batch_members(k, strength, remaining));
@@ -13997,7 +13996,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit);
                 if ((d.scratch || args.construction == "external") && !args.pool_writers)
                     slots = std::max(slots, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
-                        d.requested.params.get_k(), d.requested.params.get_strength())));
+                        d.requested.params.get_k(), d.requested.params.get_strength(), maximum, std::min(slots, limit))));
                 startup_receivers = std::clamp(slots, 1u, limit);
             }
 #endif
@@ -14050,7 +14049,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 !d.needs_resume && !d.needs_finish && args.pool_output != "packed" &&
                 (!tune_pool || pool_choice(true).encoded) &&
                 backend->acquire_pool_client()->independent_contribution_width(
-                    d.requested.params.get_k(), d.requested.params.get_strength()) > 1;
+                    d.requested.params.get_k(), d.requested.params.get_strength(), maximum, unsigned(startup_receivers)) > 1;
 #else
             return false;
 #endif
@@ -15656,6 +15655,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 wanted = construction_batch_members(*d.engine, d.maximum, uint16_t(wanted),
                     (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            unsigned contribution_destinations = 1;
             if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
             {
                 // A writer can continue packing while another drive receives.
@@ -15668,19 +15668,28 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 {
                     total.pool_receiving_destinations = receivers;
                     total.pool_generation_member_ns = forecast.member_ns;
+                    auto same_shape = [&](auto const& other)
+                    {
+                        return other->requested.params.get_k() == d.requested.params.get_k() &&
+                            other->requested.params.get_strength() == d.requested.params.get_strength();
+                    };
                     auto const receiving = std::count_if(destinations.begin(), destinations.end(), [&](auto const& other)
                     {
-                        return other->pending && other->pending->generating.valid() &&
-                            other->requested.params.get_k() == d.requested.params.get_k() &&
-                            other->requested.params.get_strength() == d.requested.params.get_strength();
+                        return other->pending && other->pending->generating.valid() && same_shape(other);
                     });
-                    // A scratch receiver also provisions and flushes its local runs. Queue one
-                    // admitted successor so those waits do not leave a single worker idle.
-                    bool const queue = offered_slots == 1 && contribution_members && d.pool_encoded &&
+                    auto const ready = std::count_if(generation_ready.begin(), generation_ready.end(), [&](auto const& candidate)
+                    {
+                        return candidate.index != index && same_shape(destinations[candidate.index]);
+                    });
+                    contribution_destinations = unsigned(std::min<uint64_t>({uint64_t(1 + receiving + ready),
+                        total.execution_active, args.pool_inflight}));
+                    // An admitted scratch receiver may be provisioning or flushing local runs.
+                    // Keep a successor ready while the other destinations use their worker slots.
+                    bool const queue = offered_slots && contribution_members && d.pool_encoded &&
                         args.io_overlap && args.generation_overlap && args.pool_inflight > 1 &&
                         (!args.disk_io || !args.disk_io->status().pressured) &&
-                        receiving <= std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
-                            d.requested.params.get_k(), d.requested.params.get_strength()));
+                        receiving <= std::max(receivers, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
+                            d.requested.params.get_k(), d.requested.params.get_strength())));
                     if (receiving >= receivers && !queue) { blocked(ControllerWait::generation_order); continue; }
                 }
             }
@@ -15763,7 +15772,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     io.reset();
                     auto* const pending = &task;
                     uint64_t const reserved = fixed;
-                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved]
+                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved, contribution_destinations]
                     {
                         Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved};
                         producer.defer_pool_history = true;
@@ -15773,7 +15782,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             producer.fill_pool_input(*pending->prepared_input, first, other_held, bytes, &pending->cancel_generation, acquire_io) :
                             producer.fill_contributions(*pending->contribution_input, first,
                             other_held, bytes, file_io::path_text(d.path) + ": generating compressed pool member ",
-                            &pending->cancel_generation, acquire_io);
+                            &pending->cancel_generation, acquire_io, contribution_destinations);
                         return Task::Generated{generated, producer.peak, producer.generation_peak,
                             producer.pool_elapsed_ns, producer.fill_stop};
                     });

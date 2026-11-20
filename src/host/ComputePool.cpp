@@ -1319,7 +1319,9 @@ struct BrokerServer::Impl
             reader.finish(); (void)owner(identity, session);
             require(task.kind == Kind::GenerateCpu || task.kind == Kind::GenerateGpu || task.kind == Kind::GenerateAny,
                 "generation hint requires a generation task");
-            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0, independent = 0;
+            bool const independent_request = task.independent_members;
+            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0;
+            uint32_t independent = independent_request ? 0 : max_generation_batch_members;
             bool codec_available = false, concurrent_codec = false;
             auto const free = detailed ? available() : Availability{};
             for (auto const& [identity, worker] : workers)
@@ -1349,18 +1351,27 @@ struct BrokerServer::Impl
                     job.requested.work_units = count;
                     if (eligible(job, identity, worker, capacity)) { maximum = count; break; }
                 }
-                if (detailed && job.requested.kind != Kind::GenerateCpu && worker.offer.independent_k_mask)
+                if (!detailed) continue;
+                uint32_t width = 0;
+                if (job.requested.kind != Kind::GenerateCpu && worker.offer.independent_k_mask)
                 {
                     job.requested.independent_members = true;
-                    for (uint32_t count = max_generation_batch_members; count > independent; --count)
+                    for (uint32_t count = max_generation_batch_members; count; --count)
                     {
                         job.requested.work_units = count;
-                        if (eligible(job, identity, worker, capacity, Kind::GenerateGpu)) { independent = count; break; }
+                        if (eligible(job, identity, worker, capacity, Kind::GenerateGpu)) { width = count; break; }
                     }
                 }
+                // Planning shares work over all eligible lanes. A formed
+                // independent request needs only one matching worker.
+                independent = independent_request ? std::max(independent, width) : std::min(independent, width);
             }
             response.u32(maximum); response.u32(slots);
-            if (detailed) { response.u32(independent); response.u8(uint8_t(codec_available) | (uint8_t(concurrent_codec) << 1)); }
+            if (detailed)
+            {
+                response.u32(slots ? independent : 0);
+                response.u8(uint8_t(codec_available) | (uint8_t(concurrent_codec) << 1));
+            }
             break;
         }
         default: throw std::runtime_error("unknown broker operation");

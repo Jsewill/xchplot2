@@ -256,6 +256,8 @@ public:
     // independent of active leases. Advisory only; acquire still queues fairly.
     struct GenerationAvailability
     {
+        // Common width for planning, or the largest eligible width when
+        // checking a task that already requests independent members.
         uint32_t independent_batch = 0;
         bool codec_available = true, concurrent_codec = true;
     };

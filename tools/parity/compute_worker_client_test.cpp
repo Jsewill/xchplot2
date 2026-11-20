@@ -401,6 +401,19 @@ void independent_receivers()
     auto full = std::async(std::launch::async, run, 1), writable = std::async(std::launch::async, run, 2);
     worker.get(); first.get(); full.get(); writable.get();
     require(client.stats().independent_members == 2, "receiver isolation bypassed the independent stream");
+
+    auto other_identity = pool_test::issue(directory.path, "second-gpu", &ca);
+    auto other_tls = pool_test::tls(ca, other_identity);
+    pool::Listener other_peer({"127.0.0.1", 0}, other_tls);
+    offer.endpoint = other_peer.endpoint(); offer.instance = pool::random_token();
+    pool::BrokerClient(broker.server.endpoint(), other_tls).register_worker(offer);
+    config.owner_id = "two-gpu-receivers";
+    WorkerClient shared(config);
+    require(shared.generation_capacity(18, 2).slots == 2 &&
+        shared.independent_contribution_width(18, 2) == 1 && shared.independent_contribution_width(18, 2, 2) == 1 &&
+        shared.independent_contribution_width(18, 2, 3) == 2 && shared.independent_contribution_width(18, 2, 8) == 3 &&
+        shared.independent_contribution_width(18, 2, 3, 2) == 3,
+        "ordered batches must leave work for the second slot within the owner's admission limit");
 }
 
 void assigned_local_and_fencing()
