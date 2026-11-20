@@ -1760,9 +1760,11 @@ leases; workers return computed fragments directly to the plotting host.
 Workers never receive destination paths, farmer/pool keys, seeds or private
 plot memos. Enroll only machines you trust to compute correctly.
 
-On a timed generation connection the worker reports time spent generating and
-encoding, and time spent sending results. The owner measures time waiting for
-frames after first output and time consuming frames, including scratch writes.
+On a timed generation connection the worker reports its time sending results
+and the remaining time spent generating and encoding. After first output,
+the owner measures time reading frames, time waiting for the next frame,
+and time consuming frames, including scratch writes. Reads that overlap
+consumption count toward the planner's estimate of shared link usage.
 Send and receive waits include backpressure and can overlap. After three
 completed samples for a matching plot size, strength and result type, the
 owner can compare generation batch sizes and choose how many destinations
@@ -2073,8 +2075,10 @@ compressed member. Recovery follows the saved construction transaction.
 
 With I/O and generation overlap enabled, an owner with multiple CPU workers
 can validate a packed tile while receiving the next frame. This uses the
-configured CPU pool and reuses the existing network buffer. A single-CPU
-owner validates each tile inline.
+configured CPU pool and reuses the existing network buffer. When staging
+encoded contributions on scratch storage, the owner budgets one additional
+frame per concurrent receiver. It can read that frame while validating and
+writing the previous chunks. A single-CPU owner consumes each frame inline.
 
 With multiple rotating destinations, automatic selection starts with the
 available worker and storage bandwidth. When a writer has more groups to

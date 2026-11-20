@@ -118,8 +118,8 @@ public:
                            std::chrono::steady_clock::time_point connect_deadline = std::chrono::steady_clock::time_point::max());
     void send(Message, std::span<uint8_t const> payload);
     Frame receive();
-    // Reuse one frame allocation. The caller can publish completed work on
-    // this thread before TLS has to wait for the peer to make progress.
+    // Run the callback before the first socket wait or before returning a
+    // ready frame. The final membership check follows local delivery.
     void receive(Frame& frame, std::function<void()> const& before_wait = {});
     // Shorten future operations on an exclusively owned channel; never extend
     // a deadline already imposed by its creator or an earlier task boundary.
@@ -140,6 +140,8 @@ public:
     std::string const& peer_node_id() const;
     explicit operator bool() const noexcept { return bool(impl_); }
     uint32_t max_frame_bytes() const;
+    // A reusable frame may also hold an enrolled policy update.
+    static uint32_t frame_buffer_bytes(uint32_t max_frame_bytes);
     static uint64_t memory_bytes(uint32_t max_frame_bytes);
     void close() noexcept;
 private:

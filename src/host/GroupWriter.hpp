@@ -1,8 +1,16 @@
-// One ordered file consumer per physical-drive group, with at most one waiting
-// task in addition to the running task. Borrowed arguments outlive the worker.
+// One ordered consumer per output, with at most one waiting task in addition
+// to the running task. Borrowed arguments outlive the worker.
 #pragma once
-#include "host/GroupEngine.hpp"
+#include "host/GroupFormat.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <type_traits>
+#include <utility>
 
 namespace group_grow
 {
@@ -107,7 +115,7 @@ public:
         {
             std::unique_lock lock(mutex_);
             if (wait_for_room) room_.wait(lock, [this] { return stopping_ || !task_.valid(); });
-            require(!stopping_ && !task_.valid(), "destination writer queue is full"); task_ = std::move(task);
+            group_tools::require(!stopping_ && !task_.valid(), "destination writer queue is full"); task_ = std::move(task);
         }
         ready_.notify_one(); return result;
     }

@@ -64,6 +64,8 @@ using WorkerEncodedValidator = std::function<void(std::span<std::vector<uint8_t>
 struct WorkerGenerationTiming
 {
     uint64_t worker_ns = 0, send_ns = 0, frame_wait_ns = 0, receiver_ns = 0;
+    // Time reading frames after first output, including reads overlapping the sink.
+    uint64_t frame_read_ns = 0;
 };
 struct WorkerGenerationCapacity { uint32_t batch = 0, slots = 0; };
 struct WorkerGenerationEstimate
@@ -271,6 +273,8 @@ struct WorkerClientConfig
     std::function<void(WorkerTaskAdmission const&)> admit_task;
     // Shared ceiling for queued/acquiring and executing generation requests.
     unsigned max_active_generation = 64;
+    // The owner reserves one extra receive buffer for each concurrent task.
+    bool contribution_read_ahead = false;
 };
 
 // One client is safe for concurrent requests. Each admitted task keeps a

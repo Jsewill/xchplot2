@@ -247,6 +247,7 @@ void task_deadlines(TlsOptions server_tls, TlsOptions client_tls)
             require(signal.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
                 "packed delivery waited for the following frame");
             channel.send(Message::Reply, {});
+            channel.send(Message::Data, {});
         });
         auto channel = Channel::connect(listener.endpoint(), local);
         Frame frame;
@@ -257,6 +258,10 @@ void task_deadlines(TlsOptions server_tls, TlsOptions client_tls)
         });
         require(frame.type == Message::Reply && frame.payload.empty(), "packed delivery lost the following frame");
         peer.get();
+        unsigned deliveries = 0;
+        channel.receive(frame, [&] { ++deliveries; });
+        require(deliveries == 1 && frame.type == Message::Data,
+            "a ready frame bypassed or repeated local delivery");
     }
     using Clock = std::chrono::steady_clock;
     server_tls.timeout_ms = client_tls.timeout_ms = 3000;

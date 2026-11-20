@@ -738,6 +738,7 @@ struct Backend
         client.task_timeout_ms = unsigned(args.pool_timeout_ms);
         client.cpu_scheduler = cpu_scheduler;
         client.packed_receive_overlap = args.io_overlap && args.generation_overlap;
+        client.contribution_read_ahead = contribution_read_ahead_bytes(args) != 0;
         client.local_service = pool_service.get();
 #ifdef XCHPLOT2_GROUP_COMMANDS
         if (args.compute_session) client.local_service_provider = [session = args.compute_session] { return session->local_worker(); };
@@ -774,6 +775,7 @@ struct Backend
         client.task_timeout_ms = unsigned(args.pool_timeout_ms);
         client.cpu_scheduler = cpu_scheduler;
         client.packed_receive_overlap = args.io_overlap && args.generation_overlap;
+        client.contribution_read_ahead = contribution_read_ahead_bytes(args) != 0;
         client.local_service = pool_service.get();
 #ifdef XCHPLOT2_GROUP_COMMANDS
         if (args.compute_session) client.local_service_provider = [session = args.compute_session] { return session->local_worker(); };
@@ -790,6 +792,11 @@ struct Backend
             }, cpu_scheduler);
     }
 
+    static uint64_t contribution_read_ahead_bytes(Arguments const& args)
+    {
+        return args.io_overlap && args.generation_overlap && args.workers != 1 ?
+            group_grow::pool::Channel::frame_buffer_bytes(uint32_t(args.pool_frame_bytes)) : 0;
+    }
     static uint64_t fresh_receive_bytes(Arguments const& args)
     {
         return sum(product(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)), 2),
@@ -1217,9 +1224,10 @@ struct Producer
     }
     uint64_t contribution_bytes(group_grow::Config const& config, uint16_t count) const
     {
+        auto const tasks = std::min<uint64_t>(count, args.pool_inflight);
         return sum(group_grow::ExternalEngine::contribution_input_memory_bytes(config, count),
-            product(count, sum(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)),
-                sizeof(std::future<void>) + 256 +
+            product(tasks, sum(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)),
+                Backend::contribution_read_ahead_bytes(args) + sizeof(std::future<void>) + 256 +
                 group_grow::contribution_window_chunks * sizeof(std::span<uint8_t const>))));
     }
     uint64_t packed_input_bytes(group_grow::Config const& config, uint16_t count) const
@@ -5004,6 +5012,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
                       << ",\"pool_worker_processing_ns\":" << wire.generation.worker_ns
                       << ",\"pool_worker_send_ns\":" << wire.generation.send_ns
                       << ",\"pool_frame_wait_ns\":" << wire.generation.frame_wait_ns
+                      << ",\"pool_frame_read_ns\":" << wire.generation.frame_read_ns
                       << ",\"pool_receiver_ns\":" << wire.generation.receiver_ns
                       << ",\"pool_peak_generation_members\":" << wire.peak_generation_members
                       << ",\"pool_peak_active_generation\":" << wire.peak_active_generation

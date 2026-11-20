@@ -235,8 +235,12 @@ void repartition_and_global_admission()
         {
             Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20, 0};
             producer.defer_pool_history = true;
-            return producer.fill_contributions(*inputs[destination], 0, 0,
-                producer.contribution_bytes(cfg, uint16_t(raw.size())), "owner scratch fixture member ");
+            auto const count = uint16_t(raw.size());
+            auto const admitted = producer.contribution_bytes(cfg, count);
+            require(admitted - ExternalEngine::contribution_input_memory_bytes(cfg, count) ==
+                producer.contribution_bytes(cfg, 1) - ExternalEngine::contribution_input_memory_bytes(cfg, 1),
+                "serial receivers reserved transport buffers for every member");
+            return producer.fill_contributions(*inputs[destination], 0, 0, admitted, "owner scratch fixture member ");
         });
     for (auto& future : receiving) require(future.get() == raw.size(), "owner repartition silently dropped a member");
     auto const stats = client->stats();

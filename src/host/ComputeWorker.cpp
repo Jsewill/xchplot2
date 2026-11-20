@@ -3,6 +3,7 @@
 #include "host/GroupHarvesterProfile.hpp"
 #include "host/NumaTopology.hpp"
 #include "host/GroupCodec.hpp"
+#include "host/GroupWriter.hpp"
 #include "host/ComputeThreads.hpp"
 #include "host/GroupFarmResources.hpp"
 #include "plot/Plotter.hpp"
@@ -2128,7 +2129,8 @@ public:
             rates.add(value);
             at->slots = std::clamp(value.worker_slots, 1u, 64u);
             production = value.generation.worker_ns;
-            delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns, value.generation.receiver_ns});
+            delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns,
+                value.generation.frame_read_ns, value.generation.receiver_ns});
             if (value.contributions && rates.samples == 3)
             {
                 // Try one larger coencoded batch after a sustained baseline.
@@ -2252,7 +2254,8 @@ private:
                     static_cast<long double>(t.receiver_ns) + t.frame_wait_ns));
                 // The shorter observed endpoint wait avoids charging all
                 // producer stalls or receiver backpressure as wire service.
-                update(link, std::min(t.send_ns, t.frame_wait_ns)); update(receiver, t.receiver_ns);
+                update(link, std::min(t.send_ns, std::max(t.frame_read_ns, t.frame_wait_ns)));
+                update(receiver, t.receiver_ns);
             }
         };
         Peer peer;
@@ -2441,7 +2444,7 @@ struct WorkerClient::Impl
     std::atomic<uint64_t> input_bytes{0}, output_bytes{0}, generations{0}, contributions{0}, codecs{0}, failures{0};
     std::atomic<uint64_t> local_tasks{0}, task_elapsed_ns{0};
     std::atomic<uint64_t> active_generation{0}, peak_active_generation{0}, peak_generation_members{0};
-    std::atomic<uint64_t> timed_generation_tasks{0}, worker_ns{0}, send_ns{0}, frame_wait_ns{0}, receiver_ns{0};
+    std::atomic<uint64_t> timed_generation_tasks{0}, worker_ns{0}, send_ns{0}, frame_wait_ns{0}, receiver_ns{0}, frame_read_ns{0};
     struct GenerationLease
     {
         Impl& impl;
@@ -2602,7 +2605,7 @@ struct WorkerClient::Impl
             {
                 impl.timed_generation_tasks.fetch_add(1); impl.worker_ns.fetch_add(generation.worker_ns);
                 impl.send_ns.fetch_add(generation.send_ns); impl.frame_wait_ns.fetch_add(generation.frame_wait_ns);
-                impl.receiver_ns.fetch_add(generation.receiver_ns);
+                impl.receiver_ns.fetch_add(generation.receiver_ns); impl.frame_read_ns.fetch_add(generation.frame_read_ns);
             }
             impl.observed(value, lease.endpoint, planning_selection);
             if (options.observe) try { options.observe(value); } catch (...) {}
@@ -2761,15 +2764,26 @@ struct WorkerClient::Impl
                 "compute result member is truncated or has nonzero padding");
             narrow_deltas &= !(validation.flags & PackedMemberValidation::wide_delta);
         };
-        bool const overlap = packed_sink && config.packed_receive_overlap &&
-            config.cpu_scheduler && config.cpu_scheduler->can_overlap();
-        pool::Frame frame;
+        bool const overlap = config.cpu_scheduler && config.cpu_scheduler->can_overlap();
+        pool::Frame frame, next_frame;
+        Clock::duration read_time{};
+        std::optional<OrderedWriter> reader;
+        std::future<void> reading;
+        // Exclude waiting for the current sink from the next socket timeout.
+        // If the sink throws, the broken promise releases the reader before its buffers expire.
+        std::optional<std::promise<void>> resume_read;
         std::future<void> validating;
         for (;;)
         {
             auto const before = Clock::now();
             uint64_t delivery_ns = 0;
-            if (validating.valid())
+            bool const prefetched = reading.valid();
+            if (prefetched)
+            {
+                cancel.check(); resume_read->set_value(); reading.get();
+                std::swap(frame, next_frame);
+            }
+            else if (validating.valid())
             {
                 // Only the validator borrows words. The wire frame can be reused
                 // immediately. Deliver in order on the caller even if TLS stalls.
@@ -2788,7 +2802,12 @@ struct WorkerClient::Impl
             auto const received = Clock::now();
             connection->generation.receiver_ns += delivery_ns;
             if (connection->first_output != Clock::time_point{})
-                connection->generation.frame_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(received - before).count() - delivery_ns;
+            {
+                auto const wait = std::chrono::duration_cast<std::chrono::nanoseconds>(received - before).count() - delivery_ns;
+                connection->generation.frame_wait_ns += wait;
+                connection->generation.frame_read_ns += prefetched ?
+                    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(read_time).count()) : wait;
+            }
             try { connection->check_frame(frame); }
             catch (pool::UnsupportedResources const&)
             { require(!connection->output_bytes, "compute worker rejected resources after partial output"); connection->resource_rejected = true; throw; }
@@ -2847,7 +2866,7 @@ struct WorkerClient::Impl
                 require(count && count <= expected_words - received_words && uint64_t(count) * 8 <= input.remaining(), "compute word tile exceeds member");
                 words.resize(count); input.words(words); input.finish();
                 auto const first_word = received_words; received_words += count;
-                if (overlap && received_words < expected_words)
+                if (overlap && config.packed_receive_overlap && received_words < expected_words)
                 {
                     compute.reset();
                     validating = config.cpu_scheduler->submit([&, first_word] { validate_words(first_word); });
@@ -2868,6 +2887,19 @@ struct WorkerClient::Impl
             else if (type == DataKind::Contributions)
             {
                 require(contribution_sink && (!manifest || received_manifest), "unexpected compute contribution stream");
+                if (overlap && config.contribution_read_ahead && contribution_window && !manifest)
+                {
+                    if (!reader) reader.emplace([] {});
+                    auto ready = resume_read.emplace().get_future().share();
+                    reading = reader->submit([&, ready]
+                    {
+                        auto const start = Clock::now();
+                        Clock::duration paused{};
+                        connection->channel.receive(next_frame, [&]
+                        { auto const begin = Clock::now(); ready.get(); paused = Clock::now() - begin; });
+                        read_time = Clock::now() - start - paused;
+                    });
+                }
                 while (input.remaining())
                 {
                     uint64_t const first = next_chunk;
@@ -3043,7 +3075,7 @@ WorkerStats WorkerClient::stats() const
         impl_->contributions.load(), impl_->codecs.load(), impl_->failures.load(),
         impl_->local_tasks.load(), impl_->task_elapsed_ns.load(),
         impl_->peak_generation_members.load(), impl_->peak_active_generation.load(), impl_->timed_generation_tasks.load(),
-        {impl_->worker_ns.load(), impl_->send_ns.load(), impl_->frame_wait_ns.load(), impl_->receiver_ns.load()}};
+        {impl_->worker_ns.load(), impl_->send_ns.load(), impl_->frame_wait_ns.load(), impl_->receiver_ns.load(), impl_->frame_read_ns.load()}};
 }
 unsigned WorkerClient::max_window_chunks() const { return impl_->config.max_window_chunks; }
 WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t strength, bool contributions,

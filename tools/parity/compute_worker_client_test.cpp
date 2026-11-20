@@ -181,6 +181,13 @@ void planning_feedback()
     auto const limited = shared.estimate(18, 2, remote.kind, true, 8, 1, now);
     require(limited.receivers == 2 && std::abs(limited.member_ns - 990) < 1e-6L,
         "multiple worker slots multiplied shared link bandwidth");
+    Planning prefetched(1000);
+    remote.generation.frame_read_ns = remote.generation.frame_wait_ns;
+    remote.generation.frame_wait_ns = 10;
+    train(prefetched, remote, route);
+    auto const overlapping = prefetched.estimate(18, 2, remote.kind, true, 8, 1, now);
+    require(overlapping.receivers == limited.receivers && overlapping.member_ns == limited.member_ns,
+        "read-ahead hid the shared link cost from the planner");
     measured.failed(remote, route, measured.selected(remote, route, now), now);
     require(!price(2).receivers, "failed generation retained a measured receiver forecast");
 }

@@ -682,6 +682,43 @@ Every updated group matched its full-proof-checked reference by SHA-256.
 Across the two updated fills the harvester completed 61 challenges with
 eligible plots on the six C29 farm drives. The longest lookup took 0.93 s.
 
+#### Reading pooled contributions ahead of scratch writes
+
+The storage host had a 4 GiB plotting budget and eight CPU workers. One
+RTX 4090 worker sent compressed contributions over 10 GbE. Both builds
+used the same worker binary, seed and three-member k=28 groups. The
+automatic planner used two destinations at a time. Time runs from launch
+through the last durable publication.
+
+| Plotting HDDs | Members | Previous owner (s/member) | Read-ahead owner (s/member) | Less time |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 24 | 8.35 | 7.23 | 13.3% |
+| 16 | 48 | 7.86 | 6.71 | 14.6% |
+
+With the updated binary on both hosts, repeat fills took 7.25 s/member
+on eight HDDs and 6.73 s/member on sixteen. Both sixteen-drive read-ahead
+runs reached 24 published members at 7.17 s/member.
+
+GPU generation in the sixteen-drive comparison averaged 3.10 s/member in
+the control and 3.09 s/member with read-ahead. Worker processing and
+sending together fell from 6.15 to 5.04 s/member. The owner
+spent 1.35 s/member reading frames after first output. Overlapping those
+reads with validation and scratch writes cut the time waiting for frames
+from 1.32 to 0.104 s/member.
+
+The updated sixteen-drive fill averaged 154 MB/s of physical reads and
+333 MB/s of writes across the plotting HDDs. The NIC averaged 1.32 Gb/s
+inbound and peaked at 1.88 Gb/s over five seconds. Every published group
+matched its full-proof-checked reference by SHA-256. During the read-ahead
+fills in the table, the harvester farmed 1,164 plots on six additional
+HDDs. It completed 54 challenges with eligible plots. The longest took
+0.821 s.
+
+With 32 GiB of owner RAM, four HDDs and the same worker, four complete
+groups streamed directly to their destinations with zero scratch. The
+twelve members took 88.12 s with the existing writer and 88.76 s with
+experimental read-ahead. Automatic read-ahead applies to staged contributions.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

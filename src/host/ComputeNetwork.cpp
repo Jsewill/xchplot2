@@ -39,6 +39,7 @@ namespace group_grow::pool
 {
 namespace
 {
+constexpr uint32_t max_policy_frame = 262144;
 constexpr auto timed_generation_protocol = []
 {
     constexpr std::string_view name = "xchplot2-generation-time/1";
@@ -526,7 +527,6 @@ struct Channel::Impl
     }
     void policy_blob(bool write, Deadline until)
     {
-        constexpr uint32_t limit = 262144;
         std::array<uint8_t, 4> header{};
         if (write)
         {
@@ -537,7 +537,7 @@ struct Channel::Impl
         else
         {
             transfer(header, false, until); Reader input(header); auto size = input.u32();
-            require(size <= limit, "network pool policy exceeds its byte limit");
+            require(size <= max_policy_frame, "network pool policy exceeds its byte limit");
             std::vector<uint8_t> policy(size); transfer(policy, false, until); accept_pool_policy(options.membership_directory, policy);
         }
     }
@@ -703,13 +703,14 @@ void Channel::receive(Frame& frame, std::function<void()> const& before_wait)
         require(reader.u32() == 0x47504331 && reader.u16() == 1, "incompatible network frame protocol");
         auto const type = reader.u16(); auto const bytes = reader.u32(); reader.finish();
         bool const policy = Message(type) == Message::Policy;
-        require(valid_message(type) && bytes <= (policy ? 262144 : impl_->options.max_frame_bytes) &&
+        require(valid_message(type) && bytes <= (policy ? max_policy_frame : impl_->options.max_frame_bytes) &&
             (!policy || (impl_->policy_exchange && ++updates <= 4)), "invalid network frame type or size");
         frame.type = Message(type);
         if (bytes > frame.payload.capacity()) std::vector<uint8_t>().swap(frame.payload);
         frame.payload.resize(bytes);
         impl_->transfer(frame.payload, false, until, publish); check_deadline(until);
         if (policy) { accept_pool_policy(impl_->options.membership_directory, frame.payload); impl_->membership->check(); continue; }
+        if (publish) { publish(); check_deadline(until); }
         if (impl_->membership) impl_->membership->check();
         return;
     }
@@ -770,6 +771,7 @@ std::string const& Channel::peer_node_id() const
 { require(bool(impl_), "network channel is closed"); return impl_->peer_node; }
 uint32_t Channel::max_frame_bytes() const
 { require(bool(impl_), "network channel is closed"); return impl_->options.max_frame_bytes; }
+uint32_t Channel::frame_buffer_bytes(uint32_t bytes) { return std::max(bytes, max_policy_frame); }
 uint64_t Channel::memory_bytes(uint32_t bytes)
 {
     // Budget one full receive frame and TLS/socket/certificate scratch. Chain

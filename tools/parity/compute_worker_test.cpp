@@ -539,6 +539,7 @@ void network(char const* ca, char const* cert, char const* key)
     WorkerService service(options); service.start();
     WorkerClientConfig client_options; client_options.broker = options.broker; client_options.tls = tls; client_options.owner_id = "worker-loopback";
     client_options.task_timeout_ms = 10000; client_options.cpu_scheduler = options.cpu_scheduler;
+    client_options.contribution_read_ahead = true;
     WorkerClient client(client_options);
     std::array<uint8_t, 32> id{}; id.fill(0x71);
     worker_detail::CpuLimit limit(1);
@@ -622,11 +623,21 @@ void network(char const* ca, char const* cert, char const* key)
     };
     client.contributions(18, 2, {&id, 1}, check_contribution);
     require(next_chunk == PlotGroupFile::getChunkCountForK(18), "TLS contribution stream was truncated");
+    bool declined = false;
+    try
+    {
+        client.contributions(18, 2, {&id, 1}, check_contribution, {}, {},
+            [](auto, auto, auto) { throw WorkerTaskDeclined(); });
+    }
+    catch (WorkerTaskDeclined const&) { declined = true; }
+    require(declined, "read-ahead lost the contribution sink's decline");
     next_chunk = 0; first = 0; size_t largest_window = 0;
+    auto const caller = std::this_thread::get_id();
     client.contributions(18, 2, {&id, 1}, check_contribution, {}, {},
         [&](uint64_t ordinal, std::span<std::span<uint8_t const> const> window, uint16_t members)
         {
             require(!window.empty() && window.size() <= contribution_window_chunks, "unbounded contribution window");
+            require(caller == std::this_thread::get_id(), "read-ahead changed the contribution sink thread");
             largest_window = std::max(largest_window, window.size());
             for (auto const bytes : window) check_contribution(ordinal++, bytes, members);
         });
