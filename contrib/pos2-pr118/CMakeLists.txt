@@ -6,7 +6,7 @@ if(NOT DEFINED POS2_PR118_DIR)
     include(FetchContent)
     FetchContent_Declare(pos2_pr118
         GIT_REPOSITORY https://github.com/Chia-Network/pos2-chip
-        GIT_TAG ff89d3e61f4315311a7f975409a6433e67f699ff
+        GIT_TAG 077c692b51a32cde748e6a8f1ccefe5354c81fa8
         SOURCE_SUBDIR .no-cmakelists-here)
     FetchContent_MakeAvailable(pos2_pr118)
     set(POS2_PR118_DIR "${pos2_pr118_SOURCE_DIR}")

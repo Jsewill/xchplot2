@@ -1,11 +1,15 @@
 # PoS2 1.0 compatibility and reference tools
 
 Normal builds and this separate reference build pin
-[pos2-chip 1.0.0, `ff89d3e`](https://github.com/Chia-Network/pos2-chip/commit/ff89d3e61f4315311a7f975409a6433e67f699ff).
+[pos2-chip 1.0.1, `077c692`](https://github.com/Chia-Network/pos2-chip/commit/077c692b51a32cde748e6a8f1ccefe5354c81fa8).
 This includes merged plot groups ([#118](https://github.com/Chia-Network/pos2-chip/pull/118)),
 the incompatible Feistel cipher ([#119](https://github.com/Chia-Network/pos2-chip/pull/119)),
 and corrected decompression buffer sizing ([#120](https://github.com/Chia-Network/pos2-chip/pull/120)).
 The directory/tool names retain `pr118` for existing scripts.
+
+Version 1.0.1 keeps the 1.0.0 plot format and adds solver candidate
+headroom, recoverable solver errors and fixed Feistel vectors.
+xchplot2 keeps its growing candidate buffers and solver thread limit. [Upstream changes from 1.0.0](https://github.com/Chia-Network/pos2-chip/compare/1.0.0...1.0.1)
 
 Normal Linux and experimental native Windows builds include multi-member
 construction, planning, growth and shared compute. Use the installed commands
@@ -16,11 +20,12 @@ This directory retains the independent reference tools and experimental
 nonzero-index reader extension. Files starting at nonzero indices use the
 0x82 extension; normal xchplot2 and upstream readers reject that extension.
 
-Farming requires a farmer that supports the PoS2 1.0 group format. Upstream
-[farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21566)
-merged on 2026-10-28. Confirm support in your farmer release and network
-activation before plotting for production. Key generation includes the V2 taproot change from
-[chia-blockchain PR #21500](https://github.com/Chia-Network/chia-blockchain/pull/21500).
+Farming requires a farmer that supports the PoS2 1.0 group format. Chia has
+merged its farmer integration and the CPU reference plotting command
+`chia plots create2`. Confirm support in your farmer release and network
+activation before plotting for production. [Farmer integration](https://github.com/Chia-Network/chia-blockchain/pull/21566) · [Reference plotting command](https://github.com/Chia-Network/chia-blockchain/pull/21430)
+
+Key generation includes Chia's V2 taproot change. [Upstream key derivation](https://github.com/Chia-Network/chia-blockchain/pull/21500)
 
 ## Run the compatibility check
 

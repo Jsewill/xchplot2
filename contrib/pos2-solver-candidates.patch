@@ -1,22 +1,12 @@
 --- a/solve/Solver.hpp
 +++ b/solve/Solver.hpp
-@@ -12,6 +12,7 @@
+@@ -10,5 +10,6 @@
+ #include "common/ParallelForRange.hpp"
+ #include <algorithm>
++#include <exception>
  #include <array>
  #include <atomic>
  #include <bitset>
-+#include <exception>
- #include <iomanip>
- #include <iostream>
- #include <numeric> // for iota
-@@ -1168,7 +1169,7 @@
-             = uint64_t(hit_probability * static_cast<double>(NUM_XS) * extra_margin);
- 
-         // round down to multiple of 16
--        size_t const MAX_RESULTS_PER_THREAD = (estimated_matches / num_threads) & ~size_t(0xf);
-+        size_t const INITIAL_RESULTS_PER_THREAD = (estimated_matches / num_threads) & ~size_t(0xf);
- 
-         if (false) {
-             std::cout << "num x pairs: " << num_x_pairs << std::endl;
 @@ -1181,28 +1182,30 @@
                        << std::endl;
          }
@@ -51,8 +41,8 @@
 -                int thread_matches = 0;
 +                auto& xs = local_xs[t];
 +                auto& hashes = local_hashes[t];
-+                xs.reserve(INITIAL_RESULTS_PER_THREAD);
-+                hashes.reserve(INITIAL_RESULTS_PER_THREAD);
++                xs.reserve(MAX_RESULTS_PER_THREAD);
++                hashes.reserve(MAX_RESULTS_PER_THREAD);
                  uint64_t start = uint64_t(t) * chunk_size;
                  uint64_t end = (t + 1 == (int)num_threads) ? NUM_XS : start + chunk_size;
  
