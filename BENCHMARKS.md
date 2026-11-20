@@ -652,6 +652,36 @@ simultaneously. Those rates used eight read-only and seven write-only
 spindles. The complete plotting workload also generates, validates and
 checkpoints each group.
 
+#### Scratch reservations and parallel checkpoint writes
+
+A follow-up compared commit `596dd0a` with the updated plotter on the same
+4 GiB storage host and single RTX 4090 worker. The updated plotter bounds
+temporary contributions using the plot format and flushes checkpoint
+summaries across independent scratch HDDs. The automatic planner selected
+two destinations at a time for the three-member k=28 groups.
+
+| Plotting HDDs | Members | Control (s/member) | Updated (s/member) | Control scratch (GiB/destination) | Updated scratch (GiB/destination) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 24 | 8.74 | 8.31 | 7.08 | 3.45 |
+| 16 | 48 | 8.18 | 7.93 | 6.85 | 3.45 |
+
+Time runs from launch through the last durable publication. Scratch is the
+mean reported peak reservation per destination. Those peaks can occur at
+different times. At the same 24-member endpoint, the updated sixteen-drive
+fill averaged 8.19 s/member. The eight-drive run recorded 2,161 file syncs,
+down from 4,681. A separate trial using larger GPU requests took 224 s
+for 24 members, versus 210 s for the control.
+
+Both sixteen-drive controls measured 8.18 s/member. In the paired runs,
+the worker averaged 3.25 s/member generating fragments in the control and
+3.23 s/member in the updated build.
+Processing and sending together occupied its single slot for 6.25 s/member.
+The plotting HDDs averaged 130 MB/s read and 283 MB/s written. The storage
+NIC received 1.12 Gb/s, with a best five-second interval of 1.77 Gb/s.
+Every updated group matched its full-proof-checked reference by SHA-256.
+Across the two updated fills the harvester completed 61 challenges with
+eligible plots on the six C29 farm drives. The longest lookup took 0.93 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

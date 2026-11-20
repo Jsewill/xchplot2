@@ -2763,12 +2763,10 @@ struct WorkerClient::Impl
         };
         bool const overlap = packed_sink && config.packed_receive_overlap &&
             config.cpu_scheduler && config.cpu_scheduler->can_overlap();
-        pool::Frame packed_frame;
+        pool::Frame frame;
         std::future<void> validating;
         for (;;)
         {
-            pool::Frame contribution_frame;
-            auto& frame = packed_sink ? packed_frame : contribution_frame;
             auto const before = Clock::now();
             uint64_t delivery_ns = 0;
             if (validating.valid())

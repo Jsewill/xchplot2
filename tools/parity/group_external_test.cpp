@@ -1915,7 +1915,9 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
     {
         auto cfg = config(); cfg.io_overlap = overlap;
         auto const path = root / (std::string("prepared-") + (packed ? "packed" : "raw") + (overlap ? "-overlap" : "-serial"));
-        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+        auto scratch = ext;
+        if (packed && overlap) for (auto& grant : scratch.scratch) grant.capacity_bytes = 2ull << 20;
+        ExternalEngine engine(path.string(), cfg, scratch, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "prepared input reservation rejected");
         require(input->reserved_bytes() >= input->written_bytes(), "prepared input reservation undercounts payload");
         feed(*input, packed); require(input->sealed(), "prepared input did not seal");
@@ -2342,8 +2344,9 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
     {
         auto const path = root / "contribution-exact"; auto cfg = config();
-        cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, ext);
-        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+        auto tight = ext; for (auto& grant : tight.scratch) grant.capacity_bytes = 2ull << 20;
+        cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, tight);
+        ExternalEngine engine(path.string(), cfg, tight, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "exact contribution preflight rejected");
         feed(*input, 0, false); require(engine.append(*input).accepted, "exact contribution capacity rejected");
         engine.finish(); require(contents(path) == reference, "exact contribution output differs");

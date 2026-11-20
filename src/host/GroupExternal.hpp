@@ -321,6 +321,7 @@ private:
     };
     struct Packet { uint16_t first, count; uint32_t bytes; };
     static_assert(sizeof(Packet) == 8);
+    static uint64_t contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound);
     struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
     static constexpr uint64_t segment_header_bytes = 64;
     static constexpr size_t max_roots = 1024;
@@ -1182,28 +1183,40 @@ inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
     using namespace external_detail;
     require(phase_ == Phase::stage && members_ && !pending_summary_.bytes, "invalid external pending summary generation");
     require(summaries.size() == PlotGroupFile::getChunkCountForK(identity_.header.k), "external replacement summary coverage changed");
-    auto bytes = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(summaries.data()), summaries.size_bytes());
+    auto const bytes = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(summaries.data()), summaries.size_bytes());
     summary_digest_ = grow_digest(bytes, config_.cpu_scheduler.get());
-    for (auto& segment : pending_summary_.segments)
+    // Unequal grants can give adjacent segments different lengths. Map them
+    // to their immutable source bytes before independent disk writers start.
+    std::vector<size_t> offsets;
+    offsets.reserve(pending_summary_.segments.size());
+    size_t end = 0;
+    for (auto const& segment : pending_summary_.segments)
+    {
+        require(segment.ordinal == offsets.size() && segment.bytes <= bytes.size() - end,
+            "external pending summary coverage changed");
+        offsets.push_back(end); end += size_t(segment.bytes);
+    }
+    require(end == bytes.size(), "external summary exceeded its admitted reservation");
+    scratch_segments(pending_summary_, [&](Segment& segment, Stats* stats, ExecutionIO* service)
     {
         auto const path = segment_path(pending_summary_, segment);
         require(stamp(path) == segment.stamp, "external pending summary segment changed");
         Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
         require(file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
-            file_io::matches_durable_identity(file.fd, segment.identity)) && segment.bytes <= bytes.size(),
-            "external pending summary handle or coverage changed");
+            file_io::matches_durable_identity(file.fd, segment.identity)), "external pending summary handle changed");
+        auto const io = io_context("checkpoint_summary", service);
+        auto const payload = bytes.subspan(offsets[segment.ordinal], size_t(segment.bytes));
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
             size_t const count = size_t(std::min(config_.window_bytes, segment.bytes - offset));
-            write(file.fd, segment_header_bytes + offset, bytes.subspan(size_t(offset), count), &stats_, io_context("checkpoint_summary", &execution_scratch_)); offset += count;
+            write(file.fd, segment_header_bytes + offset, payload.subspan(size_t(offset), count), stats, io); offset += count;
         }
-        external_detail::sync(file.fd, &stats_, io_context("checkpoint_summary", &execution_scratch_));
+        external_detail::sync(file.fd, stats, io);
         require(stamp(path).file == segment.stamp.file, "external written summary path was replaced");
-        segment.stamp = stamp(path); pending_summary_.bytes += segment.bytes; bytes = bytes.subspan(size_t(segment.bytes));
+        segment.stamp = stamp(path);
         if (config_.release_cache) external_detail::evict(file.fd);
-    }
-    require(bytes.empty(), "external summary exceeded its admitted reservation");
-    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
+    });
+    pending_summary_.bytes = end;
     grow_failpoint("external-summary-flushed");
 }
 inline void ExternalEngine::save(std::string const& label, std::span<Summary const> summaries)
@@ -2654,13 +2667,28 @@ inline uint64_t ExternalEngine::contribution_input_memory_bytes(Config const& co
     return grow_add(grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec), inspection),
         multiply(members, grow_add(config.window_bytes, sizeof(ContributionInput::MemberRecord) + sizeof(Writer))));
 }
+inline uint64_t ExternalEngine::contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound)
+{
+    // The ordered deltas in each chunk span at most one range per member.
+    // Round its unary allowance up so singleton reservations also cover a
+    // coencoded run. The fixed FSE table consumes at most 11 bits per symbol,
+    // plus two 11-bit states and the end bit (as in ChunkCodec::size_bounds).
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    uint64_t const range = 1ull << (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    uint64_t const threshold = 178ull << (k - 8);
+    uint64_t const unary = multiply(members, (range + threshold - 1) / threshold);
+    uint64_t const symbols = multiply(members, fragment_bound);
+    uint64_t const bits = grow_add(multiply(symbols, (k - 7) + 11), multiply(chunks, unary + 23));
+    // Round the two bitstreams independently in each chunk and include the
+    // largest unsigned length prefix and the on-disk packet header.
+    return grow_add(bits / 8, multiply(chunks, 2 + 10 + sizeof(Packet)));
+}
 inline uint64_t ExternalEngine::contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
 {
     require(k >= 18 && k <= 28 && !(k & 1) && members && members <= max_runs && fragment_bound && fragment_bound <= UINT32_MAX,
         "invalid contribution input bound");
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
-    uint64_t const member = grow_add(grow_add(multiply(fragment_bound, 9), fragment_bound / 128),
-        multiply(chunks, POS2_FSE_compressBound(0) + sizeof(Packet) + 11));
+    uint64_t const member = contribution_run_bound(k, 1, fragment_bound);
     return grow_add(multiply(members, member), multiply(chunks, sizeof(Summary)));
 }
 inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepare_contributions(uint16_t members,
@@ -2711,16 +2739,11 @@ inline uint64_t ExternalEngine::input_scratch_bytes(uint8_t k, uint16_t members,
 {
     require(k >= 18 && k <= 28 && !(k & 1) && members && fragment_bound && fragment_bound <= UINT32_MAX,
         "invalid prepared input bound");
-    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k), symbols = multiply(members, fragment_bound);
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
     uint64_t const bits = multiply(fragment_bound, k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
     uint64_t const compact = multiply(members, grow_add(multiply(chunks + 1, sizeof(uint32_t)),
         multiply(bits / 64 + (bits % 64 != 0), sizeof(uint64_t))));
-    // Every valid delta has at most eight low bytes and one ANS symbol.
-    // FSE's per-chunk bound is n + (n >> 7) + 512; include prefix, packet and
-    // rounding per chunk. This preflight may decline in favor of exact ordinary
-    // append, but can never consume an unreserved generated member.
-    uint64_t const contribution = grow_add(grow_add(multiply(symbols, 9), symbols / 128),
-        multiply(chunks, grow_add(POS2_FSE_compressBound(0), sizeof(Packet) + 11)));
+    uint64_t const contribution = contribution_run_bound(k, members, fragment_bound);
     return grow_add(compact, grow_add(contribution, multiply(chunks, sizeof(Summary))));
 }
 inline bool ExternalEngine::staging_slot()

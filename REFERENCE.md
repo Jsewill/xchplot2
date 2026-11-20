@@ -700,8 +700,11 @@ boundaries so appending the next chunk can proceed while the disk is busy.
 The packing checkpoint synchronizes the output and index before releasing
 consumed scratch.
 
-When a compute worker supplies compressed contributions, the plotting host
-validates their chunks as they arrive. With I/O overlap and spare CPU
+Before receiving compressed contributions from a compute worker, the
+plotting host uses the fragment count, the range of the deltas and the fixed
+compression table to bound the scratch it reserves. The same bound applies
+to the contribution produced from packed input.
+The host validates chunks as they arrive. With I/O overlap and spare CPU
 workers it can check a window of independent chunks in parallel within
 the codec RAM budget. A capacity probe checks chunks in order so it can
 stop receiving as soon as the next member cannot fit.
@@ -722,7 +725,9 @@ plots retain the ordinary v2 format.
 
 Writers sharing a physical drive serialize their I/O. Independent drives can
 progress together within the shared RAM and CPU limits. With I/O overlap
-enabled, external jobs on independent output HDDs can share a codec worker.
+enabled, scratch HDDs can flush their portions of a checkpoint summary in
+parallel. The plotter waits for all portions before committing the checkpoint.
+External jobs on independent output HDDs can also share a codec worker.
 Before timing data are available, automatic construction tries to keep a
 complete fresh HDD group in RAM when the batch limit permits. It sizes the
 initial set of destinations using available generator slots and allows
