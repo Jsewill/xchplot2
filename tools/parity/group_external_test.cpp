@@ -2160,7 +2160,7 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         bool rejected = false; try { action(); } catch (std::runtime_error const&) { rejected = true; }
         require(rejected, "invalid contribution input was accepted");
     };
-    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width = 17)
+    auto write_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width)
     {
         for (uint64_t chunk = 0; chunk < chunks;)
         {
@@ -2170,8 +2170,9 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
             for (size_t i = 0; i < count; ++i) window[i] = encoded[offset + member][size_t(chunk) + i];
             input.append_chunks(member, chunk, {window.data(), count}); chunk += count;
         }
-        input.finish_member(member);
     };
+    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width = 17)
+    { write_member(input, member, offset, width); input.finish_member(member); };
     auto feed = [&](ExternalEngine::ContributionInput& input, size_t offset, bool concurrent)
     {
         std::vector<std::future<void>> pending;
@@ -2228,6 +2229,44 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         if (!concurrent) require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
             "ordered validated contributions were reread during conservative sizing");
         input.reset(); engine.finish(); require(contents(path) == reference, "grouped contributions changed canonical bytes");
+    }
+    uint64_t ordered_bound = 0;
+    for (bool retry : {false, true})
+    {
+        auto const path = root / (retry ? "contribution-ordered-lease-retry" : "contribution-ordered-lease");
+        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
+        require(bool(input), "ordered lease reservation rejected");
+        // Start the retry with a shorter first member so reusing the stale
+        // summary would give a different capacity bound.
+        if (retry) for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            uint64_t const first = chunk * range + 7;
+            std::array<uint64_t, 4> const values{first, first + range / 4, first + range / 2, first + 3 * range / 4};
+            FragmentRegion const region{std::span(values)};
+            input->append_chunk(0, chunk, codec.encode(chunk, {}, 0, {&region, 1}));
+        }
+        for (uint16_t member = retry ? 1 : 0; member < input->size(); ++member)
+            write_member(*input, member, 0, 17);
+        rejects([&] { input->seal(); });
+        if (retry)
+        {
+            input->reset_member(0);
+            write_member(*input, 0, 0, 17);
+        }
+        for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
+        input->seal();
+        auto const reads = engine.stats().phases[size_t(WorkPhase::plan)].read_bytes;
+        auto const result = engine.append(*input);
+        require(result.accepted, "ordered lease append rejected");
+        if (retry) require(result.attempted_final_bytes == ordered_bound, "ordered lease retry used a stale capacity bound");
+        else
+        {
+            ordered_bound = result.attempted_final_bytes;
+            require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
+                "ordered lease members were reread after deferred writer completion");
+        }
+        engine.finish(); require(contents(path) == reference, "ordered lease changed canonical bytes");
     }
     for (bool split : {false, true})
     {

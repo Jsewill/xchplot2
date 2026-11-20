@@ -2258,6 +2258,9 @@ public:
             if (!entry.writer->room()) { copying.reset(); entry.writer->flush(); }
         }
         entry.next += chunks.size(); entry.failed = false;
+        // The next member can extend this summary even when the lease
+        // finishes all its scratch writers together after delivery.
+        if (entry.summarizing && entry.next == total) summarized_ += count;
         return true;
     }
     void finish_member(uint16_t member, uint16_t count = 1)
@@ -2268,7 +2271,6 @@ public:
         require(entry.owner == member && entry.count == count && !entry.failed && !entry.finished && entry.writer && entry.next == PlotGroupFile::getChunkCountForK(engine_->identity_.header.k),
             "contribution member has missing chunks");
         entry.failed = true; entry.writer->finish(); entry.writer.reset(); entry.finished = true; entry.failed = false;
-        if (entry.summarizing) summarized_ += count;
     }
     // Only the controller of these members may restart them, after the prior
     // producer has stopped. Restore their original singleton reservations so

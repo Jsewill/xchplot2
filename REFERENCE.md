@@ -708,9 +708,11 @@ The host validates chunks as they arrive. With I/O overlap and spare CPU
 workers it can check a window of independent chunks in parallel within
 the codec RAM budget. A capacity probe checks chunks in order so it can
 stop receiving as soon as the next member cannot fit.
-The plotting host reuses the consecutive prefix in
-member order for conservative sizing. An out-of-order suffix is read from
-scratch. Tight capacity still triggers exact sizing against the saved runs.
+When the current summary is in RAM, each member received in plot order
+extends it, including successive members of one GPU lease. Conservative
+sizing can then skip those scratch reads. A retry or an out-of-order
+stream can require a reread. Tight capacity still triggers exact sizing
+against the saved runs.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both

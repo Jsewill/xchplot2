@@ -810,6 +810,31 @@ combined T2 and T3 matching from 1.97 to 1.40 s/member. Launch-to-exit
 times averaged 5.33 and 5.27 s/member respectively, with overlapping run
 times. All outputs matched the full-proof-checked reference files.
 
+#### Sizing ordered GPU contributions on scratch HDDs
+
+The storage host and its single-slot RTX 4090 worker each had a 4 GiB
+plotting RAM budget. The harvester had 17,886 plots loaded on separate
+HDDs. Each GPU lease delivered three members in plot order. The storage
+host kept each member's summary as its last compressed chunk arrived.
+
+| Plotting HDDs | Published k=28 members | Previous (s/member) | Updated (s/member) | Time saved | First group, previous → updated (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 24 | 6.72 | 6.49 | 3.4% | 35.31 → 36.06 |
+| 16 | 48 | 6.30 | 5.70 | 9.6% | 37.23 → 35.78 |
+
+In the first 16-HDD comparison, sizing reads fell from 33.04 GB to zero
+and cumulative planning time fell from 96.97 s to 3.27 s. The plotting
+disks reported 49.6 GB of physical reads in both fills. The storage host
+saved the time it had spent reading and inspecting validated chunks again.
+Final packing still read the contributions and wrote the finished plots.
+The optimized files matched the controls by SHA-256 in both comparisons.
+Fresh verification of all sixteen groups in the wider fill validated 727
+full proofs.
+
+A repeat published at 6.65 s/member. During startup the broker reported a
+host-memory wait after the GPU worker retained its output buffer. The first
+group took 67 s. Sizing still recorded zero scratch reads.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
