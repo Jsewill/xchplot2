@@ -145,6 +145,13 @@ struct CapacityUpdate
     Resources capacity;
     uint64_t revision = 0;
     std::optional<std::vector<GenerationProfile>> generation_profiles = {};
+    // A full worker snapshot can omit the profiles once this broker has
+    // acknowledged the same revision for this worker instance.
+    CapacityUpdate for_broker(uint64_t registered_revision) const
+    {
+        if (revision == registered_revision) return {capacity, revision, {}};
+        return *this;
+    }
 };
 struct DeliveryObservation
 {

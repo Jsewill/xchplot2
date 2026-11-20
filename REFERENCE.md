@@ -1854,6 +1854,9 @@ required safety allowance; it does not infer spare GPU compute time from free
 memory. A GPU worker can encode the last member of a batch directly from its
 pinned output buffer. Its host RAM reservation includes separate raw copies
 only for earlier members and accounts for retained GPU buffers across tasks.
+When the worker keeps a buffer for reuse, it reports the remaining RAM and
+the revised per-job memory requirement together. Each broker can use the
+new figures to admit its next queued job as the previous lease finishes.
 A plotting job partitions its host budget between the embedded service, local work,
 construction and optional remote encoding, honoring saved offered limits.
 A worker registers with up to 128 brokers by default. Save another limit with

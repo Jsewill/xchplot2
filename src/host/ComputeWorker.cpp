@@ -314,9 +314,10 @@ public:
             changed_.wait_for(lock, std::chrono::milliseconds(50));
         }
     }
-    uint64_t task_capacity() const
+    uint64_t task_capacity(uint64_t* standing = nullptr) const
     {
         std::lock_guard lock(mutex_);
+        if (standing) *standing = baseline_;
         return std::min(capacity_ - baseline_, add(used_ - baseline_, available_locked()));
     }
     std::pair<uint64_t, unsigned> active() const
@@ -695,7 +696,7 @@ struct WorkerService::Impl
     std::string instance = pool::random_token();
     mutable std::mutex advertisement_mutex;
     pool::CapacityUpdate advertised_capacity;
-    uint64_t next_capacity_revision = 1;
+    uint64_t advertised_baseline = 0;
     std::atomic<uint64_t> retained_gpu_host{0};
     uint64_t service_baseline = 0;
     pool::WorkerHardware physical;
@@ -804,8 +805,8 @@ struct WorkerService::Impl
                 if (gpu_profiles.empty()) gpu_enabled = false;
 #endif
             });
-            auto const capacity = current_capacity();
-            advertised_capacity = {capacity, 1, profiles(capacity)};
+            auto const capacity = current_capacity(&advertised_baseline);
+            advertised_capacity = {capacity, 1, profiles(capacity, advertised_baseline)};
         }
         catch (...)
         { stopping.store(true); jobs_ready.notify_all(); if (gpu_thread.joinable()) gpu_thread.join(); throw; }
@@ -885,7 +886,7 @@ struct WorkerService::Impl
         available.cpu_threads = std::min(available.cpu_threads, uint32_t(profile_detail::logical_cpus()));
         return available;
     }
-    pool::Resources current_capacity() const
+    pool::Resources current_capacity(uint64_t* standing = nullptr) const
     {
         auto capacity = config.capacity;
         if (!gpu_enabled) capacity.gpu_bytes = 0;
@@ -894,24 +895,23 @@ struct WorkerService::Impl
         capacity.cpu_threads = std::min(capacity.cpu_threads, std::max(active, std::max(uint32_t(1), available.cpu_threads)));
         // A positive unavailable partition carries no useful generation
         // profile; existing active leases remain represented until release.
-        capacity.host_bytes = std::max(uint64_t(1), budget->task_capacity());
+        capacity.host_bytes = std::max(uint64_t(1), budget->task_capacity(standing));
         return capacity;
     }
-    pool::CapacityUpdate capacity_update(bool force = false)
+    pool::CapacityUpdate capacity_update(std::optional<uint64_t> registered_revision = {}, bool force = false)
     {
         std::lock_guard lock(advertisement_mutex);
-        auto const capacity = current_capacity();
-        if (!force && capacity == advertised_capacity.capacity)
-            return {capacity, advertised_capacity.revision, {}};
-        require(next_capacity_revision < UINT64_MAX, "worker capacity revision exhausted");
-        return {capacity, ++next_capacity_revision, profiles(capacity)};
+        uint64_t standing;
+        auto const capacity = current_capacity(&standing);
+        if (force || capacity != advertised_capacity.capacity || standing != advertised_baseline)
+        {
+            require(advertised_capacity.revision < UINT64_MAX, "worker capacity revision exhausted");
+            advertised_capacity = {capacity, advertised_capacity.revision + 1, profiles(capacity, standing)};
+            advertised_baseline = standing;
+        }
+        return advertised_capacity.for_broker(registered_revision.value_or(advertised_capacity.revision));
     }
-    void commit_capacity(pool::CapacityUpdate const& update)
-    {
-        std::lock_guard lock(advertisement_mutex);
-        if (update.revision > advertised_capacity.revision) advertised_capacity = update;
-    }
-    pool::BrokerClient control_for(pool::Lease const& lease) const
+    pool::BrokerClient control_for(pool::Lease const& lease, uint64_t* registered_revision = nullptr) const
     {
         std::lock_guard lock(brokers_mutex);
         std::shared_ptr<Registration> selected;
@@ -919,7 +919,11 @@ struct WorkerService::Impl
             if (!broker->epoch.empty() && broker->epoch == lease.epoch && broker->identity == lease.broker_identity &&
                 (!selected || (broker->healthy && !selected->healthy) ||
                     (broker->healthy == selected->healthy && broker->seen > selected->seen))) selected = broker;
-        if (selected) return selected->client;
+        if (selected)
+        {
+            if (registered_revision) *registered_revision = selected->revision;
+            return selected->client;
+        }
         throw pool::StaleLease("worker does not recognize the lease's broker epoch");
     }
     void begin_assigned(pool::BrokerClient const& broker, pool::Lease const& lease, std::string const& owner, WorkerCancellation cancel)
@@ -1001,7 +1005,7 @@ struct WorkerService::Impl
                 refresh_cursor = (refresh_cursor + std::max<size_t>(1, snapshot.size())) % brokers.size();
             }
         }
-        auto update = capacity_update(); commit_capacity(update);
+        capacity_update();
         std::vector<std::future<void>> requests;
         for (auto const& broker : snapshot) requests.push_back(std::async(std::launch::async, [this, broker]
         {
@@ -1024,7 +1028,7 @@ struct WorkerService::Impl
                 }
                 if (!advertised_endpoint.host.empty() && value.endpoint != advertised_endpoint)
                 {
-                    auto revised = capacity_update(true); commit_capacity(revised);
+                    capacity_update({}, true);
                     auto route = value.endpoint; value = offer(); value.endpoint = std::move(route);
                 }
                 std::string peer, node;
@@ -1104,10 +1108,10 @@ struct WorkerService::Impl
         }
     }
 
-    std::vector<pool::GenerationProfile> profiles(pool::Resources const& capacity) const
+    std::vector<pool::GenerationProfile> profiles(pool::Resources const& capacity, uint64_t standing) const
     {
         std::vector<pool::GenerationProfile> result;
-        auto const retained = budget->baseline() - service_baseline;
+        auto const retained = standing - service_baseline;
         for (uint8_t k = 18; k <= 28; k += 2)
             for (uint8_t strength = STRENGTH_MIN;
                  strength <= std::min<unsigned>(STRENGTH_MAX, k - PlotProofParams::num_section_bits_for_k(k) - 1); ++strength)
@@ -1675,6 +1679,7 @@ struct WorkerService::Impl
     {
         std::optional<pool::Lease> lease;
         std::optional<pool::BrokerClient> broker;
+        uint64_t registered_revision = 0;
         std::atomic<bool> cancelled{false};
         std::exception_ptr renewal_failure;
         bool begun = false, output_started = false;
@@ -1707,7 +1712,7 @@ struct WorkerService::Impl
             require(task_timeout && task_timeout <= config.task_timeout_ms, "worker task timeout exceeds configured limit");
             WorkerCancellation cancel{&cancelled, Clock::now() + std::chrono::milliseconds(task_timeout), &stopping};
             channel.set_deadline(cancel.deadline);
-            broker = control_for(*lease);
+            broker = control_for(*lease, &registered_revision);
             auto active = broker->with_deadline(cancel.deadline);
             accepted.emplace(*this);
             begin_assigned(*broker, *lease, channel.peer_identity(), cancel);
@@ -1883,7 +1888,7 @@ struct WorkerService::Impl
             if (kind == WorkerError::Unsupported && !unsupported) kind = WorkerError::Permanent;
             if (unsupported && begun) try
             { auto cleanup = worker_detail::cleanup_control(*broker, config.tls);
-              auto update = capacity_update(); cleanup.reject(*lease, pool::FailureCode::UnsupportedResources, update); commit_capacity(update); }
+              cleanup.reject(*lease, pool::FailureCode::UnsupportedResources, capacity_update(registered_revision)); }
             catch (...)
             {
                 // Other granted leases may still rely on the old capacity.
@@ -1899,7 +1904,7 @@ struct WorkerService::Impl
         }
         if (begun)
         {
-            try { auto update = capacity_update(); worker_detail::cleanup_control(*broker, config.tls).finish(*lease, update); commit_capacity(update); }
+            try { worker_detail::cleanup_control(*broker, config.tls).finish(*lease, capacity_update(registered_revision)); }
             catch (...)
             {
                 try { worker_detail::cleanup_control(*broker, config.tls).finish(*lease); } catch (...) {}
@@ -2047,7 +2052,8 @@ void WorkerService::generate_assigned(pool::Lease const& lease,
     require(owns(lease) && lease.task.kind != pool::Kind::Pack && lease.task.work_units == ids.size(),
         "local generation lease targets another task or executor");
     cancel = impl_->cancellation(cancel);
-    auto control = impl_->control_for(lease);
+    uint64_t registered_revision = 0;
+    auto control = impl_->control_for(lease, &registered_revision);
     auto active = control.with_deadline(cancel.deadline);
     Impl::Acceptance accepted(*impl_);
     impl_->begin_assigned(control, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
@@ -2072,17 +2078,16 @@ void WorkerService::generate_assigned(pool::Lease const& lease,
         auto failure = std::current_exception();
         try
         {
-            auto update = impl_->capacity_update();
+            auto update = impl_->capacity_update(registered_revision);
             auto cleanup = worker_detail::cleanup_control(control, impl_->config.tls);
             if (dynamic_cast<pool::UnsupportedResources const*>(&error))
                 cleanup.reject(lease, pool::FailureCode::UnsupportedResources, update);
             else cleanup.finish(lease, update);
-            impl_->commit_capacity(update);
         }
         catch (...) { /* The next heartbeat publishes the current capacity. */ }
         std::rethrow_exception(task_failure(failure, renewal_failure));
     }
-    try { auto update = impl_->capacity_update(); worker_detail::cleanup_control(control, impl_->config.tls).finish(lease, update); impl_->commit_capacity(update); }
+    try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease, impl_->capacity_update(registered_revision)); }
     catch (...) { /* The next heartbeat publishes the current capacity. */ }
 }
 void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t const> payload,

@@ -757,7 +757,9 @@ void retained_budget()
     ready.wait(); require(waiting.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
         "model request did not wait for transient memory");
     current.transfer(retained, 50);
-    require(budget.task_capacity() == 40 && waiting.wait_for(std::chrono::seconds(1)) == std::future_status::ready && waiting.get(),
+    uint64_t standing = 0;
+    require(budget.task_capacity(&standing) == 40 && standing == 60 &&
+        waiting.wait_for(std::chrono::seconds(1)) == std::future_status::ready && waiting.get(),
         "persistent retention did not wake and reject an impossible request");
 
     std::promise<void> resizing; auto queued = resizing.get_future();

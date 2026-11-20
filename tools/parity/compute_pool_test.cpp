@@ -777,8 +777,12 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
     auto changed = request; changed.work_units = 2; changed.attempt = 2;
     rejects([&] { (void)owner.acquire(session, changed); });
     auto updated = batch.generation_profiles; updated.front().resources.host_bytes = 512;
-    auto capacity = batch.capacity; capacity.host_bytes = 3584;
-    worker.finish(*grant, CapacityUpdate{capacity, 2, updated});
+    auto capacity = batch.capacity; capacity.host_bytes = 2048;
+    CapacityUpdate const warm{capacity, 2, updated};
+    require(!warm.for_broker(warm.revision).generation_profiles, "acknowledged revision retransmitted its generation profiles");
+    // The heartbeat can cache the warm revision locally while this broker
+    // still holds the cold offer. Finish must reprice its already queued job.
+    worker.finish(*grant, warm.for_broker(batch.capacity_revision));
     worker.register_worker(batch);
     auto next = owner.acquire(session, full);
     require(next && next->task.work_units == 4 && next->task.resources.host_bytes == 2048,

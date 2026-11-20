@@ -835,6 +835,23 @@ A repeat published at 6.65 s/member. During startup the broker reported a
 host-memory wait after the GPU worker retained its output buffer. The first
 group took 67 s. Sizing still recorded zero scratch reads.
 
+With the worker reporting available RAM and per-job requirements in the
+same revision, the next 16-HDD fill published at 6.00 s/member. The
+first group arrived in 36.23 s. Midway through that fill the worker
+deferred generation when the host's available RAM fell below its standing
+allocation. An eight-HDD fill using the revised worker with the previous
+broker published at 6.34 s/member.
+
+The final 16-HDD repeat published at 5.73 s/member. Its first group
+arrived in 35.28 s. The worker served all 48 members in 16 leases and
+spent 3.48 s/member processing and sending them. The 10 GbE link averaged
+1.54 Gb/s inbound and peaked at 3.79 Gb/s over five-second intervals.
+Final packing remained the longest storage-host phase.
+
+Across these three fills, the harvester reported 77 completed challenges
+with eligible plots. The longest took 6.62 s. It also logged one C3
+decoding error while fetching qualities from an existing v1 plot.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
