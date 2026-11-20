@@ -714,7 +714,7 @@ private:
             {
                 if (size_only)
                 {
-                    high_.data[high_.size++] = uint8_t((delta % (178ull << (k_ - 8))) >> (k_ - 8));
+                    high_.data[high_.size++] = uint8_t((delta >> (k_ - 8)) % 178);
                     bit_count += delta_width(delta);
                 }
                 else append_delta(delta, bit_count);
@@ -874,7 +874,7 @@ private:
     }
     static uint32_t delta_width(uint8_t k, uint64_t delta)
     {
-        uint64_t const quotient = delta / (178ull << (k - 8));
+        uint64_t const quotient = (delta >> (k - 8)) / 178;
         group_tools::require(quotient + 1 + k - 8 <= 64, "unencodable group fragment delta");
         return uint32_t(quotient + 1 + k - 8);
     }
@@ -901,12 +901,10 @@ private:
     }
     void append_low_delta(uint64_t delta, size_t& bit_count)
     {
-        uint64_t const threshold = 178ull << (k_ - 8);
-        uint64_t const quotient = delta / threshold;
-        uint64_t const remainder = delta % threshold;
-        uint64_t value = (((1ull << quotient) - 1) << (k_ - 8))
-            | (remainder & ((1ull << (k_ - 8)) - 1));
+        uint32_t const low_bits = k_ - 8;
         uint32_t const width = delta_width(delta);
+        uint32_t const quotient = width - low_bits - 1;
+        uint64_t const value = (((1ull << quotient) - 1) << low_bits) | (delta & ((1ull << low_bits) - 1));
         append_low_word(value, width, bit_count);
     }
     void append_low_word(uint64_t value, uint32_t width, size_t& bit_count)
@@ -916,8 +914,11 @@ private:
         size_t const byte = bit_count >> 3;
         uint32_t const shift = uint32_t(bit_count & 7);
         auto const tail = low_.span().subspan(byte);
-        uint64_t const word = load_word(tail) | (value << shift);
-        std::memcpy(low_.data.get() + byte, &word, std::min(tail.size(), sizeof(word)));
+        // Appends are ordered. Only the low bits of this first byte belong
+        // to an earlier field. The following bytes can be written directly.
+        uint64_t const word = (tail.front() & ((1u << shift) - 1)) | (value << shift);
+        if (tail.size() >= sizeof(word)) std::memcpy(low_.data.get() + byte, &word, sizeof(word));
+        else std::memcpy(low_.data.get() + byte, &word, tail.size());
         if (width > 64 - shift) low_.data[byte + 8] |= uint8_t(value >> (64 - shift));
         bit_count += width;
     }

@@ -852,6 +852,14 @@ Across these three fills, the harvester reported 77 completed challenges
 with eligible plots. The longest took 6.62 s. It also logged one C3
 decoding error while fetching qualities from an existing v1 plot.
 
+#### Encoding k28 contributions
+
+On a Ryzen 9 5950X, one CPU thread re-encoded 8,192 chunks from a
+full-proof-checked k28 member 120 times per run. Preserving just the
+partially written byte when appending each delta field reduced median
+elapsed time from 0.651 s to 0.529 s (18.8%) across four runs per build.
+Both builds reproduced the source bytes for every chunk.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
