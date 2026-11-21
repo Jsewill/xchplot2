@@ -924,6 +924,40 @@ from each fill verified 280 proofs from 100 challenges and 47 proofs from
 16 challenges, respectively. Across the two fills the harvester completed
 55 challenges with eligible plots. The longest took 6.23 s.
 
+#### Concurrent GPU generation and independent HDD publication
+
+Each fill published the same 48 k=28 members on 16 HDDs while the harvester
+farmed 17,886 v1 plots on separate drives. The RTX 4090 used 10 GbE and
+the RX 6700 XT used 1 GbE over SSH. Construction, batch size, worker
+output and writer count were automatic. Seconds per member divide the time
+from launch to durable publication of the last group by 48. Each comparison
+used the same build for both GPU configurations. The 32 GiB repeat and the
+4 GiB runs included the updated scratch reservation for the next writer.
+
+| Plotting RAM (owner / each worker) | RTX 4090 (s/member) | RTX 4090 and RX 6700 XT (s/member) |
+| --- | ---: | ---: |
+| 32 / 10 GiB, both GPUs first | 4.83 | 4.09 |
+| 32 / 10 GiB, 4090 first | 4.73 | 4.38 |
+| 4 / 4 GiB, both GPUs first | 4.46 | 5.04 |
+
+With `fill -M 32G` on the storage host and `compute worker --host-bytes 10G`
+on each worker, neither GPU configuration needed HDD scratch. Adding the
+Radeon reduced mean time per member by 11.4%, from 4.78 s to 4.23 s.
+In both fills the 4090 delivered 40 members and the Radeon delivered
+eight. Generation and delivery overlapped across workers for 156 s and
+155 s. The 4090 alone published the first group sooner in both comparisons
+(30.30 s and 29.10 s, versus 39.14 s and 39.74 s with both GPUs).
+
+With 4 GiB on the owner and each worker, automatic construction admitted
+two destinations and used up to 14 scratch HDDs. The Radeon delivered six
+members. Two HDDs packed simultaneously for 24.6 s, and the last
+group began receiving members while the preceding group was still packing.
+
+Every output matched its full-proof-checked reference by SHA-256. A fresh
+full-proof check sampled one group from each fill. Across these six fills,
+the harvester completed 141 challenges with eligible plots. The longest
+took 6.97 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
