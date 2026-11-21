@@ -1182,6 +1182,7 @@ void local_only_parallel()
     std::array<std::shared_ptr<WorkerService>, 2> services{
         std::make_shared<WorkerService>(offer), std::make_shared<WorkerService>(offer)};
     std::atomic<unsigned> next{0}, selected{0}, observed{0}, entered{0};
+    std::promise<void> lanes_selected, consumers_ready;
     WorkerClientConfig config; config.local_only = true; config.max_active_generation = 2;
     config.local_service_provider = [&] { return services[next.fetch_add(1) % services.size()]; };
     config.admit_task = [&](WorkerTaskAdmission const& value)
@@ -1191,7 +1192,8 @@ void local_only_parallel()
             "private local admission acquired an identity or lost its concrete resource bound");
     };
     config.selected = [&](WorkerTaskObservation const& value)
-    { require(value.local_direct && value.kind == pool::Kind::GenerateCpu, "private local selection lost its backend"); ++selected; };
+    { require(value.local_direct && value.kind == pool::Kind::GenerateCpu, "private local selection lost its backend");
+      if (++selected == services.size()) lanes_selected.set_value(); };
     config.observe = [&](WorkerTaskObservation const& value)
     { require(value.local_direct && value.elapsed_ns && !value.input_bytes && !value.output_bytes,
         "private local observation counted nonexistent transport traffic"); ++observed; };
@@ -1208,7 +1210,11 @@ void local_only_parallel()
         client.generate(18, 2, id, [&](PackedFragmentTile const& tile, uint64_t count)
         {
             if (!receiver)
-            { receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count)); ++entered; finish.wait(); }
+            {
+                receiver = std::make_unique<CompactMemberReceiver>(18, size_t(count));
+                if (++entered == services.size()) consumers_ready.set_value();
+                finish.wait();
+            }
             receiver->append(tile);
         });
         require(bool(receiver), "private local generation emitted no member"); return receiver->finish();
@@ -1217,13 +1223,9 @@ void local_only_parallel()
     {
         CodecScheduler::Lease pressure(scheduler.get());
         first = std::async(std::launch::async, collect); second = std::async(std::launch::async, collect);
-        auto const until = Clock::now() + std::chrono::seconds(1);
-        while (selected.load() != 2 && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        shared_gate = selected.load() == 2 && !entered.load();
+        shared_gate = lanes_selected.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready && !entered.load();
     }
-    auto const until = Clock::now() + std::chrono::seconds(3);
-    while (entered.load() != 2 && Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    bool const parallel = entered.load() == 2;
+    bool const parallel = consumers_ready.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready;
     bool bounded = true;
     for (auto const& service : services)
     {
@@ -1232,7 +1234,9 @@ void local_only_parallel()
             status.active.host_bytes <= offer.capacity.host_bytes - status.baseline_host_bytes;
     }
     release.set_value(); auto left = first.get(), right = second.get();
-    require(shared_gate && parallel && bounded, "private local lanes bypassed shared CPUs, serialized consumers or exceeded RAM partitions");
+    require(shared_gate, "private local lanes bypassed the shared CPU reservation or were not selected");
+    require(parallel, "private local consumers could not overlap after CPU admission");
+    require(bounded, "active private local consumers exceeded their RAM or slot partitions");
     auto values = [](Member const& member)
     {
         std::vector<uint64_t> result; auto view = member.view();

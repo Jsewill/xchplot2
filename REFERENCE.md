@@ -1803,7 +1803,9 @@ the requested batch size when available. It can wait for a busy worker
 if it can finish the owner's whole ready queue before an idle worker would deliver
 its first job. Each job must still start within its admission deadline.
 If a pipeline runs past its average, the broker can wait up to the longest
-delivery it observed for the same width, or the next larger measured width.
+delivery it observed at that width. For a late GPU singleton or independent
+pipeline, the next larger independent batch measured on the same worker can
+also bound the wait.
 With at least three deliveries at the exact width, it can wait one observed
 range of variation beyond the longest sample if the busy worker can still
 finish the ready queue sooner.

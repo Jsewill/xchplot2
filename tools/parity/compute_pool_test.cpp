@@ -961,6 +961,31 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled delivery exceeded its bounded variation");
     owner.cancel(session, request.task_id, 1); execute(*variable).finish(*variable);
+
+    session = owner.open_owner("singleton-pipeline-duration"); request.sequence = 0;
+    require(sample_width(4, 900000000) == wide, "larger independent pipeline did not start");
+    request.sequence++; request.task_id = "slow"; request.work_units = 1; request.independent_members = false;
+    slow = owner.acquire(session, request);
+    require(slow && slow->worker_identity != wide && execute(*slow).begin(*slow, slow->owner_identity),
+        "idle singleton route did not start");
+    execute(*slow).finish(*slow); owner.delivered(*slow, {2000000000, 32, 1024});
+    request.sequence++; request.task_id = "fast";
+    auto singleton = owner.acquire(session, request);
+    require(singleton && singleton->worker_identity == wide && execute(*singleton).begin(*singleton, singleton->owner_identity),
+        "faster singleton route was not sampled");
+    execute(*singleton).finish(*singleton); owner.delivered(*singleton, {150000000, 32, 1024});
+    request.sequence++; request.task_id = "late";
+    singleton = owner.acquire(session, request);
+    require(singleton && singleton->worker_identity == wide && execute(*singleton).begin(*singleton, singleton->owner_identity),
+        "measured singleton did not start");
+    auto const singleton_started = std::chrono::steady_clock::now();
+    request.sequence++; request.task_id = "tail";
+    std::this_thread::sleep_until(singleton_started + std::chrono::milliseconds(300));
+    require(!owner.acquire(session, request), "a late singleton ignored a longer independent delivery on its worker");
+    std::this_thread::sleep_until(singleton_started + std::chrono::milliseconds(1000));
+    spill = owner.acquire(session, request);
+    require(spill && spill->worker_identity == slow->worker_identity, "a stalled singleton held work beyond the longer delivery");
+    owner.cancel(session, request.task_id, 1); execute(*singleton).finish(*singleton);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)

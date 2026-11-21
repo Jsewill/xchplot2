@@ -520,7 +520,7 @@ struct BrokerServer::Impl
             if (exact) return same / exact;
             return used ? total / used * units : std::numeric_limits<long double>::max();
         }
-        long double remaining_ns(uint64_t units, long double elapsed) const
+        long double remaining_ns(uint64_t units, long double elapsed, bool strictly_larger = false) const
         {
             uint64_t width = UINT64_MAX, lower = UINT64_MAX, upper = 0;
             size_t observations = 0;
@@ -528,6 +528,7 @@ struct BrokerServer::Impl
             {
                 auto const& sample = samples[i];
                 if (sample.units != units && (!independent || sample.units < units)) continue;
+                if (strictly_larger && sample.units == units) continue;
                 if (sample.units < width) { width = sample.units; lower = UINT64_MAX; upper = 0; observations = 0; }
                 if (sample.units != width) continue;
                 auto const ns = sample.observation.elapsed_ns;
@@ -809,6 +810,15 @@ struct BrokerServer::Impl
             auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
                 { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
             if (sample != worker.histories.end()) finish = sample->remaining_ns(lease.task.work_units, elapsed);
+            if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && (lease.task.independent_members || lease.task.work_units == 1))
+            {
+                // A singleton delivers the same chunks as one member of an
+                // independent pipeline. The next larger measured lease can
+                // still bound its completion after its own samples run out.
+                auto const pipeline = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                    { return item.independent && item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads, false); });
+                if (pipeline != worker.histories.end()) finish = pipeline->remaining_ns(lease.task.work_units, elapsed, true);
+            }
         }
         if (finish <= 0 || finish >= idle_ns || finish >= Nanoseconds(running.expires - now).count()) return false;
         for (auto const* job : queue)
