@@ -958,6 +958,59 @@ full-proof check sampled one group from each fill. Across these six fills,
 the harvester completed 141 challenges with eligible plots. The longest
 took 6.97 s.
 
+#### Choosing a delivery route on the live farm
+
+Each fill started with a fresh broker and published the same 48 k=28 members
+as 16 three-member groups on separate HDDs. The RTX 4090 used 10 GbE and
+the RX 6700 XT used 1 GbE over SSH. The harvester had 17,886 v1 plots
+loaded on separate disks. Times cover launch through durable publication of
+the last group. All 16 SHA-256 hashes matched full-proof-checked references.
+A fresh full-proof check sampled one group per fill. One earlier control
+was repeated after its log missed two publication events.
+
+| Owner / worker RAM cap | RTX 4090 alone (s/member) | Both GPUs (s/member) | Both GPUs, repeat (s/member) |
+| --- | ---: | ---: | ---: |
+| 4 / 4 GiB, HDD scratch | 4.49 | 4.61 | — |
+| 32 / 10 GiB, no HDD scratch | 4.83 | 3.88 | 3.85 |
+
+These comparisons ran with the workstation tests stopped and automatic
+construction, batching, output and writer count. With 32 GiB the two GPUs
+worked concurrently. The Radeon delivered seven members in the first run
+and six in the repeat. The two fills averaged 3.87 s/member, 19.8% less
+time than the 4090-only control. In the first two-GPU fill, the 4090 spent
+180.4 of 186.4 seconds generating or delivering members, and the 10 GbE
+interface averaged 2.11 Gb/s received. The 4090 alone published the first
+group in 28.35 s. The two-GPU runs took 41.20 s and 40.14 s to publish
+their first groups.
+
+Before the controller used measured packed delivery times to size
+multi-worker batches, an otherwise comparable run took 4.79 s/member
+on the 4090 and 4.57 s/member with both GPUs. In the dual-GPU run,
+45 members arrived in singleton leases. A control that forced encoded output
+and two HDD writers took 9.37 s/member, with six entire groups streamed
+from the Radeon.
+
+The 4 GiB comparison exercised the scratch contribution path before the
+resident packed-batch change. Two destinations could receive or pack at
+once, with up to 14 scratch HDDs. The 4090 delivered 46 members and the
+Radeon delivered two. The 16 HDDs averaged 224 MB/s read and 457 MB/s
+written, and the 10 GbE interface averaged 1.84 Gb/s received from launch
+through process exit.
+
+In a separate cold-start comparison on scratch, limiting the first request
+per ready destination to a singleton reduced the two-GPU time from 5.10
+to 4.60 s/member. In a later fill the broker sent two batches of two
+members to the Radeon shortly before the 4090 became available. Using the next
+larger measured independent batch to bound the wait reduced the two-GPU
+time from 5.37 to 5.11 s/member on the repeat.
+
+Available worker RAM also changed the result. During a 32 / 10 GiB
+4090-only control with other CPU tests running, three singleton requests
+waited for host memory. The fill took 6.44 s/member.
+
+Across the five timed fills in the table, the harvester logged 114 completed
+challenges with eligible plots. The longest lookup took 7.25 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
