@@ -900,6 +900,29 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     auto immediate = deadline.acquire(session, urgent);
     require(immediate && immediate->worker_identity != fast, "finish-time planning exceeded a short admission deadline");
     owner.cancel(session, urgent.task_id, 1); execute(*following).finish(*following);
+
+    session = owner.open_owner("pipeline-duration");
+    request.sequence = 1; request.task_id = "three"; request.work_units = 3; request.independent_members = true;
+    auto three = owner.acquire(session, request);
+    require(three && execute(*three).begin(*three, three->owner_identity), "larger pipeline sample did not start");
+    execute(*three).finish(*three); owner.delivered(*three, {900000000, 32, 1024});
+    request.sequence = 2; request.task_id = "slow"; request.work_units = 1; request.independent_members = false;
+    auto slow = owner.acquire(session, request);
+    require(slow && slow->worker_identity != three->worker_identity && execute(*slow).begin(*slow, slow->owner_identity),
+        "unmeasured singleton route did not start");
+    execute(*slow).finish(*slow); owner.delivered(*slow, {3000000000ULL, 32, 1024});
+    request.sequence = 3; request.task_id = "pair"; request.work_units = 2; request.independent_members = true;
+    auto pair = owner.acquire(session, request);
+    require(pair && pair->worker_identity == three->worker_identity && execute(*pair).begin(*pair, pair->owner_identity),
+        "shorter pipeline did not acquire the fast route");
+    auto const started = std::chrono::steady_clock::now();
+    request.sequence = 4; request.task_id = "tail"; request.work_units = 1; request.independent_members = false;
+    std::this_thread::sleep_until(started + std::chrono::milliseconds(650));
+    require(!owner.acquire(session, request), "an average overrun spilled before the observed pipeline duration");
+    std::this_thread::sleep_until(started + std::chrono::milliseconds(950));
+    auto spill = owner.acquire(session, request);
+    require(spill && spill->worker_identity == slow->worker_identity, "a stalled pipeline held the idle worker past its observed duration");
+    owner.cancel(session, request.task_id, 1); execute(*pair).finish(*pair);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)

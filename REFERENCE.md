@@ -1774,15 +1774,18 @@ receive concurrently. When detailed timings are unavailable, the owner uses
 whole-task timings. The full execution forecast also needs measured packing
 and storage costs for the destination.
 
-For independent GPU contributions, the owner sizes each worker's share from
-its measured time to generate and deliver a member and the work ready across
-destinations. It tracks pipelined and jointly encoded batches separately.
+For independent GPU contributions, the owner sizes the next request using
+the available workers' measured time to generate and deliver a member and
+the work ready across destinations. It tracks pipelined and jointly encoded
+batches separately.
 For CPU and GPU generation, the broker measures service from worker selection
 through delivery, including connection setup. It can wait for a busy worker
 if it can finish the owner's whole ready queue before an idle worker would deliver
 its first job. Each job must still start within its admission deadline.
-A larger backlog, a competing owner, an unmeasured route, or an overdue
-prediction lets an idle compatible worker take work immediately.
+If a pipeline runs past its average, the broker can wait up to the longest
+delivery it observed for the same width, or the next larger measured width.
+A larger backlog, a competing owner, an unmeasured route, or a job running
+past its observed range lets an idle compatible worker take work immediately.
 
 The scheduler prioritizes the next batch that can start an idle output drive.
 Compatible worker slots and measured transfer rates limit concurrent receivers.

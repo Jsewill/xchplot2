@@ -513,6 +513,18 @@ struct BrokerServer::Impl
                 { total += static_cast<long double>(samples[i].observation.elapsed_ns) / samples[i].units; ++used; }
             return used ? total / used * units : std::numeric_limits<long double>::max();
         }
+        uint64_t observed_upper_ns(uint64_t units) const
+        {
+            uint64_t width = UINT64_MAX, upper = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                auto const& sample = samples[i];
+                if (sample.units != units && (!independent || sample.units < units)) continue;
+                if (sample.units < width) { width = sample.units; upper = 0; }
+                if (sample.units == width) upper = std::max(upper, sample.observation.elapsed_ns);
+            }
+            return upper;
+        }
         void add(DeliveryObservation observation, uint64_t units)
         { samples[next] = {observation, units}; next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size()); }
     };
@@ -774,7 +786,16 @@ struct BrokerServer::Impl
         capacity.host_bytes += held.host_bytes; capacity.gpu_bytes += held.gpu_bytes;
         auto const active_ns = delivery_cost(worker, lease.task, lease.task.kind, running.owner, held.cpu_threads).ns;
         using Nanoseconds = std::chrono::duration<long double, std::nano>;
-        auto finish = active_ns - Nanoseconds(now - running.granted_at).count();
+        auto const elapsed = Nanoseconds(now - running.granted_at).count();
+        auto finish = active_ns - elapsed;
+        if (finish <= 0)
+        {
+            // A shorter pipeline still pays setup for the whole lease. Allow
+            // observed variation before spilling to a slower idle worker.
+            auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
+            if (sample != worker.histories.end()) finish = sample->observed_upper_ns(lease.task.work_units) - elapsed;
+        }
         if (finish <= 0 || finish >= idle_ns || finish >= Nanoseconds(running.expires - now).count()) return false;
         for (auto const* job : queue)
         {
