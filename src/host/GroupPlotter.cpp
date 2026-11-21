@@ -15081,6 +15081,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         using Kind = Change::Kind;
         std::vector<Change> changes; changes.reserve(destinations.size());
         std::vector<size_t> owners; owners.reserve(destinations.size());
+        bool const local_journal = farm->state.version >= 9 || !farm->all_replicas;
+        auto in_flight = [](auto const& item)
+        {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (item->pending && item->pending->generating.valid()) return true;
+#endif
+            return item->ready.valid();
+        };
+        metadata_waiting = false;
         for (size_t index = 0; index < destinations.size(); ++index)
         {
             auto& d = *destinations[index]; auto const& lane = farm->lanes[d.owner];
@@ -15117,22 +15126,29 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 changes.push_back(std::move(change));
             }
             else continue;
+            if (scratch_pool && local_journal)
+            {
+                // Independent extent changes write only this lane's journal.
+                // The controller owns the grants until these futures retire.
+                auto const& target = devices[d.owner];
+                bool busy = std::any_of(destinations.begin(), destinations.end(), [&](auto const& other)
+                {
+                    return (in_flight(other) && !scratch_pool->target_io_compatible(target, other->scratch_owner)) ||
+                        (other->successor && other->successor->io && !scratch_pool->target_io_compatible(target, other->successor->owner));
+                });
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                busy = busy || (pool_prefetch.ready.valid() && pool_prefetch.batch.owner == d.owner);
+#endif
+                if (busy) { changes.pop_back(); metadata_waiting = true; continue; }
+            }
             owners.push_back(index);
         }
-        if (changes.empty()) { metadata_waiting = false; return false; }
-        if (scratch_pool)
+        if (changes.empty()) return metadata_waiting ? blocked(ControllerWait::storage_lease) : false;
+        if (scratch_pool && !local_journal)
         {
-            // Every revision writes every destination. A different owner's
-            // scratch may share any of those drives, so drain its ordinary
-            // future first; the completion path then releases its I/O lease.
-            // Waiting inside a metadata worker would retain that same lease.
-            metadata_waiting = std::any_of(destinations.begin(), destinations.end(), [](auto const& item)
-            {
-#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-                if (item->pending && item->pending->generating.valid()) return true;
-#endif
-                return item->ready.valid();
-            });
+            // A replicated revision writes every destination. Drain the work
+            // here so its completion can release the storage lease.
+            metadata_waiting = std::any_of(destinations.begin(), destinations.end(), in_flight);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             metadata_waiting = metadata_waiting || pool_prefetch.ready.valid();
 #endif
@@ -15148,8 +15164,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             farming_resource_error = error.what(); blocked(ControllerWait::engine_memory); return false;
         }
         sync_farm(before); farming_resource_error.clear();
-        // No dependent output setup, engine admission, generation or final
-        // publication occurs until the complete replicated revision commits.
+        // A dependent output can proceed once its extent change is durable.
         for (size_t index = 0; index < changes.size(); ++index)
         {
             auto& d = *destinations[owners[index]]; auto const& change = changes[index];
@@ -15461,7 +15476,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             size_t const index = (next + step) % destinations.size(); auto& d = *destinations[index];
             if (d.complete || d.awaiting_extent || d.ready.valid() || d.pending || d.needs_resume || d.needs_finish || !d.metrics.stop_reason.empty() ||
                 (d.engine && d.metrics.members == d.maximum)) continue;
-            if (!d.engine && active >= total.execution_active) continue;
+            // The first activation sizes the destination plan. Ready peers
+            // already count when sharing the first batch among worker slots.
+            if (!d.engine && total.execution_active && active >= total.execution_active) continue;
             group_grow::ExecutionReady candidate{index, d.generation_deferrals};
             uint64_t pack_at = d.maximum;
             long double member_bytes = d.metrics.members ?

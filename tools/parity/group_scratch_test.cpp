@@ -180,12 +180,17 @@ void topology(fs::path const& directory, bool nonrotating, bool unknown)
         "topology output reservations failed");
     require(!pool.try_reserve_output(4, first, UINT64_MAX), "inactive output fixture unexpectedly reserved capacity");
     ScratchPool const& view = pool;
-    require(!view.io_compatible(0, 1), "I/O compatibility preceded saved ownership admission");
+    require(!view.io_compatible(0, 1) && !view.target_io_compatible(second.device, 0),
+        "I/O compatibility preceded saved ownership admission");
     pool.seal_recovery();
     require(pool.grant(0, 30 * unit, 30 * unit, unit, 2).has_value() &&
         pool.grant(1, 30 * unit, 30 * unit, unit, 2).has_value(), "shared scratch quotas failed");
     auto const memory = pool.memory_bytes(), capacity = pool.available_for_output(0, first);
     bool const compatible = nonrotating && !unknown;
+    require(view.target_io_compatible(second.device, 0) == !unknown &&
+        !view.target_io_compatible(shared_destination.device, 0) && !view.target_io_compatible(scratch_destination.device, 0) &&
+        !view.target_io_compatible(second.device, 4) && !view.target_io_compatible(second.device, 5),
+        "a lane journal must exclude aliased, unbound or unknown drives and admit an independent target");
     require(view.io_compatible(0, 1) == compatible && view.io_compatible(1, 0) == compatible,
         "full I/O compatibility disagreed with shared scratch topology");
     require(!view.io_compatible(0, 2) && !view.io_compatible(2, 0) &&
@@ -500,6 +505,25 @@ void rotating_bandwidth(fs::path const& directory)
         check(*b, 1, 30 * unit) && check(*b, 2, 20 * unit),
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
+
+    auto writer = second; writer.device.rotating = true;
+    struct SuccessorCase { uint64_t demand; uint64_t writer_rate; bool free_target; };
+    for (auto [demand, writer_rate, free_target] : std::array<SuccessorCase, 3>{{
+        {30 * unit, 1, true}, {150 * unit, 1, false}, {30 * unit, 4, false}}})
+    {
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        ScratchPool tail(disks, 0); tail.set_io_governor(rates);
+        require(tail.try_reserve_output(0, first, unit) && tail.try_reserve_output(1, writer, unit) &&
+            tail.try_reserve_output(2, disks[1], 0), "queued successor outputs were not admitted");
+        for (auto const& disk : disks) rates->observe_transfer(disk.device, unit, unit);
+        rates->observe_transfer(writer.device, writer_rate * unit, unit);
+        tail.seal_recovery();
+        auto running = tail.grant(0, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 2);
+        auto stripe = tail.grant(1, demand, demand, unit, 2, false, 0, 0, 4, 1);
+        require(running && stripe && quota(*stripe) == demand && tail.io_compatible(0, 1) &&
+            tail.target_io_compatible(disks[1].device, 1) == free_target,
+            "a scratch stripe must free the next writer when enough capacity and bandwidth remain");
+    }
 
     ScratchPool queued(disks, 0);
     require(queued.try_reserve_output(0, first, unit) && queued.try_reserve_output(1, first, unit) &&

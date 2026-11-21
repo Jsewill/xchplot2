@@ -371,6 +371,16 @@ public:
         auto const* a = find(left); auto const* b = find(right);
         return a && b && a->output && b->output && !conflicts(*a, *b, false, false);
     }
+    // A lane journal writes only its target. A producer can acquire its
+    // admitted scratch again between network frames, so check its whole grant.
+    bool target_io_compatible(StorageDevice const& target, uint64_t owner) const
+    {
+        std::lock_guard lock(mutex_);
+        auto const* entry = find(owner);
+        if (!sealed_ || !entry || !entry->output || overlap(target, roots_[entry->output->root].value.device)) return false;
+        return std::none_of(entry->roots.begin(), entry->roots.end(), [&](size_t root)
+        { return overlap(target, roots_[root].value.device); });
+    }
 
     // Call only after the engine has durably removed all owned scratch files.
     // Keeping the output lease permits a handoff to ordinary same-file growth.
@@ -562,7 +572,8 @@ private:
         // with a measured rate gets correspondingly less work.
         long double total_rate = 0; size_t measured = 0;
         for (auto const& disk : disks) if (disk.rate > 0) { total_rate += disk.rate; ++measured; }
-        for (auto& disk : disks) if (!disk.rate) disk.rate = measured ? total_rate / measured : 1;
+        long double const typical = measured ? total_rate / measured : 1;
+        for (auto& disk : disks) if (!disk.rate) disk.rate = typical;
         std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.rate > b.rate; });
         // Balance the available bandwidth of simultaneous owners. One
         // fast spindle can serve the same work as several slower ones.
@@ -573,6 +584,30 @@ private:
             *least += disk.rate; return least != loads.begin();
         });
         if (disks.size() > width) disks.resize(width);
+        // When this fills the last open slot, a peer can finish before this
+        // stripe is released. Leave a queued writer a target if the rest of
+        // the stripe still has the requested space and can feed the output.
+        if (open_slots == 1 && !outputs.empty())
+        {
+            auto const output_rate = bandwidth_ ? bandwidth_->bandwidth(destination) : 0;
+            StorageDevice const* successor = nullptr;
+            long double least = 0;
+            for (auto const& other : owners_)
+            {
+                if (other.id == owner || !other.output || other.io || !other.external.scratch.empty()) continue;
+                auto const& target = roots_[other.output->root].value.device;
+                if (overlap(destination, target)) continue;
+                uint64_t room = 0; long double kept = 0, lost = 0;
+                for (auto const& disk : disks)
+                    if (overlap(target, roots_[disk.root].value.device)) lost += disk.rate;
+                    else { kept += disk.rate; room += std::min(desired - room, disk.room); }
+                if (!lost) { successor = nullptr; break; }
+                if (room == desired && kept >= (output_rate > 0 ? output_rate : typical) && (!successor || lost < least))
+                { successor = &target; least = lost; }
+            }
+            if (successor) std::erase_if(disks, [&](Candidate const& disk)
+            { return overlap(*successor, roots_[disk.root].value.device); });
+        }
         std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.room / a.rate < b.room / b.rate; });
         total_rate = 0; for (auto const& disk : disks) total_rate += disk.rate;
         std::vector<std::pair<size_t, uint64_t>> shares;

@@ -2210,11 +2210,19 @@ public:
         uint64_t production = value.execution_ns, delivery = value.transfer_ns;
         if (timed)
         {
-            auto& rates = value.independent_members ? at->independent : at->rates[value.contributions ? value.work_units : 0];
-            rates.add(value);
             at->slots = std::clamp(value.worker_slots, 1u, 64u);
-            // Separate members measure this worker's pipeline, not a joint encoding batch.
-            if (value.independent_members) return;
+            // The independent pipeline sends the same contribution as a
+            // singleton. Use singleton service until the pipeline has its own
+            // baseline, while keeping joint encoding and exact singletons separate.
+            if (value.independent_members)
+            {
+                if (!at->independent.samples) at->independent = at->rates[1];
+                at->independent.add(value); return;
+            }
+            auto& rates = at->rates[value.contributions ? value.work_units : 0];
+            rates.add(value);
+            if (value.kind == pool::Kind::GenerateGpu && value.contributions && value.work_units == 1 &&
+                at->independent.samples && at->independent.samples < 3) at->independent.add(value);
             production = value.generation.worker_ns;
             delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns,
                 value.generation.frame_read_ns, value.generation.receiver_ns});
@@ -2272,6 +2280,7 @@ public:
         struct Route { History::Rate const* rate; unsigned slots; };
         std::array<Route, maximum> routes{};
         unsigned slots = 0;
+        size_t measured = 0;
         for (size_t i = 0; i < count; ++i)
         {
             auto const& item = *peers[i];
@@ -2280,16 +2289,16 @@ public:
             auto const& rates = contributions && batch > 1 && item.independent.samples >= 3 &&
                 (item.rates[n].samples < 3 || item.independent.service < item.rates[n].service) ?
                 item.independent : item.rates[n];
-            if (rates.samples < 3) return {};
-            routes[i] = {&rates, item.slots}; slots += item.slots;
+            if (rates.samples < 3) continue;
+            routes[measured++] = {&rates, item.slots}; slots += item.slots;
         }
-        std::sort(routes.begin(), routes.begin() + count, [](auto a, auto b) { return a.rate->service < b.rate->service; });
+        std::sort(routes.begin(), routes.begin() + measured, [](auto a, auto b) { return a.rate->service < b.rate->service; });
         WorkerGenerationEstimate best; best.measured_slots = slots;
         long double throughput = 0, link = 0, receiver = 0;
         unsigned lanes = 0;
         // Start with the fastest available service. Additional sources can
         // overlap generation while sharing the owner's link and receiver work.
-        for (size_t i = 0; i < count && lanes < active; ++i)
+        for (size_t i = 0; i < measured && lanes < active; ++i)
         {
             auto const& rates = *routes[i].rate;
             for (unsigned j = 0; j < routes[i].slots && lanes < active; ++j)

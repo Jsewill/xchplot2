@@ -363,6 +363,10 @@ Compatible changes on different destinations can share a saved revision.
 Replacement copies can be staged concurrently on independent drives; every
 destination must have a durable copy before the revision is published and
 construction relying on it proceeds.
+When an extent fits a destination's existing grant, its local progress
+journal can commit while another destination receives or packs a group.
+The controller waits if the journal shares a physical drive with that
+work's output or scratch, or if it cannot identify the drives.
 Completed files stay unchanged, and resume retains admitted additions and the
 recorded stop reason. Construction methods and configured I/O windows can
 stop filling before the output budget is exhausted, so some unused capacity
@@ -741,7 +745,10 @@ The farm plan assigns final output to each destination. During `fill`, a
 queued output on its own HDD filesystem can lend its available space to
 active groups under the temporary-space policy. External construction
 stripes runs across eligible scratch HDDs using the available
-bandwidth. If the packer's RAM requirements reduce how many groups can run
+bandwidth. When writers are running together, it keeps a queued destination
+free if the remaining scratch drives have enough space for the grant and
+bandwidth to feed the writer.
+If the packer's RAM requirements reduce how many groups can run
 together, the planner can give their freed scratch bandwidth to the groups
 that fit. With shared compute, another group can receive compressed
 contributions directly to scratch during a final pack. Its receive buffers
@@ -1777,7 +1784,9 @@ and storage costs for the destination.
 For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
 the work ready across destinations. It tracks pipelined and jointly encoded
-batches separately.
+batches separately. Single-member contribution timings can help establish
+an independent pipeline's initial rate. Workers still collecting timings
+remain eligible while the owner forecasts service from measured workers.
 For CPU and GPU generation, the broker measures service from worker selection
 through delivery, including connection setup. It can wait for a busy worker
 if it can finish the owner's whole ready queue before an idle worker would deliver

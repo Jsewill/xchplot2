@@ -192,7 +192,8 @@ void planning_feedback()
     require(overlapping.receivers == limited.receivers && overlapping.member_ns == limited.member_ns,
         "read-ahead hid the shared link cost from the planner");
     measured.failed(remote, route, measured.selected(remote, route, now), now);
-    require(!price(2).receivers, "failed generation retained a measured receiver forecast");
+    require(price(2).receivers == 1 && price(2).measured_slots == 1 && price(2).member_ns == 400,
+        "a failed route must leave the other worker's measured service available");
 
     Planning fleet(1000);
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
@@ -204,6 +205,17 @@ void planning_feedback()
         fleet.suggested(18, 2, pipeline.kind, now).batch == 1,
         "independent pipeline samples must price the route without training joint encoding or hiding an unknown slot");
     auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
+    auto single = pipeline; single.independent_members = false; single.work_units = 1; single.generation = {400, 50, 25, 25};
+    for (bool singleton_first : {false, true})
+    {
+        Planning mixed(1000);
+        if (singleton_first) observe(mixed, single, route);
+        observe(mixed, pipeline, route); observe(mixed, pipeline, route);
+        if (!singleton_first) observe(mixed, single, route);
+        require(mixed.estimate(18, 2, pipeline.kind, true, 2, 3, now).member_ns == 350 &&
+            !mixed.estimate(18, 2, pipeline.kind, true, 2, 1, now).receivers && mixed.suggested(18, 2, pipeline.kind, now).batch == 1,
+            "singleton and independent delivery samples must jointly price the pipeline without qualifying a singleton or joint batch");
+    }
     train(fleet, singleton, route);
     auto const one_receiver = fleet.estimate(18, 2, pipeline.kind, true, 1, 3, now);
     auto const two_receivers = fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now);
