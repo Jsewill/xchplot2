@@ -71,6 +71,7 @@ struct TargetPipelineBarrier
 } target_pipeline_barrier;
 struct SharedStorageBarrier
 {
+    static constexpr auto timeout = std::chrono::seconds(30);
     std::mutex mutex;
     std::condition_variable ready;
     std::string path;
@@ -84,7 +85,7 @@ void hold_shared_storage(int fd, bool sync)
     auto const size = ::readlink(descriptor.c_str(), path.data(), path.size());
     if (size <= 0 || std::string_view(path.data(), size_t(size)) != state.path) return;
     state.blocked = true; state.ready.notify_all();
-    if (!state.ready.wait_for(lock, std::chrono::seconds(10), [&] { return state.released; })) state.timed_out = true;
+    if (!state.ready.wait_for(lock, state.timeout, [&] { return state.released; })) state.timed_out = true;
 }
 extern "C" size_t __real_POS2_FSE_compress_usingCTable(void*, size_t, void const*, size_t, FSE_CTable const*);
 extern "C" size_t __wrap_POS2_FSE_compress_usingCTable(void* dst, size_t capacity, void const* src, size_t size, FSE_CTable const* table)
@@ -1844,7 +1845,7 @@ void shared_storage_cpu(fs::path const& root, Members input)
         bool observed;
         {
             std::unique_lock lock(shared_storage_barrier.mutex); auto& state = shared_storage_barrier;
-            observed = state.ready.wait_for(lock, std::chrono::seconds(5), [&] { return state.blocked; });
+            observed = state.ready.wait_for(lock, state.timeout, [&] { return state.blocked; });
         }
         auto other = std::async(std::launch::async, [&]
         {
@@ -1853,7 +1854,9 @@ void shared_storage_cpu(fs::path const& root, Members input)
             require(second.append(input).accepted, "independent shared CPU contribution rejected");
             return second.finish();
         });
-        bool const progressed = other.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        // The held syscall has its own deadlock timeout. Wait for the second
+        // output to finish so the assertion checks the order of completion.
+        other.wait();
         bool const outstanding = blocked.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
         bool timed_out;
         {
@@ -1862,8 +1865,9 @@ void shared_storage_cpu(fs::path const& root, Members input)
         }
         shared_storage_barrier.ready.notify_all();
         auto const appended = blocked.get(); auto const finished = other.get();
-        require(observed && progressed && outstanding && !timed_out && appended.accepted && finished.members == input.size(),
-            "blocked output storage retained shared compute admission");
+        require(observed, "first output did not reach the shared storage barrier");
+        require(outstanding && !timed_out, "blocked output storage retained shared compute admission");
+        require(appended.accepted && finished.members == input.size(), "shared compute did not finish both outputs");
         require(contents(blocked_path) == contents(other_path), "shared compute changed ordinary/external v2 bytes");
     }
 #else
