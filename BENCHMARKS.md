@@ -894,6 +894,36 @@ were 0.98 Gb/s on 1 GbE and 3.75 Gb/s on 10 GbE. The plotting HDDs averaged
 Across the two updated two-GPU fills the harvester completed 63 challenges
 with eligible plots. The longest took 6.07 s.
 
+#### Delegating by measured completion time
+
+Each fill started with no worker timing history and published the same 48
+k=28 members on 16 HDDs. The storage host and each worker had a 4 GiB
+plotting RAM budget. The RTX 4090 used 10 GbE and the RX 6700 XT used
+1 GbE over SSH. The harvester had 17,886 v1 plots loaded on separate
+HDDs. Times run from the start of the fill through durable publication of
+the last group.
+
+| Scheduler and workers | First fill (s/member) | Second fill (s/member) | Mean (s/member) |
+| --- | ---: | ---: | ---: |
+| Previous, both GPUs | 6.14 | 7.26 | 6.70 |
+| Measured completion time, both GPUs | 5.87 | 4.96 | 5.41 |
+| RTX 4090 alone | 4.69 | — | — |
+
+The two-GPU mean fell by 19.2%. The previous scheduler sent five members
+to the Radeon in one fill and eleven in the other. The updated scheduler
+sent two to the Radeon and 46 to the 4090 in each fill. Generation and
+delivery overlapped across workers for 16.53 s and 16.57 s, respectively.
+The first updated fill logged broker decisions. The second used the
+production build throughout. The 4090 alone finished fastest in this series.
+
+In the production fill, the storage host's highest five-second receive
+rates were 0.98 Gb/s on 1 GbE and 4.14 Gb/s on 10 GbE. Final packing was
+the longest measured storage phase in both fills. Both fills reproduced
+all 16 full-proof-checked groups byte for byte. Fresh checks of one group
+from each fill verified 280 proofs from 100 challenges and 47 proofs from
+16 challenges, respectively. Across the two fills the harvester completed
+55 challenges with eligible plots. The longest took 6.23 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
