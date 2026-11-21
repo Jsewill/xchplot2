@@ -1380,7 +1380,10 @@ struct Producer
             }
             auto const limit = unsigned(std::min<uint64_t>(args.pool_inflight, input.size()));
             auto const width = client->independent_contribution_width(k, strength, input.size(), destinations);
-            size_t const concurrency = std::min(limit, std::max(width,
+            // Sample one member per ready destination until the first route
+            // delivers. An unmeasured slow worker then holds only one member.
+            bool const probe = destinations > 1 && width > 1 && client->probe_contribution_route(k, strength);
+            size_t const concurrency = probe ? 1 : std::min(limit, std::max(width,
                 client->suggested_generation_concurrency(k, strength, limit)));
             while (pending.size() < concurrency && scheduled < input.size())
             {
@@ -1391,10 +1394,10 @@ struct Producer
                 bool const independent = remaining > 1 && client->generation_capacity(k, strength).batch == 1;
                 // The first request takes the next free route's share. Other
                 // requests in this pass must not count that same slot again.
-                unsigned const dispatch = independent && pending.empty() ?
+                unsigned const dispatch = !probe && independent && pending.empty() ?
                     client->independent_contribution_width(k, strength, remaining, destinations, true) : width;
-                bool const separate = independent && dispatch > 1;
-                uint16_t const count = uint16_t(separate ? std::min(dispatch, remaining) :
+                bool const separate = !probe && independent && dispatch > 1;
+                uint16_t const count = probe ? 1 : uint16_t(separate ? std::min(dispatch, remaining) :
                     client->suggested_batch_members(k, strength, remaining));
                 require(count && count <= input.size() - scheduled, "invalid pool batch recommendation");
                 std::vector<std::array<uint8_t, 32>> plot_ids; plot_ids.reserve(count);
@@ -3719,36 +3722,39 @@ struct DestinationPlan
     unsigned workers = 0;
     uint16_t batch = 0;
 };
+struct PackingGrant { size_t active = 0; uint64_t bytes = 0; };
 template<class Memory, class Cost>
 DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t generation,
     uint64_t member_bytes, size_t drive_groups, unsigned workers, uint16_t maximum,
     uint16_t minimum, Memory memory, Cost cost, size_t active_limit = 0, size_t packing_writers = 0,
-    bool prefer_full_batch = false)
+    bool prefer_full_batch = false, PackingGrant packing = {})
 {
     // A fresh whole group avoids both prefix rewrites and a scratch round
     // trip. Try all fitting worker grants before accepting a partial batch.
     if (prefer_full_batch && minimum < maximum)
     {
         auto whole = destination_plan(budget, fixed, generation, member_bytes, drive_groups, workers,
-            maximum, maximum, memory, cost, active_limit, packing_writers);
+            maximum, maximum, memory, cost, active_limit, packing_writers, false, packing);
         if (whole.active) return whole;
     }
     DestinationPlan best;
-    if (fixed >= budget || generation > budget - fixed) return best;
-    uint64_t const room = budget - fixed - generation;
+    if (fixed >= budget || generation > budget - fixed || packing.bytes > budget - fixed - generation) return best;
+    uint64_t const room = budget - fixed - generation - packing.bytes;
     long double best_cost = std::numeric_limits<long double>::infinity();
     size_t const lanes = std::min(drive_groups, (active_limit ? active_limit : workers) + packing_writers);
-    for (size_t active = 1; active <= lanes; ++active)
+    for (size_t active = packing.active + 1; active <= lanes; ++active)
     {
         unsigned share = std::max(1u, unsigned(workers / active));
         // The next producer peak includes its own returned member. Every
-        // other active group may retain a whole batch while that producer runs.
-        if (active - 1 > room / std::max(uint64_t(1), member_bytes)) continue;
-        uint64_t const queued = uint64_t(active - 1) * member_bytes;
+        // other receiver may retain a whole batch while that producer runs.
+        // Sealed groups in final packing hold only their existing leases.
+        size_t const receiving = active - packing.active;
+        if (receiving - 1 > room / std::max(uint64_t(1), member_bytes)) continue;
+        uint64_t const queued = uint64_t(receiving - 1) * member_bytes;
         uint16_t batch = 0;
         for (;;)
         {
-            batch = admitted_batch_cap(maximum, minimum, (room - queued) / active,
+            batch = admitted_batch_cap(maximum, minimum, (room - queued) / receiving,
                 member_bytes, [&](uint16_t count) { return memory(share, count); });
             if (batch || share == 1) break;
             --share;
@@ -13833,6 +13839,25 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         return group_grow::pipeline_execution_estimate(lanes, count, workers, grant, groups, overlap,
             bandwidth ? bandwidth->concurrent_bandwidth(scratch) : 0);
     };
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    auto generation_estimate = [&](Destination const& d, bool external, bool encoded, unsigned receivers, unsigned batch)
+    {
+        // An external job may receive packed members, and a fresh in-file
+        // group may receive encoded chunks. Price the transfer it can use.
+        bool contributions = false;
+        if (d.pending)
+            contributions = d.pending->work == Work::append && (d.pending->contribution_input || d.pending->fresh_members);
+        else if (!d.needs_resume && !d.needs_finish)
+        {
+            if (external) contributions = encoded || (d.engine && d.packed_declined);
+            else if (encoded && args.io_overlap && args.generation_overlap && !d.metrics.members &&
+                batch == d.maximum && (!d.engine || !d.fresh_declined) &&
+                (d.mode == "auto" || d.mode == "incremental") && (!d.engine || d.engine->incremental))
+                contributions = backend->fresh_group_slots(d.requested, batch) != 0;
+        }
+        return backend->pool_estimate(d.requested, contributions, receivers, batch);
+    };
+#endif
     auto admit_destination = [&](Destination& d)
     {
         if (d.engine) return true;
@@ -13962,12 +13987,16 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         std::vector<bool> seen(writer_count, false);
         size_t packing_writers = 0;
+        PackingGrant packing_grant;
         bool only_packing = args.io_overlap;
         if (args.io_overlap) for (auto const& other : destinations) if (!other->complete)
         {
             bool const packing = other->scratch && devices[other->owner].rotating &&
                 (other->needs_finish || (other->pending && other->pending->packing()));
             if (!packing) only_packing = false;
+            if (packing && pooled_generation && args.generation_overlap && other->packing_released_bytes &&
+                other->pending && other->pending->work == Work::finish)
+            { ++packing_grant.active; packing_grant.bytes = sum(packing_grant.bytes, other->lease_bytes); }
             if (packing && !seen[other->writer] && (other->engine || other.get() == &d))
             { seen[other->writer] = true; ++packing_writers; }
         }
@@ -13976,6 +14005,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         size_t unfinished_groups = pooled_generation ? 0 : packing_writers;
         for (auto const& other : destinations) if (!other->complete && (pooled_generation || !seen[other->writer]))
         { seen[other->writer] = true; ++unfinished_groups; }
+        auto initial_pool_output = [&](bool external, size_t receivers)
+        { return args.pool_output == "encoded" || (args.pool_output == "auto" && (external || receivers >= unfinished_groups)); };
         // A packing HDD needs no new member. Its codec work still acquires
         // shared permits, and its output still uses the ordered physical writer.
         size_t const receiving_lanes = pooled_generation ? size_t(args.pool_inflight) : 0;
@@ -13996,8 +14027,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (pooled_generation)
             {
                 unsigned const limit = unsigned(std::min(unfinished_groups, receiving_lanes));
-                auto const forecast = backend->pool_estimate(d.requested, d.scratch || args.construction == "external",
-                    limit, maximum);
+                bool const external = d.scratch || args.construction == "external";
+                auto const forecast = generation_estimate(d, external, initial_pool_output(external, 1), limit, maximum);
                 unsigned slots = backend->pool_receivers(d.requested, forecast);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit);
@@ -14073,8 +14104,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 long double member_ns = backend->generation_history.member_ns();
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-                if (pooled_generation) member_ns = backend->pool_estimate(other->requested,
-                    bool(other->scratch), unsigned(count), batch).member_ns;
+                if (pooled_generation)
+                {
+                    bool const external = other->scratch || args.construction == "external";
+                    bool const encoded = other->engine ? other->pool_encoded : initial_pool_output(external, startup_receivers);
+                    member_ns = generation_estimate(*other, external, encoded, unsigned(count), batch).member_ns;
+                }
 #endif
                 if (!member_ns) return group_grow::ExecutionEstimate{};
                 if (other->needs_resume || other->needs_finish) return group_grow::ExecutionEstimate{};
@@ -14129,7 +14164,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             bool const whole = fresh_hdd && !input_required && !d.scratch && args.construction == "auto" && maximum == d.maximum;
             auto plan = destination_plan(args.max_ram, reserved, generation, storage, groups,
-                workers, maximum, minimum, memory, neutral, receivers, writers, whole);
+                workers, maximum, minimum, memory, neutral, receivers, writers, whole, packing_grant);
             if (!plan.active) return plan;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             if (fresh_hdd && d.scratch && backend->mode == "pool" && args.io_overlap && args.generation_overlap &&
@@ -14150,7 +14185,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         return sum(memory(grant, count), packed ? probe.packed_input_bytes(cfg, count) : probe.contribution_bytes(cfg, count));
                     };
                     auto streams = destination_plan(args.max_ram, reserved, generation, 0, groups,
-                        workers, recoverable, plan.batch, receive, neutral, receivers, writers);
+                        workers, recoverable, plan.batch, receive, neutral, receivers, writers, false, packing_grant);
                     if (streams.active > plan.active || (streams.active == plan.active && streams.batch > plan.batch)) plan = streams;
                 }
             }
@@ -14164,7 +14199,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (std::isfinite(projected) && (!tune_pool || !args.pool_writers))
             {
                 auto priced = destination_plan(args.max_ram, reserved, generation, storage, sampling ? unfinished_groups : groups,
-                    workers, maximum, minimum, memory, cost, limit);
+                    workers, maximum, minimum, memory, cost, limit, 0, false, packing_grant);
                 if (priced.active && cost(priced.active, priced.workers, priced.batch) <= projected) return priced;
             }
             // Before timings are available, reserve parallel scratch for an
@@ -14413,8 +14448,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         if (preserve_fallback && !group_grow::execution_singleton_fallback(args.max_ram, generation_fixed(),
             memory(share, batch), fallback_generation)) return defer();
-        bool const initial_encoded = args.pool_output == "encoded" || (args.pool_output == "auto" &&
-            (!pooled_hdd || d.scratch || startup_receivers >= unfinished_groups));
+        bool const initial_encoded = initial_pool_output(!pooled_hdd || d.scratch, startup_receivers);
         auto const choice = tune_pool ? pool_choice(bool(d.scratch)) : group_grow::PoolPublicationHistory::Choice{1, initial_encoded, false};
         auto& publications = pool_publications[bool(d.scratch)];
         if (tune_pool && std::any_of(destinations.begin(), destinations.end(), [&](auto const& peer)
@@ -15519,7 +15553,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         prefetched.members.empty() || prefetched.owner != d.owner);
                 long double member_ns = backend->generation_history.member_ns();
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-                if (backend->mode == "pool") member_ns = backend->pool_estimate(d.requested, bool(d.engine->external),
+                if (backend->mode == "pool") member_ns = generation_estimate(d, bool(d.engine->external), d.pool_encoded,
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), std::max(uint16_t(1), d.batch_cap)).member_ns;
 #endif
                 if (candidate.members_to_pack != UINT16_MAX && member_ns > 0)
@@ -15684,7 +15718,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 // A writer can continue packing while another drive receives.
                 // Price only simultaneous generation until packing is measured.
-                auto const forecast = backend->pool_estimate(d.requested, d.pool_encoded && !select_merged,
+                auto const forecast = generation_estimate(d, contribution_members && !select_merged, d.pool_encoded && !select_merged,
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(contribution_members ? contribution_members : wanted));
                 unsigned offered_slots = 0;
                 unsigned const receivers = backend->pool_receivers(d.requested, forecast, &offered_slots);

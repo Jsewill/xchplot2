@@ -235,7 +235,7 @@ public:
         std::function<void(WorkerTaskAdmission const&)> const& = {});
 private:
     friend class WorkerClient;
-    void generate_assigned(pool::Lease const&, std::span<std::array<uint8_t, 32> const>,
+    unsigned generate_assigned(pool::Lease const&, std::span<std::array<uint8_t, 32> const>,
         WorkerPackedSink const&, WorkerContributionSink const&, WorkerCancellation);
     void encode_assigned(pool::Lease const&, std::span<uint8_t const>, uint64_t,
         std::function<void(size_t, std::span<uint8_t const>)> const&, WorkerCancellation);
@@ -320,6 +320,7 @@ public:
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
+    bool probe_contribution_route(uint8_t k, uint8_t strength) const;
     bool codec_probe_available(uint8_t k, uint64_t timeout_ns) const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
     unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;

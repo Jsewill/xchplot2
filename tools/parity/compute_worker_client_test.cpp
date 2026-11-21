@@ -191,14 +191,101 @@ void planning_feedback()
     auto const overlapping = prefetched.estimate(18, 2, remote.kind, true, 8, 1, now);
     require(overlapping.receivers == limited.receivers && overlapping.member_ns == limited.member_ns,
         "read-ahead hid the shared link cost from the planner");
+    auto compute_bound = peer; compute_bound.worker_slots = 2; compute_bound.generation = {550, 550, 550, 0};
+    train(shared, compute_bound, route);
+    auto const unequal = shared.estimate(18, 2, remote.kind, true, 2, 1, now);
+    require(unequal.receivers == 2 && std::abs(unequal.member_ns - 550) < 1e-6L,
+        "the individually fastest slots crowded out a faster combination on the shared link");
+    Planning mixed_link(1000);
+    auto link_heavy = peer; link_heavy.worker_slots = 2; link_heavy.generation = {100, 900, 900, 0};
+    auto link_light = compute_bound; link_light.worker_identity = "light-worker";
+    link_light.generation = {1200, 300, 300, 0};
+    train(mixed_link, link_heavy, route); train(mixed_link, link_light, route);
+    // Six sevenths of a receiver on the first worker and eight sevenths on
+    // the second use two receivers and exactly one link.
+    auto const partial = mixed_link.estimate(18, 2, remote.kind, true, 2, 1, now);
+    require(partial.receivers == 2 && std::abs(partial.member_ns - 10500.L / 17) < 1e-6L,
+        "the forecast did not time-share workers at the shared link limit");
+    Planning dual_backend(1000);
+    link_heavy.worker_slots = 1;
+    auto efficient_cpu = link_heavy; efficient_cpu.generation = {1080, 120, 120, 0};
+    link_heavy.kind = pool::Kind::GenerateGpu;
+    train(dual_backend, link_heavy, route); train(dual_backend, efficient_cpu, route);
+    link_heavy.worker_identity = "gpu-only-worker"; train(dual_backend, link_heavy, route);
+    auto const combined = dual_backend.estimate(18, 2, pool::Kind::GenerateAny, true, 3, 1, now);
+    require(combined.receivers == 2 && combined.measured_slots == 2 &&
+        std::abs(combined.member_ns - 6000.L / 11) < 1e-6L,
+        "a hybrid worker lost its low-link backend or offered the same slot twice");
+    // Independently enumerate integer allocations and all time shares between
+    // two allocations that straddle the link limit, for several receiver caps.
+    Planning three_workers(1000);
+    std::array<unsigned, 3> const service{1000, 1000, 1500}, wire{900, 650, 300};
+    for (unsigned i = 0; i < service.size(); ++i)
+    {
+        auto sample = peer; sample.worker_identity = "worker-" + std::to_string(i); sample.worker_slots = 2;
+        sample.generation = {service[i] - wire[i], wire[i], wire[i], 0}; train(three_workers, sample, route);
+    }
+    long double previous = 0; unsigned needed = 0;
+    for (unsigned limit = 1; limit <= 6; ++limit)
+    {
+        struct Load { long double rate = 0, link = 0; };
+        std::vector<Load> loads;
+        for (unsigned a = 0; a <= 2; ++a) for (unsigned b = 0; b <= 2; ++b) for (unsigned c = 0; c <= 2; ++c)
+        {
+            if (a + b + c > limit) continue;
+            Load load; std::array<unsigned, 3> const slots{a, b, c};
+            for (size_t i = 0; i < slots.size(); ++i)
+            {
+                auto const rate = static_cast<long double>(slots[i]) / service[i];
+                load.rate += rate; load.link += rate * wire[i];
+            }
+            loads.push_back(load);
+        }
+        long double best = 0;
+        for (auto const& low : loads) if (low.link <= 1)
+        {
+            best = std::max(best, low.rate);
+            for (auto const& high : loads) if (high.link > 1)
+                best = std::max(best, low.rate + (high.rate - low.rate) * (1 - low.link) / (high.link - low.link));
+        }
+        if (best > previous + 1e-12L) { needed = limit; previous = best; }
+        auto const estimate = three_workers.estimate(18, 2, remote.kind, true, limit, 1, now);
+        require(estimate.receivers == needed && std::abs(estimate.member_ns - 1 / best) < 1e-6L,
+            "worker rate or receiver count differed from the feasible allocation search");
+    }
+    Planning direct(1000);
+    auto local = compute_bound; local.local_direct = true; local.contributions = true;
+    local.execution_ns = 1000; local.transfer_ns = 100; local.worker_slots = 1;
+    remote.worker_slots = 1; train(direct, remote, route); train(direct, local, route);
+    auto const local_and_remote = direct.estimate(18, 2, remote.kind, true, 2, 1, now);
+    require(local_and_remote.receivers == 2 && std::abs(local_and_remote.member_ns - 11000.L / 21) < 1e-6L,
+        "a co-located worker suppressed the remote forecast or consumed network bandwidth");
+    auto other_backend = local; other_backend.kind = pool::Kind::GenerateGpu;
+    observe(direct, other_backend, route);
+    require(direct.estimate(18, 2, pool::Kind::GenerateAny, true, 2, 1, now).member_ns == local_and_remote.member_ns,
+        "a cold backend hid the other backend's measured service on the same worker");
     measured.failed(remote, route, measured.selected(remote, route, now), now);
     require(price(2).receivers == 1 && price(2).measured_slots == 1 && price(2).member_ns == 400,
         "a failed route must leave the other worker's measured service available");
 
     Planning fleet(1000);
+    require(fleet.probe_contribution_route(18, 2, now), "a cold GPU route was assumed to have a delivery sample");
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
     pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
     auto width = [&] { return fleet.dispatch_width(18, 2, 3, 2, 2, 3, 2, now); };
+    auto packed = pipeline; packed.independent_members = packed.contributions = false; packed.work_units = 1;
+    train(fleet, packed, route);
+    require(fleet.probe_contribution_route(18, 2, now), "packed delivery suppressed an unmeasured contribution probe");
+    Planning legacy(1000); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
+    require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, true, 2, 3, now).receivers,
+        "an untimed delivery kept probing or supplied an unmeasured link rate");
+    train(fleet, pipeline, route);
+    require(!fleet.probe_contribution_route(18, 2, now) && fleet.probe_contribution_route(20, 2, now) &&
+        fleet.probe_contribution_route(18, 2, now + std::chrono::milliseconds(1001)),
+        "a GPU route sample crossed workload or lifetime boundaries");
+    auto failed = fleet.selected(pipeline, route, now);
+    fleet.failed(pipeline, route, failed, now); fleet.released(pipeline.worker_identity, failed);
+    require(fleet.probe_contribution_route(18, 2, now), "a failed route kept a cold contribution batch open");
     train(fleet, pipeline, route);
     require(width() == 2 && fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now).member_ns == 300 &&
         !fleet.estimate(18, 2, pipeline.kind, true, 2, 1, now).receivers &&
@@ -500,6 +587,7 @@ void assigned_local_and_fencing()
     auto stats = client.stats();
     require(stats.local_tasks == 1 && !stats.input_bytes && !stats.output_bytes &&
         observations.size() == 1 && observations.front().local_direct && observations.front().execution_ns &&
+        observations.front().worker_slots == offer.capacity.slots &&
         sink_ns && observations.front().transfer_ns >= sink_ns,
         "ordinary local assignment used wire payload or omitted its observation");
     WorkerTaskObservation remote_observation;

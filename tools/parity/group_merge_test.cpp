@@ -2833,6 +2833,14 @@ void destination_admission()
         [](unsigned grant, uint16_t) { return grant * mib; }, neutral, 1, 0, true);
     require(whole_workers.workers == 3 && whole_workers.batch == 3,
         "whole-group HDD admission discarded a fitting intermediate worker grant");
+    auto finishing = [&](uint64_t room, PackingGrant pack)
+    {
+        return destination_plan(room, 0, 3 * mib, 3 * mib, 3, 6, 1, 1,
+            [](unsigned, uint16_t) { return mib; }, neutral, 2, 1, false, pack);
+    };
+    require(finishing(9 * mib, {}).active == 2 && finishing(9 * mib, {1, mib}).active == 3 &&
+        finishing(9 * mib - 1, {1, mib}).active == 2 && !finishing(9 * mib, {1, 7 * mib}).active,
+        "a sealed pack retained a generation slot or spent more than the actual remaining RAM");
     for (auto room : {9 * mib, 10 * mib})
     {
         auto const owning = destination_plan(room, 0, 3 * mib, 3 * mib, 2, 4, 2, 1,
@@ -3084,6 +3092,19 @@ void execution_planning()
     require(scaling.select(shape, 5, 2, 0, "auto", false).width == 5,
         "improving packed transfers did not test the remaining physical writer");
 
+    PoolPublicationHistory interior;
+    for (unsigned wave = 0; wave < 16; ++wave)
+    {
+        auto const choice = interior.select(shape, 8, 4, 0, "packed");
+        if (!choice.trial) break;
+        auto const distance = choice.width > 6 ? choice.width - 6 : 6 - choice.width;
+        for (size_t i = 0; i < choice.width; ++i) require(interior.begin(shape, choice, 0), "could not enroll HDD width trial");
+        for (size_t i = 0; i < choice.width; ++i) interior.publish(3, choice.width * 3 * (10 + distance), true);
+    }
+    auto const refined = interior.select(shape, 8, 4, 0, "packed");
+    require(!refined.trial && refined.width == 6 && !refined.encoded,
+        "pooled publication missed the fastest writer count between two coarse trials");
+
     PoolPublicationHistory limited;
     auto limited_choice = [&] { return limited.select(shape, 2, 2, 2, "auto"); };
     require(limited.begin(shape, limited_choice(), 10), "could not start partial publication trial");
@@ -3099,6 +3120,14 @@ void execution_planning()
     auto const once = cold.select(shape, 4, 2, 0, "auto", false, false);
     require(!cold.observed(shape) && !once.trial && !once.encoded && once.width == 2,
         "a one-pass fill replaced the unmeasured startup plan");
+    auto const five = cold.select(shape, 5, 5, 5, "auto", false);
+    for (unsigned i = 0; i < 5; ++i) require(cold.begin(shape, five, 20), "could not enroll five HDD writers");
+    require(cold.select(shape, 6, 2, 2, "encoded").width == 2 && cold.select(shape, 6, 2, 2, "encoded").encoded,
+        "an in-flight publication sample overrode an explicit width or output");
+    for (unsigned i = 0; i < 5; ++i) cold.publish(3, 80, true);
+    auto const reused = cold.select(shape, 6, 2, 0, "auto", true, false);
+    require(reused.width == 5 && !reused.encoded && !reused.trial && cold.select(shape, 4, 2, 0, "auto", true, false).width == 2,
+        "a changed writer count lost a measured feasible width or reused one beyond the available HDDs");
 
     StreamingInputCohort cohort(3);
     require(cohort.stream_allowed(0) && !cohort.stream_allowed(1), "cold compact input split an existing cohort");
@@ -4040,7 +4069,9 @@ void replot_save_diagnostics(fs::path const& root)
         structural.resources.native.verification_cpu_threads = 0;
         std::ostringstream resource_text; write_profile_json(resource_text, structural.resources);
         structural.review.resources_json = resource_text.str();
-        auto const bounded = replot_request(args, structural);
+        // Mapping previews use the reviewed resource grant before execution
+        // samples live RAM, which can be in use by other plotting jobs.
+        auto const bounded = replot_request(args, structural, false);
         require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)) &&
             assess_replot_review(args, structural).feasible, "structural mapping required a migration proof grant");
         structural.review.verification = ReplotVerification{ReplotVerificationMode::sampled, 0, 2};

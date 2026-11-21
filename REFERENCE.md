@@ -738,6 +738,9 @@ Before timing data are available, automatic construction tries to keep a
 complete fresh HDD group in RAM when the batch limit permits. It sizes the
 initial set of destinations using available generator slots and allows
 another group to receive members while an independent HDD is writing.
+Once an external group has sealed its scratch runs and released its staging
+memory, the pooled planner charges its remaining packing workspace. It can
+admit another receiver if that workspace and the new job fit together.
 With measured generation and storage costs it chooses the concurrency with
 the shortest projected completion time.
 
@@ -1777,7 +1780,11 @@ consumption count toward the planner's estimate of shared link usage.
 Send and receive waits include backpressure and can overlap. After three
 completed samples for a matching plot size, strength and result type, the
 owner can compare generation batch sizes and choose how many destinations
-receive concurrently. When detailed timings are unavailable, the owner uses
+receive concurrently. It uses the fewest receivers that can sustain the
+forecast rate under the shared link limit. A brokered worker on the plotting
+host contributes its measured generation and delivery time with zero network
+cost. CPU and GPU work on the same worker share its advertised slots.
+When detailed timings are unavailable, the owner uses
 whole-task timings. The full execution forecast also needs measured packing
 and storage costs for the destination.
 
@@ -1787,12 +1794,19 @@ the work ready across destinations. It tracks pipelined and jointly encoded
 batches separately. Single-member contribution timings can help establish
 an independent pipeline's initial rate. Workers still collecting timings
 remain eligible while the owner forecasts service from measured workers.
+When multiple destinations and independent GPU slots are ready but delivery
+speed is unknown, each destination starts with one member. The first
+completed contribution lets the owner start filling longer pipelines.
 For CPU and GPU generation, the broker measures service from worker selection
-through delivery, including connection setup. It can wait for a busy worker
+through delivery, including connection setup. It uses measured deliveries at
+the requested batch size when available. It can wait for a busy worker
 if it can finish the owner's whole ready queue before an idle worker would deliver
 its first job. Each job must still start within its admission deadline.
 If a pipeline runs past its average, the broker can wait up to the longest
 delivery it observed for the same width, or the next larger measured width.
+With at least three deliveries at the exact width, it can wait one observed
+range of variation beyond the longest sample if the busy worker can still
+finish the ready queue sooner.
 A larger backlog, a competing owner, an unmeasured route, or a job running
 past its observed range lets an idle compatible worker take work immediately.
 
@@ -2130,7 +2144,9 @@ Older compute peers use the existing generation paths.
 With multiple rotating destinations, automatic selection starts with the
 available worker and storage bandwidth. When a writer has more groups to
 produce, it samples independent writer counts and both output forms through
-durable publication. Its last pass can reuse those measurements. When
+durable publication. It tests intermediate writer counts around the fastest
+measured width. As drives finish or become available, it can reuse the
+fastest measured combination that still fits. When
 the worker slots for whole-group streams are occupied, another destination
 can receive packed members and assemble them on the storage host.
 When the disk I/O governor reports farming pressure, the planner limits

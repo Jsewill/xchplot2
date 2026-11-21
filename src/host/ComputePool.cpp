@@ -507,23 +507,37 @@ struct BrokerServer::Impl
             (!framing || independent == task.independent_members); }
         long double cost(uint64_t units, bool singletons = false) const
         {
-            long double total = 0; size_t used = 0;
+            long double total = 0, same = 0; size_t used = 0, exact = 0;
             for (size_t i = 0; i < count; ++i)
                 if (!singletons || samples[i].units == 1)
-                { total += static_cast<long double>(samples[i].observation.elapsed_ns) / samples[i].units; ++used; }
+                {
+                    auto const elapsed = samples[i].observation.elapsed_ns;
+                    if (samples[i].units == units) { same += elapsed; ++exact; }
+                    total += static_cast<long double>(elapsed) / samples[i].units; ++used;
+                }
+            // A pipeline pays setup once. Its measured duration at this width
+            // is more informative than scaling other widths by member count.
+            if (exact) return same / exact;
             return used ? total / used * units : std::numeric_limits<long double>::max();
         }
-        uint64_t observed_upper_ns(uint64_t units) const
+        long double remaining_ns(uint64_t units, long double elapsed) const
         {
-            uint64_t width = UINT64_MAX, upper = 0;
+            uint64_t width = UINT64_MAX, lower = UINT64_MAX, upper = 0;
+            size_t observations = 0;
             for (size_t i = 0; i < count; ++i)
             {
                 auto const& sample = samples[i];
                 if (sample.units != units && (!independent || sample.units < units)) continue;
-                if (sample.units < width) { width = sample.units; upper = 0; }
-                if (sample.units == width) upper = std::max(upper, sample.observation.elapsed_ns);
+                if (sample.units < width) { width = sample.units; lower = UINT64_MAX; upper = 0; observations = 0; }
+                if (sample.units != width) continue;
+                auto const ns = sample.observation.elapsed_ns;
+                lower = std::min(lower, ns); upper = std::max(upper, ns); ++observations;
             }
-            return upper;
+            long double remaining = upper - elapsed;
+            // A live HDD flush can run just beyond the slowest recent
+            // delivery. Bound its extension by the variation at this width.
+            if (remaining <= 0 && width == units && observations >= 3) remaining += upper - lower;
+            return remaining;
         }
         void add(DeliveryObservation observation, uint64_t units)
         { samples[next] = {observation, units}; next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size()); }
@@ -794,7 +808,7 @@ struct BrokerServer::Impl
             // observed variation before spilling to a slower idle worker.
             auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
                 { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
-            if (sample != worker.histories.end()) finish = sample->observed_upper_ns(lease.task.work_units) - elapsed;
+            if (sample != worker.histories.end()) finish = sample->remaining_ns(lease.task.work_units, elapsed);
         }
         if (finish <= 0 || finish >= idle_ns || finish >= Nanoseconds(running.expires - now).count()) return false;
         for (auto const* job : queue)

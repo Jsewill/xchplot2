@@ -923,6 +923,44 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     auto spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled pipeline held the idle worker past its observed duration");
     owner.cancel(session, request.task_id, 1); execute(*pair).finish(*pair);
+
+    session = owner.open_owner("delivery-at-requested-width"); request.sequence = 0;
+    auto sample_width = [&](unsigned units, uint64_t elapsed)
+    {
+        request.task_id = "width-" + std::to_string(++request.sequence);
+        request.work_units = units; request.independent_members = true;
+        auto lease = owner.acquire(session, request);
+        require(lease && execute(*lease).begin(*lease, lease->owner_identity), "could not start a pipeline width sample");
+        execute(*lease).finish(*lease); owner.delivered(*lease, {elapsed, 32, 1024});
+        return lease->worker_identity;
+    };
+    auto const wide = sample_width(4, 800000000);
+    auto const quick_pair = sample_width(2, 660000000);
+    require(quick_pair != wide, "the second pipeline route was not sampled");
+    second.worker_admission(batch.instance, WorkerAdmission::Paused);
+    require(sample_width(2, 750000000) == wide, "the paused worker received a pipeline sample");
+    second.worker_admission(batch.instance, WorkerAdmission::Accepting);
+    require(sample_width(2, 660000000) == quick_pair,
+        "an efficient four-member pipeline displaced the faster measured worker for a pair");
+
+    session = owner.open_owner("variable-delivery"); request.sequence = 0;
+    for (auto ns : {150000000u, 300000000u, 450000000u}) sample_width(4, ns);
+    request.sequence++; request.task_id = "slow"; request.work_units = 1; request.independent_members = false;
+    slow = owner.acquire(session, request);
+    require(slow && slow->worker_identity != wide && execute(*slow).begin(*slow, slow->owner_identity), "idle route did not start");
+    execute(*slow).finish(*slow); owner.delivered(*slow, {2000000000ULL, 32, 1024});
+    request.sequence++; request.task_id = "variable"; request.work_units = 4; request.independent_members = true;
+    auto variable = owner.acquire(session, request);
+    require(variable && variable->worker_identity == wide && execute(*variable).begin(*variable, variable->owner_identity),
+        "variable pipeline did not start");
+    auto const acquired = std::chrono::steady_clock::now();
+    request.sequence++; request.task_id = "tail"; request.work_units = 1; request.independent_members = false;
+    std::this_thread::sleep_until(acquired + std::chrono::milliseconds(500));
+    require(!owner.acquire(session, request), "normal delivery variation spilled a short queue to a slower route");
+    std::this_thread::sleep_until(acquired + std::chrono::milliseconds(800));
+    spill = owner.acquire(session, request);
+    require(spill && spill->worker_identity == slow->worker_identity, "a stalled delivery exceeded its bounded variation");
+    owner.cancel(session, request.task_id, 1); execute(*variable).finish(*variable);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)

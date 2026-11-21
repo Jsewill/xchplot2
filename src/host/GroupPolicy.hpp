@@ -97,11 +97,25 @@ public:
                   bool initial_encoded = true, bool allow_trial = true) const
     {
         require(available && initial, "empty pooled publication candidate");
-        if (live_ && shape == shape_ && current_.width <= available) return current_;
         auto ordinary = std::min(available, fixed_width ? size_t(fixed_width) : initial);
         if (!fixed_width && ordinary > 3) ordinary = std::bit_floor(ordinary);
+        auto allowed = [&](bool encoded) { return output == "auto" || encoded == (output == "encoded"); };
+        if (live_ && shape == shape_ && current_.width <= available && (!fixed_width || current_.width == ordinary) &&
+            allowed(current_.encoded)) return current_;
         Choice best{ordinary, output == "auto" ? initial_encoded : output == "encoded", false};
         long double fastest = std::numeric_limits<long double>::infinity();
+        // A shrinking or expanding set of HDDs can make a previously measured
+        // width feasible again, even if a new trial would skip that width.
+        if (shape == shape_) for (auto const& result : results_)
+        {
+            if (!result.width || result.width > available || (fixed_width && result.width != ordinary)) continue;
+            for (bool encoded : {initial_encoded, !initial_encoded}) if (allowed(encoded))
+            {
+                auto const time = result.times[encoded].member_ns();
+                if (time && time < fastest) { fastest = time; best = {result.width, encoded, false}; }
+            }
+        }
+        if (!allow_trial || (fixed_width && output != "auto")) return best;
         auto measured = [&](size_t width) -> Result const*
         {
             if (shape != shape_) return nullptr;
@@ -113,15 +127,7 @@ public:
             auto const* result = measured(width);
             for (bool encoded : {initial_encoded, !initial_encoded})
             {
-                if ((output == "packed" && encoded) || (output == "encoded" && !encoded)) continue;
-                if (fixed_width && output != "auto") return Choice{width, encoded, false};
-                if (!result || !result->tried[encoded])
-                {
-                    if (allow_trial) return Choice{width, encoded, true};
-                    continue;
-                }
-                auto const time = result->times[encoded].member_ns();
-                if (time && time < fastest) { fastest = time; best = {width, encoded, false}; }
+                if (allowed(encoded) && (!result || !result->tried[encoded])) return Choice{width, encoded, true};
             }
             return {};
         };
@@ -155,6 +161,25 @@ public:
         }
         for (size_t width = 1; width < ordinary; width = next_width(width))
             if (auto choice = candidate(width)) return *choice;
+        // Once the coarse trials finish, narrow the interval around the
+        // fastest measured width. A shared controller can saturate between
+        // powers of two. Keep the completed measurements when storage is full.
+        size_t below = 0, above = 0;
+        bool room = false;
+        for (auto const& result : results_)
+        {
+            if (!result.width) { room = true; continue; }
+            if (result.width > available) continue;
+            if (auto choice = candidate(result.width)) return *choice;
+            if (result.width < best.width) below = std::max(below, result.width);
+            if (result.width > best.width && (!above || result.width < above)) above = result.width;
+        }
+        if (room && std::isfinite(fastest))
+        {
+            auto const left = below ? best.width - below : 0, right = above ? above - best.width : 0;
+            if (std::max(left, right) > 1)
+                return Choice{right >= left ? best.width + right / 2 : best.width - left / 2, best.encoded, true};
+        }
         return best;
     }
     bool begin(Shape shape, Choice choice, uint64_t now)

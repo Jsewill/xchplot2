@@ -2046,7 +2046,7 @@ WorkerStatus WorkerService::remote_control(pool::Endpoint const& endpoint, pool:
     require(value.identity == channel.peer_identity() && value.node_id == channel.peer_node_id(), "worker status identity differs from authenticated peer");
     return value;
 }
-void WorkerService::generate_assigned(pool::Lease const& lease,
+unsigned WorkerService::generate_assigned(pool::Lease const& lease,
     std::span<std::array<uint8_t, 32> const> ids, WorkerPackedSink const& packed,
     WorkerContributionSink const& contributions, WorkerCancellation cancel)
 {
@@ -2090,6 +2090,7 @@ void WorkerService::generate_assigned(pool::Lease const& lease,
     }
     try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease, impl_->capacity_update(registered_revision)); }
     catch (...) { /* The next heartbeat publishes the current capacity. */ }
+    return impl_->config.capacity.slots;
 }
 void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t const> payload,
     uint64_t maximum, std::function<void(size_t, std::span<uint8_t const>)> const& sink, WorkerCancellation cancel)
@@ -2206,9 +2207,12 @@ public:
             *at = History{}; at->peer = peer; at->kind = value.kind; at->k = value.k; at->strength = value.strength;
         }
         at->seen = now; at->sequence = sequence_;
-        bool const timed = value.generation.worker_ns && value.work_units <= pool::max_generation_batch_members && !value.local_direct;
+        bool const bounded = value.work_units <= pool::max_generation_batch_members;
+        if (bounded && value.contributions && (value.work_units == 1 || value.independent_members))
+            at->delivered_contribution = true;
+        bool const timed = bounded && value.generation.worker_ns && !value.local_direct;
         uint64_t production = value.execution_ns, delivery = value.transfer_ns;
-        if (timed)
+        if (timed || (bounded && value.local_direct))
         {
             at->slots = std::clamp(value.worker_slots, 1u, 64u);
             // The independent pipeline sends the same contribution as a
@@ -2223,10 +2227,13 @@ public:
             rates.add(value);
             if (value.kind == pool::Kind::GenerateGpu && value.contributions && value.work_units == 1 &&
                 at->independent.samples && at->independent.samples < 3) at->independent.add(value);
-            production = value.generation.worker_ns;
-            delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns,
-                value.generation.frame_read_ns, value.generation.receiver_ns});
-            if (value.contributions && rates.samples == 3)
+            if (timed)
+            {
+                production = value.generation.worker_ns;
+                delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns,
+                    value.generation.frame_read_ns, value.generation.receiver_ns});
+            }
+            if (timed && value.contributions && rates.samples == 3)
             {
                 // Try one larger coencoded batch after a sustained baseline.
                 // Once both have observations, prefer lower time per member.
@@ -2259,58 +2266,56 @@ public:
         if (at == histories_.begin() + count_) return;
         at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2);
         at->votes = 0; at->direction = 0;
-        at->rates = {}; at->independent = {};
+        at->rates = {}; at->independent = {}; at->delivered_contribution = false;
     }
     WorkerGenerationEstimate estimate(uint8_t k, uint8_t strength, pool::Kind kind, bool contributions,
                           unsigned active, unsigned batch, Clock::time_point now = Clock::now())
     {
         if (!active || !batch) return {};
         retire(now);
-        std::array<History const*, maximum> peers{}; size_t count = 0;
+        std::array<History const*, maximum> peers{};
+        std::array<Route, maximum> routes{};
+        std::array<unsigned, maximum> worker_slots{};
+        size_t measured = 0, workers = 0;
         for (size_t i = 0; i < count_; ++i)
         {
             auto const& item = histories_[i];
             if (item.k != k || item.strength != strength ||
                 (kind != pool::Kind::GenerateAny && kind != item.kind)) continue;
-            if (item.peer.local) return {};
-            size_t at = 0; while (at < count && peers[at]->peer.worker != item.peer.worker) ++at;
-            if (at == count) peers[count++] = &item;
-            else if (item.sequence > peers[at]->sequence) peers[at] = &item;
-        }
-        struct Route { History::Rate const* rate; unsigned slots; };
-        std::array<Route, maximum> routes{};
-        unsigned slots = 0;
-        size_t measured = 0;
-        for (size_t i = 0; i < count; ++i)
-        {
-            auto const& item = *peers[i];
             unsigned n = contributions ? std::min(batch, item.plan.batch) : 0;
             while (n > 1 && item.rates[n].samples < 3) --n;
             auto const& rates = contributions && batch > 1 && item.independent.samples >= 3 &&
                 (item.rates[n].samples < 3 || item.independent.service < item.rates[n].service) ?
                 item.independent : item.rates[n];
             if (rates.samples < 3) continue;
-            routes[measured++] = {&rates, item.slots}; slots += item.slots;
+            // GenerateAny can use either measured backend of one worker.
+            // Both consume the same advertised slots.
+            size_t worker = 0; while (worker < workers && peers[worker]->peer.worker != item.peer.worker) ++worker;
+            if (worker == workers) peers[workers++] = &item;
+            worker_slots[worker] = std::max(worker_slots[worker], item.slots);
+            routes[measured++] = {1 / rates.service, rates.link / rates.service, item.slots, worker};
         }
-        std::sort(routes.begin(), routes.begin() + measured, [](auto a, auto b) { return a.rate->service < b.rate->service; });
-        WorkerGenerationEstimate best; best.measured_slots = slots;
-        long double throughput = 0, link = 0, receiver = 0;
-        unsigned lanes = 0;
-        // Start with the fastest available service. Additional sources can
-        // overlap generation while sharing the owner's link and receiver work.
-        for (size_t i = 0; i < measured && lanes < active; ++i)
+        if (!measured) return {};
+        auto const fleet = std::span(routes).first(measured);
+        unsigned slots = 0; for (auto count : std::span(worker_slots).first(workers)) slots += count;
+        unsigned low = 1, high = std::min(slots, active);
+        auto const fastest = throughput(fleet, worker_slots, high);
+        // Prefer the smallest receiver count that can sustain this rate.
+        while (low < high)
         {
-            auto const& rates = *routes[i].rate;
-            for (unsigned j = 0; j < routes[i].slots && lanes < active; ++j)
-            {
-                ++lanes; throughput += 1 / rates.service;
-                link += rates.link / rates.service; receiver += rates.receiver / rates.service;
-                auto const ns = std::max({1.L, link, receiver / lanes}) / throughput;
-                if (!best.receivers || ns < best.member_ns * (1 - 8 * std::numeric_limits<long double>::epsilon()))
-                { best.member_ns = ns; best.receivers = lanes; }
-            }
+            auto const middle = low + (high - low) / 2;
+            if (throughput(fleet, worker_slots, middle) >= fastest * (1 - 8 * std::numeric_limits<long double>::epsilon())) high = middle;
+            else low = middle + 1;
         }
-        return best;
+        return {1 / fastest, low, slots};
+    }
+    bool probe_contribution_route(uint8_t k, uint8_t strength, Clock::time_point now = Clock::now())
+    {
+        retire(now);
+        return std::none_of(histories_.begin(), histories_.begin() + count_, [&](auto const& item)
+        {
+            return item.k == k && item.strength == strength && item.kind == pool::Kind::GenerateGpu && item.delivered_contribution;
+        });
     }
     unsigned dispatch_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
                             unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now())
@@ -2321,7 +2326,7 @@ public:
         for (size_t i = 0; i < count_; ++i)
         {
             auto const& item = histories_[i];
-            if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu || item.peer.local) continue;
+            if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu) continue;
             auto const& rate = item.independent.samples ? item.independent : item.rates[1];
             if (!rate.samples) continue;
             slots += item.slots; throughput += item.slots / rate.service;
@@ -2362,6 +2367,47 @@ public:
         return {batches[count / 2], concurrency[count / 2]};
     }
 private:
+    // One full slot supplies members/ns and occupies a fraction of the
+    // shared link. Per-receiver sink time is already in its service rate.
+    struct Route { long double rate, wire; unsigned slots; size_t worker; };
+    static long double throughput(std::span<Route const> routes, std::array<unsigned, maximum> const& worker_slots, unsigned limit)
+    {
+        struct Load { long double rate = 0, wire = 0; };
+        auto allocate = [&](long double price)
+        {
+            std::array<std::pair<long double, size_t>, maximum> order;
+            for (size_t i = 0; i < routes.size(); ++i)
+                order[i] = {routes[i].rate - price * routes[i].wire, i};
+            std::sort(order.begin(), order.begin() + routes.size(), std::greater<>());
+            Load load; unsigned room = limit; auto available = worker_slots;
+            for (auto const& [value, i] : std::span(order).first(routes.size()))
+            {
+                if (!room || value <= 0) break;
+                auto& slots = available[routes[i].worker];
+                auto const count = std::min({room, slots, routes[i].slots}); room -= count; slots -= count;
+                load.rate += count * routes[i].rate; load.wire += count * routes[i].wire;
+            }
+            return load;
+        };
+        auto over = allocate(0);
+        if (over.wire <= 1) return over.rate;
+        // At a given price per unit of link time, the highest net rates
+        // maximize throughput minus that price times link use. Intersect
+        // the two bounding allocations until their mix at one link is best.
+        Load under;
+        for (;;)
+        {
+            auto const price = (over.rate - under.rate) / (over.wire - under.wire);
+            auto const feasible = under.rate + price * (1 - under.wire);
+            auto const next = allocate(price);
+            auto const bound = next.rate + price * (1 - next.wire);
+            if (next.wire == 1) return next.rate;
+            auto& side = next.wire > 1 ? over : under;
+            if (bound <= feasible * (1 + 4 * std::numeric_limits<long double>::epsilon()) ||
+                (next.wire == side.wire && next.rate <= side.rate)) return feasible;
+            side = next;
+        }
+    }
     // Fixed protocol-sized keys keep the history entirely inside the client's
     // sizeof(Impl) memory reservation, including its replacement path.
     struct Peer
@@ -2376,7 +2422,7 @@ private:
     {
         struct Rate
         {
-            long double service = 0, link = 0, receiver = 0;
+            long double service = 0, link = 0;
             unsigned samples = 0;
             void add(WorkerTaskObservation const& task)
             {
@@ -2384,12 +2430,18 @@ private:
                 samples = std::min(samples + 1, 3u);
                 auto update = [&](long double& rate, long double ns)
                 { rate += (ns / task.work_units - rate) / samples; };
+                if (task.local_direct)
+                {
+                    // The sink runs inside the local worker call. Its whole
+                    // observed service occupies the slot without using a link.
+                    update(service, static_cast<long double>(task.execution_ns) + task.transfer_ns);
+                    return;
+                }
                 update(service, std::max(static_cast<long double>(t.worker_ns) + t.send_ns,
                     static_cast<long double>(t.receiver_ns) + t.frame_wait_ns));
                 // The shorter observed endpoint wait avoids charging all
                 // producer stalls or receiver backpressure as wire service.
                 update(link, std::min(t.send_ns, std::max(t.frame_read_ns, t.frame_wait_ns)));
-                update(receiver, t.receiver_ns);
             }
         };
         Peer peer;
@@ -2400,6 +2452,7 @@ private:
         Clock::time_point seen{};
         int direction = 0;
         unsigned votes = 0, slots = 1;
+        bool delivered_contribution = false;
         std::array<Rate, pool::max_generation_batch_members + 1> rates{};
         Rate independent;
     };
@@ -2911,7 +2964,7 @@ struct WorkerClient::Impl
               contribution_sink(ordinal, bytes, members); };
             try
             {
-                connection->local_service->generate_assigned(connection->lease, ids,
+                connection->worker_slots = connection->local_service->generate_assigned(connection->lease, ids,
                     packed_sink ? WorkerPackedSink(packed) : WorkerPackedSink{},
                     contribution_sink ? WorkerContributionSink(contribution) : WorkerContributionSink{}, cancel);
             }
@@ -3438,6 +3491,13 @@ unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strengt
     if (!dispatch || ready_members < 2 || width < 2 || slots != hint.slots) return fallback;
     std::lock_guard lock(impl_->planning_mutex);
     return impl_->planning.dispatch_width(k, strength, ready_members, destinations, slots, width, fallback);
+}
+bool WorkerClient::probe_contribution_route(uint8_t k, uint8_t strength) const
+{
+    auto const hint = generation_capacity(k, strength);
+    if (hint.slots < 2 || hint.batch != 1) return false;
+    std::lock_guard lock(impl_->planning_mutex);
+    return impl_->planning.probe_contribution_route(k, strength);
 }
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {
