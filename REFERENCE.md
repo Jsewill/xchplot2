@@ -1808,12 +1808,19 @@ pipeline, the next larger independent batch measured on the same worker can
 also bound the wait.
 With at least three deliveries at the exact width, it can wait one observed
 range of variation beyond the longest sample if the busy worker can still
-finish the ready queue sooner.
+finish the ready queue sooner. An overdue ordinary GPU batch can wait for
+one measured singleton delivery beyond its expected finish.
 A larger backlog, a competing owner, an unmeasured route, or a job running
 past its observed range lets an idle compatible worker take work immediately.
 
 The scheduler prioritizes the next batch that can start an idle output drive.
 Compatible worker slots and measured transfer rates limit concurrent receivers.
+When enough destinations are ready to keep the pool occupied, a compact
+in-memory receiver can request several packed members from a fast worker.
+The owner sizes these requests from measured packed deliveries. If all slots
+are busy with known packed requests, it can size queued work for the worker
+expected to deliver next. A cold pool starts with singletons when it has
+several slots.
 Observed member sizes help it serve destinations with room before probing
 nearly full ones. A repeatedly deferred destination still gets a turn.
 

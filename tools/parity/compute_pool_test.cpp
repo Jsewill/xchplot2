@@ -986,6 +986,32 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled singleton held work beyond the longer delivery");
     owner.cancel(session, request.task_id, 1); execute(*singleton).finish(*singleton);
+
+    worker.unregister_worker("pinned-output");
+    auto packed = batch; packed.instance = "resident-pair"; packed.endpoint.port = 49502;
+    packed.capacity.host_bytes = 2048; worker.register_worker(packed);
+    session = owner.open_owner("packed-duration");
+    request.sequence = 1; request.task_id = "fast"; request.work_units = 1; request.independent_members = false;
+    second.worker_admission(batch.instance, WorkerAdmission::Paused);
+    singleton = owner.acquire(session, request);
+    require(singleton && worker.begin(*singleton, singleton->owner_identity), "fast packed sample did not start");
+    worker.finish(*singleton); owner.delivered(*singleton, {400000000, 32, 1024});
+    second.worker_admission(batch.instance, WorkerAdmission::Accepting);
+    request.sequence++; request.task_id = "slow";
+    slow = owner.acquire(session, request);
+    require(slow && second.begin(*slow, slow->owner_identity), "slow packed sample did not start");
+    second.finish(*slow); owner.delivered(*slow, {2000000000, 32, 1024});
+    request.sequence++; request.task_id = "pair"; request.work_units = 2;
+    auto packed_pair = owner.acquire(session, request);
+    require(packed_pair && worker.begin(*packed_pair, packed_pair->owner_identity), "ordinary packed pair did not start");
+    auto const packed_started = std::chrono::steady_clock::now();
+    request.sequence++; request.task_id = "tail"; request.work_units = 1;
+    std::this_thread::sleep_until(packed_started + std::chrono::milliseconds(950));
+    require(!owner.acquire(session, request), "a nearly complete packed batch spilled its tail early");
+    std::this_thread::sleep_until(packed_started + std::chrono::milliseconds(1300));
+    spill = owner.acquire(session, request);
+    require(spill && spill->worker_identity == slow->worker_identity, "a stalled packed batch outwaited its last member");
+    owner.cancel(session, request.task_id, 1); worker.finish(*packed_pair);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)

@@ -1534,7 +1534,7 @@ struct Producer
     size_t fill_pool(std::vector<group_grow::Member>& values, uint16_t first, size_t wanted,
                      uint64_t other_retained, std::string const& progress,
                      std::function<bool()> const& stop, std::atomic<bool> const* stopped = nullptr,
-                     group_grow::MemberBatchHash* hash = nullptr)
+                     group_grow::MemberBatchHash* hash = nullptr, unsigned destinations = 1)
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         size_t const before = values.size();
@@ -1559,11 +1559,11 @@ struct Producer
         auto const k = uint8_t(identity.params.get_k()), strength = uint8_t(identity.params.get_strength());
         if (args.member_storage == "compact" && args.generation_overlap && !stop && wanted - before > 1)
         {
-            auto const hint = client->generation_capacity(k, strength);
-            while (hint.slots == 1 && hint.batch > 1 && wanted - values.size() > 1)
+            while (wanted - values.size() > 1)
             {
                 size_t const start = values.size();
-                size_t n = std::min<size_t>(hint.batch, wanted - start);
+                size_t n = client->packed_generation_width(k, strength, unsigned(wanted - start), destinations);
+                if (n < 2) break;
                 uint64_t const held = sum(sum(sum(fixed, backend.retained()), other_retained), resident(values));
                 while (n > 1 && sum(held, pool_receive_bytes(uint16_t(first + start), n)) > budget) --n;
                 if (n < 2) break;
@@ -1583,19 +1583,19 @@ struct Producer
                         require(count && count <= fragment_bound(identity.params) / sizeof(uint64_t), "invalid packed batch member count");
                         if (!tile.boundaries.empty())
                         {
-                        require(received.size() < n, "unexpected packed batch member");
-                        received.push_back(std::make_unique<group_grow::CompactMemberReceiver>(k, size_t(count), false));
-                    }
-                    require(!received.empty(), "packed batch has no member prelude");
-                    received.back()->append(tile);
-                    progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
-                }, cancel);
-                complete = true;
-            }
-            catch (group_grow::pool::UnsupportedResources const&) {}
-            catch (group_grow::pool::TransientTransport const&) { backend.pool_retries.fetch_add(1); }
-            catch (group_grow::pool::StaleLease const&) { backend.pool_retries.fetch_add(1); }
-            if (!complete) break;
+                            require(received.size() < n, "unexpected packed batch member");
+                            received.push_back(std::make_unique<group_grow::CompactMemberReceiver>(k, size_t(count), false));
+                        }
+                        require(!received.empty(), "packed batch has no member prelude");
+                        received.back()->append(tile);
+                        progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
+                    }, cancel);
+                    complete = true;
+                }
+                catch (group_grow::pool::UnsupportedResources const&) {}
+                catch (group_grow::pool::TransientTransport const&) { backend.pool_retries.fetch_add(1); }
+                catch (group_grow::pool::StaleLease const&) { backend.pool_retries.fetch_add(1); }
+                if (!complete) break;
                 require(received.size() == n, "truncated packed batch");
                 for (auto& receiver : received)
                 {
@@ -15713,7 +15713,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 wanted = construction_batch_members(*d.engine, d.maximum, uint16_t(wanted),
                     (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-            unsigned contribution_destinations = 1;
+            unsigned generation_destinations = 1;
             if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
             {
                 // A writer can continue packing while another drive receives.
@@ -15739,7 +15739,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     {
                         return candidate.index != index && same_shape(destinations[candidate.index]);
                     });
-                    contribution_destinations = unsigned(std::min<uint64_t>({uint64_t(1 + receiving + ready),
+                    generation_destinations = unsigned(std::min<uint64_t>({uint64_t(1 + receiving + ready),
                         total.execution_active, args.pool_inflight}));
                     // An admitted scratch receiver may be provisioning or flushing local runs.
                     // Keep a successor ready while the other destinations use their worker slots.
@@ -15830,7 +15830,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     io.reset();
                     auto* const pending = &task;
                     uint64_t const reserved = fixed;
-                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved, contribution_destinations]
+                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved, generation_destinations]
                     {
                         Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved};
                         producer.defer_pool_history = true;
@@ -15840,7 +15840,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             producer.fill_pool_input(*pending->prepared_input, first, other_held, bytes, &pending->cancel_generation, acquire_io) :
                             producer.fill_contributions(*pending->contribution_input, first,
                             other_held, bytes, file_io::path_text(d.path) + ": generating compressed pool member ",
-                            &pending->cancel_generation, acquire_io, contribution_destinations);
+                            &pending->cancel_generation, acquire_io, generation_destinations);
                         return Task::Generated{generated, producer.peak, producer.generation_peak,
                             producer.pool_elapsed_ns, producer.fill_stop};
                     });
@@ -15868,13 +15868,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (task.pool_hash_bytes) task.hash = std::make_unique<group_grow::MemberBatchHash>(wanted);
                 uint64_t const reserved = sum(fixed, task.pool_hash_bytes);
                 auto* const pending = &task;
-                task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, wanted, other_held, reserved]
+                task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, wanted, other_held, reserved, generation_destinations]
                 {
                     Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved};
                     producer.defer_pool_history = true;
                     auto const generated = producer.fill_pool(pending->members, first, wanted, other_held,
                         file_io::path_text(d.path) + ": generating pool member ", {}, &pending->cancel_generation,
-                        pending->hash.get());
+                        pending->hash.get(), generation_destinations);
                     require(generated && (!d.needs_resume || pending->members.size() == wanted),
                         "saved destination batch exceeds pool generation admission");
                     producer.admit_engine(pending->members);

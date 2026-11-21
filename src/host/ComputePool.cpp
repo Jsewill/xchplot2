@@ -810,6 +810,14 @@ struct BrokerServer::Impl
             auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
                 { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
             if (sample != worker.histories.end()) finish = sample->remaining_ns(lease.task.work_units, elapsed);
+            if (finish <= 0 && sample != worker.histories.end() && lease.task.kind == Kind::GenerateGpu &&
+                !lease.task.independent_members && lease.task.work_units > 1)
+            {
+                // A newly measured batch can still be draining its last
+                // member. Bound that wait by one actual singleton delivery.
+                auto const member = sample->cost(1, true);
+                if (member < std::numeric_limits<long double>::max()) finish = active_ns - elapsed + member;
+            }
             if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && (lease.task.independent_members || lease.task.work_units == 1))
             {
                 // A singleton delivers the same chunks as one member of an

@@ -272,7 +272,7 @@ void planning_feedback()
     require(fleet.probe_contribution_route(18, 2, now), "a cold GPU route was assumed to have a delivery sample");
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
     pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
-    auto width = [&] { return fleet.dispatch_width(18, 2, 3, 2, 2, 3, 2, now); };
+    auto width = [&] { return fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, true, 3, 2, 2, 3, 2, now); };
     auto packed = pipeline; packed.independent_members = packed.contributions = false; packed.work_units = 1;
     train(fleet, packed, route);
     require(fleet.probe_contribution_route(18, 2, now), "packed delivery suppressed an unmeasured contribution probe");
@@ -323,6 +323,25 @@ void planning_feedback()
     fleet.released(pipeline.worker_identity, old_route);
     require(width() == 1, "a late release freed the replacement route's running slot");
     fleet.released(pipeline.worker_identity, new_route);
+
+    Planning resident(1000);
+    auto packed_width = [&] { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 2, 2, 3, 1, now); };
+    auto fast_packed = single, slow_packed = singleton;
+    fast_packed.contributions = slow_packed.contributions = false;
+    train(resident, fast_packed, route); train(resident, singleton, route);
+    require(packed_width() == 1, "a contribution route supplied an unmeasured packed batch");
+    train(resident, slow_packed, route);
+    auto cpu = slow_packed; cpu.kind = pool::Kind::GenerateCpu; cpu.worker_identity = fast_packed.worker_identity;
+    train(resident, cpu, route);
+    require(packed_width() == 3, "the faster packed route lost its batch or counted its CPU and GPU slots twice");
+    auto active = resident.selected(fast_packed, route, now);
+    require(packed_width() == 1, "an occupied fast worker assigned its full packed batch to a slower route");
+    auto busy = resident.selected(slow_packed, route, now);
+    require(packed_width() == 3, "a queued packed request lost the batch of the first predicted worker");
+    require(resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 2, 2, 3, 1,
+        now + std::chrono::nanoseconds(2000)) == 1, "an overdue worker committed a queued packed batch");
+    resident.released(slow_packed.worker_identity, busy);
+    resident.released(fast_packed.worker_identity, active);
 }
 
 struct RunningBroker

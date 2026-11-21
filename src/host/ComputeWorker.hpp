@@ -318,6 +318,7 @@ public:
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
+    unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     bool probe_contribution_route(uint8_t k, uint8_t strength) const;

@@ -2178,6 +2178,12 @@ public:
             at->peer = peer; at->first = selection; at->in_flight = 0;
         }
         at->last = selection; at->seen = now; at->sequence = sequence_; ++at->in_flight;
+        at->packed_ns = 0;
+        if (!value.contributions && at->in_flight == 1)
+        {
+            auto const prior = find(value, peer);
+            if (prior != histories_.begin() + count_) at->packed_ns = prior->rates[0].service * value.work_units;
+        }
         return selection;
     }
     void released(std::string const& worker, uint64_t selection)
@@ -2317,25 +2323,52 @@ public:
             return item.k == k && item.strength == strength && item.kind == pool::Kind::GenerateGpu && item.delivered_contribution;
         });
     }
-    unsigned dispatch_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
+    unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, bool contributions, unsigned ready, unsigned destinations,
                             unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now())
     {
         retire(now);
+        auto rates = [contributions](History const& item) -> History::Rate const&
+        {
+            if (!contributions) return item.rates[0];
+            return item.independent.samples ? item.independent : item.rates[1];
+        };
+        std::array<History const*, maximum> peers{};
+        size_t count = 0;
+        for (auto const& item : std::span(histories_).first(count_))
+        {
+            if (item.k != k || item.strength != strength || (kind != pool::Kind::GenerateAny && kind != item.kind) ||
+                !rates(item).samples) continue;
+            auto const end = peers.begin() + count;
+            auto at = std::find_if(peers.begin(), end, [&](auto peer) { return peer->peer.worker == item.peer.worker; });
+            if (at == end) peers[count++] = &item;
+            else if (rates(item).service < rates(**at).service) *at = &item;
+        }
         unsigned slots = 0;
         long double throughput = 0, fastest = 0, available = 0;
-        for (size_t i = 0; i < count_; ++i)
+        long double next_rate = 0, next_finish = std::numeric_limits<long double>::max();
+        bool known = true;
+        for (auto peer : std::span(peers).first(count))
         {
-            auto const& item = histories_[i];
-            if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu) continue;
-            auto const& rate = item.independent.samples ? item.independent : item.rates[1];
-            if (!rate.samples) continue;
+            auto const& item = *peer;
+            auto const& rate = rates(item);
             slots += item.slots; throughput += item.slots / rate.service;
             if (!fastest || rate.service < fastest) fastest = rate.service;
-            if (current(item.peer.worker)->in_flight < item.slots && (!available || rate.service < available))
-                available = rate.service;
+            auto const active = current(item.peer.worker);
+            if (active->in_flight < item.slots)
+            { if (!available || rate.service < available) available = rate.service; }
+            else if (!contributions)
+            {
+                auto const elapsed = std::chrono::duration<long double, std::nano>(now - active->seen).count();
+                if (active->in_flight != 1 || active->packed_ns <= elapsed) known = false;
+                else if (auto const finish = active->packed_ns - elapsed + rate.service; finish < next_finish)
+                { next_finish = finish; next_rate = rate.service; }
+            }
         }
-        // Keep the pipeline fed while the broker samples new routes and
-        // whenever all observed slots are already occupied.
+        // A packed request may enter an already busy pool. Size it for the
+        // first predicted delivery only while every occupied route is known.
+        if (!available && known) available = next_rate;
+        // Keep the caller's ordinary width until the route set and the
+        // worker likely to accept more work have both been measured.
         if (slots != offered || !available) return fallback;
         // Give the next free worker its share of ready work, bounded by the
         // time the fastest route needs for one full lease.
@@ -2462,6 +2495,7 @@ private:
         uint64_t first = 0, last = 0, sequence = 0;
         unsigned in_flight = 0;
         Clock::time_point seen{};
+        long double packed_ns = 0;
     };
     static bool valid(WorkerTaskObservation const& value, pool::Endpoint const& route)
     {
@@ -3458,6 +3492,19 @@ WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t st
     impl_->generation_capacity = {k, strength, Clock::now() + std::chrono::seconds(1), result};
     return result;
 }
+unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const
+{
+    if (ready < 2) return ready;
+    auto const hint = generation_capacity(k, strength);
+    unsigned const width = std::min(ready, unsigned(hint.batch));
+    if (!hint.slots || width < 2) return 1;
+    if (hint.slots == 1) return width;
+    // Only form a packed batch when the other slots can serve independent
+    // destinations. An unknown next route keeps the ordinary singletons.
+    if (destinations < std::min(hint.slots, impl_->config.max_active_generation)) return 1;
+    std::lock_guard lock(impl_->planning_mutex);
+    return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, false, ready, destinations, hint.slots, width, 1);
+}
 bool WorkerClient::codec_probe_available(uint8_t k, uint64_t timeout_ns) const
 {
     std::lock_guard lock(impl_->planning_mutex);
@@ -3490,7 +3537,7 @@ unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strengt
     auto const fallback = std::min(width, 1 + (ready_members - 1) / per_destination);
     if (!dispatch || ready_members < 2 || width < 2 || slots != hint.slots) return fallback;
     std::lock_guard lock(impl_->planning_mutex);
-    return impl_->planning.dispatch_width(k, strength, ready_members, destinations, slots, width, fallback);
+    return impl_->planning.dispatch_width(k, strength, pool::Kind::GenerateGpu, true, ready_members, destinations, slots, width, fallback);
 }
 bool WorkerClient::probe_contribution_route(uint8_t k, uint8_t strength) const
 {
