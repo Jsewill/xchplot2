@@ -76,7 +76,8 @@ struct WorkerGenerationCapacity
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
-    unsigned receivers = 0;
+    // The fastest receiver count and all slots represented by the measurements.
+    unsigned receivers = 0, measured_slots = 0;
 };
 struct WorkerStats
 {
@@ -102,6 +103,7 @@ struct WorkerTaskObservation
     bool contributions = false;
     unsigned worker_slots = 0;
     WorkerGenerationTiming generation;
+    bool independent_members = false;
 };
 class WorkerTaskDeclined : public std::runtime_error
 {
@@ -317,7 +319,7 @@ public:
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
-        unsigned destinations = 1) const;
+        unsigned destinations = 1, bool dispatch = false) const;
     bool codec_probe_available(uint8_t k, uint64_t timeout_ns) const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
     unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;

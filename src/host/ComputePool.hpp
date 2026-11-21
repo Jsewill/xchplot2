@@ -155,6 +155,7 @@ struct CapacityUpdate
 };
 struct DeliveryObservation
 {
+    // Owner time from worker selection to validated delivery.
     uint64_t elapsed_ns = 0, input_bytes = 0, output_bytes = 0;
 };
 void write_lease(Writer&, Lease const&);
@@ -233,8 +234,9 @@ struct BrokerStatusPage
 // increasing sequences. Retry keeps task_id/sequence/body and raises attempt.
 // Queued tasks expire after a lease interval without a matching acquire poll;
 // a later retry needs a newer attempt, as for an expired grant.
-// For a deadline-bound codec request, supporting brokers also expire queued
-// and unclaimed work at that deadline. Running work follows the usual lease.
+// For deadline-bound codec and generation requests, supporting
+// brokers also expire queued and unclaimed work at the start deadline.
+// Running work follows the usual lease.
 class BrokerClient
 {
 public:

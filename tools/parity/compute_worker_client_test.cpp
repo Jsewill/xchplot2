@@ -73,7 +73,10 @@ void planning_feedback()
     auto hint = [&](Planning& planning, uint8_t k = 18, uint8_t strength = 2, pool::Kind kind = pool::Kind::GenerateCpu)
     { return planning.suggested(k, strength, kind, now); };
     auto observe = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
-    { auto const selected = planning.selected(value, endpoint, now); planning.observed(value, endpoint, selected, now); };
+    {
+        auto const selected = planning.selected(value, endpoint, now);
+        planning.observed(value, endpoint, selected, now); planning.released(value.worker_identity, selected);
+    };
     auto train = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
     { for (unsigned i = 0; i < 3; ++i) observe(planning, value, endpoint); };
     Planning planning(1000);
@@ -190,6 +193,37 @@ void planning_feedback()
         "read-ahead hid the shared link cost from the planner");
     measured.failed(remote, route, measured.selected(remote, route, now), now);
     require(!price(2).receivers, "failed generation retained a measured receiver forecast");
+
+    Planning fleet(1000);
+    auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
+    pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
+    auto width = [&] { return fleet.dispatch_width(18, 2, 3, 2, 2, 3, 2, now); };
+    train(fleet, pipeline, route);
+    require(width() == 2 && fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now).member_ns == 300 &&
+        !fleet.estimate(18, 2, pipeline.kind, true, 2, 1, now).receivers &&
+        fleet.suggested(18, 2, pipeline.kind, now).batch == 1,
+        "independent pipeline samples must price the route without training joint encoding or hiding an unknown slot");
+    auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
+    train(fleet, singleton, route);
+    auto const one_receiver = fleet.estimate(18, 2, pipeline.kind, true, 1, 3, now);
+    auto const two_receivers = fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now);
+    require(one_receiver.member_ns == 300 && one_receiver.measured_slots == 2 &&
+        two_receivers.receivers == 2 && std::abs(two_receivers.member_ns - 250) < 1e-6L,
+        "the forecast must select the fastest single route and combine unequal rates when both can run");
+    require(width() == 3, "the faster free GPU did not receive a full batch");
+    auto const active_fast = fleet.selected(pipeline, route, now);
+    require(width() == 1, "the slower free route received a full batch while the faster GPU was occupied");
+    auto const active_slow = fleet.selected(singleton, route, now);
+    require(width() == 2, "a fully occupied pool did not retain the normal queued batch limit");
+    fleet.released(pipeline.worker_identity, active_fast); fleet.released(singleton.worker_identity, active_slow);
+    require(width() == 3, "completed work left a GPU slot occupied");
+    auto const old_route = fleet.selected(pipeline, route, now);
+    train(fleet, pipeline, relocated);
+    require(width() == 3, "a changed route inherited its predecessor's outstanding lease");
+    auto const new_route = fleet.selected(pipeline, relocated, now);
+    fleet.released(pipeline.worker_identity, old_route);
+    require(width() == 1, "a late release freed the replacement route's running slot");
+    fleet.released(pipeline.worker_identity, new_route);
 }
 
 struct RunningBroker

@@ -639,12 +639,14 @@ struct Backend
             uint8_t(identity.params.get_strength()), contributions, active, batch);
     }
 
-    unsigned pool_receivers(Identity const& identity, unsigned measured, unsigned* offered_slots = nullptr)
+    unsigned pool_receivers(Identity const& identity, group_grow::WorkerGenerationEstimate const& measured,
+        unsigned* offered_slots = nullptr)
     {
         auto const offered = acquire_pool_client()->generation_capacity(identity.params.get_k(),
             identity.params.get_strength()).slots;
         if (offered_slots) *offered_slots = offered;
-        return offered && measured ? std::min(offered, measured) : std::max(offered, measured);
+        if (!offered) return measured.receivers;
+        return measured.receivers && measured.measured_slots == offered ? std::min(offered, measured.receivers) : offered;
     }
 
     void initialize_local(Arguments const& args)
@@ -1386,8 +1388,13 @@ struct Producer
                 unsigned const remaining = unsigned(input.size() - scheduled);
                 // Give each available lane an ordered part of this destination.
                 // A worker with room to coencode keeps its batch policy.
-                bool const separate = width > 1 && remaining > 1 && client->generation_capacity(k, strength).batch == 1;
-                uint16_t const count = uint16_t(separate ? std::min(width, remaining) :
+                bool const independent = remaining > 1 && client->generation_capacity(k, strength).batch == 1;
+                // The first request takes the next free route's share. Other
+                // requests in this pass must not count that same slot again.
+                unsigned const dispatch = independent && pending.empty() ?
+                    client->independent_contribution_width(k, strength, remaining, destinations, true) : width;
+                bool const separate = independent && dispatch > 1;
+                uint16_t const count = uint16_t(separate ? std::min(dispatch, remaining) :
                     client->suggested_batch_members(k, strength, remaining));
                 require(count && count <= input.size() - scheduled, "invalid pool batch recommendation");
                 std::vector<std::array<uint8_t, 32>> plot_ids; plot_ids.reserve(count);
@@ -13991,7 +13998,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 unsigned const limit = unsigned(std::min(unfinished_groups, receiving_lanes));
                 auto const forecast = backend->pool_estimate(d.requested, d.scratch || args.construction == "external",
                     limit, maximum);
-                unsigned slots = backend->pool_receivers(d.requested, forecast.receivers);
+                unsigned slots = backend->pool_receivers(d.requested, forecast);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit);
                 if ((d.scratch || args.construction == "external") && !args.pool_writers)
@@ -15661,9 +15668,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 // A writer can continue packing while another drive receives.
                 // Price only simultaneous generation until packing is measured.
                 auto const forecast = backend->pool_estimate(d.requested, d.pool_encoded && !select_merged,
-                    unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(wanted));
+                    unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(contribution_members ? contribution_members : wanted));
                 unsigned offered_slots = 0;
-                unsigned const receivers = backend->pool_receivers(d.requested, forecast.receivers, &offered_slots);
+                unsigned const receivers = backend->pool_receivers(d.requested, forecast, &offered_slots);
                 if (receivers)
                 {
                     total.pool_receiving_destinations = receivers;

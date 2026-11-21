@@ -425,6 +425,7 @@ void selection(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions co
     auto preferred = owner.acquire(session, task("preferred", 3));
     require(preferred && preferred->worker_identity == fast, "measured completion cost did not prefer faster worker");
     require(worker(*preferred).begin(*preferred, preferred->owner_identity), "preferred task did not begin");
+    std::this_thread::sleep_for(std::chrono::milliseconds(3)); // The measured 1 ms service is now overdue.
     auto spill = owner.acquire(session, task("spill", 4));
     require(spill && spill->worker_identity == slow, "busy fast worker prevented available slow-worker admission");
     owner.cancel(session, "spill", 1); worker(*preferred).finish(*preferred);
@@ -740,8 +741,9 @@ void mixed_backend_selection(BrokerOptions options, TlsOptions const& owner_tls,
 {
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
-    auto mixed = offer("mixed-backends", 49501); mixed.capacity.gpu_bytes = 8192;
+    auto mixed = offer("mixed-backends", 49501); mixed.capacity.slots = 2;
     mixed.capabilities |= capability(Kind::GenerateGpu); mixed.generation_profiles = {profile(Kind::GenerateGpu)};
+    mixed.capacity.gpu_bytes = mixed.generation_profiles.front().resources.gpu_bytes;
     worker.register_worker(mixed); auto session = owner.open_owner("mixed-backends");
     for (uint64_t sequence = 1; sequence <= 3; ++sequence)
     {
@@ -753,6 +755,24 @@ void mixed_backend_selection(BrokerOptions options, TlsOptions const& owner_tls,
         worker.finish(*grant);
         owner.delivered(*grant, {grant->task.kind == Kind::GenerateGpu ? 1000000000ull : 1000000ull, 32, 1024});
     }
+    session = owner.open_owner("mixed-queue");
+    for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
+    {
+        auto sample = task(kind == Kind::GenerateGpu ? "gpu" : "cpu", kind == Kind::GenerateGpu ? 1 : 2); sample.kind = kind;
+        auto grant = owner.acquire(session, sample);
+        require(grant && worker.begin(*grant, grant->owner_identity), "mixed queue calibration did not start");
+        worker.finish(*grant); owner.delivered(*grant, {kind == Kind::GenerateGpu ? 300000000ull : 2000000000ull, 32, 1024});
+    }
+    auto active = task("active-gpu", 3); active.kind = Kind::GenerateGpu;
+    auto gpu = owner.acquire(session, active);
+    require(gpu && worker.begin(*gpu, gpu->owner_identity), "mixed queue GPU did not start");
+    auto tail = task("either-backend", 4); tail.kind = Kind::GenerateAny;
+    require(!owner.acquire(session, tail), "idle CPU took a member the occupied GPU could finish sooner");
+    owner.cancel(session, tail.task_id, 1);
+    auto cpu = owner.acquire(session, task("cpu-only", 5));
+    require(cpu && cpu->task.kind == Kind::GenerateCpu && worker.begin(*cpu, cpu->owner_identity),
+        "incompatible GPU delayed an explicit CPU request");
+    worker.finish(*cpu); worker.finish(*gpu);
 }
 void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
 {
@@ -795,6 +815,7 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
 void independent_members(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls,
                          TlsOptions const& second_tls)
 {
+    options.lease_ms = 5000; options.max_tasks = 8;
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
     auto batch = offer("pinned-output", 49502);
@@ -838,6 +859,47 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     second.register_worker(batch); request.independent_members = false;
     require(hint() == 1 && slots == 2 && availability.independent_batch == 2,
         "the pool-wide width exceeded the smaller independent worker");
+
+    session = owner.open_owner("gpu-delegation");
+    std::string fast;
+    auto execute = [&](Lease const& lease) -> BrokerClient&
+    { return lease.worker_identity == certificate_identity(worker_tls.cert_file) ? worker : second; };
+    for (uint64_t i = 1; i <= 2; ++i)
+    {
+        request.task_id = "singleton-" + std::to_string(i); request.sequence = i; request.work_units = 1;
+        auto probe = owner.acquire(session, request);
+        require(probe && execute(*probe).begin(*probe, probe->owner_identity), "singleton route probe did not start");
+        execute(*probe).finish(*probe); owner.delivered(*probe, {i == 1 ? 8000000000ULL : 1500000000ULL, 32, 1024});
+        if (i == 2) fast = probe->worker_identity;
+    }
+    request.sequence = 3; request.task_id = "pipeline"; request.work_units = 2; request.independent_members = true;
+    auto pipeline = owner.acquire(session, request);
+    require(pipeline && pipeline->worker_identity == fast,
+        "the first independent batch ignored measured singleton delivery rates");
+    request.sequence = 4; request.task_id = "alongside"; request.work_units = 1; request.independent_members = false;
+    require(!owner.acquire(session, request), "a back-to-back request ignored the faster GPU's connecting lease");
+    require(execute(*pipeline).begin(*pipeline, pipeline->owner_identity), "the faster GPU did not start its pipeline");
+    require(!owner.acquire(session, request), "a lone tail was sent to a GPU predicted to finish later");
+    auto queued = request; queued.sequence = 5; queued.task_id = "backlog";
+    require(!owner.acquire(session, queued), "a short queue finishing sooner on the busy GPU was split");
+    auto third = request; third.sequence = 6; third.task_id = "third";
+    require(!owner.acquire(session, third), "the predicted time of the ready backlog was overcharged");
+    auto fourth = request; fourth.sequence = 7; fourth.task_id = "fourth";
+    (void)owner.acquire(session, fourth);
+    auto alongside = owner.acquire(session, request);
+    require(alongside && alongside->worker_identity != fast && execute(*alongside).begin(*alongside, alongside->owner_identity),
+        "a running fast batch prevented useful work on the other GPU");
+    owner.cancel(session, third.task_id, 1); owner.cancel(session, fourth.task_id, 1);
+    execute(*pipeline).finish(*pipeline);
+    auto following = owner.acquire(session, queued);
+    require(following && following->worker_identity == fast && execute(*following).begin(*following, following->owner_identity),
+        "the next member did not start when the faster GPU finished");
+    execute(*alongside).finish(*alongside);
+    auto urgent = request; urgent.sequence = 8; urgent.task_id = "short-deadline";
+    auto deadline = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+    auto immediate = deadline.acquire(session, urgent);
+    require(immediate && immediate->worker_identity != fast, "finish-time planning exceeded a short admission deadline");
+    owner.cancel(session, urgent.task_id, 1); execute(*following).finish(*following);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
