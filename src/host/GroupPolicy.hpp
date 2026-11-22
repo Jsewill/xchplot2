@@ -182,6 +182,24 @@ public:
         }
         return best;
     }
+    bool final_group_encoded(Shape shape, bool encoded, bool fixed_width,
+                             long double packed_member_ns, long double fresh_member_ns) const
+    {
+        if (shape == shape_)
+        {
+            auto const measured = std::find_if(results_.begin(), results_.end(), [](auto const& result) { return result.width == 1; });
+            if (measured != results_.end())
+            {
+                auto const packed = measured->times[false].member_ns(), fresh = measured->times[true].member_ns();
+                // Durable publication includes the owner's packing and syncs.
+                if (packed && fresh) return fresh <= packed;
+                if (packed && !fresh_member_ns) return false;
+            }
+        }
+        // Spare workers cannot hide an output trial when generation is draining.
+        if (packed_member_ns > 0) return fresh_member_ns > 0 && fresh_member_ns < packed_member_ns;
+        return encoded || (!fixed_width && select(shape, 1, 1, 1, "auto", true, false).encoded);
+    }
     bool begin(Shape shape, Choice choice, uint64_t now)
     {
         // Enroll one wave. Other groups can start on idle writers while its

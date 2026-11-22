@@ -1829,6 +1829,11 @@ shares the available threads among runnable disk writers and keeps the
 packing workspace within the RAM already reserved for that group. Receive
 validation uses the same CPU budget.
 
+For the final group in automatic mode, the owner uses comparable
+single-writer publication timings when available. If it has a measured
+packed route and no such comparison, it switches to a whole-group stream
+only when it has a faster delivery estimate for that group size.
+
 For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
 the work ready across destinations. It tracks pipelined and jointly encoded

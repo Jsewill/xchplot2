@@ -3143,6 +3143,26 @@ void execution_planning()
     auto const once = cold.select(shape, 4, 2, 0, "auto", false, false);
     require(!cold.observed(shape) && !once.trial && !once.encoded && once.width == 2,
         "a one-pass fill replaced the unmeasured startup plan");
+    require(!cold.final_group_encoded(shape, false, false, 20, 0) &&
+        !cold.final_group_encoded(shape, true, false, 20, 0) &&
+        !cold.final_group_encoded(shape, true, true, 20, 0),
+        "the final group switched measured packed generation to an unmeasured fresh width");
+    require(cold.final_group_encoded(shape, false, false, 20, 10) &&
+        !cold.final_group_encoded(shape, true, false, 20, 30) &&
+        cold.final_group_encoded(shape, false, false, 0, 0),
+        "the final group did not preserve a faster fresh stream or the cold startup choice");
+    PoolPublicationHistory final_wave;
+    auto const packed_tail = final_wave.select(shape, 1, 1, 1, "auto", false);
+    require(!packed_tail.encoded && final_wave.begin(shape, packed_tail, 10), "could not enroll a packed tail publication");
+    final_wave.publish(3, 100, true);
+    require(!final_wave.final_group_encoded(shape, true, false, 0, 0),
+        "a measured packed publication permitted an unmeasured fresh tail");
+    auto const fresh_tail = final_wave.select(shape, 1, 1, 1, "auto", false);
+    require(fresh_tail.encoded && final_wave.begin(shape, fresh_tail, 110), "could not enroll a fresh tail publication");
+    final_wave.publish(3, 170, true);
+    require(final_wave.final_group_encoded(shape, false, false, 10, 15) &&
+        !final_wave.final_group_encoded({28, 2, 4}, false, false, 10, 15),
+        "the final group ignored a faster matching durable publication when its worker delivery was slower");
     auto const five = cold.select(shape, 5, 5, 5, "auto", false);
     for (unsigned i = 0; i < 5; ++i) require(cold.begin(shape, five, 20), "could not enroll five HDD writers");
     require(cold.select(shape, 6, 2, 2, "encoded").width == 2 && cold.select(shape, 6, 2, 2, "encoded").encoded,

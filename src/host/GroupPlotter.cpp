@@ -634,12 +634,12 @@ struct Backend
     }
 
     group_grow::WorkerGenerationEstimate pool_estimate(Identity const& identity, group_grow::pool::GenerationOutput output,
-        unsigned active, unsigned batch)
+        unsigned active, unsigned batch, uint64_t horizon_members = 0)
     {
         std::lock_guard lock(pool_mutex);
         if (!pool_client) return {};
         return pool_client->generation_estimate(uint8_t(identity.params.get_k()),
-            uint8_t(identity.params.get_strength()), output, active, batch);
+            uint8_t(identity.params.get_strength()), output, active, batch, horizon_members);
     }
 
     unsigned pool_receivers(Identity const& identity, group_grow::WorkerGenerationEstimate const& measured,
@@ -16060,17 +16060,23 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 !has_prefetched && !select_merged && wanted == d.maximum && args.pool_output != "packed" &&
                 sum(sum(sum(fixed, backend->retained()), other_held), Backend::fresh_receive_bytes(args)) <= args.max_ram)
             {
-                // With no next group waiting for generation, the last writer
-                // can use the single-destination choice while its peers drain.
-                bool const last = args.pool_output == "auto" && !args.pool_writers && !d.pool_encoded &&
+                bool const last = args.pool_output == "auto" &&
                     std::none_of(destinations.begin(), destinations.end(), [&](auto const& other)
                     {
                         return other.get() != &d && !other->complete && !other->awaiting_extent && !other->pending &&
                             !other->ready.valid() && !other->needs_finish && other->metrics.stop_reason.empty() &&
                             other->metrics.members < other->maximum;
                     });
-                bool const direct = d.pool_encoded || (last && pool_publications[0].select({unsigned(d.requested.params.get_k()),
-                    unsigned(d.requested.params.get_strength()), d.maximum}, 1, 1, 1, args.pool_output).encoded);
+                bool direct = d.pool_encoded;
+                if (last)
+                {
+                    unsigned const batch = unsigned(wanted);
+                    auto const packed = backend->pool_estimate(d.requested, GenerationOutput::Packed, 1, batch, batch);
+                    auto const fresh = backend->pool_estimate(d.requested, GenerationOutput::Fresh, 1, batch, batch);
+                    direct = pool_publications[0].final_group_encoded({unsigned(d.requested.params.get_k()),
+                        unsigned(d.requested.params.get_strength()), d.maximum}, direct, args.pool_writers != 0,
+                        packed.member_ns, fresh.member_ns);
+                }
                 if (auto slots = direct ? backend->fresh_group_slots(d.requested, wanted) : 0)
                 {
                     // A whole-group stream holds a remote slot through its
