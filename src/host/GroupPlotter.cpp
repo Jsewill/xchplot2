@@ -611,7 +611,8 @@ struct Backend
             << " transfer_ns=" << task.transfer_ns << " output_bytes=" << task.output_bytes << " worker_ns=" << task.generation.worker_ns
             << " send_ns=" << task.generation.send_ns << " frame_wait_ns=" << task.generation.frame_wait_ns
             << " receiver_ns=" << task.generation.receiver_ns << " local_direct=" << unsigned(task.local_direct)
-            << " contributions=" << unsigned(task.contributions) << " independent_members=" << unsigned(task.independent_members) << '\n';
+            << " contributions=" << unsigned(task.generation_output != group_grow::pool::GenerationOutput::Packed)
+            << " independent_members=" << unsigned(task.independent_members) << '\n';
     }
     static void wait_pool_retry(group_grow::WorkerCancellation const& cancel, std::chrono::milliseconds& delay)
     {
@@ -632,12 +633,13 @@ struct Backend
         return pool_client;
     }
 
-    group_grow::WorkerGenerationEstimate pool_estimate(Identity const& identity, bool contributions, unsigned active, unsigned batch)
+    group_grow::WorkerGenerationEstimate pool_estimate(Identity const& identity, group_grow::pool::GenerationOutput output,
+        unsigned active, unsigned batch)
     {
         std::lock_guard lock(pool_mutex);
         if (!pool_client) return {};
         return pool_client->generation_estimate(uint8_t(identity.params.get_k()),
-            uint8_t(identity.params.get_strength()), contributions, active, batch);
+            uint8_t(identity.params.get_strength()), output, active, batch);
     }
 
     unsigned pool_receivers(Identity const& identity, group_grow::WorkerGenerationEstimate const& measured,
@@ -1410,7 +1412,7 @@ struct Producer
             // delivers. An unmeasured slow worker then holds only one member.
             bool const probe = destinations > 1 && width > 1 && client->probe_contribution_route(k, strength);
             size_t const concurrency = probe ? 1 : std::min(limit, std::max(width,
-                client->suggested_generation_concurrency(k, strength, limit)));
+                client->suggested_generation_concurrency(k, strength, limit, group_grow::pool::GenerationOutput::Contributions)));
             while (pending.size() < concurrency && (scheduled < input.size() || !deferred.empty()))
             {
                 bool const resubmit = !deferred.empty();
@@ -1434,7 +1436,7 @@ struct Producer
                     unsigned joint = 1;
                     if (!probe && remaining > 1)
                         joint = std::max(width, dispatch) > 1 ? client->joint_contribution_members(k, strength, ready, whole ? input.size() : 0) :
-                            client->suggested_batch_members(k, strength, remaining);
+                            client->suggested_batch_members(k, strength, remaining, group_grow::pool::GenerationOutput::Contributions);
                     uint16_t const count = uint16_t(joint ? joint : ready);
                     require(count && count <= remaining, "invalid pool batch recommendation");
                     range = {scheduled, count, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms)};
@@ -3789,6 +3791,18 @@ struct DestinationPlan
     unsigned workers = 0;
     uint16_t batch = 0;
 };
+#if (defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK) || defined(GROW_TEST_CONSTRUCTION)
+unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsigned measured_slots, unsigned useful)
+{
+    // Unmeasured batch producers can still fill their share of the pipeline.
+    // A singleton probe can use an ordinary slot without sizing the scratch
+    // fleet for that slot until its delivery rate justifies another receiver.
+    if (!batch_slots) return offered;
+    if (measured_slots > offered) return std::min(offered, batch_slots);
+    if (measured_slots < offered) useful = std::max(useful, batch_slots);
+    return useful ? std::min(offered, useful) : offered;
+}
+#endif
 struct PackingGrant
 {
     size_t active = 0;
@@ -13916,22 +13930,29 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             bandwidth ? bandwidth->concurrent_bandwidth(scratch) : 0);
     };
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-    auto generation_estimate = [&](Destination const& d, bool external, bool encoded, unsigned receivers, unsigned batch)
+    using group_grow::pool::GenerationOutput;
+    auto generation_output = [&](Destination const& d, bool external, bool encoded, unsigned batch)
     {
-        // An external job may receive packed members, and a fresh in-file
-        // group may receive encoded chunks. Price the transfer it can use.
-        bool contributions = false;
         if (d.pending)
-            contributions = d.pending->work == Work::append && (d.pending->contribution_input || d.pending->fresh_members);
+        {
+            if (d.pending->work == Work::append && d.pending->fresh_members) return GenerationOutput::Fresh;
+            if (d.pending->work == Work::append && d.pending->contribution_input) return GenerationOutput::Contributions;
+        }
         else if (!d.needs_resume && !d.needs_finish)
         {
-            if (external) contributions = encoded || (d.engine && d.packed_declined);
-            else if (encoded && args.io_overlap && args.generation_overlap && !d.metrics.members &&
+            if (external && (encoded || (d.engine && d.packed_declined))) return GenerationOutput::Contributions;
+            if (!external && encoded && args.io_overlap && args.generation_overlap && !d.metrics.members &&
                 batch == d.maximum && (!d.engine || !d.fresh_declined) &&
-                (d.mode == "auto" || d.mode == "incremental") && (!d.engine || d.engine->incremental))
-                contributions = backend->fresh_group_slots(d.requested, batch) != 0;
+                (d.mode == "auto" || d.mode == "incremental") && (!d.engine || d.engine->incremental) &&
+                backend->fresh_group_slots(d.requested, batch)) return GenerationOutput::Fresh;
         }
-        return backend->pool_estimate(d.requested, contributions, receivers, batch);
+        return GenerationOutput::Packed;
+    };
+    auto generation_estimate = [&](Destination const& d, bool external, bool encoded, unsigned receivers, unsigned batch)
+    {
+        auto const output = generation_output(d, external, encoded, batch);
+        if (output == GenerationOutput::Fresh && d.pending) batch = d.pending->fresh_members;
+        return backend->pool_estimate(d.requested, output, receivers, batch);
     };
 #endif
     auto admit_destination = [&](Destination& d)
@@ -14110,7 +14131,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         bool const fresh_hdd = needs_generation && !d.guard && devices[d.owner].rotating &&
             (args.construction == "auto" || args.construction == "external" ||
                 (pooled_generation && args.construction == "incremental"));
-        size_t startup_receivers = receiving_lanes, startup_writers = packing_writers;
+        size_t startup_receivers = receiving_lanes, startup_writers = packing_writers, writing = packing_writers;
         bool const pipeline_hdd = fresh_hdd && (pooled_generation || backend->generation_overlap);
         auto size_pipeline = [&](bool external)
         {
@@ -14119,10 +14140,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (pooled_generation)
             {
                 unsigned const limit = unsigned(std::min(unfinished_groups, receiving_lanes));
-                auto const forecast = generation_estimate(d, external, initial_pool_output(external, 1), limit, maximum);
+                auto const output = generation_output(d, external, initial_pool_output(external, 1), maximum);
+                auto const forecast = backend->pool_estimate(d.requested, output, limit, maximum);
                 unsigned slots = backend->pool_receivers(d.requested, forecast);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
-                    d.requested.params.get_k(), d.requested.params.get_strength(), limit);
+                    d.requested.params.get_k(), d.requested.params.get_strength(), limit, output);
                 if (external && !args.pool_writers)
                     slots = std::max(slots, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
                         d.requested.params.get_k(), d.requested.params.get_strength(), maximum, std::min(slots, limit))));
@@ -14132,10 +14154,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             // Start with a writer for each producer. A backlog on independent
             // writers can justify more lanes while other drives remain available
             // to the scratch allocator. Completed pack-only work needs no producer.
-            size_t const writing = std::count_if(writers.begin(), writers.end(),
-                [](auto const& writer) { return writer && writer->busy(); });
             if (args.io_overlap && args.generation_overlap)
-                startup_writers = std::min(writer_count, std::max({startup_receivers, writing, packing_writers}));
+            {
+                size_t const busy = std::count_if(writers.begin(), writers.end(),
+                    [](auto const& writer) { return writer && writer->busy(); });
+                writing = std::max(busy, packing_writers);
+                startup_writers = std::min(writer_count, std::max(startup_receivers, writing));
+            }
         };
         if (pipeline_hdd) size_pipeline(d.scratch || args.construction == "external");
         bool const pooled_hdd = pipeline_hdd && pooled_generation && args.io_overlap && args.generation_overlap &&
@@ -14322,16 +14347,48 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         bool const request_scratch = fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) &&
             !d.guard && !d.scratch && (args.construction == "external" ||
                 (args.construction == "auto" && (input_required || plan.batch < d.maximum)));
-        size_t scratch_lanes = plan.active;
+        size_t scratch_lanes = plan.active, stripe_lanes = SIZE_MAX;
         if (request_scratch && pooled_hdd && !farming_pressure && independent_input())
         {
             if (args.construction == "auto") size_pipeline(true);
-            size_t const lanes = tune_pool ? pool_choice(true).width : startup_receivers + startup_writers;
+            auto const choice = tune_pool ? pool_choice(true) :
+                group_grow::PoolPublicationHistory::Choice{startup_receivers + startup_writers, true, false};
             auto recover = [&](size_t active, unsigned grant, uint16_t batch)
             { return recovery_cost(shared_fixed, true, active, grant, batch); };
             auto const streams = destination_plan(args.max_ram, shared_fixed, backend->retained(), 0,
-                unfinished_groups, workers, maximum, minimum, memory, recover, lanes, 0, false, packing_grant);
+                unfinished_groups, workers, maximum, minimum, memory, recover, choice.width, 0, false, packing_grant);
             scratch_lanes = std::max(scratch_lanes, streams.active);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (!args.pool_writers && choice.encoded)
+            {
+                auto const client = backend->acquire_pool_client();
+                auto const k = d.requested.params.get_k(), strength = d.requested.params.get_strength();
+                auto const capacity = client->generation_capacity(k, strength);
+                auto const width = capacity.availability.independent_width(unsigned(std::min<uint64_t>(maximum, receiving_lanes)));
+                if (width > 1)
+                {
+                    // Price one wave of same-shape generation. The controller
+                    // still admits receivers against the full queue capacity.
+                    uint64_t const ceiling = product(startup_receivers, maximum);
+                    uint64_t ready = maximum;
+                    for (auto const& other : destinations)
+                    {
+                        if (ready == ceiling) break;
+                        if (other.get() == &d || other->complete || other->awaiting_extent || other->needs_resume ||
+                            other->needs_finish || other->ready.valid() || !other->metrics.stop_reason.empty() ||
+                            (other->pending && !other->pending->generating.valid()) ||
+                            other->metrics.members >= other->maximum || other->requested.params.get_k() != k ||
+                            other->requested.params.get_strength() != strength) continue;
+                        ready += std::min({ceiling - ready, uint64_t(maximum), other->maximum - other->metrics.members});
+                    }
+                    auto const forecast = client->generation_estimate(k, strength, GenerationOutput::Contributions,
+                        unsigned(startup_receivers), maximum, ready);
+                    size_t const useful = std::min<size_t>(startup_receivers, pooled_scratch_receivers(capacity.slots,
+                        capacity.availability.independent_slots[width], forecast.measured_slots, forecast.receivers));
+                    stripe_lanes = useful + std::min(writer_count, std::max(useful, writing));
+                }
+            }
+#endif
         }
         if (pooled_generation && fresh_hdd && active >= scratch_lanes) return false;
         if (d.deferred_output)
@@ -14353,7 +14410,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         // explicit directories and the enabled destination policy.
         if (request_scratch)
         {
-            auto open_slots = [&](size_t lanes) { return lanes - std::min(lanes - 1, active); };
+            auto open_slots = [&](size_t lanes)
+            {
+                lanes = std::min(lanes, stripe_lanes);
+                return lanes - std::min(lanes - 1, active);
+            };
             size_t const initial_slots = open_slots(scratch_lanes);
             size_t scratch_slots = initial_slots;
             DestinationPlan first_external;

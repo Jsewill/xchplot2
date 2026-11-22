@@ -66,12 +66,14 @@ void retry_pressure()
 void planning_feedback()
 {
     using Planning = worker_detail::GenerationPlanning;
+    using Output = pool::GenerationOutput;
     auto const now = Clock::now(); pool::Endpoint route{"127.0.0.1", 49101};
     WorkerTaskObservation fast; fast.worker_identity = "local-worker"; fast.worker_instance = "first";
     fast.kind = pool::Kind::GenerateCpu; fast.k = 18; fast.strength = 2; fast.work_units = 1;
     fast.local_direct = true; fast.execution_ns = 400; fast.transfer_ns = 100;
-    auto hint = [&](Planning& planning, uint8_t k = 18, uint8_t strength = 2, pool::Kind kind = pool::Kind::GenerateCpu)
-    { return planning.suggested(k, strength, kind, now); };
+    auto hint = [&](Planning& planning, uint8_t k = 18, uint8_t strength = 2, pool::Kind kind = pool::Kind::GenerateCpu,
+        Output output = Output::Packed)
+    { return planning.suggested(k, strength, kind, output, now); };
     auto observe = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
     {
         auto const selected = planning.selected(value, endpoint, now);
@@ -121,7 +123,7 @@ void planning_feedback()
     require(hint(replacement).batch == 1, "a changed authenticated route inherited old feedback");
     changed.local_direct = false; observe(replacement, changed, relocated);
     require(hint(replacement).batch == 1, "a TLS route inherited local delivery votes");
-    require(replacement.suggested(18, 2, pool::Kind::GenerateCpu, now + std::chrono::milliseconds(1001)).concurrency == 2,
+    require(replacement.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, now + std::chrono::milliseconds(1001)).concurrency == 2,
         "an idle worker retained stale pressure beyond the task timeout");
 
     Planning bounded(1000);
@@ -158,42 +160,93 @@ void planning_feedback()
     auto expired_selection = late.selected(changed, route, now);
     auto const expired = now + std::chrono::milliseconds(1001);
     late.observed(changed, route, expired_selection, expired); late.failed(changed, route, expired_selection, expired);
-    require(late.suggested(18, 2, pool::Kind::GenerateCpu, expired).batch == 1,
+    require(late.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, expired).batch == 1,
         "a delayed completion revived a peer after its monotonic observation timeout");
 
     Planning measured(1000);
-    auto remote = slow; remote.contributions = true; remote.worker_slots = 1;
+    auto remote = slow; remote.generation_output = Output::Contributions; remote.worker_slots = 1;
     remote.generation = {300, 100, 80, 120};
-    auto price = [&](unsigned lanes, unsigned batch = 1, bool contributions = true)
-    { return measured.estimate(18, 2, remote.kind, contributions, lanes, batch, now); };
+    auto price = [&](unsigned lanes, unsigned batch = 1, Output output = Output::Contributions)
+    { return measured.estimate(18, 2, remote.kind, output, lanes, batch, now); };
     observe(measured, remote, route); observe(measured, remote, route);
     require(!price(2).receivers, "two samples priced an untrained remote receiver");
     observe(measured, remote, route);
-    require(price(2).member_ns == 400 && price(2).receivers == 1 && !price(2, 1, false).receivers &&
-        hint(measured).batch == 2, "a remote singleton did not price its measured service and trial a coencoded batch");
+    require(price(2).member_ns == 400 && price(2).receivers == 1 && !price(2, 1, Output::Packed).receivers &&
+        hint(measured, 18, 2, remote.kind, Output::Contributions).batch == 2,
+        "a remote singleton did not price its measured service and trial a coencoded batch");
     auto pair = remote; pair.work_units = 2; pair.generation = {700, 300, 250, 250};
     train(measured, pair, route);
-    require(hint(measured).batch == 1, "a slower measured batch displaced the faster singleton");
+    require(hint(measured, 18, 2, remote.kind, Output::Contributions).batch == 1,
+        "a slower measured batch displaced the faster singleton");
+    {
+        Planning output_modes(1000);
+        auto fresh = remote; fresh.kind = pool::Kind::GenerateGpu; fresh.generation_output = Output::Fresh;
+        auto estimate = [&](Output output, unsigned batch)
+        { return output_modes.estimate(18, 2, fresh.kind, output, 1, batch, now); };
+        train(output_modes, fresh, route);
+        require(estimate(Output::Fresh, 1).member_ns == 400 && !estimate(Output::Fresh, 2).receivers &&
+            !estimate(Output::Contributions, 1).receivers && output_modes.probe_contribution_route(18, 2, now) &&
+            output_modes.suggested(18, 2, fresh.kind, Output::Contributions, now).batch == 1 &&
+            output_modes.dispatch_width(18, 2, fresh.kind, Output::Contributions, 3, 2, 1, 3, 2, now) == 2,
+            "fresh group observations changed ordinary contribution sizing or priced an unmeasured group size");
+        auto ordinary = fresh; ordinary.generation_output = Output::Contributions;
+        ordinary.generation = {700, 300, 250, 250}; train(output_modes, ordinary, route);
+        fresh.work_units = 2; train(output_modes, fresh, route);
+        require(std::abs(estimate(Output::Fresh, 2).member_ns - 200) < 1e-6L &&
+            std::abs(estimate(Output::Contributions, 2).member_ns - 1000) < 1e-6L,
+            "fresh group delivery changed the measured ordinary contribution rate");
+        auto const failed = output_modes.selected(fresh, route, now);
+        output_modes.failed(fresh, route, failed, now);
+        require(!estimate(Output::Fresh, 2).receivers && std::abs(estimate(Output::Contributions, 2).member_ns - 1000) < 1e-6L,
+            "fresh group failure erased matching ordinary timings");
+    }
     auto peer = remote; peer.worker_identity = "second-timed-worker";
     train(measured, peer, route);
     require(price(2).receivers == 2 && price(2).member_ns == 200 && price(1).member_ns == 400,
         "independent worker service did not improve the two-receiver forecast");
+    {
+        Planning wave(1000);
+        auto const kind = pool::Kind::GenerateGpu;
+        auto quick = remote; quick.kind = kind; quick.work_units = 2; quick.independent_members = true;
+        quick.generation = {1800, 200, 200, 0};
+        auto medium = peer; medium.kind = kind; medium.generation = {2400, 100, 100, 0};
+        auto slow_wave = medium; slow_wave.worker_identity = "slow-wave-worker"; slow_wave.generation = {9900, 100, 100, 0};
+        auto sizing = [&](uint64_t members)
+        { return wave.estimate(18, 2, kind, Output::Contributions, 3, 3, now, members); };
+        auto const probe = wave.selected(slow_wave, route, now);
+        observe(wave, quick, route);
+        auto const first = sizing(9);
+        require(first.receivers == 1 && first.measured_slots == 1 && std::abs(first.member_ns - 1000) < 1e-6L &&
+            !sizing(0).receivers && !wave.estimate(20, 2, kind, Output::Contributions, 3, 3, now, 9).receivers &&
+            !wave.estimate(18, 2, kind, Output::Packed, 3, 3, now, 9).receivers &&
+            !wave.estimate(18, 2, kind, Output::Contributions, 3, 1, now, 9).receivers,
+            "a first completion did not price only its matching ready work");
+        observe(wave, medium, route);
+        require(sizing(9).receivers == 2 && sizing(9).measured_slots == 2,
+            "a pending unmeasured probe suppressed the measured routes' scratch sizing");
+        wave.observed(slow_wave, route, probe, now); wave.released(slow_wave.worker_identity, probe);
+        auto const short_wave = sizing(9), long_wave = sizing(30);
+        require(short_wave.receivers == 2 && short_wave.measured_slots == 3 &&
+            std::abs(short_wave.member_ns - 5000.L / 7) < 1e-6L &&
+            long_wave.receivers == 3 && long_wave.measured_slots == 3 && long_wave.member_ns < short_wave.member_ns,
+            "the slow receiver changed the short scratch wave or was ignored for a longer wave");
+    }
     peer.generation = remote.generation = {10, 990, 990, 10};
     Planning shared(1000);
     remote.worker_slots = 8; train(shared, remote, route);
-    auto const limited = shared.estimate(18, 2, remote.kind, true, 8, 1, now);
+    auto const limited = shared.estimate(18, 2, remote.kind, Output::Contributions, 8, 1, now);
     require(limited.receivers == 2 && std::abs(limited.member_ns - 990) < 1e-6L,
         "multiple worker slots multiplied shared link bandwidth");
     Planning prefetched(1000);
     remote.generation.frame_read_ns = remote.generation.frame_wait_ns;
     remote.generation.frame_wait_ns = 10;
     train(prefetched, remote, route);
-    auto const overlapping = prefetched.estimate(18, 2, remote.kind, true, 8, 1, now);
+    auto const overlapping = prefetched.estimate(18, 2, remote.kind, Output::Contributions, 8, 1, now);
     require(overlapping.receivers == limited.receivers && overlapping.member_ns == limited.member_ns,
         "read-ahead hid the shared link cost from the planner");
     auto compute_bound = peer; compute_bound.worker_slots = 2; compute_bound.generation = {550, 550, 550, 0};
     train(shared, compute_bound, route);
-    auto const unequal = shared.estimate(18, 2, remote.kind, true, 2, 1, now);
+    auto const unequal = shared.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(unequal.receivers == 2 && std::abs(unequal.member_ns - 550) < 1e-6L,
         "the individually fastest slots crowded out a faster combination on the shared link");
     Planning mixed_link(1000);
@@ -203,7 +256,7 @@ void planning_feedback()
     train(mixed_link, link_heavy, route); train(mixed_link, link_light, route);
     // Six sevenths of a receiver on the first worker and eight sevenths on
     // the second use two receivers and exactly one link.
-    auto const partial = mixed_link.estimate(18, 2, remote.kind, true, 2, 1, now);
+    auto const partial = mixed_link.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(partial.receivers == 2 && std::abs(partial.member_ns - 10500.L / 17) < 1e-6L,
         "the forecast did not time-share workers at the shared link limit");
     Planning dual_backend(1000);
@@ -212,7 +265,7 @@ void planning_feedback()
     link_heavy.kind = pool::Kind::GenerateGpu;
     train(dual_backend, link_heavy, route); train(dual_backend, efficient_cpu, route);
     link_heavy.worker_identity = "gpu-only-worker"; train(dual_backend, link_heavy, route);
-    auto const combined = dual_backend.estimate(18, 2, pool::Kind::GenerateAny, true, 3, 1, now);
+    auto const combined = dual_backend.estimate(18, 2, pool::Kind::GenerateAny, Output::Contributions, 3, 1, now);
     require(combined.receivers == 2 && combined.measured_slots == 2 &&
         std::abs(combined.member_ns - 6000.L / 11) < 1e-6L,
         "a hybrid worker lost its low-link backend or offered the same slot twice");
@@ -249,20 +302,20 @@ void planning_feedback()
                 best = std::max(best, low.rate + (high.rate - low.rate) * (1 - low.link) / (high.link - low.link));
         }
         if (best > previous + 1e-12L) { needed = limit; previous = best; }
-        auto const estimate = three_workers.estimate(18, 2, remote.kind, true, limit, 1, now);
+        auto const estimate = three_workers.estimate(18, 2, remote.kind, Output::Contributions, limit, 1, now);
         require(estimate.receivers == needed && std::abs(estimate.member_ns - 1 / best) < 1e-6L,
             "worker rate or receiver count differed from the feasible allocation search");
     }
     Planning direct(1000);
-    auto local = compute_bound; local.local_direct = true; local.contributions = true;
+    auto local = compute_bound; local.local_direct = true; local.generation_output = Output::Contributions;
     local.execution_ns = 1000; local.transfer_ns = 100; local.worker_slots = 1;
     remote.worker_slots = 1; train(direct, remote, route); train(direct, local, route);
-    auto const local_and_remote = direct.estimate(18, 2, remote.kind, true, 2, 1, now);
+    auto const local_and_remote = direct.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(local_and_remote.receivers == 2 && std::abs(local_and_remote.member_ns - 11000.L / 21) < 1e-6L,
         "a co-located worker suppressed the remote forecast or consumed network bandwidth");
     auto other_backend = local; other_backend.kind = pool::Kind::GenerateGpu;
     observe(direct, other_backend, route);
-    require(direct.estimate(18, 2, pool::Kind::GenerateAny, true, 2, 1, now).member_ns == local_and_remote.member_ns,
+    require(direct.estimate(18, 2, pool::Kind::GenerateAny, Output::Contributions, 2, 1, now).member_ns == local_and_remote.member_ns,
         "a cold backend hid the other backend's measured service on the same worker");
     measured.failed(remote, route, measured.selected(remote, route, now), now);
     require(price(2).receivers == 1 && price(2).measured_slots == 1 && price(2).member_ns == 400,
@@ -272,12 +325,13 @@ void planning_feedback()
     require(fleet.probe_contribution_route(18, 2, now), "a cold GPU route was assumed to have a delivery sample");
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
     pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
-    auto width = [&] { return fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, true, 3, 2, 2, 3, 2, now); };
-    auto packed = pipeline; packed.independent_members = packed.contributions = false; packed.work_units = 1;
+    auto width = [&] { return fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Contributions, 3, 2, 2, 3, 2, now); };
+    auto packed = pipeline; packed.independent_members = false;
+    packed.generation_output = Output::Packed; packed.work_units = 1;
     train(fleet, packed, route);
     require(fleet.probe_contribution_route(18, 2, now), "packed delivery suppressed an unmeasured contribution probe");
     Planning legacy(1000); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
-    require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, true, 2, 3, now).receivers,
+    require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now).receivers,
         "an untimed delivery kept probing or supplied an unmeasured link rate");
     train(fleet, pipeline, route);
     Planning whole_group(1000);
@@ -293,9 +347,9 @@ void planning_feedback()
     fleet.failed(pipeline, route, failed, now); fleet.released(pipeline.worker_identity, failed);
     require(fleet.probe_contribution_route(18, 2, now), "a failed route kept a cold contribution batch open");
     train(fleet, pipeline, route);
-    require(width() == 2 && fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now).member_ns == 300 &&
-        !fleet.estimate(18, 2, pipeline.kind, true, 2, 1, now).receivers &&
-        fleet.suggested(18, 2, pipeline.kind, now).batch == 1,
+    require(width() == 2 && fleet.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now).member_ns == 300 &&
+        !fleet.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 1, now).receivers &&
+        fleet.suggested(18, 2, pipeline.kind, Output::Contributions, now).batch == 1,
         "independent pipeline samples must price the route without training joint encoding or hiding an unknown slot");
     auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
     auto single = pipeline; single.independent_members = false; single.work_units = 1; single.generation = {400, 50, 25, 25};
@@ -330,7 +384,7 @@ void planning_feedback()
         require(!coalesced.joint_contribution_members(18, 2, 2, now),
             "an unmeasured joint batch queued behind an occupied worker");
         coalesced.released(pipeline.worker_identity, occupied);
-        require(coalesced.suggested(18, 2, pipeline.kind, now).batch == 1 &&
+        require(coalesced.suggested(18, 2, pipeline.kind, Output::Contributions, now).batch == 1 &&
             coalesced.joint_contribution_members(18, 2, 2, now) == 2,
             "coalesced singleton requests left a ready destination waiting for a singleton sample");
         observe(coalesced, joint, route);
@@ -437,8 +491,8 @@ void planning_feedback()
         Planning bounded(1000);
         auto triple = joint; triple.work_units = 3; triple.generation = {300, 150, 50, 50};
         train(bounded, single, route); train(bounded, joint, route); train(bounded, triple, route);
-        require(bounded.estimate(18, 2, pipeline.kind, true, 1, 2, now).member_ns == 450 &&
-            bounded.estimate(18, 2, pipeline.kind, true, 1, 3, now).member_ns == 150,
+        require(bounded.estimate(18, 2, pipeline.kind, Output::Contributions, 1, 2, now).member_ns == 450 &&
+            bounded.estimate(18, 2, pipeline.kind, Output::Contributions, 1, 3, now).member_ns == 150,
             "a narrower destination inherited a joint rate slower than its measured singleton");
         auto slower_pipe = pipeline; slower_pipe.generation = {1800, 300, 150, 100};
         train(bounded, slower_pipe, route);
@@ -451,22 +505,26 @@ void planning_feedback()
         if (singleton_first) observe(mixed, single, route);
         observe(mixed, pipeline, route); observe(mixed, pipeline, route);
         if (!singleton_first) observe(mixed, single, route);
-        require(mixed.estimate(18, 2, pipeline.kind, true, 2, 3, now).member_ns == 350 &&
-            !mixed.estimate(18, 2, pipeline.kind, true, 2, 1, now).receivers && mixed.suggested(18, 2, pipeline.kind, now).batch == 1,
+        require(mixed.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now).member_ns == 350 &&
+            !mixed.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 1, now).receivers &&
+            mixed.suggested(18, 2, pipeline.kind, Output::Contributions, now).batch == 1,
             "singleton and independent delivery samples must jointly price the pipeline without qualifying a singleton or joint batch");
     }
     train(fleet, singleton, route);
-    auto const one_receiver = fleet.estimate(18, 2, pipeline.kind, true, 1, 3, now);
-    auto const two_receivers = fleet.estimate(18, 2, pipeline.kind, true, 2, 3, now);
+    auto const one_receiver = fleet.estimate(18, 2, pipeline.kind, Output::Contributions, 1, 3, now);
+    auto const two_receivers = fleet.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now);
     require(one_receiver.member_ns == 300 && one_receiver.measured_slots == 2 &&
         two_receivers.receivers == 2 && std::abs(two_receivers.member_ns - 250) < 1e-6L,
         "the forecast must select the fastest single route and combine unequal rates when both can run");
     require(width() == 3, "the faster free GPU did not receive a full batch");
     auto const active_fast = fleet.selected(pipeline, route, now);
     require(width() == 1, "the slower free route received a full batch while the faster GPU was occupied");
+    require(fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Contributions, 3, 2, 1, 3, 2, now, 3) == 3 &&
+        fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Contributions, 3, 2, 1, 3, 2, now + std::chrono::nanoseconds(2000), 3) == 2,
+        "a singleton-only route changed the batch queued for the independently eligible slot");
     auto const active_slow = fleet.selected(singleton, route, now);
     require(width() == 3 &&
-        fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, true, 3, 2, 2, 3, 2, now + std::chrono::nanoseconds(2000)) == 2,
+        fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Contributions, 3, 2, 2, 3, 2, now + std::chrono::nanoseconds(2000)) == 2,
         "a queued independent batch must use a known next delivery and fall back when it runs late");
     fleet.released(pipeline.worker_identity, active_fast); fleet.released(singleton.worker_identity, active_slow);
     require(width() == 3, "completed work left a GPU slot occupied");
@@ -479,9 +537,9 @@ void planning_feedback()
     fleet.released(pipeline.worker_identity, new_route);
 
     Planning resident(1000);
-    auto packed_width = [&] { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 2, 2, 3, 1, now); };
+    auto packed_width = [&] { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 2, 2, 3, 1, now); };
     auto fast_packed = single, slow_packed = singleton;
-    fast_packed.contributions = slow_packed.contributions = false;
+    fast_packed.generation_output = slow_packed.generation_output = Output::Packed;
     train(resident, fast_packed, route); train(resident, singleton, route);
     require(packed_width() == 1, "a contribution route supplied an unmeasured packed batch");
     train(resident, slow_packed, route);
@@ -491,12 +549,12 @@ void planning_feedback()
     auto active = resident.selected(fast_packed, route, now);
     require(packed_width() == 1, "an occupied fast worker assigned its full packed batch to a slower route");
     auto queued_width = [&](Clock::time_point at)
-    { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 3, 2, 3, 1, at); };
+    { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 3, 2, 3, 1, at); };
     require(queued_width(now) == 3 && queued_width(now + std::chrono::nanoseconds(2000)) == 1,
         "an extra packed destination lost an earlier delivery or relied on an overdue worker");
     auto busy = resident.selected(slow_packed, route, now);
     require(packed_width() == 3, "a queued packed request lost the batch of the first predicted worker");
-    require(resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 2, 2, 3, 1,
+    require(resident.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 2, 2, 3, 1,
         now + std::chrono::nanoseconds(2000)) == 1, "an overdue worker committed a queued packed batch");
     resident.released(slow_packed.worker_identity, busy);
     resident.released(fast_packed.worker_identity, active);
@@ -673,6 +731,7 @@ void independent_receivers()
             auto frame = channel.receive(); pool::Reader request(frame.payload);
             auto lease = pool::read_lease(request);
             require(frame.type == pool::Message::Work && lease.task.work_units == count &&
+                lease.task.generation_output == pool::GenerationOutput::Contributions &&
                 lease.task.independent_members == (count > 1) && control.begin(lease, channel.peer_identity()),
                 "receiver cohort did not share its GPU lease");
             (void)request.u32();
@@ -760,10 +819,14 @@ void independent_receivers()
 
     other.unregister_worker(offer.instance);
     offer.instance = pool::random_token(); offer.independent_k_mask = 0;
+    offer.capacity = {4, 2, uint64_t(256) << 20, 2048};
     other.register_worker(offer);
     config.owner_id = "mixed-output-receivers";
     WorkerClient mixed(config);
-    require(mixed.generation_capacity(18, 2).slots == 2 &&
+    auto const mixed_capacity = mixed.generation_capacity(18, 2);
+    require(mixed_capacity.slots == 3 &&
+        mixed_capacity.availability.independent_width(UINT32_MAX) == 4 &&
+        !mixed_capacity.availability.independent_width(0) &&
         mixed.independent_contribution_width(18, 2, 3) == 1 &&
         mixed.independent_contribution_width(18, 2, 3, 2) == 3 &&
         mixed.independent_contribution_width(18, 2, 3) == 1,
@@ -781,12 +844,15 @@ void assigned_local_and_fencing()
     auto data_tls = tls; data_tls.max_frame_bytes = 4096;
     WorkerConfig offer; offer.broker = broker.server.endpoint(); offer.listen = {"127.0.0.1", 0}; offer.tls = data_tls;
     offer.capacity = {2, 4, uint64_t(2) << 30, 0}; offer.generation_threads = 1;
+    offer.available_resources = [capacity = offer.capacity](unsigned) { return capacity; };
     WorkerService service(offer); service.start();
     WorkerClientConfig config; config.broker = offer.broker; config.tls = data_tls;
     config.owner_id = "direct-local-owner"; config.local_service = &service;
     std::vector<WorkerTaskObservation> observations;
     config.observe = [&](auto const& value) { observations.push_back(value); };
     WorkerClient client(config);
+    auto const generation_slots = client.generation_capacity(18, 2).slots;
+    require(generation_slots && generation_slots < offer.capacity.slots, "fixture requires CPU-limited generation capacity");
     std::array<uint8_t, 32> id{};
     std::vector<std::array<uint8_t, 32>> oversized(pool::max_generation_batch_members + 1);
     rejects([&] { client.contributions(18, 2, oversized, [](auto, auto, auto) {}); });
@@ -808,7 +874,7 @@ void assigned_local_and_fencing()
     auto stats = client.stats();
     require(stats.local_tasks == 1 && !stats.input_bytes && !stats.output_bytes &&
         observations.size() == 1 && observations.front().local_direct && observations.front().execution_ns &&
-        observations.front().worker_slots == offer.capacity.slots &&
+        observations.front().worker_slots == generation_slots &&
         sink_ns && observations.front().transfer_ns >= sink_ns,
         "ordinary local assignment used wire payload or omitted its observation");
     WorkerTaskObservation remote_observation;
@@ -825,7 +891,7 @@ void assigned_local_and_fencing()
     require(!remote_observation.local_direct && remote_observation.execution_ns &&
         sink_ns && remote_observation.transfer_ns >= sink_ns && timing.timed_generation_tasks == 1 &&
         timing.generation.worker_ns && timing.generation.send_ns && timing.generation.frame_wait_ns &&
-        timing.generation.receiver_ns >= sink_ns && remote_observation.worker_slots == offer.capacity.slots &&
+        timing.generation.receiver_ns >= sink_ns && remote_observation.worker_slots == generation_slots &&
         !stats.timed_generation_tasks,
         "TLS result consumption used a different sink observation boundary");
 
@@ -874,8 +940,8 @@ void assigned_local_and_fencing()
     std::array<std::array<uint8_t, 32>, 2> ids{id, id};
     client.contributions(18, 3, ids, [&](uint64_t ordinal, auto bytes, uint16_t members)
     { require(ordinal == chunks++ && !bytes.empty() && members == ids.size(), "changed-workload batch was truncated"); });
-    require(chunks == PlotGroupFile::getChunkCountForK(18) && client.suggested_batch_members(18, 3, 2) <= 2 &&
-        client.suggested_generation_concurrency(18, 3, 1) == 1,
+    require(chunks == PlotGroupFile::getChunkCountForK(18) && client.suggested_batch_members(18, 3, 2, pool::GenerationOutput::Contributions) <= 2 &&
+        client.suggested_generation_concurrency(18, 3, 1, pool::GenerationOutput::Contributions) == 1,
         "adaptive worker suggestions exceeded the caller's storage or RAM ceiling");
     config.local_service = nullptr; config.owner_id = "minimum-frame-wire-owner";
     WorkerClient wire(config); chunks = 0;

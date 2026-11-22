@@ -43,10 +43,17 @@ namespace worker_detail
 {
 using group_tools::require;
 using Clock = std::chrono::steady_clock;
+using pool::GenerationOutput;
 constexpr uint64_t mib = uint64_t(1) << 20;
 constexpr size_t max_broker_routes = 8;
 constexpr size_t initial_contribution_window_chunks = 64;
 enum class Operation : uint8_t { Packed = 1, Contributions = 2, Encode = 3, Fresh = 4 };
+pool::GenerationOutput generation_output(Operation operation)
+{
+    if (operation == Operation::Contributions) return pool::GenerationOutput::Contributions;
+    if (operation == Operation::Fresh) return pool::GenerationOutput::Fresh;
+    return pool::GenerationOutput::Packed;
+}
 enum class DataKind : uint8_t { Prelude = 1, Boundaries = 2, Words = 3, Contributions = 4, Encoded = 5, FreshManifest = 6 };
 enum class WorkerError : uint8_t { Permanent = 0, Unsupported = 1, Transport = 2, Stale = 3 };
 // ParallelEncoder already owns contiguous encoded chunks and their sizes until
@@ -931,6 +938,21 @@ struct WorkerService::Impl
         }
         return advertised_capacity.for_broker(registered_revision.value_or(advertised_capacity.revision));
     }
+    unsigned generation_slots(pool::Task const& task) const
+    {
+        std::lock_guard lock(advertisement_mutex);
+        auto demand = task.resources;
+        // Rate estimates are per member. Report the pool's singleton lane
+        // capacity even when this lease also held a batch's extra output.
+        if (auto const& profiles = advertised_capacity.generation_profiles)
+        {
+            auto const at = std::find_if(profiles->begin(), profiles->end(), [&](auto const& profile)
+            { return profile.kind == task.kind && profile.k == task.k && profile.strength == task.strength; });
+            if (at != profiles->end())
+            { demand = at->resources; demand.cpu_threads = task.resources.cpu_threads; }
+        }
+        return advertised_capacity.capacity.parallel_tasks(demand);
+    }
     pool::BrokerClient control_for(pool::Lease const& lease, uint64_t* registered_revision = nullptr) const
     {
         std::lock_guard lock(brokers_mutex);
@@ -1310,6 +1332,8 @@ struct WorkerService::Impl
             WorkerTaskAdmission value; value.worker = status(); value.local_fallback = true;
             value.task.compatibility = worker_compatibility(); value.task.kind = use_gpu ? pool::Kind::GenerateGpu : pool::Kind::GenerateCpu;
             value.task.k = k; value.task.strength = strength; value.task.work_units = ids.size();
+            value.task.generation_output = generation_output(packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions);
+            value.task.independent_members = independent;
             value.task.resources = {threads, 1, dynamic_peak, use_gpu ? config.capacity.gpu_bytes : 0};
             admit(value); cancel.check();
         }
@@ -1796,7 +1820,7 @@ struct WorkerService::Impl
             }, config.tls.timeout_ms);
             auto task_slot = budget->acquire(0, true, cancel);
             auto const operation = Operation(in.u8()); uint8_t const k = in.u8(), strength = in.u8();
-            require(!lease->task.independent_members || operation == Operation::Contributions, "independent lease requires contributions");
+            require(generation_output(operation) == lease->task.generation_output, "worker generation output differs from lease");
             require(k == lease->task.k && strength == lease->task.strength, "worker parameters differ from lease");
             if (operation == Operation::Packed || operation == Operation::Contributions || operation == Operation::Fresh)
             {
@@ -1947,7 +1971,7 @@ struct WorkerService::Impl
             {
                 end.u64(std::chrono::duration_cast<std::chrono::nanoseconds>(processing).count());
                 end.u64(std::chrono::duration_cast<std::chrono::nanoseconds>(sending).count());
-                end.u32(config.capacity.slots);
+                end.u32(generation_slots(lease->task));
             }
             { std::lock_guard lock(output_mutex); keepalive_enabled = false; channel.send(pool::Message::End, end.data()); }
         }
@@ -2119,9 +2143,12 @@ WorkerStatus WorkerService::remote_control(pool::Endpoint const& endpoint, pool:
 }
 unsigned WorkerService::generate_assigned(pool::Lease const& lease,
     std::span<std::array<uint8_t, 32> const> ids, WorkerPackedSink const& packed,
-    WorkerContributionSink const& contributions, WorkerCancellation cancel)
+    WorkerContributionSink const& contributions, WorkerContributionWindowSink const& window,
+    WorkerFreshManifest const& manifest, WorkerCancellation cancel)
 {
-    require(owns(lease) && lease.task.kind != pool::Kind::Pack && lease.task.work_units == ids.size(),
+    auto const operation = packed ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions;
+    require(owns(lease) && lease.task.kind != pool::Kind::Pack && lease.task.work_units == ids.size() &&
+        lease.task.generation_output == generation_output(operation),
         "local generation lease targets another task or executor");
     cancel = impl_->cancellation(cancel);
     uint64_t registered_revision = 0;
@@ -2139,10 +2166,39 @@ unsigned WorkerService::generate_assigned(pool::Lease const& lease,
         { cancel.check(); running.check(); packed(tile, total); };
         auto checked_contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
         { cancel.check(); contributions(ordinal, bytes, members); };
+        auto deliver = contributions ? individual_contributions(checked_contribution, running) : ContributionBlockSink{};
+        // The owner budgets the same borrowed chunk descriptors as for TLS.
+        std::vector<std::span<uint8_t const>> chunks;
+        if (manifest && window)
+        {
+            chunks.resize(fresh_group_window_chunks);
+            deliver = [&](uint64_t first, std::span<uint64_t const> sizes, std::span<uint8_t const> bytes, uint16_t members)
+            {
+                cancel.check();
+                require(!sizes.empty() && sizes.size() <= chunks.size(), "fresh group receive window exceeds admission");
+                {
+                    CpuWork cpu(impl_->offered_cpu, impl_->scheduler.get(), running);
+                    for (size_t i = 0; i < sizes.size(); ++i)
+                    {
+                        auto const size = sizes[i];
+                        require(size && size <= bytes.size(), "invalid local contribution block size");
+                        chunks[i] = bytes.first(size_t(size)); bytes = bytes.subspan(size_t(size));
+                    }
+                    require(bytes.empty(), "invalid local contribution block size");
+                }
+                cancel.check(); running.check();
+                window(first, std::span(chunks).first(sizes.size()), members);
+            };
+        }
+        auto checked_manifest = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
+        {
+            cancel.check(); running.check(); manifest(payload, largest, digest);
+            cancel.check(); running.check();
+        };
         impl_->generation(lease.task.k, lease.task.strength, ids,
-            packed ? WorkerPackedSink(checked_packed) : WorkerPackedSink{},
-            contributions ? individual_contributions(checked_contribution, running) : ContributionBlockSink{},
-            running, lease.task.kind == pool::Kind::GenerateGpu, true, &lease.task.resources, {}, {}, lease.task.independent_members);
+            packed ? WorkerPackedSink(checked_packed) : WorkerPackedSink{}, deliver,
+            running, lease.task.kind == pool::Kind::GenerateGpu, true, &lease.task.resources, {},
+            manifest ? WorkerFreshManifest(checked_manifest) : WorkerFreshManifest{}, lease.task.independent_members);
         cancel.check(); running.check();
     }
     catch (std::exception const& error)
@@ -2161,7 +2217,7 @@ unsigned WorkerService::generate_assigned(pool::Lease const& lease,
     }
     try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease, impl_->capacity_update(registered_revision)); }
     catch (...) { /* The next heartbeat publishes the current capacity. */ }
-    return impl_->config.capacity.slots;
+    return impl_->generation_slots(lease.task);
 }
 void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t const> payload,
     uint64_t maximum, std::function<void(size_t, std::span<uint8_t const>)> const& sink, WorkerCancellation cancel)
@@ -2256,7 +2312,7 @@ public:
             if (prior != histories_.begin() + count_)
             {
                 auto const& rate = value.independent_members ? prior->pipeline_rate() :
-                    prior->rates[value.contributions ? value.work_units : 0];
+                    prior->rates[value.generation_output == GenerationOutput::Packed ? 0 : value.work_units];
                 at->delivery_ns = rate.service * value.work_units;
             }
         }
@@ -2287,11 +2343,15 @@ public:
                     [](History const& a, History const& b) { return a.sequence < b.sequence; });
             else at = histories_.begin() + count_++;
             *at = History{}; at->peer = peer; at->kind = value.kind; at->k = value.k; at->strength = value.strength;
+            at->output = value.generation_output;
         }
         at->seen = now; at->sequence = sequence_;
         bool const bounded = value.work_units <= pool::max_generation_batch_members;
-        if (bounded && value.contributions && (value.work_units == 1 || value.independent_members))
+        bool const contributions = value.generation_output == GenerationOutput::Contributions;
+        if (bounded && contributions && (value.work_units == 1 || value.independent_members))
             at->delivered_contribution = true;
+        if (bounded && value.independent_members)
+            at->independent_width = std::max(at->independent_width, unsigned(value.work_units));
         bool const timed = bounded && value.generation.worker_ns && !value.local_direct;
         uint64_t production = value.execution_ns, delivery = value.transfer_ns;
         if (timed || (bounded && value.local_direct))
@@ -2305,16 +2365,16 @@ public:
                 if (!at->independent.samples) at->independent = at->rates[1];
                 at->independent.add(value); return;
             }
-            auto& rates = at->rates[value.contributions ? value.work_units : 0];
+            auto& rates = at->rates[value.generation_output == GenerationOutput::Packed ? 0 : value.work_units];
             rates.add(value);
-            if (value.kind == pool::Kind::GenerateGpu && value.contributions && value.work_units > 1)
+            if (value.kind == pool::Kind::GenerateGpu && contributions && value.work_units > 1)
             {
                 at->deferred_joint = false;
                 for (auto& item : std::span(histories_).first(count_))
-                    if (item.k == value.k && item.strength == value.strength && item.joint_trial == value.work_units)
+                    if (item.matches(value.k, value.strength, value.kind, value.generation_output) && item.joint_trial == value.work_units)
                         item.joint_trial = 0;
             }
-            if (value.kind == pool::Kind::GenerateGpu && value.contributions && value.work_units == 1 &&
+            if (value.kind == pool::Kind::GenerateGpu && contributions && value.work_units == 1 &&
                 at->independent.samples && at->independent.samples < 3) at->independent.add(value);
             if (timed)
             {
@@ -2322,7 +2382,7 @@ public:
                 delivery = std::max({value.generation.send_ns, value.generation.frame_wait_ns,
                     value.generation.frame_read_ns, value.generation.receiver_ns});
             }
-            if (timed && value.contributions && rates.samples == 3)
+            if (timed && contributions && rates.samples == 3)
             {
                 // Try one larger coencoded batch after a sustained baseline.
                 // Once both have observations, prefer lower time per member.
@@ -2356,9 +2416,10 @@ public:
         at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2);
         at->votes = 0; at->direction = 0;
         at->rates = {}; at->independent = {}; at->delivered_contribution = false; at->joint_trial = 0; at->deferred_joint = false;
+        at->independent_width = 0;
     }
-    WorkerGenerationEstimate estimate(uint8_t k, uint8_t strength, pool::Kind kind, bool contributions,
-                          unsigned active, unsigned batch, Clock::time_point now = Clock::now())
+    WorkerGenerationEstimate estimate(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output,
+                          unsigned active, unsigned batch, Clock::time_point now = Clock::now(), uint64_t horizon_members = 0)
     {
         if (!active || !batch) return {};
         retire(now);
@@ -2366,42 +2427,45 @@ public:
         std::array<Route, maximum> routes{};
         std::array<unsigned, maximum> worker_slots{};
         size_t measured = 0, workers = 0;
+        unsigned const samples = horizon_members ? 1 : 3;
         for (size_t i = 0; i < count_; ++i)
         {
             auto const& item = histories_[i];
-            if (item.k != k || item.strength != strength ||
-                (kind != pool::Kind::GenerateAny && kind != item.kind)) continue;
-            unsigned const n = contributions ? std::max(1u, item.best_joint(batch, 3)) : 0;
-            auto const& rates = contributions && batch > 1 && item.independent_faster(n) ?
-                item.independent : item.rates[n];
-            if (rates.samples < 3) continue;
+            if (!item.matches(k, strength, kind, output)) continue;
+            auto const& rate = item.estimate_rate(batch, samples);
+            if (rate.samples < samples) continue;
             // GenerateAny can use either measured backend of one worker.
             // Both consume the same advertised slots.
             size_t worker = 0; while (worker < workers && peers[worker]->peer.worker != item.peer.worker) ++worker;
             if (worker == workers) peers[workers++] = &item;
             worker_slots[worker] = std::max(worker_slots[worker], item.slots);
-            routes[measured++] = {1 / rates.service, rates.link / rates.service, item.slots, worker};
+            routes[measured++] = {1 / rate.service, rate.link / rate.service, item.slots, worker};
         }
         if (!measured) return {};
         auto const fleet = std::span(routes).first(measured);
         unsigned slots = 0; for (auto count : std::span(worker_slots).first(workers)) slots += count;
         unsigned low = 1, high = std::min(slots, active);
         auto const fastest = throughput(fleet, worker_slots, high);
-        // Prefer the smallest receiver count that can sustain this rate.
+        // A scratch layout serves a bounded amount of ready work. Reserve
+        // another receiver when it can deliver another whole member in that
+        // interval. Ordinary throughput forecasts use the full sustained rate.
         while (low < high)
         {
             auto const middle = low + (high - low) / 2;
-            if (throughput(fleet, worker_slots, middle) >= fastest * (1 - 8 * std::numeric_limits<long double>::epsilon())) high = middle;
+            auto const rate = throughput(fleet, worker_slots, middle);
+            bool const enough = horizon_members ? (fastest - rate) / fastest * horizon_members < 1 :
+                rate >= fastest * (1 - 8 * std::numeric_limits<long double>::epsilon());
+            if (enough) high = middle;
             else low = middle + 1;
         }
-        return {1 / fastest, low, slots};
+        return {1 / (horizon_members ? throughput(fleet, worker_slots, low) : fastest), low, slots};
     }
     bool probe_contribution_route(uint8_t k, uint8_t strength, Clock::time_point now = Clock::now())
     {
         retire(now);
         return std::none_of(histories_.begin(), histories_.begin() + count_, [&](auto const& item)
         {
-            return item.k == k && item.strength == strength && item.kind == pool::Kind::GenerateGpu && item.delivered_contribution;
+            return item.matches(k, strength, pool::Kind::GenerateGpu, GenerationOutput::Contributions) && item.delivered_contribution;
         });
     }
     unsigned joint_contribution_members(uint8_t k, uint8_t strength, unsigned maximum_members,
@@ -2419,7 +2483,7 @@ public:
         std::array<bool, pool::max_generation_batch_members + 1> sampled{};
         for (auto& item : std::span(histories_).first(count_))
         {
-            if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu) continue;
+            if (!item.matches(k, strength, pool::Kind::GenerateGpu, GenerationOutput::Contributions)) continue;
             auto const active = current(item.peer.worker);
             bool const busy = active->in_flight >= item.slots;
             if (!busy && item.deferred_joint) deferred_single = std::max(deferred_single, item.independent_cost(1));
@@ -2464,7 +2528,7 @@ public:
         bool trial = false, available = false;
         for (auto const& item : std::span(histories_).first(count_))
         {
-            if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu) continue;
+            if (!item.matches(k, strength, pool::Kind::GenerateGpu, GenerationOutput::Contributions)) continue;
             trial |= item.joint_trial == count && now < item.trial_until;
             available |= item.independent.samples == 3 && current(item.peer.worker)->in_flight < item.slots;
         }
@@ -2475,7 +2539,7 @@ public:
     unsigned repartition_contributions(WorkerTaskObservation const& task, Clock::time_point now = Clock::now(),
                                        Clock::time_point other_work_until = {})
     {
-        if (task.kind != pool::Kind::GenerateGpu || !task.contributions || task.work_units < 2 ||
+        if (task.kind != pool::Kind::GenerateGpu || task.generation_output != GenerationOutput::Contributions || task.work_units < 2 ||
             task.work_units > pool::max_generation_batch_members || !valid(task, {})) return 0;
         retire(now);
         auto const active = current(text<64>(task.worker_identity));
@@ -2494,8 +2558,8 @@ public:
         unsigned first = 0;
         for (auto const& other : std::span(histories_).first(count_))
         {
-            if (other.peer.worker == selected->peer.worker || other.k != task.k || other.strength != task.strength ||
-                other.kind != task.kind || other.independent.samples < 3) continue;
+            if (other.peer.worker == selected->peer.worker || !other.matches(task.k, task.strength, task.kind, task.generation_output) ||
+                other.independent.samples < 3) continue;
             auto const peer = current(other.peer.worker);
             bool const busy = peer->in_flight >= other.slots;
             auto const wait = busy ? peer->remaining_ns(now) : 0;
@@ -2518,26 +2582,28 @@ public:
         {
             if (!joint.samples) selected->deferred_joint = true;
             for (auto& item : std::span(histories_).first(count_))
-                if (item.k == task.k && item.strength == task.strength && item.joint_trial == task.work_units)
+                if (item.matches(task.k, task.strength, task.kind, task.generation_output) && item.joint_trial == task.work_units)
                     item.joint_trial = 0;
         }
         return first;
     }
-    unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, bool contributions, unsigned ready, unsigned destinations,
-                            unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now())
+    unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, unsigned ready, unsigned destinations,
+                            unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now(),
+                            unsigned independent_width = 0)
     {
         retire(now);
-        auto rates = [contributions](History const& item) -> History::Rate const&
+        bool const packed = output == GenerationOutput::Packed;
+        auto rates = [packed](History const& item) -> History::Rate const&
         {
-            if (!contributions) return item.rates[0];
+            if (packed) return item.rates[0];
             return item.pipeline_rate();
         };
         std::array<History const*, maximum> peers{};
         size_t count = 0;
         for (auto const& item : std::span(histories_).first(count_))
         {
-            if (item.k != k || item.strength != strength || (kind != pool::Kind::GenerateAny && kind != item.kind) ||
-                !rates(item).samples) continue;
+            if (!item.matches(k, strength, kind, output) ||
+                item.independent_width < independent_width || !rates(item).samples) continue;
             auto const end = peers.begin() + count;
             auto at = std::find_if(peers.begin(), end, [&](auto peer) { return peer->peer.worker == item.peer.worker; });
             if (at == end) peers[count++] = &item;
@@ -2566,7 +2632,7 @@ public:
         }
         // Another packed destination can supply a singleton to the idle route.
         // Size this batch for the busy worker if it can deliver first.
-        if (known && (!available || (!contributions && destinations > offered && next_finish < available)))
+        if (known && (!available || (packed && destinations > offered && next_finish < available)))
             available = next_rate;
         // Keep the caller's ordinary width until the route set and the
         // worker likely to accept more work have both been measured.
@@ -2577,7 +2643,7 @@ public:
             static_cast<long double>(ready) * std::max(1u, destinations) / throughput);
         return std::clamp(unsigned(std::ceil(horizon / available)), 1u, std::min(ready, limit));
     }
-    Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, Clock::time_point now = Clock::now())
+    Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, Clock::time_point now = Clock::now())
     {
         retire(now);
         std::array<unsigned, maximum> batches{}, concurrency{};
@@ -2585,7 +2651,7 @@ public:
         for (size_t i = 0; i < count_; ++i)
         {
             auto const& item = histories_[i];
-            if (item.k != k || item.strength != strength || (kind != pool::Kind::GenerateAny && item.kind != kind)) continue;
+            if (!item.matches(k, strength, kind, output)) continue;
             size_t at = 0;
             while (at < count && representatives[at]->peer.worker != item.peer.worker) ++at;
             if (at == count) { representatives[count] = &item; ++count; }
@@ -2681,16 +2747,19 @@ private:
         Peer peer;
         pool::Kind kind = pool::Kind::GenerateCpu;
         uint8_t k = 0, strength = 0;
+        GenerationOutput output = GenerationOutput::Packed;
         Plan plan;
         uint64_t sequence = 0;
         Clock::time_point seen{};
         int direction = 0;
         unsigned votes = 0, slots = 1;
-        unsigned joint_trial = 0;
+        unsigned joint_trial = 0, independent_width = 0;
         Clock::time_point trial_until{};
         bool delivered_contribution = false, deferred_joint = false;
         std::array<Rate, pool::max_generation_batch_members + 1> rates{};
         Rate independent;
+        bool matches(uint8_t size, uint8_t compression, pool::Kind requested, GenerationOutput expected) const
+        { return k == size && strength == compression && output == expected && (requested == pool::Kind::GenerateAny || kind == requested); }
         Rate const& pipeline_rate() const { return independent.samples ? independent : rates[1]; }
         long double independent_cost(unsigned n) const
         { return n == 1 && rates[1].samples ? rates[1].service : n * pipeline_rate().service; }
@@ -2703,10 +2772,17 @@ private:
                 if (rates[n].samples >= minimum_samples && (!best || rates[n].service < rates[best].service)) best = n;
             return best;
         }
-        bool independent_faster(unsigned joint_members) const
+        Rate const& estimate_rate(unsigned batch, unsigned minimum_samples) const
         {
-            auto const& joint = rates[joint_members];
-            return independent.samples >= 3 && (joint.samples < 3 || independent.service < joint.service);
+            if (output == GenerationOutput::Packed) return rates[0];
+            // A fresh group is published as a complete stream of this width.
+            if (output == GenerationOutput::Fresh) return rates[batch < rates.size() ? batch : 0];
+            auto const& joint = rates[std::max(1u, best_joint(batch, minimum_samples))];
+            auto const& single = rates[1];
+            auto const& ordinary = single.samples >= minimum_samples && single.service < joint.service ? single : joint;
+            if (batch > 1 && independent.samples >= minimum_samples &&
+                (ordinary.samples < minimum_samples || independent.service < ordinary.service)) return independent;
+            return ordinary;
         }
     };
     struct ActivePeer
@@ -2727,6 +2803,8 @@ private:
     {
         return (value.kind == pool::Kind::GenerateCpu || value.kind == pool::Kind::GenerateGpu) &&
             value.k >= 18 && value.k <= 28 && !(value.k & 1) && value.strength <= 32 && value.work_units &&
+            value.generation_output <= GenerationOutput::Fresh &&
+            (!value.independent_members || value.generation_output == GenerationOutput::Contributions) &&
             !value.worker_identity.empty() && value.worker_identity.size() <= 64 &&
             !value.worker_instance.empty() && value.worker_instance.size() <= 64 &&
             route.host.size() <= 253 && route.server_name.size() <= 253;
@@ -2739,7 +2817,7 @@ private:
     std::array<History, maximum>::iterator find(WorkerTaskObservation const& value, Peer const& peer)
     {
         return std::find_if(histories_.begin(), histories_.begin() + count_, [&](History const& item)
-        { return item.peer == peer && item.kind == value.kind && item.k == value.k && item.strength == value.strength; });
+        { return item.peer == peer && item.matches(value.k, value.strength, value.kind, value.generation_output); });
     }
     std::array<ActivePeer, maximum>::iterator current(std::array<char, 64> const& worker)
     {
@@ -2834,7 +2912,7 @@ struct WorkerClient::Impl
     mutable std::mutex planning_mutex;
     worker_detail::GenerationPlanning planning;
     struct CapacityHint { uint8_t k = 0, strength = 0; Clock::time_point expires{}; WorkerGenerationCapacity value; };
-    CapacityHint generation_capacity, independent_capacity;
+    CapacityHint generation_capacity;
     uint64_t data_connect_ns = 0;
     struct PendingMember
     {
@@ -2962,6 +3040,7 @@ struct WorkerClient::Impl
             task.local_fallback = false; task.owner_id = config.owner_id;
             value.worker_identity = task.worker.identity; value.worker_instance = task.worker.instance;
             value.kind = task.task.kind; value.k = task.task.k; value.strength = task.task.strength; value.work_units = task.task.work_units;
+            value.generation_output = task.task.generation_output;
             selected_at = Clock::now(); admit(task);
             if (config.selected) config.selected(value);
             cancel.check();
@@ -3017,7 +3096,7 @@ struct WorkerClient::Impl
             auto const boundary = first_output == Clock::time_point{} ? end : first_output;
             result.execution_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(boundary - selected_at).count());
             result.transfer_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - boundary).count());
-            result.contributions = operation == Operation::Contributions || operation == Operation::Fresh; result.generation = generation;
+            result.generation_output = lease.task.generation_output; result.generation = generation;
             result.worker_slots = worker_slots;
             result.independent_members = lease.task.independent_members;
             return result;
@@ -3102,6 +3181,7 @@ struct WorkerClient::Impl
         pool::Task task; task.task_id = identity.task_id.empty() ? pool::random_token() : identity.task_id;
         require(task.task_id.size() <= 256 && identity.attempt, "invalid compute task identity");
         task.kind = kind; task.k = k; task.strength = strength; task.work_units = work_units;
+        task.generation_output = generation_output(operation);
         task.independent_members = independent;
         task.chunk_count = chunk_count; task.max_output_bytes = max_output_bytes;
         task.compatibility = kind == pool::Kind::Pack ? config.codec_compatibility : config.compatibility;
@@ -3133,7 +3213,8 @@ struct WorkerClient::Impl
                     pool::BrokerClient::GenerationAvailability availability;
                     auto const batch = control.generation_hint(session, task, nullptr,
                         independent || options.queued_generation ? &availability : nullptr);
-                    if (options.queued_generation && !options.queued_generation(availability.independent_batch))
+                    if (options.queued_generation &&
+                        !options.queued_generation(availability.independent_width(unsigned(work_units))))
                     { declined = true; throw WorkerTaskDeclined(); }
                     // A joint scratch batch can split as soon as a smaller
                     // grant fits. With no eligible worker, keep waiting.
@@ -3155,7 +3236,8 @@ struct WorkerClient::Impl
             throw;
         }
         auto connection = std::unique_ptr<Connection>(new Connection{*this, std::move(control), *lease, session, state, {}, begin, operation});
-        require(lease->task.independent_members == independent, "compute lease changed contribution framing");
+        require(lease->task.generation_output == task.generation_output && lease->task.independent_members == independent,
+            "compute lease changed generation output");
         connection->options = options;
         connection->local_service = local_service();
         connection->local_direct = connection->local_service && connection->local_service->owns(*lease);
@@ -3215,25 +3297,58 @@ struct WorkerClient::Impl
         uint64_t const chunks_per_group = PlotGroupFile::getChunkCountForK(k);
         uint64_t const expected_chunks = chunks_per_group * (independent ? ids.size() : 1);
         uint64_t const host = worker_cpu_task_bytes(k, strength, members_per_chunk, config.max_task_bytes);
+        auto const operation = packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions;
         auto connection = connect(independent ? pool::Kind::GenerateGpu : config.generation_kind, k, strength, ids.size(), host,
-            packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions, identity, cancel, options, 0, 0, independent);
+            operation, identity, cancel, options, 0, 0, independent);
+        uint64_t next_chunk = 0;
+        bool received_manifest = false;
+        auto check_contribution = [&](uint64_t ordinal, uint16_t members, std::span<uint8_t const> bytes)
+        {
+            require(ordinal == next_chunk++ && ordinal < expected_chunks && members == members_per_chunk && !bytes.empty(),
+                "invalid compute contribution order or membership");
+        };
+        auto receive_manifest = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
+        {
+            require(manifest && !received_manifest && !next_chunk, "unexpected fresh group manifest");
+            try { manifest(payload, largest, digest); }
+            catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
+            received_manifest = true;
+        };
         if (connection->local_direct)
         {
-            if (manifest) { connection->declined = true; throw WorkerTaskDeclined(); }
             connection->logical_input_bytes = multiply(ids.size(), sizeof(ids.front()));
             auto first_output = [&]
             { if (connection->first_output == Clock::time_point{}) connection->first_output = Clock::now(); };
             auto packed = [&](PackedFragmentTile const& tile, uint64_t count)
             { first_output(); connection->logical_output_bytes = add(connection->logical_output_bytes,
                 add(tile.boundaries.size_bytes(), tile.words.size_bytes())); packed_sink(tile, count); };
+            auto local_chunks = [&](uint64_t first, std::span<std::span<uint8_t const> const> chunks, uint16_t members)
+            {
+                require(!manifest || received_manifest, "unexpected compute contribution stream");
+                first_output();
+                for (auto bytes : chunks)
+                {
+                    check_contribution(first++, members, bytes);
+                    connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
+                }
+            };
             auto contribution = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
-            { first_output(); connection->logical_output_bytes = add(connection->logical_output_bytes, bytes.size());
-              contribution_sink(ordinal, bytes, members); };
+            { local_chunks(ordinal, {&bytes, 1}, members); contribution_sink(ordinal, bytes, members); };
+            auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> chunks, uint16_t members)
+            { local_chunks(first, chunks, members); contribution_window(first, chunks, members); };
+            auto local_manifest = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
+            {
+                first_output();
+                connection->logical_output_bytes = add(connection->logical_output_bytes, 2 * sizeof(uint64_t) + digest.size());
+                receive_manifest(payload, largest, digest);
+            };
             try
             {
                 connection->worker_slots = connection->local_service->generate_assigned(connection->lease, ids,
                     packed_sink ? WorkerPackedSink(packed) : WorkerPackedSink{},
-                    contribution_sink ? WorkerContributionSink(contribution) : WorkerContributionSink{}, cancel);
+                    contribution_sink ? WorkerContributionSink(contribution) : WorkerContributionSink{},
+                    manifest && contribution_window ? WorkerContributionWindowSink(window) : WorkerContributionWindowSink{},
+                    manifest ? WorkerFreshManifest(local_manifest) : WorkerFreshManifest{}, cancel);
             }
             catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
             catch (pool::UnsupportedResources const&)
@@ -3241,21 +3356,22 @@ struct WorkerClient::Impl
               connection->resource_rejected = true; throw; }
             catch (pool::TransientTransport const&)
             { connection->retry_same_worker = true; throw; }
+            if (contribution_sink) require(next_chunk == expected_chunks, "compute contributions are truncated");
             cancel.check(); connection->delivered(); return false;
         }
         auto compute = cpu_lease(cancel);
         pool::Writer request(config.tls.max_frame_bytes); pool::write_lease(request, connection->lease);
         request.u32(remaining_timeout(cancel));
-        request.u8(uint8_t(packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions)); request.u8(k); request.u8(strength); request.u16(uint16_t(ids.size()));
+        request.u8(uint8_t(operation)); request.u8(k); request.u8(strength); request.u16(uint16_t(ids.size()));
         for (auto const& id : ids) request.bytes(id); connection->input_bytes = request.data().size();
         compute.reset(); connection->channel.send(pool::Message::Work, request.data());
-        uint64_t total = 0, expected_boundaries = 0, expected_words = 0, received_words = 0, next_chunk = 0;
+        uint64_t total = 0, expected_boundaries = 0, expected_words = 0, received_words = 0;
         std::vector<std::span<uint8_t const>> chunks;
         if (contribution_sink) chunks.resize(contribution_window ?
             (manifest ? fresh_group_window_chunks : contribution_window_chunks) : 1);
         PackedMemberValidation validation; std::vector<uint32_t> boundaries; std::vector<uint64_t> words;
         bool prelude = false, delivered_prelude = false, narrow_deltas = true;
-        size_t started = 0; bool received_manifest = false;
+        size_t started = 0;
         PackedWordValidation checked_words;
         auto validate_words = [&](uint64_t first_word)
         { checked_words.append(k, validation.flags & PackedMemberValidation::wide_delta, boundaries, first_word, words); };
@@ -3376,14 +3492,11 @@ struct WorkerClient::Impl
             }
             else if (type == DataKind::FreshManifest)
             {
-                require(manifest && !received_manifest && !next_chunk, "unexpected fresh group manifest");
                 auto const payload = input.u64(), largest = input.u64(); auto const value = input.bytes(32); input.finish();
                 std::array<uint8_t, 32> digest{};
                 require(value.size() == digest.size(), "invalid fresh group digest");
                 std::copy(value.begin(), value.end(), digest.begin()); compute.reset();
-                try { manifest(payload, largest, digest); }
-                catch (WorkerTaskDeclined const&) { connection->declined = true; throw; }
-                received_manifest = true;
+                receive_manifest(payload, largest, digest);
             }
             else if (type == DataKind::Contributions)
             {
@@ -3408,7 +3521,7 @@ struct WorkerClient::Impl
                     do
                     {
                         auto const ordinal = input.u64(); auto const members = input.u16(); auto const bytes = input.bytes(config.tls.max_frame_bytes);
-                        require(ordinal == next_chunk++ && ordinal < expected_chunks && members == members_per_chunk && !bytes.empty(), "invalid compute contribution order or membership");
+                        check_contribution(ordinal, members, bytes);
                         chunks[count++] = bytes;
                     } while (contribution_window && input.remaining() && count < chunks.size() &&
                         (!independent || next_chunk % chunks_per_group));
@@ -3712,17 +3825,18 @@ WorkerStats WorkerClient::stats() const
         impl_->independent_tasks.load(), impl_->independent_members.load()};
 }
 unsigned WorkerClient::max_window_chunks() const { return impl_->config.max_window_chunks; }
-WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t strength, bool contributions,
-                                                          unsigned active, unsigned batch) const
+WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t strength, GenerationOutput output,
+                                                          unsigned active, unsigned batch, uint64_t horizon_members) const
 {
     std::lock_guard lock(impl_->planning_mutex);
-    return impl_->planning.estimate(k, strength, impl_->config.generation_kind, contributions, active, batch);
+    return impl_->planning.estimate(k, strength, impl_->config.generation_kind, output, active, batch,
+        Clock::now(), horizon_members);
 }
 uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_bytes; }
-WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength, bool independent) const
+WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength) const
 {
     if (impl_->config.local_only) return {};
-    auto& hint = independent ? impl_->independent_capacity : impl_->generation_capacity;
+    auto& hint = impl_->generation_capacity;
     {
         std::lock_guard lock(impl_->planning_mutex);
         if (hint.k == k && hint.strength == strength && Clock::now() < hint.expires) return hint.value;
@@ -3742,7 +3856,6 @@ WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t st
         pool::Task prototype; prototype.compatibility = impl_->config.compatibility;
         prototype.kind = impl_->config.generation_kind; prototype.k = k; prototype.strength = strength;
         prototype.resources.cpu_threads = impl_->config.generation_threads;
-        prototype.independent_members = independent;
         auto const begin = Clock::now();
         result.batch = control.generation_hint(session, prototype, &result.slots, &result.availability, impl_->config.codec_compatibility);
         result.control_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
@@ -3763,7 +3876,8 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     // destinations. An unknown next route keeps the ordinary singletons.
     if (destinations < std::min(hint.slots, impl_->config.max_active_generation)) return 1;
     std::lock_guard lock(impl_->planning_mutex);
-    return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, false, ready, destinations, hint.slots, width, 1);
+    return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, GenerationOutput::Packed,
+        ready, destinations, hint.slots, width, 1);
 }
 bool WorkerClient::codec_probe_available(uint8_t k, uint64_t timeout_ns) const
 {
@@ -3790,20 +3904,23 @@ unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strengt
     if (!hint.slots || !ready_members) return 1;
     unsigned supported = hint.availability.independent_batch;
     // Other ready destinations can supply ordinary work to a worker that
-    // cannot stream this batch. Ask what a compatible GPU can accept.
-    auto const needed = std::min({ready_members, impl_->config.max_active_generation, pool::max_generation_batch_members});
-    if (hint.slots > 1 && destinations > 1 && needed > std::max(1u, supported))
-        supported = std::max(supported, generation_capacity(k, strength, true).availability.independent_batch);
+    // cannot stream this batch. Share the batch across the slots that can.
+    if (hint.slots > 1 && destinations > 1)
+        supported = std::max(supported, hint.availability.independent_width(std::min(ready_members, impl_->config.max_active_generation)));
     auto const width = std::max(1u, std::min(supported, impl_->config.max_active_generation));
     // A lone slot can combine ready callers from different destinations. Share
     // several slots among the ready destinations for this plot shape.
     if (hint.slots == 1) return width;
-    auto const slots = std::min(hint.slots, impl_->config.max_active_generation);
+    auto const batch = std::min(width, ready_members);
+    auto const offered = destinations > 1 && batch > 1 ? hint.availability.independent_slots[batch] : hint.slots;
+    if (!offered) return 1;
+    auto const slots = std::min(offered, impl_->config.max_active_generation);
     auto const per_destination = 1 + (slots - 1) / std::max(1u, destinations);
     auto const fallback = std::min(width, 1 + (ready_members - 1) / per_destination);
-    if (!dispatch || ready_members < 2 || width < 2 || slots != hint.slots) return fallback;
+    if (!dispatch || batch < 2 || slots != offered) return fallback;
     std::lock_guard lock(impl_->planning_mutex);
-    return impl_->planning.dispatch_width(k, strength, pool::Kind::GenerateGpu, true, ready_members, destinations, slots, width, fallback);
+    return impl_->planning.dispatch_width(k, strength, pool::Kind::GenerateGpu, GenerationOutput::Contributions, ready_members, destinations, slots, width, fallback,
+        Clock::now(), offered < hint.slots ? batch : 0);
 }
 bool WorkerClient::probe_contribution_route(uint8_t k, uint8_t strength) const
 {
@@ -3820,20 +3937,20 @@ unsigned WorkerClient::joint_contribution_members(uint8_t k, uint8_t strength, u
     return impl_->planning.joint_contribution_members(k, strength, available, Clock::now(),
         destination_batch == ready_members ? available : destination_batch);
 }
-unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
+unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum, GenerationOutput output) const
 {
     (void)parameters(k, strength); if (!maximum) return 0;
     auto const hint = generation_capacity(k, strength);
     std::lock_guard lock(impl_->planning_mutex);
-    auto const learned = impl_->planning.suggested(k, strength, impl_->config.generation_kind).batch;
+    auto const learned = impl_->planning.suggested(k, strength, impl_->config.generation_kind, output).batch;
     return std::max(1u, std::min({maximum, learned, unsigned(hint.batch)}));
 }
-unsigned WorkerClient::suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const
+unsigned WorkerClient::suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum, GenerationOutput output) const
 {
     (void)parameters(k, strength); if (!maximum) return 0;
     if (impl_->config.local_only) return std::min(maximum, impl_->config.max_active_generation);
     std::lock_guard lock(impl_->planning_mutex);
-    return std::max(1u, std::min(maximum, impl_->planning.suggested(k, strength, impl_->config.generation_kind).concurrency));
+    return std::max(1u, std::min(maximum, impl_->planning.suggested(k, strength, impl_->config.generation_kind, output).concurrency));
 }
 uint64_t WorkerClient::memory_bytes()
 {

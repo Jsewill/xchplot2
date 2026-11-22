@@ -665,23 +665,73 @@ void network(char const* ca, char const* cert, char const* key)
         require(incoming.size() == reference.size(), "packed lease lost a member");
         for (size_t i = 0; i < incoming.size(); ++i)
             require(unpack(incoming[i]->finish(checked)) == reference[i], "packed lease changed member order or content");
-        size_t ordinal = 0; uint64_t size = 0, peak = 0, budget = 0, largest = 0;
-        auto receive = [&](uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count)
+        auto const reference_digest = members_digest(18, Members(reference), nullptr, [] {});
+        auto collect_fresh = [&](WorkerClient& source)
         {
-            require(budget && chunk == ordinal++ && count == ids.size(), "fresh lease lost its manifest or chunk order");
-            auto inspected = codec.inspect(chunk, bytes, count);
-            require(inspected.summary.symbols, "empty fresh contribution");
-            size += bytes.size(); peak = std::max<uint64_t>(peak, bytes.size());
-        };
-        client.contributions(18, 2, ids, receive, {}, {}, {},
-            [&](uint64_t payload, uint64_t max_chunk, auto const& digest)
+            size_t ordinal = 0, largest_window = 0;
+            uint64_t size = 0, peak = 0, budget = 0, largest = 0;
+            std::array<size_t, 2> positions{};
+            auto receive = [&](uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count)
             {
-                require(!budget && digest == members_digest(18, Members(reference), nullptr, [] {}),
-                    "fresh lease changed the recovery digest");
-                budget = payload; largest = max_chunk;
-            });
-        require(ordinal == PlotGroupFile::getChunkCountForK(18) && size <= budget && peak <= largest,
-            "fresh lease exceeded its storage bound");
+                require(budget && chunk == ordinal++ && count == ids.size(), "fresh lease lost its manifest or chunk order");
+                std::array<std::span<uint64_t const>, 2> row;
+                for (size_t i = 0; i < reference.size(); ++i)
+                {
+                    auto const first = positions[i];
+                    while (positions[i] < reference[i].size() && reference[i][positions[i]] < (chunk + 1) * range)
+                        ++positions[i];
+                    row[i] = std::span(reference[i]).subspan(first, positions[i] - first);
+                }
+                require(std::ranges::equal(bytes, codec.encode(chunk, {}, 0, row)),
+                    "fresh lease changed the reference contribution bytes");
+                size += bytes.size(); peak = std::max<uint64_t>(peak, bytes.size());
+            };
+            auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> batch, uint16_t count)
+            {
+                require(!batch.empty() && batch.size() <= fresh_group_window_chunks, "fresh group receive window exceeds admission");
+                // A shared scheduler must accept owner validation after the
+                // worker releases its codec permits, including in-process.
+                if (!largest_window) client_options.cpu_scheduler->submit([] {}).get();
+                largest_window = std::max(largest_window, batch.size());
+                for (auto bytes : batch) receive(first++, bytes, count);
+            };
+            source.contributions(18, 2, ids, receive, {}, {}, window,
+                [&](uint64_t payload, uint64_t max_chunk, auto const& digest)
+                {
+                    require(!budget && digest == reference_digest, "fresh lease changed the recovery digest");
+                    budget = payload; largest = max_chunk;
+                });
+            require(ordinal == PlotGroupFile::getChunkCountForK(18) && largest_window > 1 && size <= budget && peak <= largest,
+                "fresh lease lost window batching, chunks or storage bounds");
+            return std::array{budget, largest, size};
+        };
+        auto local_options = client_options; local_options.local_service = &service;
+        local_options.owner_id += "-fresh-local";
+        WorkerTaskObservation observation;
+        local_options.observe = [&](auto const& value) { observation = value; };
+        WorkerClient local(local_options);
+        auto const remote_manifest = collect_fresh(client);
+        require(collect_fresh(local) == remote_manifest, "direct and TLS fresh leases differ in bounds or size");
+        auto const completed = local.stats();
+        require(completed.completed_contributions == 1 && completed.local_tasks == 1 &&
+            !completed.input_bytes && !completed.output_bytes && observation.local_direct &&
+            observation.generation_output == pool::GenerationOutput::Fresh &&
+            observation.execution_ns && observation.transfer_ns, "local fresh delivery lost its task observation");
+
+        auto unexpected = [](auto, auto, auto) { throw std::runtime_error("fresh delivery preceded manifest acceptance"); };
+        bool declined = false;
+        try { local.contributions(18, 2, {ids.data(), 1}, unexpected, {}, {}, {},
+            [](auto, auto, auto const&) { throw WorkerTaskDeclined(); }); }
+        catch (WorkerTaskDeclined const&) { declined = true; }
+        require(declined && local.stats().failed_tasks == completed.failed_tasks && !service.status().active.slots,
+            "manifest rejection did not release the freshly assigned lease");
+        std::atomic<bool> stop{false}; WorkerCancellation cancel; cancel.stop = &stop;
+        bool cancelled = false;
+        try { local.contributions(18, 2, {ids.data(), 1}, unexpected, cancel, {}, {},
+            [&](auto, auto, auto const&) { stop.store(true); }); }
+        catch (TaskCancelled const&) { cancelled = true; }
+        require(cancelled && stop.load() && local.stats().completed_contributions == completed.completed_contributions &&
+            !service.status().active.slots, "manifest cancellation delivered chunks or kept its lease");
     }
 
     // A stalled consumer retains memory but relinquishes application compute.

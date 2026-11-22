@@ -826,10 +826,12 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     worker.register_worker(batch);
     auto session = owner.open_owner("independent-receivers");
     auto request = task("separate-streams"); request.kind = Kind::GenerateGpu; request.work_units = 4; request.resources.cpu_threads = 2;
+    request.generation_output = GenerationOutput::Contributions;
     BrokerClient::GenerationAvailability availability;
     uint32_t slots = 0;
     auto hint = [&] { return owner.generation_hint(session, request, &slots, &availability, "test-format"); };
-    require(hint() == 1 && slots == 1 && !availability.independent_batch,
+    require(hint() == 1 && slots == 1 && !availability.independent_batch &&
+        availability.independent_slots[1] == 0,
         "an ordinary worker advertised an independent output slot");
     worker.unregister_worker(batch.instance);
     batch.independent_k_mask = 1u << model.k; worker.register_worker(batch);
@@ -839,7 +841,8 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     auto grant = owner.acquire(session, request);
     require(grant && grant->task.independent_members && grant->task.resources.host_bytes == 1024 &&
         worker.begin(*grant, grant->owner_identity), "independent generation was not leased at singleton cost");
-    require(hint() == 1 && !availability.codec_available, "a busy single-slot worker attracted a codec probe");
+    require(hint() == 1 && !availability.codec_available && availability.independent_slots[4] == 1,
+        "an active lease changed the offered batch slots or attracted a codec probe");
     auto altered = *grant; altered.task.independent_members = false;
     rejects([&] { worker.finish(altered); });
     worker.finish(*grant);
@@ -849,15 +852,16 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     batch.instance = "ordinary-output"; batch.endpoint.port = 49503; batch.independent_k_mask = 0;
     second.register_worker(batch);
     request.independent_members = false;
-    require(hint() == 1 && slots == 2 && !availability.independent_batch,
+    require(hint() == 1 && slots == 2 && !availability.independent_batch && availability.independent_slots[4] == 1,
         "pool-wide batches stranded a worker that accepts singleton requests");
     request.independent_members = true;
-    require(hint() == 1 && slots == 2 && availability.independent_batch == 4,
+    require(hint() == 1 && slots == 2 && availability.independent_batch == 4 && availability.independent_slots[4] == 1,
         "a ready independent request lost its capable worker");
     second.unregister_worker(batch.instance);
     batch.independent_k_mask = 1u << model.k; batch.generation_profiles.front().max_batch_members = 2;
     second.register_worker(batch); request.independent_members = false;
-    require(hint() == 1 && slots == 2 && availability.independent_batch == 2,
+    require(hint() == 1 && slots == 2 && availability.independent_batch == 2 &&
+        availability.independent_slots[2] == 2 && availability.independent_slots[3] == 1 && !availability.independent_slots[5],
         "the pool-wide width exceeded the smaller independent worker");
 
     session = owner.open_owner("gpu-delegation");
@@ -1044,6 +1048,7 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     packed.capacity.host_bytes = 2048; worker.register_worker(packed);
     session = owner.open_owner("packed-duration");
     request.sequence = 1; request.task_id = "fast"; request.work_units = 1; request.independent_members = false;
+    request.generation_output = GenerationOutput::Packed;
     second.worker_admission(batch.instance, WorkerAdmission::Paused);
     singleton = owner.acquire(session, request);
     require(singleton && worker.begin(*singleton, singleton->owner_identity), "fast packed sample did not start");
@@ -1064,6 +1069,129 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled packed batch outwaited its last member");
     owner.cancel(session, request.task_id, 1); worker.finish(*packed_pair);
+}
+void parallel_generation_tail(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls,
+                              TlsOptions const& second_tls, TlsOptions const& third_tls)
+{
+    options.lease_ms = 60000; options.worker_ms = 60000; options.max_tasks = 64;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls), third(endpoint, third_tls);
+    auto session = owner.open_owner("parallel-tail");
+    auto request = task("sample"); request.kind = Kind::GenerateGpu; request.resources.cpu_threads = 2; request.sequence = 0;
+    request.generation_output = GenerationOutput::Contributions;
+    auto produce = [&](BrokerClient& worker, char const* instance, uint16_t port, bool independent, uint64_t elapsed)
+    {
+        auto advertised = offer(instance, port);
+        advertised.capabilities |= capability(Kind::GenerateGpu); advertised.generation_threads = 2;
+        auto model = profile(Kind::GenerateGpu); model.resources.cpu_threads = model.cpu_threads = 2;
+        model.max_batch_members = independent ? 2 : 1; advertised.generation_profiles = {model};
+        advertised.capacity.gpu_bytes = model.resources.gpu_bytes;
+        if (independent) advertised.independent_k_mask = 1u << model.k;
+        worker.register_worker(advertised);
+        request.task_id = instance; ++request.sequence;
+        auto lease = owner.acquire(session, request);
+        require(lease && worker.begin(*lease, lease->owner_identity), "parallel tail calibration did not begin");
+        worker.finish(*lease); owner.delivered(*lease, {elapsed, 32, 1024});
+        worker.worker_admission(instance, WorkerAdmission::Paused);
+    };
+    produce(first, "wide-fast", 49502, true, 9000000000ULL);
+    produce(second, "narrow-fast", 49503, false, 10000000000ULL);
+    produce(third, "late", 49504, false, 38000000000ULL);
+    first.worker_admission("wide-fast", WorkerAdmission::Accepting);
+    second.worker_admission("narrow-fast", WorkerAdmission::Accepting);
+    third.worker_admission("late", WorkerAdmission::Accepting);
+    auto submit = [&](std::string id)
+    { request.task_id = std::move(id); ++request.sequence; return owner.acquire(session, request); };
+    for (unsigned i = 0; i < 32; ++i)
+    {
+        auto preferred = submit("preferred-" + std::to_string(i));
+        require(preferred && first.begin(*preferred, preferred->owner_identity),
+            "an aged GPU displaced the measured faster worker at the tail");
+        first.finish(*preferred); owner.delivered(*preferred, {9000000000ULL, 32, 1024});
+    }
+    auto active_first = submit("active-first"), active_second = submit("active-second");
+    require(active_first && first.begin(*active_first, active_first->owner_identity) &&
+        active_second && second.begin(*active_second, active_second->owner_identity), "fast parallel tail routes did not start");
+    request.independent_members = true; request.work_units = 2;
+    require(!submit("wide"), "wide work escaped its only eligible busy worker");
+    request.independent_members = false; request.work_units = 1;
+    require(!submit("first-single"), "a late worker took a member the fast routes could finish sooner");
+    auto single = request;
+    require(!submit("second-single") && !submit("third-single"), "the forecast ignored parallel delivery of a mixed-width tail");
+    (void)submit("fourth-single");
+    auto extra = owner.acquire(session, single);
+    require(extra && third.begin(*extra, extra->owner_identity), "an idle third worker was held after it could shorten delivery");
+    third.finish(*extra); first.finish(*active_first); second.finish(*active_second);
+}
+void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
+                                 TlsOptions const& first_tls, TlsOptions const& second_tls)
+{
+    options.lease_ms = 5000; options.worker_ms = 10000; options.max_tasks = 16;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls);
+    auto advertised = offer("first-shape", 49502);
+    auto model = profile(Kind::GenerateGpu); model.max_batch_members = 2;
+    advertised.generation_profiles = {model}; advertised.capacity.gpu_bytes = model.resources.gpu_bytes;
+    advertised.capabilities |= capability(Kind::GenerateGpu);
+    auto other = advertised; other.instance = "second-shape"; other.endpoint.port = 49503;
+    first.register_worker(advertised); second.register_worker(other);
+    auto session = owner.open_owner("generation-output");
+    auto request = task("shape"); request.kind = Kind::GenerateGpu; request.sequence = 0; request.work_units = 2;
+    auto submit = [&](GenerationOutput output)
+    {
+        request.task_id = "shape-" + std::to_string(++request.sequence);
+        request.generation_output = output;
+        auto lease = owner.acquire(session, request);
+        require(lease && lease->task.generation_output == output, "generation output was lost from the lease");
+        return *lease;
+    };
+    auto calibrate = [&](GenerationOutput output, uint64_t first_ns, uint64_t second_ns)
+    {
+        second.worker_admission(other.instance, WorkerAdmission::Paused);
+        auto a = submit(output);
+        require(first.begin(a, a.owner_identity), "first generation output calibration did not begin");
+        first.finish(a); owner.delivered(a, {first_ns, 32, 1024});
+        second.worker_admission(other.instance, WorkerAdmission::Accepting);
+        first.worker_admission(advertised.instance, WorkerAdmission::Paused);
+        auto b = submit(output);
+        require(second.begin(b, b.owner_identity), "second generation output calibration did not begin");
+        second.finish(b); owner.delivered(b, {second_ns, 32, 1024});
+        first.worker_admission(advertised.instance, WorkerAdmission::Accepting);
+    };
+    auto verify = [&](GenerationOutput output, BrokerClient& worker)
+    {
+        auto lease = submit(output);
+        auto altered = lease; altered.task.generation_output = output == GenerationOutput::Packed ?
+            GenerationOutput::Contributions : GenerationOutput::Packed;
+        permanent_rejects([&] { (void)worker.begin(altered, altered.owner_identity); });
+        require(worker.begin(lease, lease.owner_identity), "other generation output displaced the measured route");
+        worker.finish(lease);
+    };
+    calibrate(GenerationOutput::Packed, 100000000ULL, 3000000000ULL);
+    calibrate(GenerationOutput::Contributions, 2000000000ULL, 200000000ULL);
+    calibrate(GenerationOutput::Fresh, 2000000000ULL, 200000000ULL);
+    verify(GenerationOutput::Packed, first);
+    verify(GenerationOutput::Fresh, second);
+    request.work_units = 1;
+    calibrate(GenerationOutput::Fresh, 100000000ULL, 3000000000ULL);
+    verify(GenerationOutput::Packed, first);
+    verify(GenerationOutput::Contributions, second);
+    verify(GenerationOutput::Fresh, first);
+
+    second.worker_admission(other.instance, WorkerAdmission::Paused);
+    auto old_route = submit(GenerationOutput::Contributions);
+    require(first.begin(old_route, old_route.owner_identity), "old route did not begin before the address changed");
+    ++advertised.capacity_revision; advertised.endpoint.port = 49504;
+    first.register_worker(advertised);
+    first.finish(old_route); owner.delivered(old_route, {2000000000ULL, 32, 1024});
+    second.worker_admission(other.instance, WorkerAdmission::Accepting);
+    auto fresh_route = submit(GenerationOutput::Contributions);
+    require(fresh_route.endpoint == advertised.endpoint && first.begin(fresh_route, fresh_route.owner_identity),
+        "previous endpoint timings prevented probing the changed route");
+    first.finish(fresh_route); owner.delivered(fresh_route, {10000000ULL, 32, 1024});
+    auto preferred = submit(GenerationOutput::Contributions);
+    require(first.begin(preferred, preferred.owner_identity), "a late delivery altered the new route's cost");
+    first.finish(preferred);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
@@ -1387,44 +1515,6 @@ void codec_start_deadline(BrokerOptions options, TlsOptions const& owner_tls, Tl
     require(!owner.acquire(session, task("while-running", 4)), "codec start deadline released a running worker");
     worker.renew(*retry); worker.finish(*retry);
 }
-void legacy_acquire(BrokerOptions options, TlsOptions const& owner_tls, bool backlog)
-{
-    Listener listener({"127.0.0.1", 0}, options.tls);
-    BrokerClient client(listener.endpoint(), owner_tls);
-    auto peer = std::async(std::launch::async, [&]
-    {
-        auto channel = listener.accept(2000);
-        uint8_t legacy = 0;
-        for (unsigned i = 0; i < 4; ++i)
-        {
-            auto frame = channel.receive(); Reader reader(frame.payload);
-            require(frame.type == Message::Control && reader.u32() == protocol_version, "invalid acquire request");
-            auto const operation = reader.u8();
-            if (!i) legacy = operation;
-            Writer response;
-            if (i == 1)
-            {
-                require(operation != legacy, "optional acquire used the legacy operation");
-                response.u8(1); response.string("unknown broker operation"); channel.send(Message::Error, response.data());
-            }
-            else
-            {
-                require(operation == legacy, "legacy broker capability was not retained");
-                response.u8(0); channel.send(Message::Reply, response.data());
-            }
-        }
-    });
-    OwnerSession session{"owner", "session", "epoch", 1};
-    auto request = backlog ? task("legacy-backlog") : pack_task("legacy-codec");
-    if (backlog) { request.kind = Kind::GenerateGpu; request.independent_members = true; request.work_units = 2; }
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    auto timed = client.with_deadline(deadline);
-    require(!(backlog ? timed : client).acquire(session, request), "legacy queue response returned a grant");
-    auto const until = backlog ? deadline : std::chrono::steady_clock::time_point{};
-    require(!timed.acquire(session, request, until) && !timed.acquire(session, request, until),
-        "legacy acquire fallback changed the grant");
-    peer.get();
-}
 void automatic_lifecycle(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
 {
     options.max_owners = 1; options.lease_ms = 500;
@@ -1654,6 +1744,8 @@ int main() try
     mixed_backend_selection(options, a_tls, tls(ca, wa));
     batched_profiles(options, a_tls, tls(ca, wa));
     independent_members(options, a_tls, tls(ca, wa), tls(ca, wb));
+    parallel_generation_tail(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
+    generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);
     idle_lending_fairness(options, a_tls, b_tls, tls(ca, wa));
@@ -1664,7 +1756,6 @@ int main() try
     compact_heartbeat(options, a_tls, tls(ca, wa));
     queued_expiry(options, a_tls, b_tls, tls(ca, wa));
     codec_start_deadline(options, a_tls, tls(ca, wa));
-    legacy_acquire(options, a_tls, false); legacy_acquire(options, a_tls, true);
     automatic_lifecycle(options, a_tls, tls(ca, wa));
     restart(options, a_tls, tls(ca, wa));
     live_status(options, a_tls, tls(ca, wa));

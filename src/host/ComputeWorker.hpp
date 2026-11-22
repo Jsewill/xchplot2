@@ -76,7 +76,7 @@ struct WorkerGenerationCapacity
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
-    // The fastest receiver count and all slots represented by the measurements.
+    // The selected receiver count and all slots represented by the measurements.
     unsigned receivers = 0, measured_slots = 0;
 };
 struct WorkerStats
@@ -100,7 +100,8 @@ struct WorkerTaskObservation
     uint64_t work_units = 0, elapsed_ns = 0, execution_ns = 0, transfer_ns = 0;
     uint64_t input_bytes = 0, output_bytes = 0;
     bool local_direct = false;
-    bool contributions = false;
+    pool::GenerationOutput generation_output = pool::GenerationOutput::Packed;
+    // Singleton slots for this workload in the worker's advertised capacity.
     unsigned worker_slots = 0;
     WorkerGenerationTiming generation;
     bool independent_members = false;
@@ -241,7 +242,8 @@ public:
 private:
     friend class WorkerClient;
     unsigned generate_assigned(pool::Lease const&, std::span<std::array<uint8_t, 32> const>,
-        WorkerPackedSink const&, WorkerContributionSink const&, WorkerCancellation);
+        WorkerPackedSink const&, WorkerContributionSink const&, WorkerContributionWindowSink const&,
+        WorkerFreshManifest const&, WorkerCancellation);
     void encode_assigned(pool::Lease const&, std::span<uint8_t const>, uint64_t,
         std::function<void(size_t, std::span<uint8_t const>)> const&, WorkerCancellation);
     struct Impl;
@@ -329,7 +331,7 @@ public:
     bool local_available() const;
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
-    WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength, bool independent = false) const;
+    WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
@@ -337,10 +339,13 @@ public:
     unsigned joint_contribution_members(uint8_t k, uint8_t strength, unsigned ready_members, unsigned destination_batch = 0) const;
     bool probe_contribution_route(uint8_t k, uint8_t strength) const;
     bool codec_probe_available(uint8_t k, uint64_t timeout_ns) const;
-    unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;
-    unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum) const;
-    WorkerGenerationEstimate generation_estimate(uint8_t k, uint8_t strength, bool contributions,
-        unsigned active, unsigned batch) const;
+    unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum,
+        pool::GenerationOutput output = pool::GenerationOutput::Packed) const;
+    unsigned suggested_generation_concurrency(uint8_t k, uint8_t strength, unsigned maximum,
+        pool::GenerationOutput output = pool::GenerationOutput::Packed) const;
+    // A positive ready-work horizon uses first deliveries to size receivers.
+    WorkerGenerationEstimate generation_estimate(uint8_t k, uint8_t strength, pool::GenerationOutput output,
+        unsigned active, unsigned batch, uint64_t horizon_members = 0) const;
     static uint64_t memory_bytes();
 private:
     struct Impl;

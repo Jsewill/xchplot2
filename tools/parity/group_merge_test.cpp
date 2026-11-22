@@ -2806,6 +2806,13 @@ void destination_admission()
         packing(1, 1, budget).active == 2 &&
         packing(2, 0, metadata + 2 * memory(1, 1)).active == 2,
         "packing writers did not share a codec worker within the RAM and receiver limits");
+    require(pooled_scratch_receivers(3, 2, 0, 0) == 2 && pooled_scratch_receivers(3, 2, 1, 1) == 2 &&
+        pooled_scratch_receivers(3, 2, 3, 2) == 2 && pooled_scratch_receivers(3, 2, 3, 3) == 3,
+        "pooled scratch sized a singleton probe like a batch receiver or ignored a useful measured route");
+    require(pooled_scratch_receivers(3, 3, 0, 0) == 3 && pooled_scratch_receivers(3, 3, 3, 2) == 2 &&
+        pooled_scratch_receivers(2, 2, 3, 1) == 2 && pooled_scratch_receivers(3, 0, 1, 1) == 3 &&
+        pooled_scratch_receivers(1, 0, 0, 0) == 1,
+        "pooled scratch discarded homogeneous capacity, used stale fleet timings or changed singleton fallback");
     auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
     require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
         "many destinations did not activate a bounded useful subset");

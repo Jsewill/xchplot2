@@ -8,7 +8,7 @@
 // also requires the codec contract. Resource profiles and supported task kinds
 // are negotiated separately by the broker, not encoded in these identities.
 #ifndef GROW_COMPUTE_TASK_IDENTITY
-#define GROW_COMPUTE_TASK_IDENTITY "compute-task-2"
+#define GROW_COMPUTE_TASK_IDENTITY "compute-task-3"
 #endif
 #ifndef GROW_COMPUTE_GENERATION_IDENTITY
 #define GROW_COMPUTE_GENERATION_IDENTITY "pos2-1.0-generation-1"

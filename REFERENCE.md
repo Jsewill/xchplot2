@@ -1807,9 +1807,13 @@ receive concurrently. It uses the fewest receivers that can sustain the
 forecast rate under the shared link limit. A brokered worker on the plotting
 host contributes its measured generation and delivery time with zero network
 cost. CPU and GPU work on the same worker share its advertised slots.
-When detailed timings are unavailable, the owner uses
-whole-task timings. The full execution forecast also needs measured packing
-and storage costs for the destination.
+For fresh HDD scratch, the first timed delivery can help size the next
+scratch grant. The owner compares how many whole members additional
+receivers could deliver across the ready destinations. It reserves scratch
+bandwidth for the slots that can serve that batch size while ordinary
+receivers can still sample other workers. When detailed timings are
+unavailable, the owner uses whole-task timings. The full execution forecast
+also needs measured packing and storage costs for the destination.
 
 For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
@@ -1846,21 +1850,22 @@ When multiple destinations and independent GPU slots are ready but delivery
 speed is unknown, each destination starts with one member. The first
 completed contribution lets the owner start filling longer pipelines.
 For CPU and GPU generation, the broker measures service from worker selection
-through delivery, including connection setup. It uses measured deliveries at
-the requested batch size when available. It can wait for a busy worker
-if it can finish the owner's whole ready queue before an idle worker would deliver
-the waiting job. If a wide batch should wait, the broker checks whether the
+through delivery, including connection setup. It keeps separate timings for
+packed members, encoded contributions and complete fresh groups, and uses
+the requested batch size when available. Changing a worker's data endpoint
+starts a new timing history for that route. The broker can wait when busy workers
+together can finish the owner's ready queue before an idle worker would
+deliver the waiting job. If a wide batch should wait, the broker checks whether the
 idle worker can help by taking a later, shorter job. The wide batch keeps
 its queue position. Each job must still start within its admission deadline.
 During a multi-destination scratch fill the owner can also forecast generation
 for fresh groups with enough planned output space. A compatible idle GPU can
 take a whole independent batch if its measured delivery fits inside that
-interval. The forecast expires as time passes. Older brokers continue to
-schedule from their submitted queue.
+interval. The forecast expires as time passes.
 If a pipeline runs past its average, the broker can wait up to the longest
-delivery it observed at that width. For a late GPU singleton or independent
-pipeline, the next larger independent batch measured on the same worker can
-also bound the wait.
+delivery it observed at that width. For a late single contribution or an
+independent batch, the next larger independent batch measured on the same
+GPU can also bound the wait.
 With at least three deliveries at the exact width, it can wait one observed
 range of variation beyond the longest sample if the busy worker can still
 finish the ready queue sooner. An overdue GPU batch can have up to one
@@ -1887,7 +1892,9 @@ nearly full ones. A repeatedly deferred destination still gets a turn.
 When the pool offers one compatible generation slot, a fresh fixed-size group
 that fits one lease can arrive as encoded chunks in file order. The destination
 validates the chunks, starts disk writeback during transfer, and publishes
-after the complete stream and index are durable. A saved prefix can resume
+after the complete stream and index are durable. A brokered worker in the
+owner's process can deliver the manifest and chunks directly to the same
+writer. A saved prefix can resume
 with another compatible producer. When other drives still need members, the
 worker can send consecutive packed members under one lease and overlap GPU
 generation with delivery.
@@ -2032,7 +2039,7 @@ agree. Source-build identity is diagnostic provenance. Generation and codec
 eligibility are checked separately; incompatible work is not scheduled.
 Compatible releases can be rolled through workers without rebuilding every
 machine together. A wire-protocol change requires upgrading brokers, workers
-and plotting hosts together. This version uses compute protocol 7. Drain
+and plotting hosts together. This version uses compute protocol 8. Drain
 workers and wait for `drained` before replacing services. Preserve the saved
 enrollment directory, restart services, then run `compute resume` on the
 drained workers to accept new tasks.
@@ -2208,14 +2215,14 @@ send several ready members in one lease. With multiple eligible slots, it
 shares them among ready destinations with the same k and strength.
 A single destination can spread its ready members across GPUs. With one slot,
 the owner can also combine requests from different destinations.
-The broker reports a batch width all eligible workers can serve.
+The broker reports a common batch width and the number of slots that can
+stream each independent batch size within the workers' CPU and memory budgets.
 The GPU generates and sorts the next member while the worker encodes the
 preceding member. Both members use the same pinned output
 buffer in turn. Each receiver gets its own ordered compressed chunks.
 This works when the worker has RAM for only one raw member. Encoding can
 reduce its CPU thread count between windows as other work needs the host.
 The owner budgets each scratch receiver, and disk pressure limits queued destinations.
-Older compute peers use the existing generation paths.
 
 With multiple rotating destinations, automatic selection starts with the
 available worker and storage bandwidth. When a writer has more groups to
@@ -2243,8 +2250,7 @@ CPU and task slots to decide whether it can finish within the local encoding
 time. Probes back off after repeated failures while local encoding
 continues. The owner passes the remaining time for a codec window to the
 broker. If that time runs out before a worker starts, the broker releases
-the reservation so generation can use the slot. Older brokers use their
-configured lease timeout for an abandoned reservation.
+the reservation so generation can use the slot.
 When a window spans several network requests, the owner compares
 local encoding with each worker's total time per byte across its share of that
 window. Plotting JSON distinguishes calibration attempts, declined or failed

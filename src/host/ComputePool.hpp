@@ -1,6 +1,8 @@
 // Broker control plane. Bulk results travel directly from worker to owner.
 #pragma once
 #include "host/ComputeNetwork.hpp"
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -9,7 +11,7 @@
 
 namespace group_grow::pool
 {
-inline constexpr uint32_t protocol_version = 7;
+inline constexpr uint32_t protocol_version = 8;
 inline constexpr size_t max_retry_failures = 16;
 inline constexpr uint32_t max_generation_batch_members = 8;
 inline constexpr size_t max_generation_profiles = 512;
@@ -42,6 +44,7 @@ public:
 };
 enum class Kind : uint8_t { GenerateCpu = 1, GenerateGpu = 2, Pack = 3, GenerateAny = 4 };
 inline constexpr uint32_t capability(Kind kind) { return 1u << uint8_t(kind); }
+enum class GenerationOutput : uint8_t { Packed, Contributions, Fresh };
 struct Resources
 {
     // Generation requests may use zero for the selected worker's configured
@@ -52,6 +55,14 @@ struct Resources
     // profiles refine the selected worker's exact conservative task demand.
     uint64_t host_bytes = 0, gpu_bytes = 0;
     bool operator==(Resources const&) const = default;
+    uint32_t parallel_tasks(Resources const& demand) const
+    {
+        auto const lanes = slots / std::max(1u, demand.slots);
+        auto count = std::min(lanes, cpu_threads / std::max(1u, demand.cpu_threads));
+        if (demand.host_bytes) count = uint32_t(std::min<uint64_t>(count, host_bytes / demand.host_bytes));
+        if (demand.gpu_bytes) count = uint32_t(std::min<uint64_t>(count, gpu_bytes / demand.gpu_bytes));
+        return count;
+    }
 };
 struct GenerationProfile
 {
@@ -117,6 +128,7 @@ struct Task
     // Generation tasks leave both zero. Retries preserve these fields.
     uint32_t chunk_count = 0;
     uint64_t max_output_bytes = 0;
+    GenerationOutput generation_output = GenerationOutput::Packed;
     // Independently framed members share one generation slot and reuse its
     // singleton working set. This output contract is bound to the lease.
     bool independent_members = false;
@@ -263,6 +275,14 @@ public:
         // checking a task that already requests independent members.
         uint32_t independent_batch = 0;
         bool codec_available = true, concurrent_codec = true;
+        // Total eligible slots for an independent request of each width.
+        std::array<uint32_t, max_generation_batch_members + 1> independent_slots{};
+        unsigned independent_width(unsigned limit) const
+        {
+            if (limit > max_generation_batch_members) limit = max_generation_batch_members;
+            while (limit && !independent_slots[limit]) --limit;
+            return limit;
+        }
     };
     uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr,
         GenerationAvailability* availability = nullptr, std::string const& codec = {});

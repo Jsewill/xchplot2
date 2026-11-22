@@ -203,9 +203,10 @@ void repartition_and_global_admission()
     auto client = backend.acquire_pool_client();
     // Warm the real measured policy. A subsequent grouped request is legal
     // under advertised generation RAM but cannot fit this worker's codec cap.
-    for (unsigned attempt = 0; attempt < 4 && client->suggested_batch_members(18, 2, 4) == 1; ++attempt)
+    for (unsigned attempt = 0; attempt < 4 && client->suggested_batch_members(18, 2, 4, pool::GenerationOutput::Contributions) == 1; ++attempt)
         client->contributions(18, 2, {&ids.front(), 1}, [](auto, auto, auto) {});
-    require(client->suggested_batch_members(18, 2, 4) > 1, "owner fixture did not learn contribution batching");
+    require(client->suggested_batch_members(18, 2, 4, pool::GenerationOutput::Contributions) > 1,
+        "owner fixture did not learn contribution batching");
     auto const before = client->stats();
 
     Config cfg; cfg.capacity_bytes = uint64_t(64) << 20; cfg.window_bytes = args.window;
