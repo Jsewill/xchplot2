@@ -2904,6 +2904,20 @@ struct Construction
             group_grow::StagingEngine::memory_bytes(identity().header.k, cfg, batch_members));
         return bytes;
     }
+    uint64_t packing_workspace(uint16_t batch_members, bool compact, uint64_t admitted, unsigned workers) const
+    {
+        require(external && terminal_packing, "packing workspace requires a joined external transition");
+        auto const current = memory_bytes(batch_members, compact);
+        require(current <= admitted, "final packing exceeds the destination workspace lease");
+        auto cfg = config;
+        for (; workers > config.workers; --workers)
+        {
+            cfg.workers = workers;
+            auto const bytes = memory_for(cfg, batch_members, compact, false);
+            if (bytes <= admitted) return bytes;
+        }
+        return current;
+    }
     void set_workers(unsigned workers, uint16_t batch_members, bool compact, uint64_t admitted_bytes)
     {
         auto cfg = config; cfg.workers = workers;
@@ -3801,6 +3815,10 @@ unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsign
     if (measured_slots > offered) return std::min(offered, batch_slots);
     if (measured_slots < offered) useful = std::max(useful, batch_slots);
     return useful ? std::min(offered, useful) : offered;
+}
+bool packing_cpu_consumer(bool receiving, std::future<void> const& writer)
+{
+    return !receiving && (!writer.valid() || writer.wait_for(std::chrono::seconds(0)) != std::future_status::ready);
 }
 #endif
 struct PackingGrant
@@ -14036,8 +14054,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             bool const packing = other->scratch && devices[other->owner].rotating &&
                 (other->needs_finish || (other->pending && other->pending->packing()));
             if (!packing) only_packing = false;
-            if (packing && pooled_generation && args.generation_overlap && other->packing_released_bytes &&
-                other->pending && other->pending->work == Work::finish)
+            if (packing && pooled_generation && args.generation_overlap && other->engine && other->pending &&
+                other->pending->work == Work::finish && other->engine->terminal_packing)
             {
                 ++packing_grant.active; packing_grant.bytes = sum(packing_grant.bytes, other->lease_bytes);
                 // A submitted final pack owns its writer and needs no more
@@ -14963,6 +14981,35 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         return true;
     };
+    auto packing_workers = [&](Destination const& d) -> unsigned
+    {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (backend->mode != "pool" || !args.io_overlap || !args.generation_overlap ||
+            !devices[d.owner].rotating || !d.engine->terminal_packing || !d.engine->fresh_external_pack ||
+            !d.metrics.members || d.metrics.recovered || backend->acquire_pool_client()->local_available()) return 0;
+        if (args.disk_io)
+        {
+            auto const status = args.disk_io->status();
+            if (status.farming_known && status.pressured) return 0;
+        }
+        // The shared scheduler charges the receivers' validation as it runs.
+        // Share the pack width among the writers with local work to do.
+        std::vector<bool> seen(writer_count);
+        seen[d.writer] = true;
+        size_t runnable = 1;
+        for (auto const& other : destinations)
+        {
+            if (!other->engine || !other->pending || seen[other->writer]) continue;
+            auto const& receive = other->pending->generating;
+            bool const receiving = receive.valid() && receive.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+            if (packing_cpu_consumer(receiving, other->ready))
+            { seen[other->writer] = true; ++runnable; }
+        }
+        return std::max(1u, unsigned(workers / runnable));
+#else
+        (void)d; return 0;
+#endif
+    };
     auto submit = [&](Destination& d)
     {
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
@@ -14979,18 +15026,24 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         if (task->work == Work::finish && d.engine->external && !d.engine->terminal_packing)
             task->work = Work::prepare_finish;
-        unsigned count = workers;
         // Each bounded codec task acquires CPU admission from the shared pool.
         // File consumers retain their RAM grant while waiting for I/O; they
         // never reserve CPU workers across write or durability waits.
-        size_t runnable = 1;
-        for (auto const& other : destinations)
-            if (other.get() != &d && other->engine && other->pending && !other->ready.valid() &&
-                other->writer != d.writer) ++runnable;
-        count = std::max(1u, unsigned(count / runnable));
+        unsigned const packing_share = task->work == Work::finish ? packing_workers(d) : 0;
+        unsigned count = packing_share;
+        if (!count)
+        {
+            size_t runnable = 1;
+            for (auto const& other : destinations)
+                if (other.get() != &d && other->engine && other->pending && !other->ready.valid() &&
+                    other->writer != d.writer) ++runnable;
+            count = std::max(1u, unsigned(workers / runnable));
+        }
         if (task->work == Work::prepare_finish || d.engine->staged || (!d.engine->is_staging() &&
             (task->work == Work::finish || task->work == Work::recover_finish))) count = 1;
-        uint64_t const workspace = d.engine_bytes - d.stream_input_bytes;
+        uint64_t workspace = d.engine_bytes - d.stream_input_bytes;
+        if (task->work == Work::finish && d.engine->terminal_packing && !packing_share)
+            workspace = std::min(workspace, d.engine->memory_bytes(d.batch_cap, args.member_storage == "compact"));
         auto fits_workers = [&](unsigned wanted)
         {
             auto cfg = d.engine->config; cfg.workers = wanted;
@@ -15565,11 +15618,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             d.workers = 0;
             if (task.work == Work::prepare_finish)
             {
-                // The durable transition and all its staging allocations have
-                // joined. Return only this owner's released grant, then let
-                // ordinary scheduling admit final packing and other producers.
-                uint64_t const bytes = d.engine->memory_bytes(d.batch_cap, args.member_storage == "compact");
-                require(bytes <= d.engine_bytes - d.stream_input_bytes, "final packing exceeds the destination workspace lease");
+                // The durable transition has joined. Keep the phase workspace
+                // for the live pack share and return the rest of this grant.
+                uint64_t const available = d.engine_bytes - d.stream_input_bytes;
+                uint64_t const bytes = d.engine->packing_workspace(d.batch_cap, args.member_storage == "compact",
+                    available, packing_workers(d));
                 uint64_t const released = d.engine_bytes - bytes;
                 d.packing_released_bytes = released;
                 d.metrics.packing_engine_bytes = std::max(d.metrics.packing_engine_bytes, bytes);

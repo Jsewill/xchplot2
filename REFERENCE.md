@@ -1815,6 +1815,12 @@ receivers can still sample other workers. When detailed timings are
 unavailable, the owner uses whole-task timings. The full execution forecast
 also needs measured packing and storage costs for the destination.
 
+When all generation is remote, a fresh group packing from HDD scratch can
+use CPU threads while another group waits for its GPU delivery. The owner
+shares the available threads among runnable disk writers and keeps the
+packing workspace within the RAM already reserved for that group. Receive
+validation uses the same CPU budget.
+
 For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
 the work ready across destinations. It tracks pipelined and jointly encoded

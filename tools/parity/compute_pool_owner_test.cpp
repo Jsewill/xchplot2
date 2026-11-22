@@ -148,7 +148,7 @@ void repartition_and_global_admission()
     pool_test::Directory certificates;
     auto ca = pool_test::issue(certificates.path, "owner-ca");
     auto certificate = pool_test::issue(certificates.path, "owner-host", &ca);
-    auto tls = pool_test::tls(ca, certificate); tls.timeout_ms = 2000; tls.max_frame_bytes = 4096;
+    auto tls = pool_test::tls(ca, certificate); tls.timeout_ms = 10000; tls.max_frame_bytes = 4096;
     grow_controller_test::Identity requested{PlotGroupParams(PlotGroupId(std::string(64, '7')), 18, 2, 0), {}};
     std::vector<std::array<uint8_t, 32>> ids;
     std::vector<std::vector<uint64_t>> raw;
@@ -183,6 +183,7 @@ void repartition_and_global_admission()
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(512) << 20, 0};
     offered.generation_threads = 1; offered.max_batch_members = 4; offered.max_task_bytes = single_work;
+    offered.cpu_scheduler = std::make_shared<CodecScheduler>(offered.capacity.cpu_threads);
     WorkerService worker(offered); worker.start();
     Arguments args; args.backend = "cpu"; args.workers = 2; args.pool_inflight = 1;
     args.max_ram = uint64_t(1) << 30; args.window = uint64_t(1) << 20;
@@ -216,7 +217,8 @@ void repartition_and_global_admission()
     auto const reference = directory.path / "reference.gplot";
     { Engine engine(reference.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(Members(raw)).accepted, "owner canonical reference did not fit"); }
-    std::array<std::unique_ptr<ExternalEngine>, 2> engines;
+    uint16_t const batch = uint16_t(raw.size());
+    std::array<std::unique_ptr<Construction>, 2> engines;
     std::array<std::unique_ptr<ExternalEngine::ContributionInput>, 2> inputs;
     std::array<fs::path, 2> paths;
     for (size_t destination = 0; destination < engines.size(); ++destination)
@@ -224,9 +226,9 @@ void repartition_and_global_admission()
         auto scratch = directory.path / ("scratch-" + std::to_string(destination)); fs::create_directory(scratch);
         paths[destination] = directory.path / ("output-" + std::to_string(destination) + ".gplot");
         ExternalConfig external{{{scratch.string(), uint64_t(256) << 20}}, 65536, 2};
-        engines[destination] = std::make_unique<ExternalEngine>(paths[destination].string(), cfg, external, false, initial);
+        engines[destination] = std::make_unique<Construction>(paths[destination].string(), cfg, false, initial, "external", external);
         engines[destination]->confirm_identity();
-        inputs[destination] = engines[destination]->prepare_contributions(uint16_t(raw.size()),
+        inputs[destination] = engines[destination]->external->prepare_contributions(batch,
             fragment_bound(requested.params) / sizeof(uint64_t));
         require(bool(inputs[destination]), "owner contribution reservation did not fit");
     }
@@ -236,9 +238,8 @@ void repartition_and_global_admission()
         {
             Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20, 0};
             producer.defer_pool_history = true;
-            auto const count = uint16_t(raw.size());
-            auto const admitted = producer.contribution_bytes(cfg, count);
-            require(admitted - ExternalEngine::contribution_input_memory_bytes(cfg, count) ==
+            auto const admitted = producer.contribution_bytes(cfg, batch);
+            require(admitted - ExternalEngine::contribution_input_memory_bytes(cfg, batch) ==
                 producer.contribution_bytes(cfg, 1) - ExternalEngine::contribution_input_memory_bytes(cfg, 1),
                 "serial receivers reserved transport buffers for every member");
             return producer.fill_contributions(*inputs[destination], 0, 0, admitted, "owner scratch fixture member ");
@@ -252,9 +253,43 @@ void repartition_and_global_admission()
         "owner repartition did not use separately fenced singleton tasks");
     for (size_t destination = 0; destination < engines.size(); ++destination)
     {
-        require(inputs[destination]->sealed() && engines[destination]->append(*inputs[destination]).accepted,
+        auto& engine = *engines[destination];
+        require(inputs[destination]->sealed() && engine.append(*inputs[destination], batch).accepted,
             "owner repartition did not seal an appendable exact membership");
-        inputs[destination].reset(); engines[destination]->finish();
+        inputs[destination].reset();
+        if (!destination)
+        {
+            auto const admitted = engine.memory_bytes(batch, false);
+            engine.prepare_finish();
+            auto const serial = engine.memory_bytes(batch, false);
+
+            // Keep the TLS worker in its request parser before it can return
+            // a first frame. The owner and the remote worker have separate CPU gates.
+            grow_controller_test::Identity const peer{PlotGroupParams(PlotGroupId(std::string(64, '8')), 18, 2, 0), {}};
+            std::future<Member> receiver;
+            std::optional<CodecScheduler::Lease> pressure(std::in_place, offered.cpu_scheduler.get(), offered.cpu_scheduler->workers());
+            receiver = std::async(std::launch::async, [&] { return backend.generate_pool(peer, 0, args); });
+            auto const worker_waiting = [&]
+            { auto const status = worker.status(); return status.accepted_tasks && status.active.cpu_threads; };
+            auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!worker_waiting() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            bool const receiving = receiver.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+            require(worker_waiting() && receiving, "the remote generation request did not wait before first output");
+
+            auto const local_consumers = 1u + unsigned(packing_cpu_consumer(receiving, {}));
+            auto const workers = backend.cpu_scheduler->workers() / local_consumers;
+            auto const workspace = engine.packing_workspace(batch, false, admitted, workers);
+            require(workspace > serial && workspace <= admitted, "a waiting remote receiver withheld the packer's CPU workspace");
+            engine.set_workers(workers, batch, false, workspace);
+            OrderedWriter writer([] {});
+            writer.submit([&] { (void)engine.finish(); }).get();
+            require(engine.external->stats().packing_workers == workers && workers > 1,
+                "final packing did not use its wider worker grant");
+            pressure.reset();
+            require(receiver.get().size(), "the waiting receiver did not complete after packing");
+        }
+        else engine.finish();
         require(contents(paths[destination]) == contents(reference), "owner scratch repartition changed canonical publication");
     }
     // Network receivers already own compact words; they do not pass through

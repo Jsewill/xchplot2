@@ -3781,8 +3781,18 @@ void external_finish_grants(fs::path const& root, Members input, Config cfg)
             "joined durable packing transition did not return its released RAM grant");
         auto requested = engine.config; requested.workers = cfg.workers + 1;
         auto const retuned = engine.memory_for(requested, 2, true, false);
-        require(retuned < staging, "packing worker metadata reacquired the ordinary fallback envelope");
-        engine.set_workers(requested.workers, 2, true, retuned);
+        require(retuned > packing && retuned < staging, "packing worker metadata reacquired the ordinary fallback envelope");
+        std::promise<void> writer_done;
+        auto const active_writer = writer_done.get_future();
+        require(!packing_cpu_consumer(true, {}) && packing_cpu_consumer(false, {}) &&
+            packing_cpu_consumer(false, active_writer), "packing CPU demand miscounted a receiver or a local writer");
+        writer_done.set_value();
+        require(!packing_cpu_consumer(false, active_writer), "packing CPU demand retained a completed writer");
+        auto const workspace = engine.packing_workspace(2, true, staging, requested.workers);
+        require(workspace == retuned && engine.config.workers == cfg.workers &&
+            engine.packing_workspace(2, true, retuned - 1, requested.workers) == packing,
+            "packing did not retain the wider CPU grant within the previously admitted workspace");
+        engine.set_workers(requested.workers, 2, true, workspace);
         require(engine.memory_for(engine.config, 2, true, false) <= retuned,
             "packing worker retune reacquired an unrelated ordinary envelope");
         bool rejected = false;
