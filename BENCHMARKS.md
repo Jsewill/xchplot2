@@ -1248,6 +1248,8 @@ automatic.
 | Intermediate, both GPUs | 46 / 2 | 4 | 28.09 s | 172.19 s | 3.59 |
 | Updated, RTX 4090 | 48 / 0 | 5 | 22.26 s | 152.53 s | 3.18 |
 | Updated, both GPUs | 41 / 7 | 6 | 33.03 s | 151.04 s | 3.15 |
+| Updated, both GPUs, repeat | 43 / 5 | 5 | 23.02 s | 160.16 s | 3.34 |
+| Updated, RTX 4090, repeat | 48 / 0 | 5 | 22.26 s | 169.83 s | 3.54 |
 
 A separate 4090-only control with four HDD writers and encoded output
 took 174.37 s (3.63 s/member). Much of the initial improvement came from
@@ -1266,10 +1268,42 @@ group reached disk at 209.18 s.
 The updated controller admits more scratch receivers while final HDD writes
 are in flight. The broker uses the estimated time remaining on independent
 destinations to decide when a slower worker can finish a whole batch.
-In the updated pair, the Radeon supplied seven members and the last group
-reached disk 1.49 s sooner than with the 4090 alone. All 16 group hashes
-matched the full-proof-checked references. A fresh 100-challenge sample
-validated 299 full proofs in the one-GPU fill and 292 in the two-GPU fill.
+Adding the Radeon reduced elapsed time by 0.97% in the first pair and
+5.69% when the order was reversed. Across both pairs the averages were
+3.36 s/member with the 4090 alone and 3.24 s/member with both GPUs.
+A background reference build overlapped the opening 13 seconds of the
+first two-GPU run. The reverse-order pair ran after that build finished.
+All 16 group hashes matched the full-proof-checked references. A fresh
+100-challenge sample validated 299 full proofs in the first one-GPU fill
+and 292 in the first two-GPU fill.
+
+#### An Intel Arc worker over Wi-Fi
+
+An Arc B580 worker generated the same k=28 member for a local SSD and
+for David. Its 2.4 GHz Wi-Fi link reported a transmit rate of 143.3 Mb/s.
+The worker had one GPU slot, an 8 GiB host RAM cap and a 10 GiB GPU RAM
+cap. Both owners published the same 1,002,434,213-byte file and matched
+its SHA-256. Verification ran after publication.
+
+| Storage owner | Worker processing | Worker sending | Launch to clean exit | Full proofs in 100 challenges |
+| --- | ---: | ---: | ---: | ---: |
+| Arc host, local SSD | 17.98 s | 1.27 s | 19.36 s | 110 |
+| David, direct Wi-Fi delivery | 16.29 s | 78.65 s | 95.48 s | 117 |
+
+The Wi-Fi transfer carried 1.058 GB of contribution data, averaging
+107.56 Mb/s over the worker's send interval. Even at the reported
+143.3 Mb/s radio rate, those bytes alone would take 59.04 s. During its
+busiest 12-second sample the wireless interface transmitted 116.05 Mb/s.
+
+David also filled the same 16 HDDs through a persistent broker with the Arc
+and the two wired GPUs enrolled. With a 4 GiB owner budget, the original
+controller ran all 48 members as singleton requests when the Arc was
+available. The RTX 4090 produced 44 members, the Radeon two and the Arc two.
+Only two destinations were active at once. Last publication took 349.13 s
+(7.27 s/member). With the Arc drained, five destinations were active and
+the two wired GPUs finished in 190.08 s (3.96 s/member). The Radeon
+received a late two-member joint encoding job after its first two deliveries
+had both been independently encoded batches.
 
 #### Shared compute over a dedicated Ethernet link
 

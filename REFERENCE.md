@@ -1818,17 +1818,22 @@ batches separately. Single-member contribution timings can help establish
 an independent pipeline's initial rate. For scratch construction, the
 owner can pipeline the members ready for one destination even when a joint
 batch fits. A cold pool opens enough scratch receivers to sample the
-offered worker slots. Further destinations keep their batches intact until
-the first delivery. After measuring the pipeline, it usually tries joint
-encoding with two members. When several destinations can each supply a full pipeline,
-the owner starts joint trials on intact batches up to the offered width.
+offered worker slots. When several destinations are ready, one can submit
+an independent batch to a capable GPU while another supplies ordinary
+members to a worker with a narrower output mode. Further destinations keep
+their batches intact until the first delivery. After measuring the pipeline,
+the owner usually tries joint encoding with two members. When several
+destinations can each supply a full pipeline, the owner starts joint
+trials on intact batches up to the offered width.
 Destinations share the trial.
 Before sending plot IDs, the owner checks the worker the broker assigned.
 If a calibration request queues while a measured independent pipeline is
 idle, the owner can withdraw the trial before it occupies either GPU.
 If another measured pipeline can deliver the whole batch sooner, the owner
-can request independent encoding. For an independent batch on a slower
-GPU, it can submit a prefix and the remaining members separately when the
+can request independent encoding. If a worker's first measured delivery
+was an independent batch, the owner can use its per-member time to price
+the first joint trial. For an independent batch on a slower GPU, the
+owner can submit a prefix and the remaining members separately when the
 two GPUs are predicted to finish earlier together. This comparison includes
 the expected time until the other GPU is free. Each new request keeps the
 original deadline. A worker whose current lease has outlasted its measured
@@ -1869,10 +1874,13 @@ The scheduler prioritizes the next batch that can start an idle output drive.
 Compatible worker slots and measured transfer rates limit concurrent receivers.
 When enough destinations are ready to keep the pool occupied, a compact
 in-memory receiver can request several packed members from a fast worker.
-The owner sizes these requests from measured packed deliveries. If all slots
-are busy with known packed requests, it can size queued work for the worker
-expected to deliver next. A cold pool starts with singletons when it has
-several slots.
+The owner sizes these requests from measured packed deliveries. Once a route
+has a measured packed delivery rate, a fresh HDD destination can queue one more
+RAM-backed receive within the memory and inflight limits. If a busy worker
+can deliver before an idle worker and another destination can feed the idle
+one, the owner sizes the batch for the earlier delivery. When all slots are
+busy, it can also size queued work for the next known delivery. A cold pool
+with several slots starts with singletons.
 Observed member sizes help it serve destinations with room before probing
 nearly full ones. A repeatedly deferred destination still gets a turn.
 

@@ -391,6 +391,14 @@ void planning_feedback()
         require(!assigned.repartition_contributions(slow_pair, now),
             "a measured faster joint delivery was displaced by the worker's old singleton cost");
 
+        Planning pipeline_only(1000);
+        train(pipeline_only, pipeline, route);
+        auto prior = slow_stream; prior.generation = {3600, 1800, 600, 300};
+        observe(pipeline_only, prior, route);
+        require(pipeline_only.repartition_contributions(slow_pair, now) == 2 &&
+            !pipeline_only.joint_contribution_members(18, 2, 2, now),
+            "a worker first measured in a pipeline took or repeatedly requested a slower joint trial");
+
         Planning queued(1000);
         train(queued, pipeline, route);
         require(!queued.defer_queued_joint(18, 2, 2, now) && queued.joint_contribution_members(18, 2, 3, now) == 2 &&
@@ -482,6 +490,10 @@ void planning_feedback()
     require(packed_width() == 3, "the faster packed route lost its batch or counted its CPU and GPU slots twice");
     auto active = resident.selected(fast_packed, route, now);
     require(packed_width() == 1, "an occupied fast worker assigned its full packed batch to a slower route");
+    auto queued_width = [&](Clock::time_point at)
+    { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 3, 2, 3, 1, at); };
+    require(queued_width(now) == 3 && queued_width(now + std::chrono::nanoseconds(2000)) == 1,
+        "an extra packed destination lost an earlier delivery or relied on an overdue worker");
     auto busy = resident.selected(slow_packed, route, now);
     require(packed_width() == 3, "a queued packed request lost the batch of the first predicted worker");
     require(resident.dispatch_width(18, 2, pool::Kind::GenerateAny, false, 3, 2, 2, 3, 1,
@@ -736,7 +748,8 @@ void independent_receivers()
     auto other_tls = pool_test::tls(ca, other_identity);
     pool::Listener other_peer({"127.0.0.1", 0}, other_tls);
     offer.endpoint = other_peer.endpoint(); offer.instance = pool::random_token();
-    pool::BrokerClient(broker.server.endpoint(), other_tls).register_worker(offer);
+    pool::BrokerClient other(broker.server.endpoint(), other_tls);
+    other.register_worker(offer);
     config.owner_id = "two-gpu-receivers";
     WorkerClient shared(config);
     require(shared.generation_capacity(18, 2).slots == 2 &&
@@ -744,6 +757,17 @@ void independent_receivers()
         shared.independent_contribution_width(18, 2, 3) == 2 && shared.independent_contribution_width(18, 2, 8) == 3 &&
         shared.independent_contribution_width(18, 2, 3, 2) == 3,
         "ordered batches must leave work for the second slot within the owner's admission limit");
+
+    other.unregister_worker(offer.instance);
+    offer.instance = pool::random_token(); offer.independent_k_mask = 0;
+    other.register_worker(offer);
+    config.owner_id = "mixed-output-receivers";
+    WorkerClient mixed(config);
+    require(mixed.generation_capacity(18, 2).slots == 2 &&
+        mixed.independent_contribution_width(18, 2, 3) == 1 &&
+        mixed.independent_contribution_width(18, 2, 3, 2) == 3 &&
+        mixed.independent_contribution_width(18, 2, 3) == 1,
+        "a singleton-only worker disabled another destination's capable GPU or received an incompatible batch");
 }
 
 void assigned_local_and_fencing()

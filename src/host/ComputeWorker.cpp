@@ -2422,7 +2422,7 @@ public:
             if (item.k != k || item.strength != strength || item.kind != pool::Kind::GenerateGpu) continue;
             auto const active = current(item.peer.worker);
             bool const busy = active->in_flight >= item.slots;
-            if (!busy && item.deferred_joint) deferred_single = std::max(deferred_single, item.rates[1].service);
+            if (!busy && item.deferred_joint) deferred_single = std::max(deferred_single, item.independent_cost(1));
             auto const& rate = item.pipeline_rate();
             if (rate.samples && std::pair(busy, rate.service) < pipeline)
             { pipeline = {busy, rate.service}; pipeline_worker = &item; }
@@ -2484,8 +2484,9 @@ public:
         if (selected == histories_.begin() + count_) return 0;
         unsigned const count = unsigned(task.work_units);
         auto const& joint = selected->rates[count];
-        auto const single = selected->rates[1].service, pipeline = selected->pipeline_rate().service;
-        // A first joint calibration gets the optimistic cost of one member.
+        auto const single = selected->independent_cost(1), pipeline = selected->pipeline_rate().service;
+        // Price a first joint trial as one member. A route first observed
+        // in an independent batch already has a per-member delivery cost.
         long double best = task.independent_members ? pipeline * count : joint.samples ? joint.service * count : single;
         if (!best) return 0;
         if (task.independent_members && now < other_work_until &&
@@ -2563,9 +2564,10 @@ public:
                 { next_finish = finish; next_rate = rate.service; }
             }
         }
-        // A request may enter an already busy pool. Size it for the
-        // first predicted delivery only while every occupied route is known.
-        if (!available && known) available = next_rate;
+        // Another packed destination can supply a singleton to the idle route.
+        // Size this batch for the busy worker if it can deliver first.
+        if (known && (!available || (!contributions && destinations > offered && next_finish < available)))
+            available = next_rate;
         // Keep the caller's ordinary width until the route set and the
         // worker likely to accept more work have both been measured.
         if (slots != offered || !available) return fallback;
@@ -2832,7 +2834,7 @@ struct WorkerClient::Impl
     mutable std::mutex planning_mutex;
     worker_detail::GenerationPlanning planning;
     struct CapacityHint { uint8_t k = 0, strength = 0; Clock::time_point expires{}; WorkerGenerationCapacity value; };
-    CapacityHint generation_capacity;
+    CapacityHint generation_capacity, independent_capacity;
     uint64_t data_connect_ns = 0;
     struct PendingMember
     {
@@ -3717,12 +3719,12 @@ WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t st
     return impl_->planning.estimate(k, strength, impl_->config.generation_kind, contributions, active, batch);
 }
 uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_bytes; }
-WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength) const
+WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength, bool independent) const
 {
     if (impl_->config.local_only) return {};
+    auto& hint = independent ? impl_->independent_capacity : impl_->generation_capacity;
     {
         std::lock_guard lock(impl_->planning_mutex);
-        auto const& hint = impl_->generation_capacity;
         if (hint.k == k && hint.strength == strength && Clock::now() < hint.expires) return hint.value;
     }
     WorkerGenerationCapacity result;
@@ -3740,13 +3742,14 @@ WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t st
         pool::Task prototype; prototype.compatibility = impl_->config.compatibility;
         prototype.kind = impl_->config.generation_kind; prototype.k = k; prototype.strength = strength;
         prototype.resources.cpu_threads = impl_->config.generation_threads;
+        prototype.independent_members = independent;
         auto const begin = Clock::now();
         result.batch = control.generation_hint(session, prototype, &result.slots, &result.availability, impl_->config.codec_compatibility);
         result.control_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count());
     }
     catch (std::exception const&) {} // An optional hint never owns the actual lease.
     std::lock_guard lock(impl_->planning_mutex);
-    impl_->generation_capacity = {k, strength, Clock::now() + std::chrono::seconds(1), result};
+    hint = {k, strength, Clock::now() + std::chrono::seconds(1), result};
     return result;
 }
 unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const
@@ -3785,7 +3788,13 @@ unsigned WorkerClient::independent_contribution_width(uint8_t k, uint8_t strengt
         impl_->config.local_only || impl_->config.generation_kind == pool::Kind::GenerateCpu) return 1;
     auto const hint = generation_capacity(k, strength);
     if (!hint.slots || !ready_members) return 1;
-    auto const width = std::max(1u, std::min(hint.availability.independent_batch, impl_->config.max_active_generation));
+    unsigned supported = hint.availability.independent_batch;
+    // Other ready destinations can supply ordinary work to a worker that
+    // cannot stream this batch. Ask what a compatible GPU can accept.
+    auto const needed = std::min({ready_members, impl_->config.max_active_generation, pool::max_generation_batch_members});
+    if (hint.slots > 1 && destinations > 1 && needed > std::max(1u, supported))
+        supported = std::max(supported, generation_capacity(k, strength, true).availability.independent_batch);
+    auto const width = std::max(1u, std::min(supported, impl_->config.max_active_generation));
     // A lone slot can combine ready callers from different destinations. Share
     // several slots among the ready destinations for this plot shape.
     if (hint.slots == 1) return width;

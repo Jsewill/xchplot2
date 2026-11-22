@@ -15875,15 +15875,20 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         total.execution_active, args.pool_inflight}));
                     // An admitted scratch receiver may be provisioning or flushing local runs.
                     // Keep a successor ready while the other destinations use their worker slots.
-                    bool const queue = offered_slots && contribution_members && d.pool_encoded &&
-                        args.io_overlap && args.generation_overlap && args.pool_inflight > 1 &&
-                        (!args.disk_io || !args.disk_io->status().pressured) &&
+                    bool const can_queue = offered_slots && args.io_overlap && args.generation_overlap &&
+                        args.pool_inflight > 1 && (!args.disk_io || !args.disk_io->status().pressured);
+                    bool const queue = can_queue && contribution_members && d.pool_encoded &&
                         receiving <= std::max(receivers, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
                             d.requested.params.get_k(), d.requested.params.get_strength())));
+                    // A fresh RAM-backed HDD group can queue its already budgeted
+                    // packed results once a route has a measured service rate.
+                    bool const packed_queue = can_queue && offered_slots > 1 && forecast.measured_slots &&
+                        receiving < args.pool_inflight && receiving <= receivers && devices[d.owner].rotating && d.engine->incremental &&
+                        !d.metrics.members && !d.needs_resume && !d.pool_encoded && args.member_storage == "compact";
                     // A cold pool needs one probe per available slot. Keep the
                     // next destination intact until the first delivery prices
                     // the route, then allow it to queue behind a busy worker.
-                    if (receiving >= receivers && (!queue || backend->acquire_pool_client()->probe_contribution_route(
+                    if (receiving >= receivers && !packed_queue && (!queue || backend->acquire_pool_client()->probe_contribution_route(
                         d.requested.params.get_k(), d.requested.params.get_strength())))
                     { blocked(ControllerWait::generation_order); continue; }
                     if (queue && total.execution_active > 1 && offered_slots > 1 && contribution_members > 1 && forecast.member_ns > 0)
