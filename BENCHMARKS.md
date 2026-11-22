@@ -1369,6 +1369,62 @@ the three-worker fill. Ten still got one packing thread. The wired pair
 took 165.37 s and all three took 175.08 s. The Arc delivered one member
 at 110.10 s, including 93.50 s of transfer.
 
+At `7eb35ba`, packers could use owner CPU threads while remote receivers
+waited for data. The wired pair took 146.55 and 150.38 s. The three-GPU
+fills took 172.43 and 198.19 s. In the slower fill, the penultimate
+group held the only remaining destination HDD as scratch. The owner
+recorded 10.81 s waiting for a storage lease after the other writers
+finished. The planner now checks for a spare spindle with enough space
+and bandwidth to free that destination. On a single scratch HDD it also
+starts writing back completed contribution segments during reception.
+
+All four hosts used `eb6a445` for the following comparisons. The scratch
+repeat reversed the order of the two- and three-GPU fills.
+
+| Owner RAM and construction | Wired pair, s/member | Wired pair and Arc, s/member |
+| --- | ---: | ---: |
+| 4 GiB, HDD scratch | 3.07 | 3.38 |
+| 4 GiB, HDD scratch, repeat | 3.24 | 3.69 |
+| 32 GiB, RAM assembly | 3.61 | 5.62 |
+
+The first matched 4 GiB runs show how a slow delivery can
+affect other groups. Both runs granted the same three scratch spindles
+to one group. With the wired pair it published at 38.17 s. With the
+Arc delivering one of its members it published at 112.61 s. The wired
+fill could reuse two of those spindles at 38.37 s. Two groups used a
+single scratch disk in the wired fill and seven did with all three GPUs.
+At 22.01 s in the three-GPU run, the existing grants left only one
+scratch spindle free for a three-member RTX batch. The Arc group's
+three scratch spindles remained reserved at that point.
+The 4090 spent 2.24 s/member between its first frame and completed
+delivery with the wired pair and 2.63 s/member with all three. These
+intervals include backpressure from the receiver. Five RTX batches sent
+identical bytes for the same destinations in both runs and went from
+multiple scratch disks to one. They averaged an extra 1.26 s/member in
+delivery. The owner receive callbacks took an extra 1.25 s/member.
+On the repeat, five matching batches averaged an extra 1.48 s/member
+in delivery and 1.42 s/member in those callbacks. Other work on the
+drives also changed between fills.
+
+Across the four scratch fills, the highest five-second rates were
+4.75 Gb/s received on David's 10 GbE interface and 1,103 MB/s written
+across the 16 HDDs. The independent sequential write test on those
+drives reached 3,328 MB/s. Plotting mixed reads and writes and could
+keep individual scratch spindles busy while other drives were idle.
+
+With 32 GiB, the owner assembled the groups in RAM. In a wired control
+at `9ca8b56`, it accepted 45 packed members and then tried streaming the
+last group preassembled from the Radeon. The RTX delivered its final
+members at 144.22 s, the Radeon finished at 198.46 s and the group was
+durable at 198.81 s (4.14 s/member). At `eb6a445` the owner used the
+measured packed route for all 48 members and published in 173.12 s
+(3.61 s/member), a 12.9% reduction in this comparison.
+
+With the Arc enrolled, its second packed member was assigned at about
+114.30 s. The owner reported delivery of the first at 114.75 s. The
+second arrived at 245.79 s and the last group published at 269.68 s.
+The two transfers used the same worker, route and batch size.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
