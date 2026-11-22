@@ -352,15 +352,6 @@ void write_manifest(std::string const& path, std::vector<BatchEntry> const& entr
 BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts);
 
-// Legacy bool-verbose shim kept for source-compat with older callsites.
-inline BatchResult run_batch(std::vector<BatchEntry> const& entries,
-                             bool verbose = false)
-{
-    BatchOptions opts;
-    opts.verbose = verbose;
-    return run_batch(entries, opts);
-}
-
 // Phase 2.4 auto-strategy picker. Heuristic:
 //   N == 1                              → WorkQueue
 //   smallest device VRAM < tiny peak    → PipelinePlot (work-queue won't fit)
