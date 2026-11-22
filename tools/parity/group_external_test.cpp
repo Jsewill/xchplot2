@@ -2387,6 +2387,10 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         auto const large = codec.encode(0, {}, 0, regions);
         auto cfg = config(); cfg.io_overlap = true; cfg.cpu_scheduler = std::make_shared<CodecScheduler>(cfg.workers);
         cfg.codec_bytes = ChunkCodec::estimate_work(18, large.size(), 0);
+        auto const input_bytes = ExternalEngine::contribution_input_memory_bytes(cfg, uint16_t(raw.size()));
+        cfg.workers = 1;
+        require(ExternalEngine::contribution_input_memory_bytes(cfg, uint16_t(raw.size())) > input_bytes,
+            "a single-writer destination did not budget for borrowed validation workers");
         require(ChunkCodec::estimate_work(18, window.front().size(), 0) <= cfg.codec_bytes / 4,
             "mixed-width contribution fixture cannot use two validation workers");
         ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();

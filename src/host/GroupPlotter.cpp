@@ -1343,7 +1343,8 @@ struct Producer
     size_t fill_contributions(group_grow::ExternalEngine::ContributionInput& input, uint16_t first,
         uint64_t other_retained, uint64_t admitted, std::string const& progress,
         std::atomic<bool> const* stopped = nullptr,
-        ScratchIo const& acquire_io = {}, unsigned destinations = 1)
+        ScratchIo const& acquire_io = {}, unsigned destinations = 1,
+        std::chrono::steady_clock::time_point other_work_until = {})
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         auto const begin = std::chrono::steady_clock::now();
@@ -1423,13 +1424,16 @@ struct Producer
                 else
                 {
                     unsigned const remaining = unsigned(input.size() - scheduled);
-                    // Only the first request in this pass gets the next free route's share.
-                    unsigned const dispatch = !probe && remaining > 1 && pending.empty() ?
+                    // When each destination can feed a complete pipeline, the
+                    // broker may keep this request for a busy, faster GPU. Split
+                    // for the actual lease instead of guessing which GPU gets it.
+                    bool const whole = destinations > 1 && width >= remaining;
+                    unsigned const dispatch = !probe && !whole && remaining > 1 && pending.empty() ?
                         client->independent_contribution_width(k, strength, remaining, destinations, true) : width;
                     unsigned const ready = std::min(dispatch, remaining);
                     unsigned joint = 1;
                     if (!probe && remaining > 1)
-                        joint = std::max(width, dispatch) > 1 ? client->joint_contribution_members(k, strength, ready) :
+                        joint = std::max(width, dispatch) > 1 ? client->joint_contribution_members(k, strength, ready, whole ? input.size() : 0) :
                             client->suggested_batch_members(k, strength, remaining);
                     uint16_t const count = uint16_t(joint ? joint : ready);
                     require(count && count <= remaining, "invalid pool batch recommendation");
@@ -1516,7 +1520,8 @@ struct Producer
                             {
                                 if (can_split)
                                 {
-                                    if (auto first = client->try_contributions(k, strength, ids, receive, cancel, task, receive_window, individual))
+                                    if (auto first = client->try_contributions(k, strength, ids, receive, cancel, task, receive_window,
+                                            individual, other_work_until))
                                         return first;
                                 }
                                 else client->contributions(k, strength, ids, receive, cancel, task, receive_window, {}, individual, coalesce_singletons);
@@ -3784,7 +3789,16 @@ struct DestinationPlan
     unsigned workers = 0;
     uint16_t batch = 0;
 };
-struct PackingGrant { size_t active = 0; uint64_t bytes = 0; };
+struct PackingGrant
+{
+    size_t active = 0;
+    uint64_t bytes = 0, publishing_bytes = 0;
+    bool can_recover(uint64_t budget, uint64_t fixed, uint64_t engines, uint64_t generation, bool after_publication) const
+    {
+        return group_grow::execution_singleton_fallback(budget, sum(fixed, bytes - (after_publication ? publishing_bytes : 0)),
+            engines, generation);
+    }
+};
 template<class Memory, class Cost>
 DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t generation,
     uint64_t member_bytes, size_t drive_groups, unsigned workers, uint16_t maximum,
@@ -13987,10 +14001,37 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         bool const owns_prefetch = !prefetched.members.empty() && prefetched.owner == d.owner;
         uint64_t const incoming_metadata = owns_prefetch ? prefetched.metadata_bytes : 0;
         uint64_t const other_held = held - (owns_prefetch ? prefetched.resident_bytes() : 0);
+        uint64_t fallback_held = other_held;
+        bool const can_stream = pooled_generation && !owns_prefetch && args.io_overlap && args.generation_overlap &&
+            args.member_storage == "compact" && args.pool_output != "packed" && !d.needs_resume && !d.needs_finish;
+        std::vector<bool> seen(writer_count, false);
+        size_t packing_writers = 0;
+        PackingGrant packing_grant;
+        bool only_packing = args.io_overlap;
+        if (args.io_overlap) for (auto const& other : destinations) if (!other->complete)
+        {
+            if (can_stream && other->pending && other->pending->contribution_input)
+                fallback_held -= other->pending->contribution_bytes;
+            bool const packing = other->scratch && devices[other->owner].rotating &&
+                (other->needs_finish || (other->pending && other->pending->packing()));
+            if (!packing) only_packing = false;
+            if (packing && pooled_generation && args.generation_overlap && other->packing_released_bytes &&
+                other->pending && other->pending->work == Work::finish)
+            {
+                ++packing_grant.active; packing_grant.bytes = sum(packing_grant.bytes, other->lease_bytes);
+                // A submitted final pack owns its writer and needs no more
+                // generation. An ordinary retry can wait for its publication.
+                if (other->ready.valid() && !other->successor)
+                    packing_grant.publishing_bytes = sum(packing_grant.publishing_bytes, other->lease_bytes);
+            }
+            if (packing && !seen[other->writer] && (other->engine || other.get() == &d))
+            { seen[other->writer] = true; ++packing_writers; }
+        }
         bool use_stream_input = false, input_required = false;
         // Keep fixed/held truthful through construction. Only the ordinary
         // generation view replaces the owner's old batch with its new prefix.
-        auto generation_fixed = [&] { return fixed - incoming_metadata; };
+        auto generation_fixed = [&](bool encoded = false)
+        { return fixed - incoming_metadata - (encoded && can_stream ? packing_grant.publishing_bytes : 0); };
         auto memory = [&](unsigned count, uint16_t batch)
         {
             auto options = args; options.workers = count;
@@ -14021,46 +14062,35 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             !d.needs_resume && !d.needs_finish && (d.scratch || (!d.guard && fresh_roots &&
                 (args.construction == "auto" || args.construction == "external")));
         if (input_allowed && needs_generation) (void)probe.fits_input(uint16_t(after_recovery), other_held);
-        auto admit_producer = [&](uint64_t workspace)
+        auto admit_producer = [&](uint64_t workspace, bool encoded = false)
         {
             if (!needs_generation) return true;
-            probe.fixed = sum(generation_fixed(), workspace);
+            probe.fixed = sum(generation_fixed(encoded), workspace);
             if (use_stream_input)
             {
                 if (!probe.fits_input(uint16_t(after_recovery), other_held)) return false;
                 generation = std::max(probe.input_peak(uint16_t(after_recovery)), backend->retained());
                 return true;
             }
-            bool borrowed = probe.can_borrow(sum(other_held, recovery_prefix));
-            if (!probe.fits(d.saved.old_members, other_held, borrowed && minimum == 1))
+            // A streamed receiver checks all its live buffers separately.
+            // Its ordinary fallback can wait for peer contributions to drain.
+            auto const retained = encoded ? fallback_held : other_held;
+            bool borrowed = probe.can_borrow(sum(retained, recovery_prefix));
+            if (!probe.fits(d.saved.old_members, retained, borrowed && minimum == 1))
             {
-                if (minimum != 1 || borrowed || !probe.can_borrow(sum(other_held, recovery_prefix)) ||
-                    !probe.fits(d.saved.old_members, other_held, true)) return false;
+                if (minimum != 1 || borrowed || !probe.can_borrow(sum(retained, recovery_prefix)) ||
+                    !probe.fits(d.saved.old_members, retained, true)) return false;
                 borrowed = true;
             }
             generation = std::max(probe.next_peak(d.saved.old_members, borrowed), backend->retained());
             return true;
         };
-        if (!admit_producer(floor))
+        if (!admit_producer(floor, d.scratch || (fresh_roots && !d.guard &&
+                (args.construction == "auto" || args.construction == "external"))))
         {
             if (!input_allowed) return blocked(ControllerWait::producer_memory);
             use_stream_input = input_required = true;
             if (!admit_producer(memory(1, minimum))) return blocked(ControllerWait::producer_memory);
-        }
-        std::vector<bool> seen(writer_count, false);
-        size_t packing_writers = 0;
-        PackingGrant packing_grant;
-        bool only_packing = args.io_overlap;
-        if (args.io_overlap) for (auto const& other : destinations) if (!other->complete)
-        {
-            bool const packing = other->scratch && devices[other->owner].rotating &&
-                (other->needs_finish || (other->pending && other->pending->packing()));
-            if (!packing) only_packing = false;
-            if (packing && pooled_generation && args.generation_overlap && other->packing_released_bytes &&
-                other->pending && other->pending->work == Work::finish)
-            { ++packing_grant.active; packing_grant.bytes = sum(packing_grant.bytes, other->lease_bytes); }
-            if (packing && !seen[other->writer] && (other->engine || other.get() == &d))
-            { seen[other->writer] = true; ++packing_writers; }
         }
         // A remote receiver can progress even when its final output shares
         // a writer. Count independent physical writers for local generation.
@@ -14082,19 +14112,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 (pooled_generation && args.construction == "incremental"));
         size_t startup_receivers = receiving_lanes, startup_writers = packing_writers;
         bool const pipeline_hdd = fresh_hdd && (pooled_generation || backend->generation_overlap);
-        if (pipeline_hdd)
+        auto size_pipeline = [&](bool external)
         {
             startup_receivers = 1;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             if (pooled_generation)
             {
                 unsigned const limit = unsigned(std::min(unfinished_groups, receiving_lanes));
-                bool const external = d.scratch || args.construction == "external";
                 auto const forecast = generation_estimate(d, external, initial_pool_output(external, 1), limit, maximum);
                 unsigned slots = backend->pool_receivers(d.requested, forecast);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit);
-                if ((d.scratch || args.construction == "external") && !args.pool_writers)
+                if (external && !args.pool_writers)
                     slots = std::max(slots, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
                         d.requested.params.get_k(), d.requested.params.get_strength(), maximum, std::min(slots, limit))));
                 startup_receivers = std::clamp(slots, 1u, limit);
@@ -14107,7 +14136,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 [](auto const& writer) { return writer && writer->busy(); });
             if (args.io_overlap && args.generation_overlap)
                 startup_writers = std::min(writer_count, std::max({startup_receivers, writing, packing_writers}));
-        }
+        };
+        if (pipeline_hdd) size_pipeline(d.scratch || args.construction == "external");
         bool const pooled_hdd = pipeline_hdd && pooled_generation && args.io_overlap && args.generation_overlap &&
             args.member_storage == "compact" && !d.metrics.members && !d.needs_resume && !d.needs_finish;
         group_grow::PoolPublicationHistory::Shape const pool_shape{unsigned(d.requested.params.get_k()),
@@ -14145,7 +14175,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto independent_input = [&]
         {
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-            return pooled_generation && d.scratch && args.member_storage == "compact" && !owns_prefetch &&
+            return pooled_generation && args.member_storage == "compact" && !owns_prefetch &&
                 !d.needs_resume && !d.needs_finish && args.pool_output != "packed" &&
                 (!tune_pool || pool_choice(true).encoded) &&
                 backend->acquire_pool_client()->independent_contribution_width(
@@ -14209,6 +14239,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return projected.known ? projected.completion : std::numeric_limits<long double>::infinity();
         };
         auto neutral = [](size_t count, unsigned, uint16_t) { return 1.0L / count; };
+        auto recovery_cost = [&](uint64_t reserved, bool encoded, size_t active, unsigned grant, uint16_t batch)
+        {
+            auto const engines = product(active - packing_grant.active, memory(grant, batch));
+            return packing_grant.can_recover(args.max_ram, reserved, engines, generation, encoded && can_stream) ?
+                neutral(active, grant, batch) : std::numeric_limits<long double>::infinity();
+        };
         auto select_plan = [&](uint64_t reserved)
         {
             size_t groups = unfinished_groups, receivers = startup_receivers, writers = startup_writers;
@@ -14236,18 +14272,22 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 // fallback below sizes its resident batch independently, so a
                 // streamed batch can span more members than fit in owner RAM.
                 auto const limit = uint16_t(std::min<size_t>(maximum, group_grow::ExternalEngine::max_runs));
-                auto const recoverable = independent_input() ? limit : admitted_batch_cap(limit, minimum,
+                bool const independent = independent_input();
+                auto const recoverable = independent ? limit : admitted_batch_cap(limit, minimum,
                     args.max_ram - reserved - generation, storage, [&](uint16_t count) { return memory(1, count); });
                 if (recoverable >= plan.batch)
                 {
                     auto cfg = configuration(args, d.metrics.capacity_bytes, reserved, cpu_scheduler, backend->remote_encoder());
                     auto receive = [&](unsigned grant, uint16_t count)
                     {
+                        cfg.workers = grant;
                         bool const packed = tune_pool && !pool_choice(bool(d.scratch)).encoded;
                         return sum(memory(grant, count), packed ? probe.packed_input_bytes(cfg, count) : probe.contribution_bytes(cfg, count));
                     };
-                    auto streams = destination_plan(args.max_ram, reserved, generation, 0, groups,
-                        workers, recoverable, plan.batch, receive, neutral, receivers, writers, false, packing_grant);
+                    auto recover = [&](size_t active, unsigned grant, uint16_t batch)
+                    { return recovery_cost(reserved, independent, active, grant, batch); };
+                    auto streams = destination_plan(args.max_ram, reserved, backend->retained(), 0, groups,
+                        workers, recoverable, plan.batch, receive, recover, receivers, writers, false, packing_grant);
                     if (streams.active > plan.active || (streams.active == plan.active && streams.batch > plan.batch)) plan = streams;
                 }
             }
@@ -14276,7 +14316,24 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return plan;
         };
         auto plan = select_plan(shared_fixed);
-        if (!plan.active || (pooled_generation && fresh_hdd && active >= plan.active)) return false;
+        if (!plan.active) return false;
+        // A partial in-memory plan can switch to scratch. Price its bounded
+        // receivers before comparing the active writers with that plan.
+        bool const request_scratch = fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) &&
+            !d.guard && !d.scratch && (args.construction == "external" ||
+                (args.construction == "auto" && (input_required || plan.batch < d.maximum)));
+        size_t scratch_lanes = plan.active;
+        if (request_scratch && pooled_hdd && !farming_pressure && independent_input())
+        {
+            if (args.construction == "auto") size_pipeline(true);
+            size_t const lanes = tune_pool ? pool_choice(true).width : startup_receivers + startup_writers;
+            auto recover = [&](size_t active, unsigned grant, uint16_t batch)
+            { return recovery_cost(shared_fixed, true, active, grant, batch); };
+            auto const streams = destination_plan(args.max_ram, shared_fixed, backend->retained(), 0,
+                unfinished_groups, workers, maximum, minimum, memory, recover, lanes, 0, false, packing_grant);
+            scratch_lanes = std::max(scratch_lanes, streams.active);
+        }
+        if (pooled_generation && fresh_hdd && active >= scratch_lanes) return false;
         if (d.deferred_output)
         {
             // A queued farming output can take over a scratch spindle after
@@ -14294,11 +14351,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
         // Saved roots only recover their existing jobs. Fresh roots come from
         // explicit directories and the enabled destination policy.
-        if (fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) && !d.guard && !d.scratch && plan.active &&
-            (args.construction == "external" || (args.construction == "auto" && (input_required || plan.batch < d.maximum))))
+        if (request_scratch)
         {
             auto open_slots = [&](size_t lanes) { return lanes - std::min(lanes - 1, active); };
-            size_t const initial_slots = open_slots(plan.active);
+            size_t const initial_slots = open_slots(scratch_lanes);
             size_t scratch_slots = initial_slots;
             DestinationPlan first_external;
             long double first_cost = std::numeric_limits<long double>::infinity();
@@ -14325,7 +14381,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 DestinationPlan external_plan;
                 if (d.scratch)
                 {
-                    bool const admitted = admit_producer(memory(1, minimum));
+                    bool const admitted = admit_producer(memory(1, minimum), independent_input());
                     if (!admitted && input_allowed && !input_required && scratch_slots == initial_slots)
                     {
                         use_stream_input = true;
@@ -14366,6 +14422,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     (void)defer();
                     if (args.construction == "external" || input_required)
                     { d.output_capacity_rejected = capacity_rejected; return false; }
+                    if (pooled_hdd) size_pipeline(false);
                 }
                 break;
             }
@@ -14461,18 +14518,19 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         total.execution_estimate = use_stream_input ? group_grow::ExecutionEstimate{} :
             estimate(plan.active, plan.workers, plan.batch);
         unsigned const share = plan.workers;
-        if (!admit_producer(memory(share, minimum))) return defer();
+        bool const checked_contributions = d.scratch && independent_input();
+        auto const generation_held = checked_contributions ? fallback_held : other_held;
+        if (!admit_producer(memory(share, minimum), checked_contributions)) return defer();
         if (fixed >= args.max_ram) return defer();
-        uint64_t const available = args.max_ram - generation_fixed();
-        if (other_held > available || generation > available - other_held) return defer();
-        bool const checked_contributions = independent_input();
+        uint64_t const available = args.max_ram - generation_fixed(checked_contributions);
+        if (generation_held > available || generation > available - generation_held) return defer();
         uint64_t const resident_member = use_stream_input || checked_contributions ? 0 : storage;
         uint16_t const batch = admitted_batch_cap(std::min(maximum, plan.batch), minimum,
-            available - other_held - generation, resident_member,
+            available - generation_held - generation, resident_member,
             [&](uint16_t n) { return memory(share, n); });
         if (!batch) return defer();
         uint64_t const lease = memory(share, batch);
-        if (!admit_producer(lease)) return defer();
+        if (!admit_producer(lease, checked_contributions)) return defer();
         if (sum(sum(sum(fixed, lease), held), backend->retained()) > args.max_ram) return defer();
         auto const host = available_host_bytes();
         uint64_t const growth = generation > backend->retained() ? generation - backend->retained() : 0;
@@ -14494,22 +14552,26 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (farm && histories.memory_bytes() > history_before) ++history_contexts;
         fixed = sum(fixed, histories.memory_bytes() - history_before);
         auto generation_peak = [&](uint64_t workspace)
-        { return sum(sum(sum(generation_fixed(), workspace), sum(other_held, product(batch - 1, resident_member))), generation); };
+        { return sum(sum(sum(generation_fixed(checked_contributions), workspace), sum(generation_held, product(batch - 1, resident_member))), generation); };
         auto transfer_peak = [&](uint64_t workspace)
         { return sum(sum(sum(fixed, workspace), held), backend->retained()); };
         if (std::max(generation_peak(memory(share, batch)), transfer_peak(memory(share, batch))) > args.max_ram) return defer();
         // Preserve every compact-input owner's ordinary singleton fallback
-        // when a later peer needs a different engine envelope. Queued member
-        // payloads may drain first, but all engine workspaces remain resident.
+        // when a later peer needs a different engine envelope. Live
+        // transfers still charge every packer until its lease is released.
         bool preserve_fallback = use_stream_input && !input_required;
         uint64_t fallback_generation = generation;
-        for (auto const& other : destinations) if (other->engine && other->stream_input_bytes && !other->stream_input_required)
+        for (auto const& other : destinations) if (other->engine &&
+            ((other->stream_input_bytes && !other->stream_input_required) ||
+                (pooled_generation && other->scratch && other->pool_encoded && !other->needs_finish && other->metrics.members < other->maximum)))
         {
             preserve_fallback = true;
             fallback_generation = std::max(fallback_generation, backend->generation_peak(other->requested, args));
         }
-        if (preserve_fallback && !group_grow::execution_singleton_fallback(args.max_ram, generation_fixed(),
-            memory(share, batch), fallback_generation)) return defer();
+        auto fits_fallback = [&](uint64_t workspace)
+        { return !preserve_fallback || group_grow::execution_singleton_fallback(args.max_ram,
+            generation_fixed(checked_contributions), workspace, fallback_generation); };
+        if (!fits_fallback(memory(share, batch))) return defer();
         bool const initial_encoded = initial_pool_output(!pooled_hdd || d.scratch, startup_receivers);
         auto const choice = tune_pool ? pool_choice(bool(d.scratch)) : group_grow::PoolPublicationHistory::Choice{1, initial_encoded, false};
         auto& publications = pool_publications[bool(d.scratch)];
@@ -14532,8 +14594,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const peak = std::max(generation_peak(actual), transfer_peak(actual));
         require(peak <= args.max_ram,
             "active destination workspace exceeds --max-ram");
-        require(!preserve_fallback || group_grow::execution_singleton_fallback(args.max_ram,
-            generation_fixed(), actual, fallback_generation), "active destination consumed compact-input fallback headroom");
+        require(fits_fallback(actual), "active destination consumed compact-input fallback headroom");
         engine->confirm_identity(true);
         d.engine = std::move(engine); d.batch_cap = batch;
         d.fresh_declined = d.packed_declined = false;
@@ -15753,14 +15814,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             // destinations. Scratch contributions use their own checked window.
             size_t const contribution_members = backend->mode == "pool" && d.engine->external &&
                 !d.needs_resume && !has_prefetched && !select_merged ? wanted : 0;
+#else
+            constexpr size_t contribution_members = 0;
 #endif
             bool borrowed = !streamed && wanted && producer.can_borrow(held);
+            bool ordinary_fits = true;
             if (wanted && !has_prefetched && !(streamed ? producer.fits_input(first, held) : producer.fits(first, held, borrowed)))
             {
-                if (borrowed || !producer.can_borrow(held) || !producer.fits(first, held, true))
-                { blocked(ControllerWait::producer_memory); continue; }
-                borrowed = true;
+                if (!borrowed && producer.can_borrow(held) && producer.fits(first, held, true)) borrowed = true;
+                else ordinary_fits = false;
             }
+            if (!ordinary_fits && (!contribution_members || !d.pool_encoded))
+            { blocked(ControllerWait::producer_memory); continue; }
             if (!streamed && !d.needs_resume && wanted && (!has_prefetched || prefetched.first))
             {
                 uint64_t const generation = producer.next_peak(first, borrowed);
@@ -15780,6 +15845,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             unsigned generation_destinations = 1;
+            std::chrono::steady_clock::time_point other_work_until{};
             if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
             {
                 // A writer can continue packing while another drive receives.
@@ -15814,7 +15880,27 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         (!args.disk_io || !args.disk_io->status().pressured) &&
                         receiving <= std::max(receivers, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
                             d.requested.params.get_k(), d.requested.params.get_strength())));
-                    if (receiving >= receivers && !queue) { blocked(ControllerWait::generation_order); continue; }
+                    // A cold pool needs one probe per available slot. Keep the
+                    // next destination intact until the first delivery prices
+                    // the route, then allow it to queue behind a busy worker.
+                    if (receiving >= receivers && (!queue || backend->acquire_pool_client()->probe_contribution_route(
+                        d.requested.params.get_k(), d.requested.params.get_strength())))
+                    { blocked(ControllerWait::generation_order); continue; }
+                    if (queue && total.execution_active > 1 && offered_slots > 1 && contribution_members > 1 && forecast.member_ns > 0)
+                    {
+                        // Queued leases omit destinations still waiting for their HDDs.
+                        // Count fresh groups with enough planned capacity for the full
+                        // output. Running receivers and tight capacity probes do not count.
+                        uint64_t future = 0;
+                        for (auto const& other : destinations)
+                            if (other->writer != d.writer && !other->complete && !other->pending && !other->guard &&
+                                !other->needs_resume && !other->needs_finish && !other->metrics.members &&
+                                other->maximum && !other->awaiting_extent && !other->output_capacity_rejected && same_shape(other) &&
+                                canonical_bound(other->requested, other->maximum) <= other->capacity_limit)
+                                future = sum(future, other->maximum);
+                        auto const ns = std::min<long double>(future * forecast.member_ns, args.pool_timeout_ms * 1000000.L);
+                        other_work_until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(int64_t(ns));
+                    }
                 }
             }
 #endif
@@ -15896,7 +15982,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     io.reset();
                     auto* const pending = &task;
                     uint64_t const reserved = fixed;
-                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved, generation_destinations]
+                    task.generating = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, pending, first, other_held, bytes, reserved, generation_destinations, other_work_until]
                     {
                         Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved};
                         producer.defer_pool_history = true;
@@ -15906,7 +15992,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             producer.fill_pool_input(*pending->prepared_input, first, other_held, bytes, &pending->cancel_generation, acquire_io) :
                             producer.fill_contributions(*pending->contribution_input, first,
                             other_held, bytes, file_io::path_text(d.path) + ": generating compressed pool member ",
-                            &pending->cancel_generation, acquire_io, generation_destinations);
+                            &pending->cancel_generation, acquire_io, generation_destinations, other_work_until);
                         return Task::Generated{generated, producer.peak, producer.generation_peak,
                             producer.pool_elapsed_ns, producer.fill_stop};
                     });
@@ -15916,6 +16002,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 }
                 if (task.contribution_input || task.prepared_input)
                 { scheduled_generation(index); break; }
+                if (!ordinary_fits) { d.pending.reset(); blocked(ControllerWait::producer_memory); continue; }
             }
             if (backend->mode == "pool" && wanted && task.members.empty())
             {

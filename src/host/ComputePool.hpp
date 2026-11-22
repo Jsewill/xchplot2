@@ -253,7 +253,8 @@ public:
     void disconnect_idle();
     OwnerSession open_owner(std::string const& owner_id, bool ephemeral = false);
     void close_owner(OwnerSession const&);
-    std::optional<Lease> acquire(OwnerSession const&, Task const&);
+    std::optional<Lease> acquire(OwnerSession const&, Task const&,
+        std::chrono::steady_clock::time_point other_work_until = {});
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
     struct GenerationAvailability

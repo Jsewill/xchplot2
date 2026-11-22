@@ -2405,7 +2405,7 @@ public:
         });
     }
     unsigned joint_contribution_members(uint8_t k, uint8_t strength, unsigned maximum_members,
-                                        Clock::time_point now = Clock::now())
+                                        Clock::time_point now = Clock::now(), unsigned destination_batch = 0)
     {
         maximum_members = std::min(maximum_members, unsigned(pool::max_generation_batch_members));
         if (maximum_members < 2) return 0;
@@ -2437,15 +2437,15 @@ public:
             if (rank < joint) { joint = rank; joint_members = members; encoder = &item; }
         }
         if (!measured_pipeline) return 0;
-        // Start with the smallest unmeasured joint width that can compete
-        // with the pipeline. Destinations share each outstanding trial.
-        if (!trial_pending)
+        // Probe a pair first unless independent destinations can each feed
+        // a whole pipeline. Destinations share each outstanding trial.
+        if (!trial_pending && (!destination_batch || destination_batch == maximum_members))
         {
             auto unmeasured = [&](unsigned n) { return !sampled[n] && deferred_single <= pipeline.second * n; };
             unsigned trial = 0;
-            if (!pipeline.first && unmeasured(2)) trial = 2;
+            if (!destination_batch && !pipeline.first && unmeasured(2)) trial = 2;
             else if (!pipeline.first && unmeasured(maximum_members)) trial = maximum_members;
-            else if (encoder && !joint.first && encoder->plan.batch > 1 && encoder->plan.batch < maximum_members &&
+            else if (!destination_batch && encoder && !joint.first && encoder->plan.batch > 1 && encoder->plan.batch < maximum_members &&
                 unmeasured(encoder->plan.batch)) trial = encoder->plan.batch;
             if (trial)
             {
@@ -2472,7 +2472,8 @@ public:
         // delay every destination while the same joint encoder is occupied.
         return trial && available;
     }
-    unsigned repartition_contributions(WorkerTaskObservation const& task, Clock::time_point now = Clock::now())
+    unsigned repartition_contributions(WorkerTaskObservation const& task, Clock::time_point now = Clock::now(),
+                                       Clock::time_point other_work_until = {})
     {
         if (task.kind != pool::Kind::GenerateGpu || !task.contributions || task.work_units < 2 ||
             task.work_units > pool::max_generation_batch_members || !valid(task, {})) return 0;
@@ -2487,6 +2488,8 @@ public:
         // A first joint calibration gets the optimistic cost of one member.
         long double best = task.independent_members ? pipeline * count : joint.samples ? joint.service * count : single;
         if (!best) return 0;
+        if (task.independent_members && now < other_work_until &&
+            best <= std::chrono::duration<long double, std::nano>(other_work_until - now).count()) return 0;
         unsigned first = 0;
         for (auto const& other : std::span(histories_).first(count_))
         {
@@ -3115,7 +3118,7 @@ struct WorkerClient::Impl
             state = task_states.acquire(identity, session.token);
             task.sequence = state->sequence; task.attempt = std::max(identity.attempt, state->next_attempt);
             require(task.attempt < UINT64_MAX, "compute task attempt exhausted"); state->next_attempt = task.attempt + 1;
-            submitted = true; lease = control.acquire(session, task);
+            submitted = true; lease = control.acquire(session, task, options.other_work_until);
         };
         try
         {
@@ -3138,7 +3141,7 @@ struct WorkerClient::Impl
                     next_hint = Clock::now() + std::chrono::seconds(1);
                 }
                 cancel.check(); std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                try { lease = control.acquire(session, task); }
+                try { lease = control.acquire(session, task, options.other_work_until); }
                 catch (pool::StaleOwnerSession const&) { submit(true); }
             }
             cancel.check();
@@ -3574,11 +3577,12 @@ void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::arr
 }
 unsigned WorkerClient::try_contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
-    WorkerContributionWindowSink const& window, bool independent)
+    WorkerContributionWindowSink const& window, bool independent, Clock::time_point other_work_until)
 {
     require(ids.size() > 1 && window, "adaptive encoding requires a multi-member contribution receiver");
     unsigned first = 0;
     WorkerTaskOptions options;
+    if (independent) options.other_work_until = other_work_until;
     if (!independent) options.queued_generation = [&](unsigned width)
     {
         if (width < ids.size()) return true;
@@ -3590,7 +3594,7 @@ unsigned WorkerClient::try_contributions(uint8_t k, uint8_t strength, std::span<
     {
         if (generation_capacity(k, strength).slots < 2) return true;
         std::lock_guard lock(impl_->planning_mutex);
-        first = impl_->planning.repartition_contributions(selected);
+        first = impl_->planning.repartition_contributions(selected, Clock::now(), options.other_work_until);
         return !first;
     };
     try { impl_->generate(k, strength, ids, {}, sink, cancel, std::move(identity), window, {}, independent, false, options); }
@@ -3799,11 +3803,13 @@ bool WorkerClient::probe_contribution_route(uint8_t k, uint8_t strength) const
     std::lock_guard lock(impl_->planning_mutex);
     return impl_->planning.probe_contribution_route(k, strength);
 }
-unsigned WorkerClient::joint_contribution_members(uint8_t k, uint8_t strength, unsigned ready_members) const
+unsigned WorkerClient::joint_contribution_members(uint8_t k, uint8_t strength, unsigned ready_members, unsigned destination_batch) const
 {
     auto const hint = generation_capacity(k, strength);
+    auto const available = std::min(ready_members, unsigned(hint.batch));
     std::lock_guard lock(impl_->planning_mutex);
-    return impl_->planning.joint_contribution_members(k, strength, std::min(ready_members, unsigned(hint.batch)));
+    return impl_->planning.joint_contribution_members(k, strength, available, Clock::now(),
+        destination_batch == ready_members ? available : destination_batch);
 }
 unsigned WorkerClient::suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const
 {

@@ -1034,54 +1034,59 @@ private:
         uint64_t const range = range_per_chunk();
         uint64_t const start = ordinal * range;
         uint64_t const end = start + uint64_t(members) * range;
+        uint32_t const width = k_ - 8;
+        uint64_t const mask = (1ull << width) - 1, modulus = 178ull << width;
         uint64_t previous = start;
         uint64_t first = 0;
         size_t first_bits = 0;
-        uint64_t region = 0;
+        uint64_t region_end = start + range;
         if (boundaries) boundaries->push_back(fragments->size());
         for (size_t i = 0; i < count; ++i)
         {
             uint8_t const symbol = high_.data[begin + i];
             group_tools::require(symbol < 178, "invalid group high symbol");
             auto [word, available] = peek();
-            uint32_t const width = k_ - 8;
             group_tools::require(available >= width, "truncated group low bits");
-            uint64_t const remainder = (uint64_t(symbol) << width) | (word & ((1ull << width) - 1));
+            uint64_t const remainder = (uint64_t(symbol) << width) | (word & mask);
             word >>= width;
             available -= width;
-            bit_count += width;
-            uint64_t quotient = 0;
-            for (;;)
+            uint32_t quotient = std::countr_one(word);
+            if (quotient < available)
+                bit_count += width + quotient + 1;
+            else
             {
-                // As in upstream BitReader, scan a whole unary field at once.
-                // Padding outside the input cannot act as its terminating zero.
-                uint32_t const ones = std::min(uint32_t(std::countr_one(word)), available);
-                quotient += ones;
-                bit_count += ones;
-                group_tools::require(quotient + 1 + k_ - 8 <= 64, "invalid group unary field");
-                if (ones < available) { ++bit_count; break; }
-                auto const next = peek();
-                word = next.first;
-                available = next.second;
+                // A field can cross a loaded word. Padding beyond the input
+                // cannot supply its terminating zero.
+                quotient = available;
+                bit_count += width + available;
+                for (;;)
+                {
+                    auto const next = peek();
+                    auto const ones = std::min(uint32_t(std::countr_one(next.first)), next.second);
+                    quotient += ones; bit_count += ones;
+                    group_tools::require(width + quotient + 1 <= 64, "invalid group unary field");
+                    if (ones < next.second) { ++bit_count; break; }
+                }
             }
-            uint64_t const delta = quotient * (178ull << (k_ - 8)) + remainder;
+            uint64_t const delta = quotient * modulus + remainder;
             group_tools::require(delta < end - previous && (i == 0 || delta != 0),
                                  "out-of-range or duplicate group delta");
             previous += delta;
             if (!i) { first = previous; first_bits = bit_count; }
-            uint64_t const member = (previous - start) / range;
-            group_tools::require(member == region || (i != 0 && member == region + 1),
-                                 "group member chunk is empty");
+            if (previous >= region_end)
+            {
+                group_tools::require(i != 0 && previous - region_end < range, "group member chunk is empty");
+                region_end += range;
+                if (boundaries) boundaries->push_back(fragments->size());
+            }
             if (fragments)
             {
-                if (member != region) boundaries->push_back(fragments->size());
                 group_tools::require(fragments->size() < fragments->capacity(), "decoded group exceeds fragment workspace");
-                fragments->push_back(previous - member * range);
+                fragments->push_back(start + (previous - (region_end - range)));
             }
             if (visit) (*visit)(previous);
-            region = member;
         }
-        group_tools::require(region + 1 == members, "group member chunk is empty");
+        group_tools::require(region_end == end, "group member chunk is empty");
         size_t const low_size = bytes_for_bits(bit_count);
         if (bit_count & 7)
             group_tools::require((low[low_size - 1] >> (bit_count & 7)) == 0,

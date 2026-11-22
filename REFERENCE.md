@@ -752,6 +752,9 @@ Before timing data are available, automatic construction tries to keep a
 complete fresh HDD group in RAM when the batch limit permits. It sizes the
 initial set of destinations using available generator slots and allows
 another group to receive members while an independent HDD is writing.
+If the complete group needs scratch, it recalculates the receiver count
+for encoded input before dividing the scratch HDDs among writers. One GPU
+can supply several destinations through independent member requests.
 Once an external group has sealed its scratch runs and released its staging
 memory, the pooled planner charges its remaining packing workspace. It can
 admit another receiver if that workspace and the new job fit together.
@@ -764,12 +767,18 @@ active groups under the temporary-space policy. External construction
 stripes runs across eligible scratch HDDs using the available
 bandwidth. When writers are running together, it keeps a queued destination
 free if the remaining scratch drives have enough space for the grant and
-bandwidth to feed the writer.
+bandwidth to feed the writer. When one group replaces another, the planner
+includes the drives already in use when dividing scratch bandwidth. This
+leaves bandwidth for the following writer when enough space is available.
 If the packer's RAM requirements reduce how many groups can run
 together, the planner can give their freed scratch bandwidth to the groups
-that fit. With shared compute, another group can receive compressed
-contributions directly to scratch during a final pack. Its receive buffers
-and the workspace for ordinary recovery must fit the RAM budget.
+that fit. With shared compute, groups can receive compressed contributions
+directly to scratch while other groups pack. The planner budgets the live
+receivers and packers together and checks that one ordinary member can be
+regenerated after the receivers drain. An ordinary retry can also wait for
+a running final HDD pack to publish and release its workspace. Incoming
+chunks can use idle threads from the shared codec pool within the
+destination's validation memory budget.
 After the scratch is released, the same disk can take its turn
 writing a final plot. The planner rechecks free space above `--leave-free`
 at that handoff. Saved scratch grants and the farming limits still apply.
@@ -1808,8 +1817,12 @@ the work ready across destinations. It tracks pipelined and jointly encoded
 batches separately. Single-member contribution timings can help establish
 an independent pipeline's initial rate. For scratch construction, the
 owner can pipeline the members ready for one destination even when a joint
-batch fits. After measuring the pipeline, it starts joint encoding trials
-with two members when that width fits. Destinations share the trial.
+batch fits. A cold pool opens enough scratch receivers to sample the
+offered worker slots. Further destinations keep their batches intact until
+the first delivery. After measuring the pipeline, it usually tries joint
+encoding with two members. When several destinations can each supply a full pipeline,
+the owner starts joint trials on intact batches up to the offered width.
+Destinations share the trial.
 Before sending plot IDs, the owner checks the worker the broker assigned.
 If a calibration request queues while a measured independent pipeline is
 idle, the owner can withdraw the trial before it occupies either GPU.
@@ -1831,15 +1844,24 @@ For CPU and GPU generation, the broker measures service from worker selection
 through delivery, including connection setup. It uses measured deliveries at
 the requested batch size when available. It can wait for a busy worker
 if it can finish the owner's whole ready queue before an idle worker would deliver
-its first job. Each job must still start within its admission deadline.
+the waiting job. If a wide batch should wait, the broker checks whether the
+idle worker can help by taking a later, shorter job. The wide batch keeps
+its queue position. Each job must still start within its admission deadline.
+During a multi-destination scratch fill the owner can also forecast generation
+for fresh groups with enough planned output space. A compatible idle GPU can
+take a whole independent batch if its measured delivery fits inside that
+interval. The forecast expires as time passes. Older brokers continue to
+schedule from their submitted queue.
 If a pipeline runs past its average, the broker can wait up to the longest
 delivery it observed at that width. For a late GPU singleton or independent
 pipeline, the next larger independent batch measured on the same worker can
 also bound the wait.
 With at least three deliveries at the exact width, it can wait one observed
 range of variation beyond the longest sample if the busy worker can still
-finish the ready queue sooner. An overdue ordinary GPU batch can wait for
-one measured singleton delivery beyond its expected finish.
+finish the ready queue sooner. An overdue GPU batch can have up to one
+measured singleton delivery beyond its expected finish. For independently
+streamed members, the broker uses that allowance when the waiting job
+would commit another whole batch to the slower worker.
 A larger backlog, a competing owner, an unmeasured route, or a job running
 past its observed range lets an idle compatible worker take work immediately.
 

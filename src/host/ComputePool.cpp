@@ -37,7 +37,7 @@ using Clock = std::chrono::steady_clock;
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, AcquireTimed, RegisterIndependent, GenerationAvailability, AcquireGenerationTimed };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, AcquireTimed, RegisterIndependent, GenerationAvailability, AcquireGenerationTimed, AcquireGenerationBacklog };
 constexpr uint8_t independent_flag = 0x80;
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
 { writer.string(endpoint.host); writer.u16(endpoint.port); writer.string(endpoint.server_name); }
@@ -183,6 +183,7 @@ struct BrokerClient::Connections
     ControlMetrics metrics;
     std::atomic<bool> legacy_acquire{false};
     std::atomic<bool> legacy_generation_acquire{false};
+    std::atomic<bool> legacy_backlog{false};
     std::atomic<bool> legacy_generation{false};
     Endpoint endpoint;
     uint64_t route_revision = 1;
@@ -207,7 +208,7 @@ void BrokerClient::reroute(Endpoint const& endpoint)
     require(connections_->route_revision != UINT64_MAX, "broker route revision exhausted");
     connections_->endpoint = endpoint; ++connections_->route_revision;
     connections_->legacy_acquire.store(false); connections_->legacy_generation_acquire.store(false);
-    connections_->legacy_generation.store(false);
+    connections_->legacy_generation.store(false); connections_->legacy_backlog.store(false);
 }
 bool BrokerClient::shared() const noexcept { return connections_.use_count() != 1; }
 void BrokerClient::disconnect_idle()
@@ -293,18 +294,23 @@ OwnerSession BrokerClient::open_owner(std::string const& owner_id, bool ephemera
 }
 void BrokerClient::close_owner(OwnerSession const& session)
 { auto writer = request(Operation::CloseOwner); write_session(writer, session); auto bytes = call(writer); Reader(bytes).finish(); }
-std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const& task)
+std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const& task, Clock::time_point other_work_until)
 {
     bool const codec = task.kind == Kind::Pack;
     auto& legacy = codec ? connections_->legacy_acquire : connections_->legacy_generation_acquire;
     bool const timed = tls_.deadline != Clock::time_point::max() && !legacy.load();
-    auto writer = request(timed ? (codec ? Operation::AcquireTimed : Operation::AcquireGenerationTimed) : Operation::Acquire);
+    auto const now = Clock::now();
+    auto const ahead = std::chrono::duration_cast<std::chrono::milliseconds>(std::min(other_work_until, tls_.deadline) - now).count();
+    bool const backlog = timed && task.independent_members && ahead > 0 && !connections_->legacy_backlog.load();
+    auto const operation = timed ? (codec ? Operation::AcquireTimed : Operation::AcquireGenerationTimed) : Operation::Acquire;
+    auto writer = request(backlog ? Operation::AcquireGenerationBacklog : operation);
     write_session(writer, owner); write_task(writer, task);
     if (timed)
     {
-        auto const left = std::chrono::ceil<std::chrono::milliseconds>(tls_.deadline - Clock::now()).count();
+        auto const left = std::chrono::ceil<std::chrono::milliseconds>(tls_.deadline - now).count();
         if (left <= 0) throw TransientTransport("broker control request timed out");
         writer.u32(uint32_t(std::min<int64_t>(left, UINT32_MAX)));
+        if (backlog) writer.u32(uint32_t(std::min<int64_t>(ahead, UINT32_MAX)));
     }
     std::string peer, node; std::vector<uint8_t> bytes;
     try { bytes = call(writer, &peer, &node); }
@@ -313,6 +319,7 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
         // An older broker rejects the operation before submitting any work.
         // Never replay an ambiguous transport failure.
         if (!timed || std::string_view(error.what()) != "compute broker: unknown broker operation") throw;
+        if (backlog) { connections_->legacy_backlog.store(true); return acquire(owner, task); }
         legacy.store(true); return acquire(owner, task);
     }
     Reader reader(bytes); auto const present = reader.u8(); require(present <= 1, "invalid broker grant flag");
@@ -561,6 +568,7 @@ struct BrokerServer::Impl
         std::optional<Lease> lease;
         State state = State::Queued;
         Clock::time_point expires, touched, granted_at, start_by = Clock::time_point::max();
+        Clock::time_point other_work_until{};
         Clock::time_point created = Clock::now();
         bool observed = false;
         struct Failure { std::string worker, instance; Kind kind; };
@@ -788,11 +796,11 @@ struct BrokerServer::Impl
         if (prior.ns < exact.ns) return {prior.ns, std::max(prior.assigned, exact.assigned)};
         return exact;
     }
-    bool earlier_on_release(std::vector<Job*> const& queue, Job const& running, Availability const& free,
+    bool earlier_on_release(std::vector<Job*> const& queue, Job const& waiting, Job const& running, Availability const& free,
         std::string const& idle, Kind idle_kind, long double idle_ns, Clock::time_point now) const
     {
         auto const& lease = *running.lease;
-        if (running.owner != queue.front()->owner || (lease.worker_identity == idle && lease.task.kind == idle_kind)) return false;
+        if (running.owner != waiting.owner || (lease.worker_identity == idle && lease.task.kind == idle_kind)) return false;
         auto at = workers.find(lease.worker_identity);
         if (at == workers.end() || at->second.offer.instance != lease.worker_instance) return false;
         auto const& worker = at->second;
@@ -810,13 +818,19 @@ struct BrokerServer::Impl
             auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
                 { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
             if (sample != worker.histories.end()) finish = sample->remaining_ns(lease.task.work_units, elapsed);
-            if (finish <= 0 && sample != worker.histories.end() && lease.task.kind == Kind::GenerateGpu &&
-                !lease.task.independent_members && lease.task.work_units > 1)
+            if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && lease.task.work_units > 1 &&
+                (!lease.task.independent_members || (waiting.requested.independent_members && waiting.requested.work_units > 1)))
             {
-                // A newly measured batch can still be draining its last
-                // member. Bound that wait by one actual singleton delivery.
-                auto const member = sample->cost(1, true);
-                if (member < std::numeric_limits<long double>::max()) finish = active_ns - elapsed + member;
+                // A late batch can still be delivering its last member. Before
+                // committing another whole pipeline, allow one measured
+                // singleton on the running route to bound that wait.
+                auto const ordinary = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                    { return !item.independent && item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads, false); });
+                if (ordinary != worker.histories.end())
+                {
+                    auto const member = ordinary->cost(1, true);
+                    if (member < std::numeric_limits<long double>::max()) finish = active_ns - elapsed + member;
+                }
             }
             if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && (lease.task.independent_members || lease.task.work_units == 1))
             {
@@ -868,17 +882,6 @@ struct BrokerServer::Impl
             for (auto const& owner_id : waiting)
             {
                 auto& queue = queued.at(owner_id);
-                auto job_it = queue.end();
-                for (auto it = queue.begin(); it != queue.end(); ++it)
-                {
-                    bool const ready = std::any_of(workers.begin(), workers.end(), [&](auto const& worker)
-                    { return eligible(**it, worker.first, worker.second, capacity.at(worker.first)).has_value(); });
-                    // Keep blocked jobs' original sequence so they regain FIFO
-                    // priority as soon as a compatible worker has room.
-                    if (ready) { job_it = it; break; }
-                }
-                if (job_it == queue.end()) continue;
-                auto& job = **job_it;
                 std::vector<std::string> candidates;
                 for (auto const& [identity, worker] : workers) candidates.push_back(identity);
                 auto worker_start = std::upper_bound(candidates.begin(), candidates.end(), last_worker);
@@ -886,35 +889,44 @@ struct BrokerServer::Impl
                 std::string chosen;
                 Kind chosen_kind = Kind::GenerateCpu;
                 Resources chosen_resources;
-                long double best_cost = std::numeric_limits<long double>::max();
-                uint64_t oldest_age = 0;
-                bool explore = false;
-                for (auto const& identity : candidates)
+                auto const now = Clock::now();
+                // A wide request can wait for the busy GPU while a smaller
+                // request from the same owner finishes on the idle GPU.
+                auto job_it = std::find_if(queue.begin(), queue.end(), [&](Job const* job)
                 {
-                    auto& worker = workers.at(identity);
-                    for (auto const kind : {Kind::GenerateGpu, Kind::GenerateCpu, Kind::Pack})
+                    chosen.clear();
+                    long double best_cost = std::numeric_limits<long double>::max();
+                    uint64_t oldest_age = 0;
+                    bool explore = false;
+                    for (auto const& identity : candidates)
                     {
-                        auto selected = eligible(job, identity, worker, capacity.at(identity), kind);
-                        if (!selected) continue;
-                        auto const sample = delivery_cost(worker, job.requested, selected->kind, job.owner, selected->resources.cpu_threads);
-                        auto const cost = sample.ns;
-                        uint64_t const age = assignments - sample.assigned;
-                        bool const trial = !sample.assigned || (cost == std::numeric_limits<long double>::max() && age >= 8) || age >= 32;
-                        if (chosen.empty() || (trial && (!explore || age > oldest_age)) ||
-                            (!trial && !explore && cost < best_cost))
-                        { chosen = identity; chosen_kind = selected->kind; chosen_resources = selected->resources;
-                            best_cost = cost; oldest_age = age; explore = trial; }
+                        auto& worker = workers.at(identity);
+                        for (auto const kind : {Kind::GenerateGpu, Kind::GenerateCpu, Kind::Pack})
+                        {
+                            auto selected = eligible(*job, identity, worker, capacity.at(identity), kind);
+                            if (!selected) continue;
+                            auto const sample = delivery_cost(worker, job->requested, selected->kind, job->owner, selected->resources.cpu_threads);
+                            auto const cost = sample.ns;
+                            uint64_t const age = assignments - sample.assigned;
+                            bool const trial = !sample.assigned || (cost == std::numeric_limits<long double>::max() && age >= 8) || age >= 32;
+                            if (chosen.empty() || (trial && (!explore || age > oldest_age)) ||
+                                (!trial && !explore && cost < best_cost))
+                            { chosen = identity; chosen_kind = selected->kind; chosen_resources = selected->resources;
+                                best_cost = cost; oldest_age = age; explore = trial; }
+                        }
                     }
-                }
-                if (!chosen.empty())
+                    if (chosen.empty()) return false;
+                    // The owner can see planned fill work beyond the jobs
+                    // that currently have receive buffers and a scratch grant.
+                    if (now < job->other_work_until && best_cost <=
+                        std::chrono::duration<long double, std::nano>(job->other_work_until - now).count()) return true;
+                    return chosen_kind == Kind::Pack || explore || best_cost == std::numeric_limits<long double>::max() ||
+                        waiting.size() != 1 || std::none_of(active_generation.begin(), active_generation.end(), [&](auto active)
+                        { return earlier_on_release(queue, *job, *active, capacity, chosen, chosen_kind, best_cost, now); });
+                });
+                if (job_it != queue.end())
                 {
-                    auto const now = Clock::now();
-                    // Keep the idle executor free only if the busy one can clear
-                    // this owner's entire queue before the idle one delivers
-                    // its first result. Other owners and cold routes still run.
-                    if (chosen_kind != Kind::Pack && !explore && best_cost < std::numeric_limits<long double>::max() &&
-                        waiting.size() == 1 && std::any_of(active_generation.begin(), active_generation.end(), [&](auto active)
-                        { return earlier_on_release(queue, *active, capacity, chosen, chosen_kind, best_cost, now); })) continue;
+                    auto& job = **job_it;
                     auto const& identity = chosen;
                     auto& worker = workers.at(identity);
                     if (assignments == UINT64_MAX)
@@ -1148,15 +1160,23 @@ struct BrokerServer::Impl
         case Operation::Acquire:
         case Operation::AcquireTimed:
         case Operation::AcquireGenerationTimed:
+        case Operation::AcquireGenerationBacklog:
         {
             auto session = read_session(reader); auto task = read_task(reader);
             auto start_by = Clock::time_point::max();
+            Clock::time_point other_work_until{};
             if (operation != Operation::Acquire)
             {
                 auto const remaining = reader.u32();
                 if (operation == Operation::AcquireTimed) require(task.kind == Kind::Pack && remaining, "invalid codec start deadline");
                 else require(task.kind != Kind::Pack && remaining, "invalid generation start deadline");
                 start_by = Clock::now() + std::chrono::milliseconds(remaining);
+                if (operation == Operation::AcquireGenerationBacklog)
+                {
+                    auto const ahead = reader.u32();
+                    require(task.independent_members && ahead && ahead <= remaining, "invalid generation backlog");
+                    other_work_until = Clock::now() + std::chrono::milliseconds(ahead);
+                }
             }
             reader.finish();
             auto& source = owner(identity, session);
@@ -1205,7 +1225,8 @@ struct BrokerServer::Impl
                 require(job.state == State::Queued || job.state == State::Granted, "task needs a new attempt");
                 job.touched = Clock::now();
             }
-            auto& job = it->second; job.start_by = std::min(job.start_by, start_by); schedule();
+            auto& job = it->second; job.start_by = std::min(job.start_by, start_by);
+            job.other_work_until = other_work_until; schedule();
             response.u8(job.state == State::Granted); if (job.state == State::Granted) write_lease(response, *job.lease); break;
         }
         case Operation::Cancel:

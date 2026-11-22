@@ -541,7 +541,7 @@ private:
             if (waiting >= open_slots) break;
             if (other.id == owner || !other.output || other.io || !other.external.scratch.empty()) continue;
             auto const& target = roots_[other.output->root].value.device;
-            if (overlap(destination, target) || std::any_of(outputs.begin(), outputs.end(),
+            if (shared_rotating(other.output->root, owner) || overlap(destination, target) || std::any_of(outputs.begin(), outputs.end(),
                 [&](size_t output) { return overlap(roots_[output].value.device, target); })) continue;
             outputs.push_back(other.output->root); ++waiting;
         }
@@ -575,6 +575,26 @@ private:
         long double const typical = measured ? total_rate / measured : 1;
         for (auto& disk : disks) if (!disk.rate) disk.rate = typical;
         std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.rate > b.rate; });
+        // A successor can open while an older, narrow stripe is finishing.
+        // Include occupied spindles when pricing its sustainable share. Taking
+        // every free spindle here would leave the following writer just the
+        // narrow stripe when that owner releases it.
+        long double fleet_rate = 0;
+        for (auto const& disk : disks) fleet_rate += disk.rate;
+        size_t sharing = waiting;
+        bool backlog = false;
+        for (auto const& other : owners_) if (other.id != owner && other.output)
+        {
+            if (other.roots.empty()) { if (!other.io) backlog = true; continue; }
+            if (!std::all_of(other.roots.begin(), other.roots.end(), [&](size_t i)
+                { return roots_[i].value.device.rotating && !roots_[i].value.device.drives.empty(); })) continue;
+            ++sharing;
+            for (auto i : other.roots)
+            {
+                auto const rate = bandwidth_ ? bandwidth_->bandwidth(roots_[i].value.device) : 0;
+                fleet_rate += rate > 0 ? rate : typical;
+            }
+        }
         // Balance the available bandwidth of simultaneous owners. One
         // fast spindle can serve the same work as several slower ones.
         std::vector<long double> loads(std::min(waiting, disks.size()));
@@ -584,6 +604,19 @@ private:
             *least += disk.rate; return least != loads.begin();
         });
         if (disks.size() > width) disks.resize(width);
+        if (backlog && sharing > waiting && disks.size() > 1)
+        {
+            auto const fair = fleet_rate / sharing;
+            long double kept = 0;
+            uint64_t room = 0;
+            for (size_t i = 0; i < disks.size(); ++i)
+            {
+                kept += disks[i].rate;
+                room += std::min(desired - room, disks[i].room);
+                if (room == desired && (i + 1 == disks.size() || kept + disks[i + 1].rate / 2 >= fair))
+                { disks.resize(i + 1); break; }
+            }
+        }
         // When this fills the last open slot, a peer can finish before this
         // stripe is released. Leave a queued writer a target if the rest of
         // the stripe still has the requested space and can feed the output.

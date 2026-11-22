@@ -1231,6 +1231,46 @@ for the same synthetic lengths. These are medians over 13 trials with
 alternating execution order. Exact sizing in merged construction also
 avoids a 32 MiB temporary length table at k=28.
 
+#### Overlapping GPU deliveries with HDD packing
+
+David filled 16 empty HDDs with the same 48 k=28 members, three per group,
+using a 4 GiB owner budget and 10 GiB per GPU worker. The RTX 4090 sent
+results over 10 GbE and the RX 6700 XT used its 1 GbE route over SSH.
+Each fill started with a fresh broker. Times include publication of the
+last group on disk. Construction, scratch selection and writer count were
+automatic.
+
+| Build and workers | RTX / Radeon members | Peak active destinations | First group | Last group | Seconds per member |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous, RTX 4090 | 48 / 0 | 2 | 21.76 s | 204.27 s | 4.26 |
+| Previous, both GPUs | 47 / 1 | 2 | 33.61 s | 213.41 s | 4.45 |
+| Intermediate, RTX 4090 | 48 / 0 | 2 | 21.47 s | 197.80 s | 4.12 |
+| Intermediate, both GPUs | 46 / 2 | 4 | 28.09 s | 172.19 s | 3.59 |
+| Updated, RTX 4090 | 48 / 0 | 5 | 22.26 s | 152.53 s | 3.18 |
+| Updated, both GPUs | 41 / 7 | 6 | 33.03 s | 151.04 s | 3.15 |
+
+A separate 4090-only control with four HDD writers and encoded output
+took 174.37 s (3.63 s/member). Much of the initial improvement came from
+concurrent HDD construction. In the previous mixed fill both GPUs had no
+generation or delivery in progress for 28.3 s while two HDD groups packed.
+That interval fell to 7.56 s in the intermediate mixed fill.
+
+On the Radeon, two singleton requests each returned 1.06 GB and took
+18.8 and 20.3 s from assignment through delivery. A request for three
+independently encoded members took 37.8 s, or 12.6 s/member on that worker.
+One development run placed a three-member request on the Radeon about
+half a second before the 4090 finished its current batch. The 4090 finished
+all its work at 169.91 s, the Radeon delivered at 197.03 s and the last
+group reached disk at 209.18 s.
+
+The updated controller admits more scratch receivers while final HDD writes
+are in flight. The broker uses the estimated time remaining on independent
+destinations to decide when a slower worker can finish a whole batch.
+In the updated pair, the Radeon supplied seven members and the last group
+reached disk 1.49 s sooner than with the 4090 alone. All 16 group hashes
+matched the full-proof-checked references. A fresh 100-challenge sample
+validated 299 full proofs in the one-GPU fill and 292 in the two-GPU fill.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

@@ -2841,6 +2841,18 @@ void destination_admission()
     require(finishing(9 * mib, {}).active == 2 && finishing(9 * mib, {1, mib}).active == 3 &&
         finishing(9 * mib - 1, {1, mib}).active == 2 && !finishing(9 * mib, {1, 7 * mib}).active,
         "a sealed pack retained a generation slot or spent more than the actual remaining RAM");
+    auto receivers = [&](uint64_t room, uint64_t publishing)
+    {
+        PackingGrant pack{3, 6 * mib, publishing};
+        auto retry = [&](size_t active, unsigned, uint16_t)
+        { return pack.can_recover(room, 0, (active - pack.active) * 2 * mib, 5 * mib, true) ?
+            1.L / active : std::numeric_limits<long double>::infinity(); };
+        return destination_plan(room, 0, 0, 0, 5, 5, 1, 1,
+            [](unsigned, uint16_t) { return 2 * mib; }, retry, 5, 0, false, pack).active;
+    };
+    require(receivers(11 * mib, 4 * mib) == 5 && receivers(11 * mib, 2 * mib) == 4 &&
+        receivers(9 * mib, 4 * mib) == 4 && !receivers(11 * mib, 0),
+        "streamed receivers lost a recoverable slot or spent a publishing writer's live memory");
     for (auto room : {9 * mib, 10 * mib})
     {
         auto const owning = destination_plan(room, 0, 3 * mib, 3 * mib, 2, 4, 2, 1,

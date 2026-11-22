@@ -117,6 +117,8 @@ struct WorkerTaskOptions
     // Before a generation lease starts, the broker can report a supported
     // independent width. False withdraws the owner's queued request.
     std::function<bool(unsigned)> queued_generation;
+    // Expected completion of other known work on independent destinations.
+    std::chrono::steady_clock::time_point other_work_until{};
 };
 class WorkerAlreadyRunning : public std::runtime_error
 {
@@ -311,7 +313,8 @@ public:
     // unstarted lease for independent delivery of that prefix and its remainder.
     unsigned try_contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids, WorkerContributionSink const&,
-        WorkerCancellation, WorkerTaskIdentity, WorkerContributionWindowSink const&, bool independent);
+        WorkerCancellation, WorkerTaskIdentity, WorkerContributionWindowSink const&, bool independent,
+        std::chrono::steady_clock::time_point other_work_until = {});
     // Outage fallback shares the same admission ceiling as broker tasks. The
     // embedding owner records fallback completions separately from pool stats.
     void generate_local(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const&,
@@ -331,7 +334,7 @@ public:
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     // A zero joint width selects the independent pipeline for this ready work.
-    unsigned joint_contribution_members(uint8_t k, uint8_t strength, unsigned ready_members) const;
+    unsigned joint_contribution_members(uint8_t k, uint8_t strength, unsigned ready_members, unsigned destination_batch = 0) const;
     bool probe_contribution_route(uint8_t k, uint8_t strength) const;
     bool codec_probe_available(uint8_t k, uint64_t timeout_ns) const;
     unsigned suggested_batch_members(uint8_t k, uint8_t strength, unsigned maximum) const;

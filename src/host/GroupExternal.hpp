@@ -2336,7 +2336,7 @@ private:
     { for (uint16_t member = 0; member < count; ++member) members_[member].owner = member; }
     static size_t max_inspection_chunks(Config const& config)
     {
-        if (!config.io_overlap || !config.cpu_scheduler || config.workers == 1) return 0;
+        if (!config.io_overlap || !config.cpu_scheduler || config.cpu_scheduler->workers() < 2) return 0;
         return size_t(std::min<uint64_t>(fresh_group_window_chunks,
             config.window_bytes / (sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection))));
     }
@@ -2381,7 +2381,7 @@ private:
             size_t largest = 0;
             for (auto bytes : chunks) largest = std::max(largest, bytes.size());
             auto const work = inspection_work(largest);
-            auto const lanes = unsigned(std::min<uint64_t>({cfg.workers, cfg.cpu_scheduler->workers(),
+            auto const lanes = unsigned(std::min<uint64_t>({cfg.cpu_scheduler->workers(),
                 chunks.size() / 32, budget / work}));
             if (lanes < 2 || (parallel_validator_ && work > budget / parallel_validator_->workers())) return {};
             if (!parallel_validator_)
@@ -2684,7 +2684,16 @@ inline uint64_t ExternalEngine::contribution_input_memory_bytes(Config const& co
     // Codec scratch and the append's candidate summary use the existing
     // exclusive engine workspace. Concurrent producers additionally retain
     // one bounded writer each; their transport frames belong to the caller.
-    auto const inspection = multiply(ContributionInput::max_inspection_chunks(config), sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection));
+    auto const chunks = ContributionInput::max_inspection_chunks(config);
+    auto inspection = multiply(chunks, sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection));
+    if (chunks && config.cpu_scheduler->workers() > config.workers)
+    {
+        // Validation can borrow idle CPU permits while the destination's
+        // writers wait for disk. Its codecs still share the same byte budget.
+        auto const lanes = unsigned(std::min<size_t>(chunks / 32, config.cpu_scheduler->workers()));
+        if (lanes > config.workers) inspection = grow_add(inspection,
+            ParallelEncoder::memory_bytes(lanes) - ParallelEncoder::memory_bytes(config.workers));
+    }
     return grow_add(grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec), inspection),
         multiply(members, grow_add(config.window_bytes, sizeof(ContributionInput::MemberRecord) + sizeof(Writer))));
 }

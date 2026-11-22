@@ -815,7 +815,7 @@ void batched_profiles(BrokerOptions options, TlsOptions const& owner_tls, TlsOpt
 void independent_members(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls,
                          TlsOptions const& second_tls)
 {
-    options.lease_ms = 5000; options.max_tasks = 8;
+    options.lease_ms = 5000; options.worker_ms = 10000; options.max_tasks = 8;
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), worker(endpoint, worker_tls);
     auto batch = offer("pinned-output", 49502);
@@ -900,6 +900,40 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     auto immediate = deadline.acquire(session, urgent);
     require(immediate && immediate->worker_identity != fast, "finish-time planning exceeded a short admission deadline");
     owner.cancel(session, urgent.task_id, 1); execute(*following).finish(*following);
+
+    auto large = request; large.sequence = 9; large.task_id = "active-pair";
+    large.independent_members = true; large.work_units = 2;
+    auto running_pair = owner.acquire(session, large);
+    require(running_pair && running_pair->worker_identity == fast &&
+        execute(*running_pair).begin(*running_pair, running_pair->owner_identity), "fast pipeline did not start");
+    large.sequence = 10; large.task_id = "waiting-pair";
+    require(!owner.acquire(session, large), "idle GPU claimed a pair that would finish earlier on the busy GPU");
+    auto small = request; small.sequence = 11; small.task_id = "waiting-single";
+    require(!owner.acquire(session, small), "short queue was overestimated");
+    auto last = small; last.sequence = 12; last.task_id = "last-single";
+    (void)owner.acquire(session, last);
+    auto useful = owner.acquire(session, small);
+    require(useful && useful->worker_identity != fast && execute(*useful).begin(*useful, useful->owner_identity),
+        "a deferred pair blocked useful singleton work on the idle GPU");
+    owner.cancel(session, last.task_id, 1); execute(*running_pair).finish(*running_pair);
+    auto waiting_pair = owner.acquire(session, large);
+    require(waiting_pair && waiting_pair->worker_identity == fast &&
+        execute(*waiting_pair).begin(*waiting_pair, waiting_pair->owner_identity), "deferred pair lost FIFO priority");
+    execute(*waiting_pair).finish(*waiting_pair); execute(*useful).finish(*useful);
+
+    large.sequence = 13; large.task_id = "busy-with-backlog";
+    auto busy = owner.acquire(session, large);
+    require(busy && busy->worker_identity == fast && execute(*busy).begin(*busy, busy->owner_identity),
+        "fast GPU failed to start the backlog fixture");
+    auto const now = std::chrono::steady_clock::now();
+    auto timed = owner.with_deadline(now + std::chrono::minutes(1));
+    large.sequence = 14; large.task_id = "independent-backlog";
+    require(!timed.acquire(session, large, now + std::chrono::seconds(1)),
+        "a short fill backlog sent a wide job to the slower GPU");
+    auto spare = timed.acquire(session, large, now + std::chrono::seconds(30));
+    require(spare && spare->worker_identity != fast && execute(*spare).begin(*spare, spare->owner_identity),
+        "an idle GPU could not deliver a full independent batch during planned work");
+    execute(*spare).finish(*spare); execute(*busy).finish(*busy);
 
     session = owner.open_owner("pipeline-duration");
     request.sequence = 1; request.task_id = "three"; request.work_units = 3; request.independent_members = true;
@@ -986,6 +1020,24 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled singleton held work beyond the longer delivery");
     owner.cancel(session, request.task_id, 1); execute(*singleton).finish(*singleton);
+
+    request.sequence++; request.task_id = "last-member-sample";
+    singleton = owner.acquire(session, request);
+    require(singleton && singleton->worker_identity == wide && execute(*singleton).begin(*singleton, singleton->owner_identity),
+        "fast singleton delivery was not available");
+    execute(*singleton).finish(*singleton); owner.delivered(*singleton, {950000000, 32, 1024});
+    request.sequence++; request.task_id = "draining-pipeline"; request.independent_members = true; request.work_units = 4;
+    auto draining = owner.acquire(session, request);
+    require(draining && draining->worker_identity == wide && execute(*draining).begin(*draining, draining->owner_identity),
+        "wide independent delivery did not start");
+    auto const draining_started = std::chrono::steady_clock::now();
+    request.sequence++; request.task_id = "whole-tail"; request.work_units = 2;
+    std::this_thread::sleep_until(draining_started + std::chrono::milliseconds(1050));
+    require(!owner.acquire(session, request), "a whole batch spilled while the fast pipeline could still drain its last member");
+    std::this_thread::sleep_until(draining_started + std::chrono::milliseconds(1600));
+    spill = owner.acquire(session, request);
+    require(spill && spill->worker_identity == slow->worker_identity, "an overdue independent pipeline held the whole tail indefinitely");
+    owner.cancel(session, request.task_id, 1); execute(*draining).finish(*draining);
 
     worker.unregister_worker("pinned-output");
     auto packed = batch; packed.instance = "resident-pair"; packed.endpoint.port = 49502;
@@ -1335,7 +1387,7 @@ void codec_start_deadline(BrokerOptions options, TlsOptions const& owner_tls, Tl
     require(!owner.acquire(session, task("while-running", 4)), "codec start deadline released a running worker");
     worker.renew(*retry); worker.finish(*retry);
 }
-void legacy_codec_acquire(BrokerOptions options, TlsOptions const& owner_tls)
+void legacy_acquire(BrokerOptions options, TlsOptions const& owner_tls, bool backlog)
 {
     Listener listener({"127.0.0.1", 0}, options.tls);
     BrokerClient client(listener.endpoint(), owner_tls);
@@ -1352,7 +1404,7 @@ void legacy_codec_acquire(BrokerOptions options, TlsOptions const& owner_tls)
             Writer response;
             if (i == 1)
             {
-                require(operation != legacy, "bounded codec used the legacy operation");
+                require(operation != legacy, "optional acquire used the legacy operation");
                 response.u8(1); response.string("unknown broker operation"); channel.send(Message::Error, response.data());
             }
             else
@@ -1363,10 +1415,14 @@ void legacy_codec_acquire(BrokerOptions options, TlsOptions const& owner_tls)
         }
     });
     OwnerSession session{"owner", "session", "epoch", 1};
-    auto task = pack_task("legacy-codec");
-    require(!client.acquire(session, task), "legacy queue response returned a grant");
-    auto timed = client.with_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(2));
-    require(!timed.acquire(session, task) && !timed.acquire(session, task), "legacy codec fallback changed the grant");
+    auto request = backlog ? task("legacy-backlog") : pack_task("legacy-codec");
+    if (backlog) { request.kind = Kind::GenerateGpu; request.independent_members = true; request.work_units = 2; }
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto timed = client.with_deadline(deadline);
+    require(!(backlog ? timed : client).acquire(session, request), "legacy queue response returned a grant");
+    auto const until = backlog ? deadline : std::chrono::steady_clock::time_point{};
+    require(!timed.acquire(session, request, until) && !timed.acquire(session, request, until),
+        "legacy acquire fallback changed the grant");
     peer.get();
 }
 void automatic_lifecycle(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& worker_tls)
@@ -1608,7 +1664,7 @@ int main() try
     compact_heartbeat(options, a_tls, tls(ca, wa));
     queued_expiry(options, a_tls, b_tls, tls(ca, wa));
     codec_start_deadline(options, a_tls, tls(ca, wa));
-    legacy_codec_acquire(options, a_tls);
+    legacy_acquire(options, a_tls, false); legacy_acquire(options, a_tls, true);
     automatic_lifecycle(options, a_tls, tls(ca, wa));
     restart(options, a_tls, tls(ca, wa));
     live_status(options, a_tls, tls(ca, wa));

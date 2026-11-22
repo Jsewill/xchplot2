@@ -506,6 +506,17 @@ void rotating_bandwidth(fs::path const& directory)
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
 
+    ScratchPool rotating_owners(disks, 0);
+    require(rotating_owners.try_reserve_output(0, first, unit) && rotating_owners.try_reserve_output(1, second, unit) &&
+        rotating_owners.try_reserve_output(2, first, unit), "rotating output reservations failed");
+    rotating_owners.seal_recovery();
+    auto narrow = rotating_owners.grant(0, 30 * unit, 30 * unit, unit, 2);
+    auto replacement = rotating_owners.grant(1, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 1);
+    require(narrow && narrow->scratch.size() == 1 && replacement && replacement->scratch.size() == 2 &&
+        quota(*replacement) == 30 * unit && rotating_owners.io_compatible(0, 1),
+        "a replacement stripe took the next writer's share of the available HDDs");
+    rotating_owners.cancel(0); rotating_owners.cancel(1); rotating_owners.cancel(2);
+
     auto writer = second; writer.device.rotating = true;
     struct SuccessorCase { uint64_t demand; uint64_t writer_rate; bool free_target; };
     for (auto [demand, writer_rate, free_target] : std::array<SuccessorCase, 3>{{

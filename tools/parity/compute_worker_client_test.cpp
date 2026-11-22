@@ -280,6 +280,12 @@ void planning_feedback()
     require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, true, 2, 3, now).receivers,
         "an untimed delivery kept probing or supplied an unmeasured link rate");
     train(fleet, pipeline, route);
+    Planning whole_group(1000);
+    train(whole_group, pipeline, route);
+    require(!whole_group.joint_contribution_members(18, 2, 2, now, 3) &&
+        whole_group.joint_contribution_members(18, 2, 3, now, 3) == 3 &&
+        !whole_group.joint_contribution_members(18, 2, 3, now, 3),
+        "independent destinations fragmented a whole-group trial or duplicated its assignment");
     require(!fleet.probe_contribution_route(18, 2, now) && fleet.probe_contribution_route(20, 2, now) &&
         fleet.probe_contribution_route(18, 2, now + std::chrono::milliseconds(1001)),
         "a GPU route sample crossed workload or lifetime boundaries");
@@ -374,6 +380,9 @@ void planning_feedback()
             !assigned.repartition_contributions(slow_stream, now + std::chrono::nanoseconds(901)),
             "a slow worker held the full independent batch when another GPU could finish the remainder sooner");
         assigned.released(pipeline.worker_identity, fast_busy);
+        require(!assigned.repartition_contributions(slow_stream, now, now + std::chrono::milliseconds(1)) &&
+            assigned.repartition_contributions(slow_stream, now, now) == 1,
+            "an independent delivery lost its full batch during a long fill or retained it at the tail");
         require(assigned.repartition_contributions(slow_stream, now) == 1 &&
             !assigned.repartition_contributions(pipeline, now) && !assigned.repartition_contributions(slow_single, now),
             "partitioning changed the fast pipeline or tried to split a singleton");
