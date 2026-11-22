@@ -1412,10 +1412,10 @@ across the 16 HDDs. The independent sequential write test on those
 drives reached 3,328 MB/s. Plotting mixed reads and writes and could
 keep individual scratch spindles busy while other drives were idle.
 
-With 32 GiB, the owner assembled the groups in RAM. In a wired control
-at `9ca8b56`, it accepted 45 packed members and then tried streaming the
-last group preassembled from the Radeon. The RTX delivered its final
-members at 144.22 s, the Radeon finished at 198.46 s and the group was
+With 32 GiB, the owner assembled the groups in RAM. In a wired control,
+owner build `9ca8b56` accepted 45 packed members and asked the Radeon
+to assemble and stream the last three. The RTX delivered its final members
+at 144.22 s, the Radeon finished at 198.46 s and the group was
 durable at 198.81 s (4.14 s/member). At `eb6a445` the owner used the
 measured packed route for all 48 members and published in 173.12 s
 (3.61 s/member), a 12.9% reduction in this comparison.
@@ -1424,6 +1424,26 @@ With the Arc enrolled, its second packed member was assigned at about
 114.30 s. The owner reported delivery of the first at 114.75 s. The
 second arrived at 245.79 s and the last group published at 269.68 s.
 The two transfers used the same worker, route and batch size.
+
+At `2b10c10` the broker used the elapsed time on a just-finished GPU
+lease while its first owner receipt was pending. In the three-GPU RAM
+rerun the Arc received one member, delivered it at 184.72 s and spent
+169.63 s transferring it. All 48 members reached disk in 206.60 s,
+a 23.4% reduction from the run with the repeated Arc assignment.
+
+| Construction at `2b10c10` | Wired pair, last group | Wired pair, s/member | All three, last group | All three, s/member |
+| --- | ---: | ---: | ---: | ---: |
+| 4 GiB, HDD scratch | 156.57 s | 3.26 | 172.64 s | 3.60 |
+| 32 GiB, RAM assembly | 176.14 s | 3.67 | 206.60 s | 4.30 |
+
+The wired pair finished sooner in both configurations. The 4 GiB
+measurements at `fea81ca` were 3.23 and 3.50 s/member respectively.
+Run-to-run variation on scratch exceeded the difference between builds.
+In each of the four final fills, all 16 group hashes matched their
+full-proof-verified references and a fresh 16-challenge proof check passed
+on the first group. David's harvester reported 17,886 plots across all
+75 eligible challenge samples during those fills. Its longest recorded
+lookup took 5.63 s.
 
 #### Shared compute over a dedicated Ethernet link
 
