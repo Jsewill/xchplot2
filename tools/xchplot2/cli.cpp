@@ -329,9 +329,6 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "                                      direct, PCIe-only hosts get implicit\n"
         << "                                      single-bounce via SYCL/CUDA D2D, still\n"
         << "                                      one copy fewer than HostBounce.\n"
-        << "    --prefer-peer-copy              : deprecated alias; Peer is the default\n"
-        << "                                      now, this flag is a no-op kept for\n"
-        << "                                      backward-compat with existing scripts.\n"
         << "    --tier plain|compact|minimal|tiny|pinned|auto\n"
         << "                                    : force a streaming tier even if the pool fits.\n"
         << "                                      Every tier must fit its peak plus VRAM buffer.\n"
@@ -2192,7 +2189,6 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if (a == "--host-bounce")                 opts.prefer_peer_copy = false;
             else if (a == "--no-host-bounce") opts.prefer_peer_copy = true;
-            else if (a == "--prefer-peer-copy")            { /* now the default, kept as a no-op alias */ }
             else if (a == "--tier" && i + 1 < argc) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"
@@ -2588,7 +2584,6 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             }
             else if  (a == "--host-bounce")             plot_prefer_peer_copy = false;
             else if (a == "--no-host-bounce") plot_prefer_peer_copy = true;
-            else if  (a == "--prefer-peer-copy")        { /* now the default, kept as a no-op alias */ }
             else if  (a == "--tier" && need(1)) {
                 std::string t = argv[++i];
                 if (t != "plain" && t != "compact" && t != "minimal"

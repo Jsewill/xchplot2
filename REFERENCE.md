@@ -2511,8 +2511,8 @@ colon-separated `tiny` or `minimal` values). Pipeline plotting rejects
 `--max-host-ram`; select `--strategy work-queue` when a host-memory cap is needed.
 `--pipeline-depth N` controls the preallocated boundary-buffer count
 (default 2); increasing it uses more pinned host RAM. These strategy and
-stage controls apply to `plot` and `batch`. `--prefer-peer-copy` is a
-deprecated no-op alias because peer transport is already the default.
+stage controls apply to `plot` and `batch`. Remove `--prefer-peer-copy`
+from older commands. Peer transport is the default.
 
 ## Benchmarking
 
