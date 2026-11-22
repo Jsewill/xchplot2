@@ -1348,6 +1348,27 @@ David's harvester reported 17,886 farm plots throughout the 147 eligible
 challenge samples recorded during these fills. The longest recorded lookup
 took 7.24 s.
 
+#### Scheduling GPU deliveries and HDD packing
+
+On November 22, 2026, David filled the same 16 rotational HDDs with
+48 k=28 members, three per group. Each fill had eight owner CPU threads,
+automatic construction and a fresh broker timing history. Worker services
+were warm. The RTX 4090 used 10 GbE, the RX 6700 XT used its wired relay
+and the Arc B580 used Wi-Fi. Times run through the last durable
+publication on any drive. Hashing and proof verification ran afterward.
+
+With 4 GiB of owner RAM, commit `fea81ca` took 154.95 s with the wired
+pair and 167.92 s with all three. Adding the Arc put 12 of the 16 groups
+on a single scratch spindle and gave 12 groups one thread for final
+packing. With the wired pair only one group used a single scratch
+spindle, and all 16 groups packed with two threads.
+
+At `c287b4e` the owner reserved scratch bandwidth by the batch sizes
+each route could deliver. Six groups used a single scratch spindle in
+the three-worker fill. Ten still got one packing thread. The wired pair
+took 165.37 s and all three took 175.08 s. The Arc delivered one member
+at 110.10 s, including 93.50 s of transfer.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
