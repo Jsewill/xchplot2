@@ -1305,6 +1305,49 @@ the two wired GPUs finished in 190.08 s (3.96 s/member). The Radeon
 received a late two-member joint encoding job after its first two deliveries
 had both been independently encoded batches.
 
+The updated owner queried the batch width available to a compatible GPU
+when several destinations had work. With all three workers enrolled, the
+broker reported a common independent width of zero and an eligible width
+of four. The following fills used the same executable on all four hosts.
+Each started with a fresh broker timing history. Member counts are in RTX
+4090 / RX 6700 XT / Arc B580 order. Times stop at the last durable HDD
+publication.
+
+| Owner RAM | Workers | Members by GPU | Peak active destinations | First group | Last group | Seconds per member |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 GiB | RTX only | 48 / 0 / 0 | 5 | 21.61 s | 158.29 s | 3.30 |
+| 4 GiB | RTX and Radeon | 41 / 7 / 0 | 6 | 31.71 s | 148.71 s | 3.10 |
+| 4 GiB | RTX, Radeon and Arc | 40 / 7 / 1 | 7 | 25.32 s | 160.17 s | 3.34 |
+| 4 GiB | RTX, Radeon and Arc, repeat | 40 / 7 / 1 | 6 | 24.06 s | 156.54 s | 3.26 |
+| 4 GiB | RTX and Radeon, repeat | 41 / 7 / 0 | 4 | 23.92 s | 147.81 s | 3.08 |
+| 32 GiB | RTX only | 48 / 0 / 0 | 3 | 28.75 s | 209.00 s | 4.35 |
+| 32 GiB | RTX and Radeon | 44 / 4 / 0 | 5 | 38.29 s | 164.39 s | 3.42 |
+
+With 32 GiB, both fills assembled their groups in RAM. Adding the Radeon
+reduced time to the last group by 44.61 s (21.34%). On the 4 GiB wired
+fill the owner used HDD scratch. Its 10 GbE interface averaged 2.45 Gb/s
+of received data and peaked at 5.05 Gb/s over five consecutive sample
+intervals of about a second each.
+
+The order of the two- and three-worker scratch fills was reversed for
+the repeat. The wired pair averaged 3.09 s/member and all three averaged
+3.30 s/member. In both automatic three-worker fills the wired GPUs returned
+42 members in independent batches while the Arc delivered one member at
+about 103 s. Fourteen of the 16 groups wrote contributions to a single
+scratch spindle in each of those fills. Four groups did so in the first
+wired fill.
+
+Limiting the three-worker fill to four simultaneous writers with
+`--compute-writers 4` increased the time to 228.63 s (4.76 s/member).
+The owner received 12 packed members and 36 contributions, including 27
+members produced in independent batches.
+
+In all eight fills, the SHA-256 on each of the 16 destination drives
+matched the reference group for that drive, and fresh proof checks passed.
+David's harvester reported 17,886 farm plots throughout the 147 eligible
+challenge samples recorded during these fills. The longest recorded lookup
+took 7.24 s.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With
