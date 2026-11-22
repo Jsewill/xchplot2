@@ -720,6 +720,14 @@ void network(char const* ca, char const* cert, char const* key)
 }
 void budget()
 {
+    ResourceSampler sampler;
+    uint64_t const locked = uint64_t(1) << 32;
+    sampler.locked_output(locked);
+    require(!sampler.owned_host_bytes(), "new GPU output reused an older free-memory reading");
+    sampler.sample(0);
+    require(sampler.owned_host_bytes() >= locked, "owned locked output was lost from the worker's live memory sample");
+    sampler.locked_output(0);
+    require(!sampler.owned_host_bytes(), "freed GPU output continued to credit a cached memory sample");
     Budget budget(100, 2, 10);
     WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
     rejects([&] { auto impossible = budget.acquire(91, true, cancel); });

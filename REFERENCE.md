@@ -712,15 +712,21 @@ The host validates chunks as they arrive. With I/O overlap and spare CPU
 workers it can check a window of independent chunks in parallel within
 the codec RAM budget. A capacity probe checks chunks in order so it can
 stop receiving as soon as the next member cannot fit.
-When the current summary is in RAM, each member received in plot order
-extends it, including successive members of one GPU lease. Conservative
-sizing can then skip those scratch reads. A retry or an out-of-order
-stream can require a reread. Tight capacity still triggers exact sizing
-against the saved runs.
+When the current summary is in RAM, a chunk can extend it as soon as the
+same chunk from each preceding member has arrived. Concurrent workers
+can therefore contribute to the summary while both are still sending.
+Conservative sizing skips the summarized prefix of each stream and reads
+the remaining packets from scratch. A retried stream can require rebuilding
+the summary. Tight capacity still triggers exact sizing against the saved runs.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both
 incoming data and contributions.
+When a sealed scratch batch reaches a fixed group size and its runs fit the
+packer's reader budget, the host commits them directly in the packing
+checkpoint. This saves one summary write and one checkpoint per such group.
+Recovery resumes packing from those runs. If the checkpoint was interrupted
+before it committed, recovery starts from the previously committed members.
 When the final member count is fixed and the last batch fits in RAM, external
 construction packs it directly with the saved contributions, avoiding its
 temporary write and read. An interruption
@@ -1792,8 +1798,24 @@ For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
 the work ready across destinations. It tracks pipelined and jointly encoded
 batches separately. Single-member contribution timings can help establish
-an independent pipeline's initial rate. Workers still collecting timings
-remain eligible while the owner forecasts service from measured workers.
+an independent pipeline's initial rate. For scratch construction, the
+owner can pipeline the members ready for one destination even when a joint
+batch fits. After measuring the pipeline, it starts joint encoding trials
+with two members when that width fits. Destinations share the trial.
+Before sending plot IDs, the owner checks the worker the broker assigned.
+If a calibration request queues while a measured independent pipeline is
+idle, the owner can withdraw the trial before it occupies either GPU.
+If another measured pipeline can deliver the whole batch sooner, the owner
+can request independent encoding. For an independent batch on a slower
+GPU, it can submit a prefix and the remaining members separately when the
+two GPUs are predicted to finish earlier together. This comparison includes
+the expected time until the other GPU is free. Each new request keeps the
+original deadline. A worker whose current lease has outlasted its measured
+duration needs a new observation before the owner can predict its return.
+If worker capacity falls while a joint scratch batch is queued, the owner
+can split it as soon as the broker reports that a smaller batch fits.
+Workers still collecting timings remain eligible while the owner forecasts
+service from measured workers.
 When multiple destinations and independent GPU slots are ready but delivery
 speed is unknown, each destination starts with one member. The first
 completed contribution lets the owner start filling longer pipelines.
@@ -1900,6 +1922,13 @@ required safety allowance; it does not infer spare GPU compute time from free
 memory. A GPU worker can encode the last member of a batch directly from its
 pinned output buffer. Its host RAM reservation includes separate raw copies
 only for earlier members and accounts for retained GPU buffers across tasks.
+The worker releases its host output buffer if keeping it would prevent
+admission of another member at the same k. It checks after delivery and
+when a later capacity update detects memory pressure while the GPU is idle.
+Its device tables stay available for the next job.
+For a standalone worker, a reusable output buffer that the GPU runtime
+guarantees is page-locked counts toward the worker's existing resident
+memory. This also covers buffers the operating system reports as shared.
 When the worker keeps a buffer for reuse, it reports the remaining RAM and
 the revised per-job memory requirement together. Each broker can use the
 new figures to admit its next queued job as the previous lease finishes.

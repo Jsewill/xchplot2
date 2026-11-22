@@ -608,9 +608,10 @@ struct Backend
         std::osyncstream(std::cerr) << "[grow-pool-task] worker=" << task.worker_identity
             << " instance=" << task.worker_instance << " work_units=" << task.work_units
             << " elapsed_ns=" << task.elapsed_ns << " execution_ns=" << task.execution_ns
-            << " transfer_ns=" << task.transfer_ns << " worker_ns=" << task.generation.worker_ns
+            << " transfer_ns=" << task.transfer_ns << " output_bytes=" << task.output_bytes << " worker_ns=" << task.generation.worker_ns
             << " send_ns=" << task.generation.send_ns << " frame_wait_ns=" << task.generation.frame_wait_ns
-            << " receiver_ns=" << task.generation.receiver_ns << " local_direct=" << unsigned(task.local_direct) << '\n';
+            << " receiver_ns=" << task.generation.receiver_ns << " local_direct=" << unsigned(task.local_direct)
+            << " contributions=" << unsigned(task.contributions) << " independent_members=" << unsigned(task.independent_members) << '\n';
     }
     static void wait_pool_retry(group_grow::WorkerCancellation const& cancel, std::chrono::milliseconds& delay)
     {
@@ -1225,12 +1226,26 @@ struct Producer
         uint64_t const bytes = group_grow::MemberBatchHash::memory_bytes(count);
         return peak <= budget && bytes <= budget - peak ? bytes : 0;
     }
+    struct ContributionRange
+    {
+        uint16_t first = 0, count = 0;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    using ContributionSplit = std::pair<ContributionRange, uint16_t>;
+    size_t contribution_range_capacity(uint16_t count) const
+    {
+        auto const tasks = std::min<uint64_t>(count, args.pool_inflight);
+        // Only concurrent receivers can split. All deferred ranges are
+        // resubmitted before another batch of new plot IDs can start.
+        return tasks < 2 ? 0 : std::min<uint64_t>(count, tasks * group_grow::pool::max_generation_batch_members);
+    }
     uint64_t contribution_bytes(group_grow::Config const& config, uint16_t count) const
     {
         auto const tasks = std::min<uint64_t>(count, args.pool_inflight);
-        return sum(group_grow::ExternalEngine::contribution_input_memory_bytes(config, count),
+        return sum(sum(group_grow::ExternalEngine::contribution_input_memory_bytes(config, count),
+            product(contribution_range_capacity(count), sizeof(ContributionRange))),
             product(tasks, sum(group_grow::pool::Channel::memory_bytes(uint32_t(args.pool_frame_bytes)),
-                Backend::contribution_read_ahead_bytes(args) + sizeof(std::future<void>) + 256 +
+                Backend::contribution_read_ahead_bytes(args) + sizeof(std::future<ContributionSplit>) + sizeof(ContributionSplit) + 256 +
                 group_grow::contribution_window_chunks * sizeof(std::span<uint8_t const>))));
     }
     uint64_t packed_input_bytes(group_grow::Config const& config, uint16_t count) const
@@ -1348,16 +1363,18 @@ struct Producer
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(50))));
             auto io = receive_io(acquire_io, cancel); operation();
         };
-        std::vector<std::future<void>> pending;
+        std::vector<ContributionRange> deferred;
+        deferred.reserve(contribution_range_capacity(input.size()));
+        std::vector<std::future<ContributionSplit>> pending;
         pending.reserve(size_t(std::min<uint64_t>(args.pool_inflight, input.size())));
         struct Drain
         {
             std::atomic<bool>& cancelled;
-            std::vector<std::future<void>>& pending;
-            ~Drain() { cancelled.store(true); for (auto& task : pending) if (task.valid()) task.wait(); }
+            decltype(pending)& tasks;
+            ~Drain() { cancelled.store(true); for (auto& task : tasks) if (task.valid()) task.wait(); }
         } drain{cancelled, pending};
         uint16_t scheduled = 0;
-        while (scheduled < input.size() || !pending.empty())
+        while (scheduled < input.size() || !deferred.empty() || !pending.empty())
         {
             check_cancel(args);
             if (stopped && stopped->load()) cancelled.store(true);
@@ -1369,7 +1386,15 @@ struct Producer
             {
                 if (pending[slot].wait_for(std::chrono::seconds(0)) != std::future_status::ready)
                 { ++slot; continue; }
-                try { pending[slot].get(); }
+                try
+                {
+                    auto const [range, prefix] = pending[slot].get();
+                    if (prefix)
+                    {
+                        if (prefix < range.count) deferred.push_back({uint16_t(range.first + prefix), uint16_t(range.count - prefix), range.deadline});
+                        deferred.push_back({range.first, prefix, range.deadline});
+                    }
+                }
                 catch (group_grow::WorkerTaskDeclined const&)
                 {
                     if (!input.rejected_final_bytes()) throw;
@@ -1385,37 +1410,51 @@ struct Producer
             bool const probe = destinations > 1 && width > 1 && client->probe_contribution_route(k, strength);
             size_t const concurrency = probe ? 1 : std::min(limit, std::max(width,
                 client->suggested_generation_concurrency(k, strength, limit)));
-            while (pending.size() < concurrency && scheduled < input.size())
+            while (pending.size() < concurrency && (scheduled < input.size() || !deferred.empty()))
             {
-                uint16_t const member = scheduled;
-                unsigned const remaining = unsigned(input.size() - scheduled);
-                // Give each available lane an ordered part of this destination.
-                // A worker with room to coencode keeps its batch policy.
-                bool const independent = remaining > 1 && client->generation_capacity(k, strength).batch == 1;
-                // The first request takes the next free route's share. Other
-                // requests in this pass must not count that same slot again.
-                unsigned const dispatch = !probe && independent && pending.empty() ?
-                    client->independent_contribution_width(k, strength, remaining, destinations, true) : width;
-                bool const separate = !probe && independent && dispatch > 1;
-                uint16_t const count = probe ? 1 : uint16_t(separate ? std::min(dispatch, remaining) :
-                    client->suggested_batch_members(k, strength, remaining));
-                require(count && count <= input.size() - scheduled, "invalid pool batch recommendation");
+                bool const resubmit = !deferred.empty();
+                ContributionRange range;
+                bool separate, adaptive, coalesce_singletons = false;
+                if (resubmit)
+                {
+                    range = deferred.back(); deferred.pop_back();
+                    separate = adaptive = range.count > 1;
+                }
+                else
+                {
+                    unsigned const remaining = unsigned(input.size() - scheduled);
+                    // Only the first request in this pass gets the next free route's share.
+                    unsigned const dispatch = !probe && remaining > 1 && pending.empty() ?
+                        client->independent_contribution_width(k, strength, remaining, destinations, true) : width;
+                    unsigned const ready = std::min(dispatch, remaining);
+                    unsigned joint = 1;
+                    if (!probe && remaining > 1)
+                        joint = std::max(width, dispatch) > 1 ? client->joint_contribution_members(k, strength, ready) :
+                            client->suggested_batch_members(k, strength, remaining);
+                    uint16_t const count = uint16_t(joint ? joint : ready);
+                    require(count && count <= remaining, "invalid pool batch recommendation");
+                    range = {scheduled, count, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms)};
+                    scheduled = uint16_t(scheduled + count);
+                    separate = !joint && count > 1;
+                    adaptive = count > 1 && std::max(width, dispatch) > 1;
+                    coalesce_singletons = probe || joint != 1 || ready == 1;
+                }
+                uint16_t const member = range.first, count = range.count;
                 std::vector<std::array<uint8_t, 32>> plot_ids; plot_ids.reserve(count);
                 for (uint16_t offset = 0; offset < count; ++offset)
                 {
                     auto const index = uint16_t(first + member + offset);
-                    if (args.command.empty() || args.verbose) std::osyncstream(std::cerr) << progress << index << '\n';
+                    if (!resubmit && (args.command.empty() || args.verbose)) std::osyncstream(std::cerr) << progress << index << '\n';
                     plot_ids.push_back(identity.params.get_plot_params_for_index(index).get_plot_id().data());
                 }
-                pending.push_back(std::async(std::launch::async, [&, member, count, separate, plot_ids = std::move(plot_ids)]
+                pending.push_back(std::async(std::launch::async, [&, range, member, count, separate, adaptive, coalesce_singletons, plot_ids = std::move(plot_ids)]() -> ContributionSplit
                 {
                     group_grow::WorkerCancellation cancel;
                     cancel.stop = &cancelled;
-                    cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
-                    auto generate = [&](uint16_t slot, std::span<std::array<uint8_t, 32> const> ids)
+                    cancel.deadline = range.deadline;
+                    auto generate = [&](uint16_t slot, std::span<std::array<uint8_t, 32> const> ids, bool individual, bool can_split) -> unsigned
                     {
                         uint16_t const members = uint16_t(ids.size());
-                        bool const individual = separate && members > 1;
                         uint16_t const per_chunk = individual ? 1 : members;
                         auto const chunk_count = PlotGroupFile::getChunkCountForK(k);
                         uint16_t touched = 0;
@@ -1475,7 +1514,12 @@ struct Producer
                             require(attempt < UINT64_MAX, "pool task attempt exhausted"); task.attempt = ++attempt;
                             try
                             {
-                                client->contributions(k, strength, ids, receive, cancel, task, receive_window, {}, individual);
+                                if (can_split)
+                                {
+                                    if (auto first = client->try_contributions(k, strength, ids, receive, cancel, task, receive_window, individual))
+                                        return first;
+                                }
+                                else client->contributions(k, strength, ids, receive, cancel, task, receive_window, {}, individual, coalesce_singletons);
                                 break;
                             }
                             catch (group_grow::WorkerTaskDeclined const&) { throw; }
@@ -1505,8 +1549,16 @@ struct Producer
                         with_io(cancel, [&] { for (uint16_t i = 0; i < members; i += per_chunk)
                             input.finish_member(uint16_t(slot + i), per_chunk); });
                         progress_generated(backend.progress, members);
+                        return 0;
                     };
-                    try { generate(member, plot_ids); }
+                    try
+                    {
+                        if (auto prefix = generate(member, plot_ids, separate, adaptive))
+                        {
+                            require(prefix <= count && (!separate || prefix < count), "invalid contribution repartition");
+                            return {range, uint16_t(prefix)};
+                        }
+                    }
                     catch (group_grow::pool::UnsupportedResources const&)
                     {
                         if (count == 1) throw;
@@ -1516,11 +1568,11 @@ struct Producer
                         // singleton tasks, without extending the group deadline.
                         backend.pool_retries.fetch_add(1);
                         for (uint16_t offset = 0; offset < count; ++offset)
-                            generate(uint16_t(member + offset), {&plot_ids[offset], 1});
+                            generate(uint16_t(member + offset), {&plot_ids[offset], 1}, false, false);
                     }
-
+                    return {};
                 }));
-                scheduled = uint16_t(scheduled + count); made_progress = true;
+                made_progress = true;
             }
             if (!made_progress && !pending.empty()) pending.front().wait_for(std::chrono::milliseconds(10));
         }
@@ -2867,8 +2919,12 @@ struct Construction
         group_grow::ProgressScope live(config.progress, group_grow::ProgressPhase::plan);
         // This owner operation finishes before the controller releases RAM or
         // starts another producer. No controller reads asynchronous phase state.
-        bool const fresh = external->can_append();
-        external->start_packing(); fresh_external_pack = fresh; terminal_packing = true;
+        if (!fresh_external_pack)
+        {
+            bool const fresh = external->can_append();
+            external->start_packing(); fresh_external_pack = fresh;
+        }
+        terminal_packing = true;
     }
     void retune(group_grow::Config const& cfg)
     {
@@ -3056,17 +3112,23 @@ struct Construction
         }
         return result;
     }
-    group_grow::AppendResult append(group_grow::ExternalEngine::PreparedInput& input, uint16_t prefix)
+    group_grow::AppendResult append(group_grow::ExternalEngine::PreparedInput& input, uint16_t prefix, bool final = false)
     {
         require(bool(external), "prepared input requires external construction");
-        return account_metadata(append_external([&] { return external->append(input, prefix); }, prefix, false));
+        auto result = append_external([&] { return external->append(input, prefix, final); }, prefix, false);
+        if (result.accepted && final) fresh_external_pack = !external->can_append();
+        return account_metadata(std::move(result));
     }
-    group_grow::AppendResult append(group_grow::ExternalEngine::ContributionInput& input, uint16_t prefix)
+    group_grow::AppendResult append(group_grow::ExternalEngine::ContributionInput& input, uint16_t prefix, bool final = false)
     {
         require(bool(external), "compressed input requires external construction");
         // The remote generation/compression phase is not a local CPU sample.
-        auto result = external->append(input, prefix);
-        if (result.accepted) { ++staged_batches; shape_recorded = false; }
+        auto result = external->append(input, prefix, final);
+        if (result.accepted)
+        {
+            ++staged_batches; shape_recorded = false;
+            if (final) fresh_external_pack = !external->can_append();
+        }
         return account_metadata(std::move(result));
     }
     group_grow::Result fallback_input()
@@ -4664,8 +4726,8 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 }
                 appended = join_consumer(pending, reason);
             }
-            else appended = prepared_input ? engine.append(*prepared_input, prepared_members) :
-                contribution_input ? engine.append(*contribution_input, contribution_members) : engine.append(incoming, hash.get(), false, next == maximum);
+            else appended = prepared_input ? engine.append(*prepared_input, prepared_members, next == maximum) :
+                contribution_input ? engine.append(*contribution_input, contribution_members, next == maximum) : engine.append(incoming, hash.get(), false, next == maximum);
             engine.consumed({});
             if (appended->accepted && external_before && engine.external && engine.can_append() && !contribution_input && !prepared_input)
                 engine.observe_external(uint16_t(incoming.size()), *external_before);
@@ -14833,10 +14895,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         d.workers = count;
         task->original_member_bytes = resident(task->members);
         task->finish_with_members = d.engine->external && d.engine->external->can_finish_with_members();
+        bool const streamed = task->contribution_input || task->prepared_input;
+        size_t const incoming = streamed ? task->prepared_members : task->members.size();
+        // Capacity fill can extend a provisional limit. The format and an
+        // explicit cohort size remain hard limits across restarts.
+        bool const final_batch = d.engine->external && task->work == Work::append && incoming && d.metrics.members + incoming == d.maximum &&
+            (!farm || !farm->state.capacity_fill || d.maximum == UINT16_MAX ||
+                group_grow::farming_cohort(farm->state, farm->state.directories[d.owner],
+                    farm->lanes[d.owner].ordinal).config.group_members_override == d.maximum);
         bool const terminal = d.engine->external &&
             ((task->work == Work::recover && d.engine->needs_regeneration()) ||
-                (task->work == Work::append && (!farm || !farm->state.capacity_fill) &&
-                    d.metrics.members + task->members.size() == d.maximum && task->finish_with_members));
+                (final_batch && !streamed && task->finish_with_members));
         task->recycle_members = !task->select_merged &&
             !task->members.empty() && (terminal || (task->work == Work::append &&
                 d.metrics.members + task->members.size() < d.maximum &&
@@ -14854,7 +14923,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (complete_batch) task->resident_packing.store(true, std::memory_order_release);
                 wake.notify();
             }) : std::function<void(uint64_t)>{});
-        d.ready = writers[d.writer]->submit([&, task]
+        d.ready = writers[d.writer]->submit([&, task, final_batch]
         {
             constexpr std::array names{"append", "recover", "prepare_pack", "finish", "recover_finish", "input_fallback"};
             ControllerTiming timing(names[size_t(task->work)], d.owner);
@@ -14880,12 +14949,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             d.metrics.members >= directory.layout.file_members(ordinal - directory.layout_first);
                     }
                     if (task->select_merged) { d.engine->select_merged(detailed_output(args)); task->select_merged = false; }
-                    // Capacity fill may extend this provisional limit after
-                    // admission; its last batch must remain appendable.
-                    task->appended = task->contribution_input ? d.engine->append(*task->contribution_input, task->prepared_members) :
-                        task->prepared_input ? d.engine->append(*task->prepared_input, task->prepared_members) :
-                        d.engine->append(task->members, task->hash.get(), reject_window,
-                            (!farm || !farm->state.capacity_fill) && d.metrics.members + task->members.size() == d.maximum); break;
+                    task->appended = task->contribution_input ? d.engine->append(*task->contribution_input, task->prepared_members, final_batch) :
+                        task->prepared_input ? d.engine->append(*task->prepared_input, task->prepared_members, final_batch) :
+                        d.engine->append(task->members, task->hash.get(), reject_window, final_batch); break;
                 }
                 case Work::recover: task->finished = d.engine->resume(task->members, task->hash.get()); break;
                 case Work::prepare_finish: d.engine->prepare_finish(); break;

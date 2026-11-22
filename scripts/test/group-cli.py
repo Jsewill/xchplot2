@@ -1750,6 +1750,20 @@ def check(binary, root, reference=None):
             assert not list(directory.glob("*.partial"))
     print("PASS resident final batch recovery, changed batch cap and further growth", flush=True)
 
+    fixed = root / "fixed cohort packing"
+    fixed.mkdir()
+    fixed_options = ["--compute", "off", "--construction", "external", "--batch-members", 2,
+                     "-t", scratch, "--temp-capacity-bytes", "256M", *construction]
+    run("fill", fixed, "-k", 18, *keys, "-S", SEED, "--group-members", 3, "--max-groups", 1,
+        "--max-total-members", 3, *fixed_options, "--quiet", point="external-pack-initialized-after-checkpoint", code=86)
+    checkpoint, = fixed.glob("*.external/checkpoint")
+    assert b"/terminal-1" in checkpoint.read_bytes() and not list(fixed.glob("*.gplot"))
+    run("fill", fixed, "--resume", *fixed_options, "--quiet")
+    recovered, = fixed.glob("*.gplot")
+    assert header(recovered)[3] == 3
+    verify(recovered)
+    print("PASS fixed farming cohort resumes its resident final batch", flush=True)
+
     # The final payload is durable before publication. A crash on either side
     # of the rename must resume without exposing a prefix or changing bytes.
     for mode in ("incremental", "staged", "merged", "external"):

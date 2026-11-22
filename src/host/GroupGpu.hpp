@@ -151,6 +151,10 @@ public:
     // separately. Existing host-sort scratch remains in the tier estimate.
     uint64_t host_tiled_generation_peak_bytes() const;
     uint64_t retained_host_bytes() const;
+    // Reusable host output whose allocator guarantees physical residency.
+    uint64_t locked_host_output_bytes() const;
+    // Return idle host output buffers while retaining the device tables.
+    void release_host_output();
     // Live persistent device tables and cached two-phase match scratch;
     // runtime/context and transient allocations use production VRAM admission.
     uint64_t device_resident_bytes() const;

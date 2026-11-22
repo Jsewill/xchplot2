@@ -598,16 +598,26 @@ private:
         group_tools::require(new_members.size() <= UINT16_MAX - members, "invalid group membership");
         uint16_t const old_members = uint16_t(members);
         high_.size = 0; low_.size = 0;
-        size_t bit_count = 0;
-        uint64_t const range = range_per_chunk(), start = ordinal * range;
-        uint64_t previous = start;
-        members = 0;
-        for (auto const& contribution : contributions)
+        auto decode_part = [&](EncodedChunk const& contribution)
         {
-            size_t const first_symbol = high_.size;
             auto const decoded = decode(ordinal, contribution.bytes, contribution.members, nullptr, nullptr, true);
             group_tools::require(decoded.bytes == contribution.bytes.size(), "group contribution has trailing data");
             check_gsz_size(decoded.bytes, contribution.members);
+            return decoded;
+        };
+        // The leading contribution already starts at the canonical chunk
+        // origin. Only the following contributions need a new first delta.
+        auto const& first = contributions.front();
+        auto const prefix = decode_part(first);
+        size_t bit_count = prefix.low_bits;
+        if (!size_only) copy_low(first.bytes.subspan(prefix.low_offset));
+        uint64_t previous = prefix.last;
+        uint64_t const range = range_per_chunk();
+        members = first.members;
+        for (auto const& contribution : contributions.subspan(1))
+        {
+            size_t const first_symbol = high_.size;
+            auto const decoded = decode_part(contribution);
             uint64_t const delta = decoded.first + uint64_t(members) * range - previous;
             size_t const width = delta_width(delta);
             group_tools::require(decoded.low_bits >= decoded.first_bits &&
@@ -626,6 +636,7 @@ private:
             previous = decoded.last + uint64_t(members) * range;
             members += contribution.members;
         }
+        if (new_members.empty()) return finish_encode(old_members, bit_count, previous, size_only);
         size_t symbols = high_.size, total_bits = bit_count;
         (void)visit_deltas(k_, ordinal, old_members, new_members, previous, true,
             [&](uint64_t delta)
@@ -673,11 +684,7 @@ private:
             group_tools::require(old.bytes == old_chunk.size(), "old chunk has trailing data");
             previous = old.last;
             bit_count = old.low_bits;
-            if (!size_only)
-            {
-                resize(low_, bytes_for_bits(bit_count));
-                std::memcpy(low_.data.get(), old_chunk.data() + old.low_offset, low_.size);
-            }
+            if (!size_only) copy_low(old_chunk.subspan(old.low_offset));
         }
 
         size_t symbols = high_.size;
@@ -898,6 +905,11 @@ private:
         resize(low_, bytes_for_bits(total_bits));
         if (bit_count & 7) low_.data[bit_count >> 3] &= uint8_t((1u << (bit_count & 7)) - 1);
         for (size_t i = bytes_for_bits(bit_count); i < low_.size; ++i) low_.data[i] = 0;
+    }
+    void copy_low(std::span<uint8_t const> bytes)
+    {
+        resize(low_, bytes.size());
+        std::memcpy(low_.data.get(), bytes.data(), bytes.size());
     }
     void append_low_delta(uint64_t delta, size_t& bit_count)
     {

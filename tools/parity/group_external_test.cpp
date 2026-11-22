@@ -2114,9 +2114,11 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
         input.reset(); engine.finish();
     }
 #endif
-    for (auto const* point : {"external-input-sealed", "external-contribution-flushed", "external-run-after-checkpoint"})
+    for (auto const* point : {"external-input-sealed", "external-contribution-flushed", "external-run-after-checkpoint",
+        "external-pack-initialized-before-checkpoint", "external-pack-initialized-after-checkpoint"})
     {
         auto const path = root / (std::string("prepared-crash-") + point);
+        bool const packing = std::string_view(point).starts_with("external-pack-initialized");
         auto const child = ::fork(); require(child >= 0, "cannot fork prepared input crash test");
         if (!child)
         {
@@ -2125,13 +2127,19 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
                 ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
                 auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "crash reservation rejected");
                 require(!::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1), "cannot set prepared input failpoint");
-                feed(*input, false); engine.append(*input); std::_Exit(0);
+                feed(*input, false); engine.append(*input, 0, packing); std::_Exit(0);
             }
             catch (...) { std::_Exit(1); }
         }
         int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
             "prepared input failpoint did not interrupt");
         ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
+        if (packing)
+        {
+            bool const committed = std::string_view(point).ends_with("after-checkpoint");
+            require(engine.can_append() != committed && engine.committed_member_count() == (committed ? raw.size() : 0) &&
+                !engine.pending_members(), "final prepared input recovered the wrong packing frontier");
+        }
         if (!engine.committed_member_count())
         {
             auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "resumed prepared reservation rejected");
@@ -2229,10 +2237,36 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         require(input->reserved_bytes() <= reserved && input->written_bytes() <= input->reserved_bytes(),
             "grouped contribution exceeded its original reservation");
         auto const reads = engine.stats().phases[size_t(WorkPhase::plan)].read_bytes;
-        require(engine.append(*input).accepted, "grouped contribution append rejected");
+        require(engine.append(*input, 0, true).accepted && engine.can_append(),
+            "final contribution skipped staging beyond its packing reader limit");
         if (!concurrent) require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
             "ordered validated contributions were reread during conservative sizing");
         input.reset(); engine.finish(); require(contents(path) == reference, "grouped contributions changed canonical bytes");
+    }
+    for (bool overtake : {false, true})
+    {
+        auto const path = root / (overtake ? "contribution-chunk-overtake" : "contribution-chunk-interleave");
+        auto grant = ext; grant.packing_inputs = unsigned(raw.size());
+        ExternalEngine engine(path.string(), config(), grant, false, initial_identity()); engine.confirm_identity();
+        auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
+        require(bool(input), "interleaved contribution reservation rejected");
+        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            bool const ahead = overtake && chunk == chunks / 2;
+            if (ahead) input->append_chunk(1, chunk, encoded[1][chunk]);
+            for (uint16_t member = 0; member < input->size(); ++member)
+                if (member != 1 || !ahead) input->append_chunk(member, chunk, encoded[member][chunk]);
+        }
+        for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
+        input->seal();
+        auto const bytes = input->written_bytes(); auto const before = engine.stats();
+        require(engine.append(*input, 0, true).accepted && !engine.can_append(), "interleaved final contribution did not start packing");
+        auto const plan = size_t(WorkPhase::plan), encode = size_t(WorkPhase::encode);
+        auto const reads = engine.stats().phases[plan].read_bytes - before.phases[plan].read_bytes;
+        require(overtake ? reads && reads < bytes / 2 : !reads, "sizing reread the validated chunk prefixes");
+        require(engine.stats().phases[encode].written_bytes == before.phases[encode].written_bytes,
+            "final contribution wrote an intermediate staging summary");
+        engine.finish(); require(contents(path) == reference, "interleaved chunk summaries changed canonical bytes");
     }
     uint64_t ordered_bound = 0;
     for (bool retry : {false, true})
@@ -2494,30 +2528,42 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
 #endif
     for (bool grouped : {false, true})
-    for (auto const* point : {"external-contribution-input-sealed", "external-run-before-checkpoint", "external-run-after-checkpoint"})
+    for (auto const* point : {"external-contribution-input-sealed", "external-run-before-checkpoint", "external-run-after-checkpoint",
+        "external-pack-initialized-before-checkpoint", "external-pack-initialized-after-checkpoint"})
     {
         auto const path = root / (std::string(grouped ? "contribution-grouped-crash-" : "contribution-crash-") + point);
+        bool const packing = std::string_view(point).starts_with("external-pack-initialized");
+        uint16_t const prior = packing && grouped ? 2 : 0;
+        auto grant = ext;
+        if (packing) grant.packing_inputs = unsigned(raw.size());
         auto const child = ::fork(); require(child >= 0, "cannot fork contribution recovery test");
         if (!child)
         {
             try
             {
-                ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
-                auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "crash contribution preflight rejected");
+                ExternalEngine engine(path.string(), config(), grant, false, initial_identity()); engine.confirm_identity();
+                if (prior) require(engine.append(Members(raw).subspan(0, prior)).accepted, "crash fixture lost its prefix");
+                auto input = engine.prepare_contributions(uint16_t(raw.size() - prior), raw.front().size()); require(bool(input), "crash contribution preflight rejected");
                 require(!::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1), "cannot set contribution recovery failpoint");
-                if (grouped) feed_groups(*input, 0, false); else feed(*input, 0, false);
-                engine.append(*input); std::_Exit(0);
+                if (grouped) feed_groups(*input, prior, false); else feed(*input, prior, false);
+                engine.append(*input, 0, packing); std::_Exit(0);
             }
             catch (...) { std::_Exit(1); }
         }
         int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
             "contribution failpoint did not interrupt");
-        ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
-        if (!engine.committed_member_count())
+        ExternalEngine engine(path.string(), config(), grant, true); engine.confirm_identity();
+        if (packing)
         {
-            auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "resumed contribution preflight rejected");
-            if (grouped) feed_groups(*input, 0, true); else feed(*input, 0, false);
-            require(engine.append(*input).accepted, "resumed contribution append rejected");
+            bool const committed = std::string_view(point).ends_with("after-checkpoint");
+            require(engine.can_append() != committed && engine.committed_member_count() == (committed ? raw.size() : prior) &&
+                !engine.pending_members(), "final contribution recovered the wrong packing frontier");
+        }
+        if (engine.committed_member_count() < raw.size())
+        {
+            auto input = engine.prepare_contributions(uint16_t(raw.size() - prior), raw.front().size()); require(bool(input), "resumed contribution preflight rejected");
+            if (grouped) feed_groups(*input, prior, true); else feed(*input, prior, true);
+            require(engine.append(*input, 0, packing).accepted, "resumed contribution append rejected");
         }
         engine.finish(); require(contents(path) == reference, "contribution recovery changed ordinary bytes");
     }

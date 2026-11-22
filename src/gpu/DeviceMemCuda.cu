@@ -23,6 +23,14 @@
 
 namespace pos2gpu {
 
+bool cuda_host_allocations_are_locked(int device_ordinal)
+{
+    int host_tables = 1;
+    auto const result = cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device_ordinal);
+    if (result != cudaSuccess) cudaGetLastError();
+    return result == cudaSuccess && !host_tables;
+}
+
 bool cuda_query_device_memory(int device_ordinal,
                               std::size_t& free_bytes,
                               std::size_t& total_bytes)

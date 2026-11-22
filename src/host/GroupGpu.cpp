@@ -17,6 +17,10 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef XCHPLOT2_HAVE_CUB
+namespace pos2gpu { bool cuda_host_allocations_are_locked(int device_ordinal); }
+#endif
+
 namespace group_grow
 {
 namespace
@@ -27,6 +31,21 @@ constexpr uint64_t runtime_host_bytes = uint64_t(1300) << 20;
 // Match the production spill engine's aggregate pinned staging allocation.
 // The device drain splits it into alternating windows without growing the budget.
 constexpr uint64_t transfer_window_bytes = uint64_t(64) << 20;
+
+bool locked_host_allocations(sycl::queue const& queue)
+{
+    auto const device = queue.get_device();
+    // Host USM is allocated by the context. A mixed GPU context need not
+    // use this device's allocator for its host buffers.
+    for (auto const& other : queue.get_context().get_devices())
+        if (!other.is_cpu() && other != device) return false;
+    if (device.get_backend() == sycl::backend::hip) return true;
+#ifdef XCHPLOT2_HAVE_CUB
+    if (device.get_backend() == sycl::backend::cuda)
+        return pos2gpu::cuda_host_allocations_are_locked(device.AdaptiveCpp_device_id().get_id());
+#endif
+    return false;
+}
 
 uint64_t wall_stamp()
 {
@@ -138,6 +157,7 @@ struct GpuProducer::Impl
     uint64_t capacity;
     uint64_t twophase_budget_bytes = 0;
     bool profile = false;
+    bool locked_output = false;
     bool copy_event_profiling = false;
     uint64_t profile_member = 0;
     sycl::queue* queue = nullptr;
@@ -172,6 +192,7 @@ struct GpuProducer::Impl
         pos2gpu::bind_current_device(options.device_id);
         capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
         queue = &pos2gpu::sycl_backend::queue();
+        locked_output = locked_host_allocations(*queue);
         // Match production admission: discard earlier cached scratch before
         // sampling free VRAM, and reserve the complete path peak before grants.
         pos2gpu::sycl_backend::set_twophase_budget(*queue, 0);
@@ -348,10 +369,15 @@ struct GpuProducer::Impl
         return std::min(capacity, transfer_window_bytes / sizeof(uint64_t));
     }
 
-    void prepare_tiled_output()
+    void release_full_output()
     {
         if (pool) pool->release_pinned(0);
         else release(output);
+    }
+
+    void prepare_tiled_output()
+    {
+        release_full_output();
         if (!transfer)
             transfer.reset(pos2gpu::streaming_alloc_pinned_uint64(transfer_capacity()));
         if (!transfer) throw std::runtime_error("GPU growth pinned transfer allocation failed");
@@ -519,6 +545,18 @@ uint64_t GpuProducer::host_tiled_generation_peak_bytes() const
     return std::max(host_peak(impl_->k, impl_->selected), retained) + window;
 }
 uint64_t GpuProducer::retained_host_bytes() const { return impl_->retained(); }
+uint64_t GpuProducer::locked_host_output_bytes() const
+{
+    return impl_->locked_output ? impl_->output_bytes() +
+        (impl_->transfer ? impl_->transfer_capacity() * sizeof(uint64_t) : 0) : 0;
+}
+void GpuProducer::release_host_output()
+{
+    impl_->check_generation();
+    impl_->finish_output();
+    impl_->release_full_output();
+    impl_->release(impl_->transfer);
+}
 uint64_t GpuProducer::runtime_host_allowance_bytes() noexcept { return runtime_host_bytes; }
 uint64_t GpuProducer::device_resident_bytes() const
 {

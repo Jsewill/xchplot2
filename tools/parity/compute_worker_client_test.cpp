@@ -293,6 +293,141 @@ void planning_feedback()
         "independent pipeline samples must price the route without training joint encoding or hiding an unknown slot");
     auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
     auto single = pipeline; single.independent_members = false; single.work_units = 1; single.generation = {400, 50, 25, 25};
+    {
+        Planning optional(1000);
+        auto joint_width = [&](unsigned maximum = 2) { return optional.joint_contribution_members(18, 2, maximum, now); };
+        require(!joint_width(), "a cold GPU split a ready independent batch");
+        observe(optional, single, route);
+        require(!joint_width(), "a singleton prevented the first independently pipelined batch");
+        train(optional, pipeline, route);
+        require(!joint_width(1) && joint_width() == 2 && !joint_width(3) && !joint_width(),
+            "concurrent destinations queued extra joint trials while the first was pending");
+        auto joint = single; joint.work_units = 2; joint.generation = {1200, 300, 150, 100};
+        observe(optional, joint, route);
+        require(!joint_width() && joint_width(3) == 3, "a finished joint trial prevented comparing the next ready width");
+        auto faster_joint = joint; faster_joint.worker_identity = "fast-joint"; faster_joint.generation = {80, 20, 10, 10};
+        auto other_pipe = pipeline; other_pipe.worker_identity = faster_joint.worker_identity;
+        train(optional, faster_joint, route); train(optional, other_pipe, route);
+        require(joint_width() == 2, "a faster free joint encoder was ignored");
+        auto wider = faster_joint; wider.work_units = 3; wider.generation = {600, 300, 30, 30};
+        observe(optional, wider, route);
+        require(joint_width(3) == 2, "a wider joint batch displaced the faster smaller batch");
+        auto const busy = optional.selected(faster_joint, route, now);
+        require(!joint_width(), "an occupied joint encoder hid the free worker's faster pipeline");
+        optional.released(faster_joint.worker_identity, busy);
+        require(!optional.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)),
+            "expired GPU measurements changed a fresh contribution choice");
+
+        Planning coalesced(1000);
+        train(coalesced, pipeline, route);
+        auto const occupied = coalesced.selected(pipeline, route, now);
+        require(!coalesced.joint_contribution_members(18, 2, 2, now),
+            "an unmeasured joint batch queued behind an occupied worker");
+        coalesced.released(pipeline.worker_identity, occupied);
+        require(coalesced.suggested(18, 2, pipeline.kind, now).batch == 1 &&
+            coalesced.joint_contribution_members(18, 2, 2, now) == 2,
+            "coalesced singleton requests left a ready destination waiting for a singleton sample");
+        observe(coalesced, joint, route);
+        require(!coalesced.joint_contribution_members(18, 2, 2, now),
+            "an independently delivered destination continued splitting after a slower joint trial");
+        Planning mixed_routes(1000);
+        train(mixed_routes, pipeline, route);
+        auto slow_joint = joint; slow_joint.worker_identity = "joint-only";
+        observe(mixed_routes, slow_joint, route);
+        require(!mixed_routes.joint_contribution_members(18, 2, 2, now),
+            "joint calibration repeated because the broker assigned the trial to another GPU");
+        auto occupied_pipeline = mixed_routes.selected(pipeline, route, now);
+        require(mixed_routes.joint_contribution_members(18, 2, 2, now) == 2 &&
+            !mixed_routes.joint_contribution_members(18, 2, 2, now + std::chrono::nanoseconds(600)) &&
+            mixed_routes.joint_contribution_members(18, 2, 2, now + std::chrono::nanoseconds(901)) == 2,
+            "a busy pipeline must justify its wait without displacing a free encoder after an overrun");
+        mixed_routes.released(pipeline.worker_identity, occupied_pipeline);
+
+        Planning assigned(1000);
+        train(assigned, pipeline, route);
+        auto slow_single = single; slow_single.worker_identity = "slow-uplink";
+        slow_single.generation = {1100, 700, 500, 300};
+        observe(assigned, slow_single, route);
+        require(assigned.joint_contribution_members(18, 2, 3, now) == 2,
+            "initial joint calibration took three members before pricing two");
+        auto slow_pair = slow_single; slow_pair.work_units = 2;
+        auto selected_slow = assigned.selected(slow_pair, route, now);
+        require(assigned.repartition_contributions(slow_pair, now) == 2,
+            "a joint trial occupied a slow worker longer than the whole independent batch");
+        assigned.released(slow_pair.worker_identity, selected_slow);
+        require(!assigned.joint_contribution_members(18, 2, 3, now),
+            "idle slow route repeatedly attracted the same unstarted calibration");
+        selected_slow = assigned.selected(slow_single, route, now);
+        require(assigned.joint_contribution_members(18, 2, 3, now) == 2,
+            "a busy slow worker prevented the fast worker from testing joint encoding");
+        assigned.released(slow_pair.worker_identity, selected_slow);
+        auto fast_pair = single; fast_pair.work_units = 2;
+        auto selected_fast = assigned.selected(fast_pair, route, now);
+        require(!assigned.repartition_contributions(fast_pair, now), "a fast joint calibration was rejected");
+        assigned.released(fast_pair.worker_identity, selected_fast);
+        auto fast_busy = assigned.selected(pipeline, route, now);
+        require(assigned.repartition_contributions(slow_pair, now) == 2 &&
+            !assigned.repartition_contributions(slow_pair, now + std::chrono::nanoseconds(901)),
+            "a busy pipeline needs a known remaining service time to displace an actual lease");
+        auto slow_stream = slow_single; slow_stream.independent_members = true; slow_stream.work_units = 3;
+        require(assigned.repartition_contributions(slow_stream, now) == 1 &&
+            !assigned.repartition_contributions(slow_stream, now + std::chrono::nanoseconds(901)),
+            "a slow worker held the full independent batch when another GPU could finish the remainder sooner");
+        assigned.released(pipeline.worker_identity, fast_busy);
+        require(assigned.repartition_contributions(slow_stream, now) == 1 &&
+            !assigned.repartition_contributions(pipeline, now) && !assigned.repartition_contributions(slow_single, now),
+            "partitioning changed the fast pipeline or tried to split a singleton");
+        auto competitive = slow_pair; competitive.generation = {100, 100, 100, 40};
+        observe(assigned, competitive, route);
+        require(!assigned.repartition_contributions(slow_pair, now),
+            "a measured faster joint delivery was displaced by the worker's old singleton cost");
+
+        Planning queued(1000);
+        train(queued, pipeline, route);
+        require(!queued.defer_queued_joint(18, 2, 2, now) && queued.joint_contribution_members(18, 2, 3, now) == 2 &&
+            queued.defer_queued_joint(18, 2, 2, now) && !queued.defer_queued_joint(18, 2, 3, now),
+            "a queued trial held an idle measured pipeline or changed another width");
+        fast_busy = queued.selected(pipeline, route, now);
+        require(!queued.defer_queued_joint(18, 2, 2, now), "a queued trial assumed an occupied alternative could start immediately");
+        queued.released(pipeline.worker_identity, fast_busy);
+        require(!queued.joint_contribution_members(18, 2, 3, now) &&
+            !queued.defer_queued_joint(18, 2, 2, now + std::chrono::milliseconds(1001)),
+            "a withdrawn calibration immediately retried or outlived its history");
+
+        Planning balanced(1000);
+        auto second = pipeline; second.worker_identity = "second-pipeline"; second.generation = {1200, 150, 100, 50};
+        train(balanced, second, route);
+        auto wide = second; wide.work_units = 8;
+        require(!balanced.repartition_contributions(wide, now), "a wide stream was split without another measured pipeline");
+        train(balanced, pipeline, route);
+        require(balanced.repartition_contributions(wide, now) == 3,
+            "a slower free GPU did not receive its lowest-completion-time share");
+        fast_busy = balanced.selected(pipeline, route, now);
+        require(balanced.repartition_contributions(wide, now) == 4,
+            "the busy GPU's unfinished delivery was omitted from a two-way split");
+        balanced.released(pipeline.worker_identity, fast_busy);
+
+        Planning abandoned(1000);
+        train(abandoned, pipeline, route);
+        require(abandoned.joint_contribution_members(18, 2, 2, now) == 2, "missing initial joint trial");
+        auto later = now + std::chrono::milliseconds(900);
+        auto refreshed = abandoned.selected(pipeline, route, later);
+        abandoned.observed(pipeline, route, refreshed, later); abandoned.released(pipeline.worker_identity, refreshed);
+        require(!abandoned.joint_contribution_members(18, 2, 2, later) &&
+            abandoned.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)) == 2,
+            "an undelivered joint trial suppressed new calibration past its deadline");
+
+        Planning bounded(1000);
+        auto triple = joint; triple.work_units = 3; triple.generation = {300, 150, 50, 50};
+        train(bounded, single, route); train(bounded, joint, route); train(bounded, triple, route);
+        require(bounded.estimate(18, 2, pipeline.kind, true, 1, 2, now).member_ns == 450 &&
+            bounded.estimate(18, 2, pipeline.kind, true, 1, 3, now).member_ns == 150,
+            "a narrower destination inherited a joint rate slower than its measured singleton");
+        auto slower_pipe = pipeline; slower_pipe.generation = {1800, 300, 150, 100};
+        train(bounded, slower_pipe, route);
+        require(bounded.joint_contribution_members(18, 2, 2, now) == 1,
+            "a faster measured singleton was forced back into a pipeline");
+    }
     for (bool singleton_first : {false, true})
     {
         Planning mixed(1000);
@@ -313,7 +448,9 @@ void planning_feedback()
     auto const active_fast = fleet.selected(pipeline, route, now);
     require(width() == 1, "the slower free route received a full batch while the faster GPU was occupied");
     auto const active_slow = fleet.selected(singleton, route, now);
-    require(width() == 2, "a fully occupied pool did not retain the normal queued batch limit");
+    require(width() == 3 &&
+        fleet.dispatch_width(18, 2, pool::Kind::GenerateGpu, true, 3, 2, 2, 3, 2, now + std::chrono::nanoseconds(2000)) == 2,
+        "a queued independent batch must use a known next delivery and fall back when it runs late");
     fleet.released(pipeline.worker_identity, active_fast); fleet.released(singleton.worker_identity, active_slow);
     require(width() == 3, "completed work left a GPU slot occupied");
     auto const old_route = fleet.selected(pipeline, route, now);
@@ -496,10 +633,20 @@ void independent_receivers()
     config.owner_id = "independent-receivers"; config.generation_kind = pool::Kind::GenerateGpu;
     config.contribution_read_ahead = true; config.max_active_generation = 3;
     WorkerClient client(config);
+    require(client.generation_capacity(18, 2).batch == 1, "fixture must admit only singleton joint encoding");
+    std::array<std::array<uint8_t, 32>, 2> joint_ids{};
+    bool repartition = false;
+    try
+    {
+        WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::seconds(2);
+        client.contributions(18, 2, joint_ids, [](auto, auto, auto) {}, cancel);
+    }
+    catch (pool::UnsupportedResources const&) { repartition = true; }
+    require(repartition, "a joint batch that only fits after splitting waited for its deadline");
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(18);
     auto worker = std::async(std::launch::async, [&]
     {
-        for (unsigned count : {1u, 2u})
+        for (unsigned count : {1u, 2u, 1u, 1u, 2u, 2u})
         {
             auto channel = peer.accept(10000); require(bool(channel), "missing independent receiver task");
             auto frame = channel.receive(); pool::Reader request(frame.payload);
@@ -543,7 +690,7 @@ void independent_receivers()
                     for (auto bytes : window) require(bytes.size() == 1 && bytes.front() == tag, "misrouted receiver data");
                     next += window.size();
                     if (tag == 1) throw WorkerTaskDeclined();
-                });
+                }, {}, false, tag < 3);
         } catch (WorkerTaskDeclined const&) { require(tag == 1, "a full destination declined another member"); return; }
         require(tag != 1 && next == chunks, "independent member was truncated or declined incorrectly");
     };
@@ -551,8 +698,30 @@ void independent_receivers()
     auto first = std::async(std::launch::async, run, 0);
     require(ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "initial receiver did not start");
     auto full = std::async(std::launch::async, run, 1), writable = std::async(std::launch::async, run, 2);
-    worker.get(); first.get(); full.get(); writable.get();
-    require(client.stats().independent_members == 2, "receiver isolation bypassed the independent stream");
+    first.get(); full.get(); writable.get();
+    auto exact = std::async(std::launch::async, run, 3), other_exact = std::async(std::launch::async, run, 4);
+    exact.get(); other_exact.get();
+    require(client.stats().independent_members == 2 && client.stats().completed_contributions == 4,
+        "the receiver changed an independently batched or explicitly single-member delivery");
+    joint_ids[0][0] = 6; joint_ids[1][0] = 7;
+    uint64_t received = 0;
+    auto window = [&](uint64_t ordinal, std::span<std::span<uint8_t const> const> bytes, uint16_t members)
+    {
+        require(ordinal == received && members == 1, "adaptive lease changed its contribution framing");
+        for (auto part : bytes)
+        {
+            require(part.size() == 1 && part.front() == joint_ids.at(received / chunks)[0], "adaptive lease changed its plot ID");
+            ++received;
+        }
+    };
+    auto sink = [&](uint64_t ordinal, std::span<uint8_t const> part, uint16_t members) { window(ordinal, {&part, 1}, members); };
+    require(client.try_contributions(18, 2, joint_ids, sink, {}, {}, window, true) == 0 && received == 2 * chunks,
+        "a sole eligible GPU failed to deliver its complete independent batch");
+    bool declined = false;
+    try { client.try_contributions(18, 2, joint_ids, sink, {}, {}, [](auto, auto, auto) { throw WorkerTaskDeclined(); }, true); }
+    catch (WorkerTaskDeclined const&) { declined = true; }
+    require(declined, "a destination rejection was reported as an unstarted lease split");
+    worker.get();
 
     auto other_identity = pool_test::issue(directory.path, "second-gpu", &ca);
     auto other_tls = pool_test::tls(ca, other_identity);
