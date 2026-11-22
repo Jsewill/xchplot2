@@ -767,7 +767,10 @@ active groups under the temporary-space policy. External construction
 stripes runs across eligible scratch HDDs using the available
 bandwidth. When writers are running together, it keeps a queued destination
 free if the remaining scratch drives have enough space for the grant and
-bandwidth to feed the writer. When one group replaces another, the planner
+bandwidth to feed the writer. If the only next destination would become
+part of the scratch stripe, the planner can substitute an unreserved HDD
+with sufficient capacity and bandwidth, including one that has finished
+its own group. When one group replaces another, the planner
 includes the drives already in use when dividing scratch bandwidth. This
 leaves bandwidth for the following writer when enough space is available.
 If the packer's RAM requirements reduce how many groups can run

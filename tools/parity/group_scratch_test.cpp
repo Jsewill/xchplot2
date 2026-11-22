@@ -536,6 +536,36 @@ void rotating_bandwidth(fs::path const& directory)
             "a scratch stripe must free the next writer when enough capacity and bandwidth remain");
     }
 
+    struct ReplacementCase { uint64_t room, spare_rate, writer_rate; bool free_target; };
+    for (auto [room, spare_rate, writer_rate, free_target] : std::array<ReplacementCase, 4>{{
+        {100 * unit, 3, 3, true}, {100 * unit, 4, 5, true},
+        {100 * unit, 3, 4, false}, {20 * unit, 3, 3, false}}})
+    {
+        auto roots = disks;
+        roots[2].available_bytes = room;
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        ScratchPool tail(roots, 0); tail.set_io_governor(rates);
+        require(tail.try_reserve_output(0, first, unit) && tail.try_reserve_output(1, writer, unit) &&
+            tail.try_reserve_output(2, roots[0], 0) && tail.try_reserve_output(3, roots[1], 0) &&
+            tail.try_reserve_output(4, roots[2], unit), "replacement scratch fixture output admission failed");
+        tail.seal_recovery();
+        tail.release_after_cleanup(4, unit);
+        auto running = tail.grant(0, 30 * unit, 30 * unit, unit, 2);
+        auto running_io = tail.try_io(0);
+        require(running && running_io && check(*running, 0, 30 * unit) && !tail.try_io(2),
+            "replacement scratch fixture did not block the earlier queued output");
+        rates->observe_transfer(roots[0].device, unit, unit);
+        rates->observe_transfer(roots[1].device, 4 * unit, unit);
+        rates->observe_transfer(roots[2].device, spare_rate * unit, unit);
+        rates->observe_transfer(roots[3].device, unit, unit);
+        rates->observe_transfer(writer.device, writer_rate * unit, unit);
+        auto stripe = tail.grant(1, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 1);
+        auto stripe_io = tail.try_io(1);
+        require(stripe && stripe_io && stripe->scratch.size() == 1 &&
+            check(*stripe, free_target ? 2 : 1, 30 * unit) && bool(tail.try_io(3)) == free_target,
+            "scratch failed to preserve a runnable output within the stripe bandwidth and capacity");
+    }
+
     ScratchPool queued(disks, 0);
     require(queued.try_reserve_output(0, first, unit) && queued.try_reserve_output(1, first, unit) &&
         queued.try_reserve_output(2, disks.front(), unit), "queued physical output admission failed");

@@ -603,18 +603,18 @@ private:
             auto least = std::min_element(loads.begin(), loads.end());
             *least += disk.rate; return least != loads.begin();
         });
-        if (disks.size() > width) disks.resize(width);
-        if (backlog && sharing > waiting && disks.size() > 1)
+        size_t selected = std::min(disks.size(), width);
+        if (backlog && sharing > waiting && selected > 1)
         {
             auto const fair = fleet_rate / sharing;
             long double kept = 0;
             uint64_t room = 0;
-            for (size_t i = 0; i < disks.size(); ++i)
+            for (size_t i = 0; i < selected; ++i)
             {
                 kept += disks[i].rate;
                 room += std::min(desired - room, disks[i].room);
-                if (room == desired && (i + 1 == disks.size() || kept + disks[i + 1].rate / 2 >= fair))
-                { disks.resize(i + 1); break; }
+                if (room == desired && (i + 1 == selected || kept + disks[i + 1].rate / 2 >= fair))
+                { selected = i + 1; break; }
             }
         }
         // When this fills the last open slot, a peer can finish before this
@@ -623,24 +623,52 @@ private:
         if (open_slots == 1 && !outputs.empty())
         {
             auto const output_rate = bandwidth_ ? bandwidth_->bandwidth(destination) : 0;
+            auto const required_rate = output_rate > 0 ? output_rate : typical;
             StorageDevice const* successor = nullptr;
             long double least = 0;
+            struct PendingWriter { StorageDevice const* target = nullptr; uint64_t room = 0; long double kept = 0, lost = 0; };
+            PendingWriter next;
+            bool several = false;
             for (auto const& other : owners_)
             {
                 if (other.id == owner || !other.output || other.io || !other.external.scratch.empty()) continue;
                 auto const& target = roots_[other.output->root].value.device;
-                if (overlap(destination, target)) continue;
+                if (overlap(destination, target) || shared_rotating(other.output->root, owner) ||
+                    std::any_of(outputs.begin(), outputs.end(), [&](size_t output)
+                    { return overlap(target, roots_[output].value.device); })) continue;
                 uint64_t room = 0; long double kept = 0, lost = 0;
-                for (auto const& disk : disks)
+                for (auto const& disk : std::span(disks).first(selected))
                     if (overlap(target, roots_[disk.root].value.device)) lost += disk.rate;
                     else { kept += disk.rate; room += std::min(desired - room, disk.room); }
-                if (!lost) { successor = nullptr; break; }
-                if (room == desired && kept >= (output_rate > 0 ? output_rate : typical) && (!successor || lost < least))
+                if (!lost) { successor = nullptr; next = {}; break; }
+                if (room == desired && kept >= required_rate && (!successor || lost < least))
                 { successor = &target; least = lost; }
+                if (!next.target) next = {&target, room, kept, lost};
+                else if (!overlap(*next.target, target)) several = true;
             }
-            if (successor) std::erase_if(disks, [&](Candidate const& disk)
-            { return overlap(*successor, roots_[disk.root].value.device); });
+            auto replacement = disks.end();
+            if (!successor && next.target && !several)
+            {
+                // The fair stripe can take the only runnable successor's
+                // spindle. Try the ranked slack before lending that spindle.
+                auto const sufficient_rate = std::min(required_rate, next.kept + next.lost);
+                replacement = std::find_if(disks.begin() + selected, disks.end(), [&](Candidate const& disk)
+                {
+                    return disk.room >= desired - next.room && next.kept + disk.rate >= sufficient_rate &&
+                        std::none_of(owners_.begin(), owners_.end(), [&](Owner const& other)
+                        { return other.output && overlap(roots_[disk.root].value.device, roots_[other.output->root].value.device); });
+                });
+                if (replacement != disks.end()) successor = next.target;
+            }
+            if (successor)
+            {
+                auto end = std::remove_if(disks.begin(), disks.begin() + selected, [&](Candidate const& disk)
+                { return overlap(*successor, roots_[disk.root].value.device); });
+                if (replacement != disks.end()) *end++ = *replacement;
+                selected = end - disks.begin();
+            }
         }
+        disks.resize(selected);
         std::stable_sort(disks.begin(), disks.end(), [](auto const& a, auto const& b) { return a.room / a.rate < b.room / b.rate; });
         total_rate = 0; for (auto const& disk : disks) total_rate += disk.rate;
         std::vector<std::pair<size_t, uint64_t>> shares;
