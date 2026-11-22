@@ -2243,30 +2243,35 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
             "ordered validated contributions were reread during conservative sizing");
         input.reset(); engine.finish(); require(contents(path) == reference, "grouped contributions changed canonical bytes");
     }
-    for (bool overtake : {false, true})
+    for (std::string_view mode : {"interleave", "overtake", "exact"})
     {
-        auto const path = root / (overtake ? "contribution-chunk-overtake" : "contribution-chunk-interleave");
+        auto const path = root / ("contribution-chunk-" + std::string(mode));
         auto grant = ext; grant.packing_inputs = unsigned(raw.size());
-        ExternalEngine engine(path.string(), config(), grant, false, initial_identity()); engine.confirm_identity();
-        auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
-        require(bool(input), "interleaved contribution reservation rejected");
-        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+        auto cfg = config();
+        if (mode == "exact") cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, grant);
         {
-            bool const ahead = overtake && chunk == chunks / 2;
-            if (ahead) input->append_chunk(1, chunk, encoded[1][chunk]);
-            for (uint16_t member = 0; member < input->size(); ++member)
-                if (member != 1 || !ahead) input->append_chunk(member, chunk, encoded[member][chunk]);
+            ExternalEngine engine(path.string(), cfg, grant, false, initial_identity()); engine.confirm_identity();
+            auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
+            require(bool(input), "interleaved contribution reservation rejected");
+            for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+            {
+                bool const ahead = mode != "interleave" && chunk == chunks / 2;
+                if (ahead) input->append_chunk(1, chunk, encoded[1][chunk]);
+                for (uint16_t member = 0; member < input->size(); ++member)
+                    if (member != 1 || !ahead) input->append_chunk(member, chunk, encoded[member][chunk]);
+            }
+            for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
+            input->seal(); auto const before = engine.stats();
+            require(engine.append(*input, 0, true).accepted && !engine.can_append(), "interleaved final contribution did not start packing");
+            auto const plan = size_t(WorkPhase::plan), encode = size_t(WorkPhase::encode);
+            auto const reads = engine.stats().phases[plan].read_bytes - before.phases[plan].read_bytes;
+            require(mode == "exact" ? reads && engine.stats().sized_chunks == chunks : !reads,
+                "final contribution chose the wrong sizing pass");
+            require(engine.stats().phases[encode].written_bytes == before.phases[encode].written_bytes,
+                "final contribution wrote an intermediate staging summary");
         }
-        for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
-        input->seal();
-        auto const bytes = input->written_bytes(); auto const before = engine.stats();
-        require(engine.append(*input, 0, true).accepted && !engine.can_append(), "interleaved final contribution did not start packing");
-        auto const plan = size_t(WorkPhase::plan), encode = size_t(WorkPhase::encode);
-        auto const reads = engine.stats().phases[plan].read_bytes - before.phases[plan].read_bytes;
-        require(overtake ? reads && reads < bytes / 2 : !reads, "sizing reread the validated chunk prefixes");
-        require(engine.stats().phases[encode].written_bytes == before.phases[encode].written_bytes,
-            "final contribution wrote an intermediate staging summary");
-        engine.finish(); require(contents(path) == reference, "interleaved chunk summaries changed canonical bytes");
+        ExternalEngine resumed(path.string(), cfg, grant, true); resumed.confirm_identity(); resumed.finish();
+        require(contents(path) == reference, "resumed final contributions changed canonical bytes");
     }
     uint64_t ordered_bound = 0;
     for (bool retry : {false, true})

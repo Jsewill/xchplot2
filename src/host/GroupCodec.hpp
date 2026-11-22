@@ -217,15 +217,49 @@ struct UnencodableChunkSize : std::runtime_error
     UnencodableChunkSize() : std::runtime_error("unencodable group chunk size") {}
 };
 
-inline void check_gsz_size(uint64_t size, uint16_t members)
+class ChunkIndexSize
 {
-    group_tools::require(members != 0 && size != 0 && size <= uint64_t(INT64_MAX),
-                         "invalid group chunk size");
-    uint64_t const expected = gsz_expected_for_g(members);
-    uint64_t const magnitude = size < expected ? expected - size : size - expected;
-    auto const rice = uint32_t(gsz_rice_k_for_g(members));
-    if ((magnitude >> rice) + rice + 2 > 64) throw UnencodableChunkSize();
-}
+public:
+    explicit ChunkIndexSize(uint16_t members)
+        : expected_(gsz_expected_for_g(members)), rice_(uint32_t(gsz_rice_k_for_g(members)))
+    { group_tools::require(members != 0, "invalid group chunk size"); }
+
+    uint32_t bits(uint64_t size) const
+    {
+        group_tools::require(size && size <= uint64_t(INT64_MAX), "invalid group chunk size");
+        uint64_t const length = quotient(size) + rice_ + 2;
+        if (length > 64) throw UnencodableChunkSize();
+        return uint32_t(length);
+    }
+    uint64_t bytes(std::span<uint64_t const> sizes) const
+    {
+        group_tools::require(sizes.size() <= UINT64_MAX / 64, "group index length overflow");
+        if (sizes.empty()) return 0;
+        // The Rice parameter and the sign and stop bits are shared. The two
+        // extreme sizes bound every code, so check them once after summing.
+        uint64_t total = sizes.size() * uint64_t(rice_ + 2), low = UINT64_MAX, high = 0;
+        for (auto size : sizes)
+        {
+            low = std::min(low, size); high = std::max(high, size);
+            total += quotient(size);
+        }
+        bits(low); bits(high);
+        return total / 8 + (total % 8 != 0);
+    }
+private:
+    uint64_t quotient(uint64_t size) const
+    {
+        // Use the canonical encoder's unsigned magnitude, including when
+        // bytes() has yet to validate the extrema of the input.
+        uint64_t const delta = size - expected_, sign = delta >> 63;
+        return ((delta ^ (0 - sign)) + sign) >> rice_;
+    }
+    uint64_t expected_;
+    uint32_t rice_;
+};
+
+inline void check_gsz_size(uint64_t size, uint16_t members)
+{ (void)ChunkIndexSize(members).bits(size); }
 
 struct EncodedChunk
 {

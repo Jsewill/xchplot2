@@ -321,6 +321,7 @@ private:
     };
     struct Packet { uint16_t first, count; uint32_t bytes; };
     static_assert(sizeof(Packet) == 8);
+    static uint64_t contribution_payload_bound(uint8_t k, uint16_t members, uint64_t symbols, uint64_t chunks);
     static uint64_t contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound);
     struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
     static constexpr uint64_t segment_header_bytes = 64;
@@ -1022,8 +1023,8 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     // input record while rebuilding persistent metadata. Keep
     // the existing recovery/inspection admission of a record within one eighth
     // of the grant, including descriptor-vector capacity and parser temporaries.
-    // Staging owns one cached or operation-local candidate summary. Exact sizing retains
-    // one canonical size field; durable summaries remain in scratch.
+    // Staging owns one cached or operation-local candidate summary. Exact sizing
+    // counts canonical index bits in a scalar; durable summaries remain in scratch.
     uint64_t const metadata = multiply(checkpoint_buffer_bytes(external), 8);
     if (phase == MemoryPhase::publication) return metadata;
     uint64_t const digest_memory = member_digest_words * sizeof(uint64_t) + 4096;
@@ -1048,8 +1049,7 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     uint64_t const tasks = staging ? std::max({planning_window, multiply(lanes, contribution_window), packing_tasks}) : packing_tasks;
     return grow_add(grow_add(config.codec_bytes, ParallelEncoder::memory_bytes(config.workers, !config.cpu_scheduler)), grow_add(grow_add(grow_add(multiply(config.window_bytes, 2 * lanes), tasks), std::max(config.window_bytes, uint64_t(max_runs * sizeof(Packet)))),
         grow_add(grow_add(metadata, digest_memory),
-        // Exact admission retains the candidate summary and a bounded writer
-        // for one canonical size field, with payload and bit totals in scalars.
+        // Exact admission retains the candidate summary and counts index bits.
         grow_add(staging ? grow_add(multiply(PlotGroupFile::getChunkCountForK(k), sizeof(Summary)), sizeof(uint64_t)) : 0,
             grow_add(multiply(batch_members, sizeof(size_t) + sizeof(FragmentRegion)),
                 multiply(multiply(lanes, UINT16_MAX), sizeof(EncodedChunk)))))));
@@ -2225,6 +2225,9 @@ public:
                 require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
                     "contribution input exceeds its admitted fragment count");
                 entry.symbols += inspected.summary.symbols;
+                entry.smallest_symbols = std::min(entry.smallest_symbols, inspected.summary.symbols);
+                entry.largest_symbols = std::max(entry.largest_symbols, inspected.summary.symbols);
+                entry.largest_packet = std::max<uint64_t>(entry.largest_packet, bytes.size());
                 if (ordinal < summary_limit)
                 {
                     ++entry.summary_chunks;
@@ -2322,6 +2325,7 @@ private:
         Run run;
         std::unique_ptr<Writer> writer;
         uint64_t next = 0, symbols = 0, summary_chunks = 0, summary_bytes = 0;
+        uint64_t smallest_symbols = UINT64_MAX, largest_symbols = 0, largest_packet = 0;
         uint16_t owner = 0, count = 0;
         bool finished = false, failed = false;
     };
@@ -2684,21 +2688,23 @@ inline uint64_t ExternalEngine::contribution_input_memory_bytes(Config const& co
     return grow_add(grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec), inspection),
         multiply(members, grow_add(config.window_bytes, sizeof(ContributionInput::MemberRecord) + sizeof(Writer))));
 }
-inline uint64_t ExternalEngine::contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound)
+inline uint64_t ExternalEngine::contribution_payload_bound(uint8_t k, uint16_t members, uint64_t symbols, uint64_t chunks)
 {
-    // The ordered deltas in each chunk span at most one range per member.
-    // Round its unary allowance up so singleton reservations also cover a
-    // coencoded run. The fixed FSE table consumes at most 11 bits per symbol,
-    // plus two 11-bit states and the end bit (as in ChunkCodec::size_bounds).
-    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    // The ordered deltas span at most one range per member in each chunk.
+    // The fixed FSE table consumes at most 11 bits per symbol, plus two
+    // 11-bit states and one end bit (as in ChunkCodec::size_bounds).
     uint64_t const range = 1ull << (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
     uint64_t const threshold = 178ull << (k - 8);
     uint64_t const unary = multiply(members, (range + threshold - 1) / threshold);
-    uint64_t const symbols = multiply(members, fragment_bound);
     uint64_t const bits = grow_add(multiply(symbols, (k - 7) + 11), multiply(chunks, unary + 23));
-    // Round the two bitstreams independently in each chunk and include the
-    // largest unsigned length prefix and the on-disk packet header.
-    return grow_add(bits / 8, multiply(chunks, 2 + 10 + sizeof(Packet)));
+    // Round the two bitstreams independently and include the largest LEB prefix.
+    return grow_add(bits / 8, multiply(chunks, 2 + 10));
+}
+inline uint64_t ExternalEngine::contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound)
+{
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    return grow_add(contribution_payload_bound(k, members, multiply(members, fragment_bound), chunks),
+        multiply(chunks, sizeof(Packet)));
 }
 inline uint64_t ExternalEngine::contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
 {
@@ -2948,6 +2954,10 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     uint16_t const count = prefix ? prefix : input.size();
     require(count && count <= input.size() && count <= UINT16_MAX - members_, "invalid contribution input prefix");
     uint16_t records = 0;
+    uint8_t const k = identity_.header.k;
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    uint64_t symbols = 0, smallest_symbols = 0, largest_symbols = 0, source_bound = 0;
+    bool needs_read = false;
     for (uint16_t member = 0; member < count; member += input.members_[member].count)
     {
         auto const& entry = input.members_[member];
@@ -2958,6 +2968,11 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         if (entry.count > count - member)
             return {false, false, final_bound_, grow_add(final_bound_, metadata_bytes(identity_.header.k, external_)),
                 "received prefix crosses a compute batch; regenerate its fitting members", {}};
+        symbols = grow_add(symbols, entry.symbols);
+        smallest_symbols = grow_add(smallest_symbols, entry.smallest_symbols);
+        largest_symbols = grow_add(largest_symbols, entry.largest_symbols);
+        source_bound = grow_add(source_bound, entry.largest_packet);
+        needs_read |= entry.summary_chunks < chunks;
         ++records;
     }
     require(grow_add(required_memory(count), contribution_input_memory_bytes(config_, input.size())) <= config_.memory_limit_bytes,
@@ -2965,7 +2980,56 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     check_paths(); ThreadCpuTimer cpu(contribution_owner_cpu_);
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
-    uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
+    ChunkIndexSize const index_size(after);
+    auto commit = [&](std::vector<Summary>& summaries, uint64_t bytes, uint64_t peak) -> AppendResult
+    {
+        require(pending_summary_.segments.empty() && runs_.size() + count <= max_runs,
+            "contribution append lost its reserved run slots");
+        planning.finish(); PhaseTimer encoding(stats_, WorkPhase::encode, config_.progress);
+        contribution_bytes_ = 0;
+        for (uint16_t member = 0; member < count; member += input.members_[member].count)
+        {
+            auto& run = input.members_[member].run;
+            contribution_bytes_ = grow_add(contribution_bytes_, run.bytes);
+            runs_.push_back(std::move(run)); run = {};
+        }
+        members_ = after; final_bound_ = bytes; packet_count_ = grow_add(packet_count_, records);
+        commit_runs(summaries, peak, final, encoding);
+        return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
+    };
+    // A fresh group that can pack directly needs no durable staging summary.
+    // Joining validated streams preserves the symbol count across each changed
+    // boundary delta. The totals bound the file and the per-stream extrema
+    // bound each chunk, regardless of the order of arrival.
+    auto const packing_inputs = external_.packing_inputs ? external_.packing_inputs : external_.fan_in;
+    if (needs_read && final && !members_ && count == input.size() && can_finish_with_members() &&
+        runs_.size() + records <= packing_inputs)
+    {
+        // Every symbol has k-7 low bits, plus at least one ANS byte and one
+        // length byte for the whole chunk.
+        uint64_t const least = multiply(smallest_symbols, k - 7) / 8 + 2;
+        uint64_t const largest = contribution_payload_bound(k, count, largest_symbols, 1);
+        uint64_t const bytes = grow_add(sizeof(Header) + identity_.memo.size(),
+            grow_add(contribution_payload_bound(k, count, symbols, chunks), multiply(chunks, sizeof(uint64_t))));
+        uint64_t const peak = grow_add(bytes, metadata_bytes(k, external_));
+        if (bytes <= input.final_capacity_ && peak <= config_.capacity_bytes &&
+            std::max(source_bound, largest) <= config_.window_bytes &&
+            ChunkCodec::estimate_work(k, source_bound, 0) <= config_.codec_bytes)
+        {
+            bool encodable = true;
+            try { index_size.bits(least); index_size.bits(largest); }
+            catch (UnencodableChunkSize const&) { encodable = false; }
+            if (encodable)
+            {
+                for (uint16_t member = 0; member < count; member += input.members_[member].count)
+                    check_summary_source(input.members_[member].run);
+                packing_source_bytes_ = source_bound;
+                std::vector<Summary> summaries;
+                std::vector<Summary>().swap(input.candidate_);
+                return commit(summaries, bytes, peak);
+            }
+        }
+    }
     bool const cached = !input.candidate_.empty() && std::none_of(input.members_.begin() + count,
         input.members_.end(), [](auto const& entry) { return entry.summary_chunks != 0; });
     if (!cached) std::vector<Summary>().swap(input.candidate_);
@@ -3037,7 +3101,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         if (!fits) break;
         auto const sizes = ChunkCodec::size_bounds(summary.codec);
         final_bound = grow_add(final_bound, sizes.second);
-        try { check_gsz_size(sizes.first, after); check_gsz_size(sizes.second, after); }
+        try { index_size.bits(sizes.first); index_size.bits(sizes.second); }
         catch (UnencodableChunkSize const&) { fits = false; }
         if (sizes.second > config_.window_bytes || summary.bytes > config_.window_bytes ||
             ChunkCodec::estimate_work(identity_.header.k, summary.bytes, 0) > config_.codec_bytes) fits = false;
@@ -3050,7 +3114,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         // partial group. Inspect again while gathering the complete canonical
         // chunk so even a failed first scan leaves a complete candidate table.
         rewind(true); final_bound = sizeof(Header) + identity_.memo.size();
-        uint64_t index_bits = 0; BitWriter field; fits = true;
+        uint64_t index_bits = 0; fits = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
         {
             config_.check_running();
@@ -3059,14 +3123,12 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
             if (work > config_.codec_bytes) { fits = false; break; }
             codec->prepare(work);
             uint64_t bytes = 0;
-            try { bytes = codec->joined_size(chunk, parts); check_gsz_size(bytes, after); }
+            try { bytes = codec->joined_size(chunk, parts); index_bits = grow_add(index_bits, index_size.bits(bytes)); }
             catch (UnencodableChunkSize const&) { fits = false; break; }
             ++stats_.sized_chunks;
             if (bytes > config_.window_bytes) { fits = false; break; }
             summaries[size_t(chunk)] = {codec->summary(chunk, after), payload.size()};
             final_bound = grow_add(final_bound, bytes);
-            field.clear(); gsz_encode(std::span<uint64_t const>(&bytes, 1), after, field);
-            index_bits = grow_add(index_bits, field.bitCount());
         }
         final_bound = grow_add(final_bound, grow_add(index_bits, 7) / 8);
         peak = grow_add(final_bound, metadata_bytes(identity_.header.k, external_));
@@ -3081,19 +3143,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     for (auto const& reader : readers) require(!reader->remaining(), "contribution input has trailing packets");
     readers.clear(); sources.clear(); codec.reset();
     std::vector<uint8_t>().swap(payload); std::vector<EncodedChunk>().swap(parts);
-    require(pending_summary_.segments.empty() && runs_.size() + count <= max_runs,
-        "contribution append lost its reserved run slots");
-    planning.finish(); PhaseTimer encoding(stats_, WorkPhase::encode, config_.progress);
-    contribution_bytes_ = 0;
-    for (uint16_t member = 0; member < count; member += input.members_[member].count)
-    {
-        auto& run = input.members_[member].run;
-        contribution_bytes_ = grow_add(contribution_bytes_, run.bytes);
-        runs_.push_back(std::move(run)); run = {};
-    }
-    members_ = after; final_bound_ = final_bound; packet_count_ = grow_add(packet_count_, records);
-    commit_runs(summaries, peak, final, encoding);
-    return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
+    return commit(summaries, final_bound, peak);
 }
 inline AppendResult ExternalEngine::append_source(Members members, PreparedInput* input, uint16_t count,
                                                   bool final, MemberBatchHash const* hash)
@@ -3116,6 +3166,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
             "external run limit needs more scratch; finish the committed prefix", {}};
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
+    ChunkIndexSize const index_size(after);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
     auto summaries = take_summary();
     std::vector<size_t> cursors(count, 0);
@@ -3156,7 +3207,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         uint64_t const source_bytes = terminal ? summary.bytes : grow_add(summary.bytes, bounded);
         auto const sizes = ChunkCodec::size_bounds(summary.codec);
         final_bound = grow_add(final_bound, sizes.second);
-        try { check_gsz_size(sizes.first, after); check_gsz_size(sizes.second, after); }
+        try { index_size.bits(sizes.first); index_size.bits(sizes.second); }
         catch (UnencodableChunkSize const&) { fits = false; reason = "external canonical chunk index exceeds conservative admission"; }
         if (sizes.second > config_.window_bytes || source_bytes > config_.window_bytes ||
             ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? incoming_symbols : 0) > config_.codec_bytes ||
@@ -3225,7 +3276,6 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         if (final) for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
         std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
         std::vector<EncodedChunk> contributions; contributions.reserve(UINT16_MAX);
-        BitWriter field;
         uint64_t final_bytes = sizeof(Header) + identity_.memo.size(), index_bits = 0;
         contribution_bound = 0; bool buffers = true, encodable = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
@@ -3256,19 +3306,14 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
                 {
                     final_size = contributions.empty() ? codec.encoded_size(chunk, {}, 0, regions) :
                         codec.joined_size(chunk, contributions, regions);
-                    check_gsz_size(final_size, after);
+                    index_bits = grow_add(index_bits, index_size.bits(final_size));
                     if (final_size > config_.window_bytes) buffers = false; ++stats_.sized_chunks;
                 }
                 if (!terminal) { bytes = codec.encoded_size(chunk, {}, 0, regions); ++stats_.sized_chunks; }
             }
             catch (UnencodableChunkSize const&) { encodable = false; break; }
             stats_.codec_ns += elapsed_ns(begin);
-            if (final)
-            {
-                final_bytes = grow_add(final_bytes, final_size);
-                field.clear(); gsz_encode(std::span<uint64_t const>(&final_size, 1), after, field);
-                index_bits = grow_add(index_bits, field.bitCount());
-            }
+            if (final) final_bytes = grow_add(final_bytes, final_size);
             uint64_t const source_bytes = terminal ? summaries[size_t(chunk)].bytes : grow_add(summaries[size_t(chunk)].bytes, bytes);
             if (source_bytes > config_.window_bytes ||
                 ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? symbols : 0) > config_.codec_bytes)
@@ -3705,21 +3750,17 @@ inline void ExternalEngine::pack(Members members)
     };
     auto emit = [&](std::span<uint8_t const> bytes)
     {
-        require(bytes.size() <= config_.window_bytes, "external canonical chunk exceeds output window");
-        if (writeback_window)
+        while (!bytes.empty())
         {
-            // Fill to a file-offset boundary even after a short checkpoint
-            // flush. The next write then starts beyond the pages in writeback.
-            size_t room = size_t(writeback_window - output_bytes_ % writeback_window);
-            while (bytes.size() >= room)
-            {
-                output_window.insert(output_window.end(), bytes.begin(), bytes.begin() + room);
-                output_bytes_ += room; flush_output(); bytes = bytes.subspan(room);
-                room = writeback_window;
-            }
+            // After a short checkpoint flush, align the next writeback to
+            // file offsets. Other targets can simply fill the whole buffer.
+            size_t const room = writeback_window ? size_t(writeback_window - output_bytes_ % writeback_window) :
+                size_t(config_.window_bytes) - output_window.size();
+            size_t const n = std::min(room, bytes.size());
+            output_window.insert(output_window.end(), bytes.begin(), bytes.begin() + n);
+            output_bytes_ += n; bytes = bytes.subspan(n);
+            if (n == room) flush_output();
         }
-        else if (bytes.size() > output_window.capacity() - output_window.size()) flush_output();
-        output_window.insert(output_window.end(), bytes.begin(), bytes.end()); output_bytes_ += bytes.size();
     };
     uint64_t committed = output_bytes_;
     PackingCheckpointHistory checkpoint_history;
@@ -3849,17 +3890,31 @@ inline void ExternalEngine::pack(Members members)
         stats_.codec_ns += current->codec_ns; stats_.encode_chunks += current->tasks.size();
         for (auto const& block : current->blocks)
         {
-            size_t offset = 0;
-            for (size_t i = block.begin; i < block.end; ++i)
+            size_t offset = 0, i = block.begin;
+            while (i < block.end)
             {
-                uint64_t const bytes = current->lengths[i]; require(bytes <= block.bytes.size() - offset, "external packed block changed length");
-                emit(block.bytes.subspan(offset, size_t(bytes))); offset += size_t(bytes);
-                gsz_encode(std::span<uint64_t const>(&bytes, 1), members_, index_bits);
+                // Emit contiguous codec output together. Stop on the exact
+                // checkpoint chunk and allow up to one 64-bit index field per
+                // chunk within the existing index and output windows.
+                size_t const first = i;
+                auto const fields = std::max<uint64_t>(1, (packing_index_bytes(config_) - index_bits.asBytes().size()) / sizeof(uint64_t));
+                size_t const end = i + std::min<uint64_t>(block.end - i, fields);
+                uint64_t const checkpoint_room = packing_checkpoint_bytes() - (output_bytes_ - committed);
+                size_t bytes = 0;
+                do
+                {
+                    uint64_t const length = current->lengths[i];
+                    require(length <= block.bytes.size() - offset - bytes, "external packed block changed length");
+                    require(length <= config_.window_bytes, "external canonical chunk exceeds output window");
+                    bytes += size_t(length); ++i;
+                } while (i < end && bytes < checkpoint_room);
+                emit(block.bytes.subspan(offset, bytes)); offset += bytes;
+                gsz_encode(std::span(current->lengths).subspan(first, i - first), members_, index_bits);
                 if (index_bits.asBytes().size() >= packing_index_bytes(config_)) { drain_output(); flush_index(false); }
-                packed_chunks_ = current->first + i + 1;
+                packed_chunks_ = current->first + i;
                 if (output_bytes_ - committed >= packing_checkpoint_bytes() || packed_chunks_ == chunks)
                 {
-                    checkpoint(std::span<uint64_t const>(current->frontiers).subspan(i * runs_.size(), runs_.size()));
+                    checkpoint(std::span<uint64_t const>(current->frontiers).subspan((i - 1) * runs_.size(), runs_.size()));
                     if (current->tasks.size() > workers && packed_chunks_ < current->next) grow_failpoint("external-pack-window-checkpoint");
                 }
             }

@@ -698,9 +698,11 @@ an intermediate scratch read and rewrite.
 Partitions and alternate paths to one drive share its bandwidth. Resuming a
 plot uses the scratch locations and capacities saved in its checkpoint.
 
-On Linux, an independent output HDD can start writing completed ranges while
-the plotter prepares the next chunks. The packer aligns these writes to page
-boundaries so appending the next chunk can proceed while the disk is busy.
+The external packer copies adjacent encoded chunks together and appends their
+lengths to the group index in batches. On Linux, an independent output HDD
+can start writing completed ranges while the plotter prepares the next chunks.
+The packer aligns these writes to page boundaries so appending the next chunk
+can proceed while the disk is busy.
 The packing checkpoint synchronizes the output and index before releasing
 consumed scratch.
 
@@ -716,8 +718,14 @@ When the current summary is in RAM, a chunk can extend it as soon as the
 same chunk from each preceding member has arrived. Concurrent workers
 can therefore contribute to the summary while both are still sending.
 Conservative sizing skips the summarized prefix of each stream and reads
-the remaining packets from scratch. A retried stream can require rebuilding
-the summary. Tight capacity still triggers exact sizing against the saved runs.
+the remaining packets from scratch. When a fresh group can go straight to
+packing, the plotter can also bound the finished file from the validated
+symbol counts and largest packets in each stream. This lets members arrive
+out of order without a sizing reread when the bound fits. A retried stream
+can require rebuilding the summary. Tight capacity triggers exact sizing
+against the saved runs.
+During exact sizing, merged construction keeps a running total of index bits,
+saving one 64-bit length per chunk.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both

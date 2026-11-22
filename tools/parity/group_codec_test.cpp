@@ -288,11 +288,27 @@ void synthetic()
 
 void summaries()
 {
-    for (uint16_t members : {uint16_t(1), uint16_t(64), uint16_t(UINT16_MAX)})
+    for (uint16_t members : {uint16_t(1), uint16_t(3), uint16_t(64), uint16_t(UINT16_MAX)})
     {
         uint64_t const expected = gsz_expected_for_g(members);
         unsigned const rice = unsigned(gsz_rice_k_for_g(members));
         uint64_t const magnitude = (uint64_t(63 - rice) << rice) - 1;
+        ChunkIndexSize const sizing(members);
+        std::vector<uint64_t> sizes{expected, expected + 1, expected - 1, expected + magnitude,
+            expected - std::min(expected - 1, magnitude)};
+        BitWriter index;
+        uint64_t bits = 0;
+        for (size_t i = 0; i < sizes.size(); ++i)
+        {
+            gsz_encode(std::span(sizes).subspan(i, 1), members, index);
+            bits += sizing.bits(sizes[i]);
+            require(bits == index.bitCount() && sizing.bytes(std::span(sizes).first(i + 1)) == index.asBytes().size(),
+                "exact index size differs from the canonical encoder");
+        }
+        require(!sizing.bytes({}), "empty index has a nonzero length");
+        sizes[1] = 0; rejects([&] { (void)sizing.bytes(sizes); });
+        sizes[1] = expected + magnitude + 1; rejects([&] { (void)sizing.bytes(sizes); });
+        sizes[1] = UINT64_MAX; rejects([&] { (void)sizing.bytes(sizes); });
         check_gsz_size(expected + magnitude, members);
         rejects([&] { check_gsz_size(expected + magnitude + 1, members); });
         if (expected > magnitude + 1)

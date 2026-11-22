@@ -470,7 +470,7 @@ private:
     std::unique_ptr<Window> encode_owned(uint64_t first, uint64_t count, uint64_t source_begin, Members members);
     void retain_planned_window(uint64_t first, uint64_t source_begin, std::span<EncodedBlock const> blocks,
                                std::span<uint64_t const> sizes, std::array<uint8_t, 32> const& digest);
-    void load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const;
+    uint64_t load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const;
     void scan_sizes(Header const& header, uint64_t first, uint64_t count, uint64_t begin,
                     uint64_t end, std::vector<uint64_t>& sizes) const;
     void prepare_members(Members members, uint16_t first);
@@ -907,7 +907,7 @@ inline uint64_t Engine::memory_bytes(Members members) const
     return memory_bytes(uint16_t(members.size()), wide, compact);
 }
 
-inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const
+inline uint64_t Engine::load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const
 {
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
     require(header.group_size && header.chunk_index_offset >= sizeof(Header) + header.memo_length &&
@@ -949,6 +949,7 @@ inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector
     auto const index = canonical.asBytes();
     require(index.size() <= packed.size() && std::equal(index.begin(), index.end(), packed.begin()),
             "group index is not canonical");
+    return index.size();
 }
 
 inline void Engine::discover(bool allow_resume, std::optional<Identity> const& initial,
@@ -1081,10 +1082,7 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
         finalizing_ = true;
         return;
     }
-    load_index(header, bytes, old_sizes_);
-    BitWriter index;
-    gsz_encode(old_sizes_, header.group_size, index);
-    uint64_t const canonical_bytes = grow_add(header.chunk_index_offset, index.asBytes().size());
+    uint64_t const canonical_bytes = grow_add(header.chunk_index_offset, load_index(header, bytes, old_sizes_));
     require(canonical_bytes == bytes || allow_resume,
             "group has trailing bytes; --resume may discard an interrupted initialization tail");
     if (canonical_bytes != bytes)
@@ -1395,9 +1393,7 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
     }
     require(old_offset == identity_.header.chunk_index_offset, "old payload bounds changed");
     result.header.chunk_index_offset = new_offset;
-    BitWriter index;
-    gsz_encode(result.sizes, result.new_members, index);
-    result.final_bytes = grow_add(new_offset, index.asBytes().size());
+    result.final_bytes = grow_add(new_offset, ChunkIndexSize(result.new_members).bytes(result.sizes));
     uint64_t const needed = std::max(grow_add(new_offset, result.largest_chunk_bytes), identity_.bytes);
     uint64_t const first_record = grow_add(needed,
         needed % record_alignment_ ? record_alignment_ - needed % record_alignment_ : 0);
@@ -1844,11 +1840,7 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
 inline Result Engine::finish_fresh(Plan& plan, Record const& record)
 {
     plan.header.chunk_index_offset = record.new_frontier;
-    {
-        BitWriter index;
-        gsz_encode(plan.sizes, plan.new_members, index);
-        plan.final_bytes = grow_add(plan.header.chunk_index_offset, index.asBytes().size());
-    }
+    plan.final_bytes = grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes));
     require(plan.final_bytes <= record.final_bytes, "fresh index exceeded its admitted bound");
     plan.workspace_bytes = plan.peak_file_bytes - plan.final_bytes;
     grow_failpoint("payload");
@@ -2282,9 +2274,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
         encoder_.reset();
         scan_sizes(plan.header, 0, plan.sizes.size(), sizeof(Header) + identity_.memo.size(),
                    plan.header.chunk_index_offset, plan.sizes);
-        BitWriter index;
-        gsz_encode(plan.sizes, plan.new_members, index);
-        plan.final_bytes = grow_add(plan.header.chunk_index_offset, index.asBytes().size());
+        plan.final_bytes = grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes));
         plan.peak_file_bytes = file_bytes();
         plan.workspace_bytes = plan.peak_file_bytes > plan.final_bytes ? plan.peak_file_bytes - plan.final_bytes : 0;
         require(plan.final_bytes <= file_bytes(), "payload-complete file is shorter than its canonical index");
@@ -2360,9 +2350,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
     }
     require(old_offset == record.old_frontier && new_offset == record.new_frontier,
             "regenerated batch does not reproduce saved frontier");
-    BitWriter index;
-    gsz_encode(plan.sizes, plan.new_members, index);
-    require(grow_add(plan.header.chunk_index_offset, index.asBytes().size()) == plan.final_bytes,
+    require(grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes)) == plan.final_bytes,
             "reconstructed index length differs from exact plan");
     }
     // Redo replay uses the source-window reservation for its copy buffer.

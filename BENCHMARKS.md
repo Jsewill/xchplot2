@@ -1187,6 +1187,50 @@ by SHA-256. A fresh proof check also sampled one group in each fill. The
 harvester reported 17,886 plots throughout. Its longest eligible lookup
 during these fills took 5.34 s.
 
+#### Sizing out-of-order GPU contributions on HDDs
+
+David published the same 48 k=28 members in 16 three-member groups with
+a 4 GiB owner budget and 10 GiB per GPU worker. Automatic construction used
+two active destinations and up to 14 scratch HDDs. Elapsed time ends when
+the last group reaches disk.
+
+| Build and workers | RTX 4090 / RX 6700 XT members | Last publication | Seconds per member | Scratch read for sizing |
+| --- | ---: | ---: | ---: | ---: |
+| Previous, RTX 4090 | 48 / 0 | 206.97 s | 4.31 | 0 |
+| Updated, RTX 4090 | 48 / 0 | 203.71 s | 4.24 | 0 |
+| Previous, both GPUs | 47 / 1 | 204.35 s | 4.26 | 0.96 GB |
+| Updated, both GPUs | 47 / 1 | 213.39 s | 4.45 | 0 |
+
+In the mixed fills, the 4090 took 153.39 s to deliver 19 requests on the
+previous build and 161.47 s for 21 requests on the updated build. Packing
+CPU time across the 16 groups fell from 218.30 to 214.26 s. Each row is one
+fill. An intermediate build with batched packing still reread 7.15 GB to
+size groups when the Radeon delivered five members. That fill took 240.78 s
+(5.02 s/member).
+
+All 16 groups in each fill matched their full-proof-checked references by
+SHA-256, with a fresh full-proof sample from one group per fill. The live
+harvester reported 17,886 plots. Its longest eligible lookup took 7.48 s
+during the updated single-GPU fill and 5.34 s during the updated mixed fill.
+
+To isolate construction from GPU and network timing, two scratch HDDs
+received the same three synthetic k=28 member streams in reverse membership
+order. A third HDD received the finished group. Each member repeated a
+fixed encoded chunk with 64 fragments. Each build ran twice, reversing
+the build order for the second pair. All four output hashes matched.
+The previous build reread 2.06 GB to size each group. The updated build
+read zero bytes for sizing. Mean time from sealing the input to the packing
+checkpoint fell from 7.16 s to 82.9 ms. Mean time from reserving scratch
+through publication fell from 27.79 to 20.69 s per group, or from 9.26 to
+6.90 s/member.
+
+At k=28, a group has 4,194,304 chunk lengths. On the plotting workstation,
+computing the size of a three-member index took 4.44 ms, down from 9.34 ms
+to encode it and measure the result. Both paths returned 3,971,787 bytes
+for the same synthetic lengths. These are medians over 13 trials with
+alternating execution order. Exact sizing in merged construction also
+avoids a 32 MiB temporary length table at k=28.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

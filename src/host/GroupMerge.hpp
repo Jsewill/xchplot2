@@ -336,8 +336,8 @@ public:
     {
         require(k >= 18 && k <= 28 && !(k & 1) && cfg.window_bytes, "invalid merge memory admission");
         uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
-        // One summary table, incoming/exact/original size tables, decoder and
-        // gathered codec windows, eight I/O windows shared by active readers,
+        // One summary table, incoming and original sizes, validation of the
+        // original index, codec windows, eight I/O windows shared by active readers,
         // bounded member descriptors, simultaneous checkpoint/map copies,
         // and a per-run frontier table in each live packing window. Incoming
         // descriptors have their own bounded windows; retained encoded output
@@ -564,8 +564,9 @@ inline MergeEngine::Admission MergeEngine::exact(std::span<Summary const> summar
     if (arena_.state.run_count) input = std::make_unique<Inputs>(*this, std::span(arena_.state.runs).first(arena_.state.run_count));
     ChunkCodec codec(k(), config().codec_bytes, config().cpu_scheduler); Gather gathered(*this);
     std::vector<size_t> cursors(incoming.size(), 0); std::vector<FragmentRegion> fresh(incoming.size());
-    std::vector<uint64_t> canonical(size_t(chunks()), 0);
     uint16_t const members = uint16_t(arena_.state.members + incoming.size());
+    ChunkIndexSize const index_size(members);
+    uint64_t index_bits = 0;
     Admission result; result.growth = header_bytes(); uint64_t output = header_bytes(), consumed = 0;
     for (uint64_t chunk = 0; chunk < chunks(); ++chunk)
     {
@@ -586,7 +587,8 @@ inline MergeEngine::Admission MergeEngine::exact(std::span<Summary const> summar
         arena_.stats.codec_ns += elapsed_ns(begin); ++arena_.stats.sized_chunks;
         require(codec.summary(chunk, members) == summaries[size_t(chunk)].codec,
                 "merged summary differs from its compressed data");
-        canonical[size_t(chunk)] = bytes; output = grow_add(output, bytes); consumed = grow_add(consumed, source);
+        index_bits = grow_add(index_bits, index_size.bits(bytes));
+        output = grow_add(output, bytes); consumed = grow_add(consumed, source);
         result.growth = std::max(result.growth, output > consumed ? output - consumed : 0);
         result.largest = std::max(result.largest, std::max(source, bytes));
         result.codec_required = std::max(result.codec_required,
@@ -596,8 +598,7 @@ inline MergeEngine::Admission MergeEngine::exact(std::span<Summary const> summar
         if (input) input->evict_read();
     }
     if (input) input->finish();
-    BitWriter index; gsz_encode(canonical, members, index);
-    result.live = consumed; result.minimum = output; result.canonical = grow_add(output, index.asBytes().size());
+    result.live = consumed; result.minimum = output; result.canonical = grow_add(output, grow_add(index_bits, 7) / 8);
     result.growth = std::max(result.growth, result.canonical > consumed ? result.canonical - consumed : 0);
     result.peak = workspace(result, arena_.state.run_count + (incoming.empty() ? 0 : 1)); return result;
 }
