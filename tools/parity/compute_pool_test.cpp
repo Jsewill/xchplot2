@@ -1123,6 +1123,66 @@ void parallel_generation_tail(BrokerOptions options, TlsOptions const& owner_tls
     require(extra && third.begin(*extra, extra->owner_identity), "an idle third worker was held after it could shorten delivery");
     third.finish(*extra); first.finish(*active_first); second.finish(*active_second);
 }
+void generation_pending_delivery(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& slow_tls,
+                                 TlsOptions const& fast_tls, TlsOptions const& spare_tls)
+{
+    options.lease_ms = 10000; options.worker_ms = 10000; options.max_tasks = 32;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), slow(endpoint, slow_tls), fast(endpoint, fast_tls), spare(endpoint, spare_tls);
+    auto session = owner.open_owner("pending-generation-delivery");
+    auto request = task("probe"); request.kind = Kind::GenerateGpu; request.sequence = 0;
+    auto enroll = [&](BrokerClient& worker, char const* instance, uint16_t port)
+    {
+        auto advertised = offer(instance, port);
+        advertised.capabilities |= capability(Kind::GenerateGpu);
+        advertised.generation_profiles = {profile(Kind::GenerateGpu)};
+        advertised.capacity.gpu_bytes = advertised.generation_profiles.front().resources.gpu_bytes;
+        worker.register_worker(advertised);
+    };
+    auto submit = [&](std::string id)
+    { request.task_id = std::move(id); ++request.sequence; return owner.acquire(session, request); };
+    auto start = [&](BrokerClient& worker, std::string id)
+    {
+        auto lease = submit(std::move(id));
+        require(lease && worker.begin(*lease, lease->owner_identity), "pending-delivery fixture did not start on the expected GPU");
+        return *lease;
+    };
+    auto measure = [&](BrokerClient& worker, std::string id, uint64_t elapsed)
+    {
+        auto lease = start(worker, std::move(id));
+        worker.finish(lease); owner.delivered(lease, {elapsed, 32, 1024});
+    };
+
+    enroll(slow, "pending-slow", 49502);
+    auto const pending = start(slow, "unmeasured-slow");
+    auto const started = std::chrono::steady_clock::now();
+    enroll(fast, "pending-fast", 49503); measure(fast, "fast-sample", 500000000);
+    enroll(spare, "pending-spare", 49504); measure(spare, "spare-sample", 2000000000);
+    // Let the cold lease age past the normal unmeasured route retry threshold.
+    for (unsigned i = 0; i < 7; ++i) measure(fast, "fast-repeat-" + std::to_string(i), 500000000);
+    std::this_thread::sleep_until(started + std::chrono::milliseconds(2300));
+
+    auto const active = start(fast, "fast-running");
+    require(!submit("queued"), "idle measured spare displaced a sooner fast delivery");
+    slow.finish(pending);
+    require(!owner.acquire(session, request), "worker Finish reopened a blind probe before owner delivery");
+    spare.worker_admission("pending-spare", WorkerAdmission::Paused);
+    require(!owner.acquire(session, request), "finished work was costed as unmeasured while the only faster GPU was busy");
+    fast.finish(active);
+    auto queued = owner.acquire(session, request);
+    require(queued && fast.begin(*queued, queued->owner_identity), "queued work did not take the faster released GPU");
+
+    fast.worker_admission("pending-fast", WorkerAdmission::Paused);
+    auto const idle = start(slow, "only-available");
+    owner.cancel(session, idle.task.task_id, idle.task.attempt);
+    slow.finish(idle);
+    owner.delivered(pending, {100000000, 32, 1024});
+    fast.worker_admission("pending-fast", WorkerAdmission::Accepting);
+    spare.worker_admission("pending-spare", WorkerAdmission::Accepting);
+    fast.finish(*queued);
+    auto const preferred = start(slow, "authoritative");
+    slow.finish(preferred);
+}
 void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
                                  TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
@@ -1192,6 +1252,20 @@ void generation_output_selection(BrokerOptions options, TlsOptions const& owner_
     auto preferred = submit(GenerationOutput::Contributions);
     require(first.begin(preferred, preferred.owner_identity), "a late delivery altered the new route's cost");
     first.finish(preferred);
+
+    second.worker_admission(other.instance, WorkerAdmission::Paused);
+    auto departing = submit(GenerationOutput::Contributions);
+    require(first.begin(departing, departing.owner_identity), "lease did not start before the route round trip");
+    auto const original_endpoint = advertised.endpoint;
+    ++advertised.capacity_revision; advertised.endpoint.port = 49505;
+    first.register_worker(advertised);
+    ++advertised.capacity_revision; advertised.endpoint = original_endpoint;
+    first.register_worker(advertised);
+    first.finish(departing); owner.delivered(departing, {2000000000ULL, 32, 1024});
+    second.worker_admission(other.instance, WorkerAdmission::Accepting);
+    auto returned = submit(GenerationOutput::Contributions);
+    require(first.begin(returned, returned.owner_identity), "a delayed owner receipt priced a previously departed route");
+    first.finish(returned);
 }
 void weighted_shares(BrokerOptions options, TlsOptions const& first_tls, TlsOptions const& second_tls,
                      TlsOptions const& worker_tls, uint64_t heavy_members = 1)
@@ -1745,6 +1819,7 @@ int main() try
     batched_profiles(options, a_tls, tls(ca, wa));
     independent_members(options, a_tls, tls(ca, wa), tls(ca, wb));
     parallel_generation_tail(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
+    generation_pending_delivery(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
     generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);

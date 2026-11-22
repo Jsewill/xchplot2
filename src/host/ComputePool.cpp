@@ -533,7 +533,13 @@ struct BrokerServer::Impl
         void add(DeliveryObservation observation, uint64_t units)
         { samples[next] = {observation, units}; next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size()); }
     };
-    struct Worker { WorkerOffer offer; Clock::time_point seen; std::vector<History> histories; };
+    struct Worker
+    {
+        WorkerOffer offer;
+        Clock::time_point seen;
+        std::vector<History> histories;
+        Clock::time_point route_since = seen;
+    };
     struct Owner
     {
         std::string identity;
@@ -553,6 +559,7 @@ struct BrokerServer::Impl
         Clock::time_point expires, touched, granted_at, start_by = Clock::time_point::max();
         Clock::time_point other_work_until{};
         Clock::time_point created = Clock::now();
+        Clock::time_point unreported_finish{};
         bool observed = false;
         struct Failure { std::string worker, instance; Kind kind; };
         std::vector<Failure> failures;
@@ -780,6 +787,26 @@ struct BrokerServer::Impl
         return exact;
     }
     using Nanoseconds = std::chrono::duration<long double, std::nano>;
+    static long double pending_delivery_cost(std::vector<Job const*> const& completions, Worker const& worker,
+                                             Job const& waiting, Candidate const& candidate)
+    {
+        auto const& task = waiting.requested;
+        Job const* latest = nullptr;
+        for (auto const* job : completions)
+        {
+            auto const& lease = *job->lease;
+            auto const& completed = lease.task;
+            if (job->owner != waiting.owner || job->granted_at < worker.route_since ||
+                lease.worker_instance != worker.offer.instance || lease.endpoint != worker.offer.endpoint ||
+                completed.kind != candidate.kind || completed.compatibility != task.compatibility ||
+                completed.resources.cpu_threads != candidate.resources.cpu_threads || completed.k != task.k ||
+                completed.strength != task.strength || completed.generation_output != task.generation_output ||
+                completed.independent_members != task.independent_members || completed.work_units != task.work_units) continue;
+            if (!latest || job->unreported_finish > latest->unreported_finish) latest = job;
+        }
+        return latest ? Nanoseconds(latest->unreported_finish - latest->granted_at).count() :
+            std::numeric_limits<long double>::max();
+    }
     static long double remaining_on_lease(Worker const& worker, Job const& waiting, Job const& running, Clock::time_point now)
     {
         auto const& lease = *running.lease;
@@ -876,10 +903,14 @@ struct BrokerServer::Impl
         auto capacity = available();
         std::map<std::string, std::vector<Job*>> queued;
         std::vector<Job const*> active_generation;
+        std::map<std::string, std::vector<Job const*>> pending_delivery;
+        auto const recent = Clock::now() - std::chrono::milliseconds(options.lease_ms);
         for (auto& [key, job] : jobs)
             if (job.state == State::Queued && owners.contains(job.owner)) queued[job.owner].push_back(&job);
             else if ((job.state == State::Granted || job.state == State::Running) &&
                 job.lease->task.kind != Kind::Pack && active_owner(job)) active_generation.push_back(&job);
+            else if (job.state == State::Finished && job.unreported_finish != Clock::time_point{} &&
+                job.unreported_finish > recent && active_owner(job)) pending_delivery[job.lease->worker_identity].push_back(&job);
         for (auto& [owner, queue] : queued)
             std::sort(queue.begin(), queue.end(), [](Job const* a, Job const* b)
             { return a->requested.sequence < b->requested.sequence; });
@@ -925,13 +956,21 @@ struct BrokerServer::Impl
                             auto selected = eligible(*job, identity, worker, capacity.at(identity), kind);
                             if (!selected) continue;
                             auto const sample = delivery_cost(worker, job->requested, selected->kind, job->owner, selected->resources.cpu_threads);
-                            auto const cost = sample.ns;
+                            auto cost = sample.ns;
                             uint64_t const age = assignments - sample.assigned;
-                            bool const unmeasured = cost == std::numeric_limits<long double>::max();
+                            bool const unmeasured = sample.ns == std::numeric_limits<long double>::max();
+                            // Finish can free the worker before the owner accepts the last frame.
+                            // Price that window from the broker clock until owner delivery arrives.
+                            if (unmeasured && !pending_delivery.empty())
+                            {
+                                auto const pending = pending_delivery.find(identity);
+                                if (pending != pending_delivery.end()) cost = pending_delivery_cost(pending->second, worker, *job, *selected);
+                            }
+                            bool const provisional = cost != sample.ns;
                             // Revisit measured GPU routes during enough
                             // parallel work to cover their delivery time.
-                            bool const trial = !sample.assigned || (unmeasured && age >= 8) ||
-                                (age >= 32 && (!gpu || cost <= other_work));
+                            bool const trial = !provisional && (!sample.assigned || (unmeasured && age >= 8) ||
+                                (age >= 32 && (!gpu || cost <= other_work)));
                             if (chosen.empty() || (trial && (!explore || age > oldest_age)) ||
                                 (!trial && !explore && cost < best_cost))
                             { chosen = identity; chosen_kind = selected->kind; chosen_resources = selected->resources;
@@ -1225,7 +1264,8 @@ struct BrokerServer::Impl
                     require(same_task == job.requested, "retry changes task body");
                     require(job.failures.size() < max_retry_failures, "task retry capacity is exhausted");
                     if (reserved(job)) { response.u8(0); return response; }
-                    job.requested = task; job.lease.reset(); job.state = State::Queued; job.observed = false;
+                    job.requested = task; job.lease.reset(); job.state = State::Queued;
+                    job.observed = false; job.unreported_finish = {};
                     job.start_by = Clock::time_point::max();
                 }
                 else require(task == job.requested, "stale or changed task attempt");
@@ -1247,7 +1287,7 @@ struct BrokerServer::Impl
                 if (job.state == State::Granted) job.state = State::Finished;
                 else if (job.state == State::Running) job.state = State::Cancelled;
                 else if (job.state == State::Queued) job.state = State::Finished;
-                job.touched = Clock::now();
+                job.unreported_finish = {}; job.touched = Clock::now();
             }
             schedule(); break;
         }
@@ -1313,7 +1353,8 @@ struct BrokerServer::Impl
                     saved.generation_threads = offer.generation_threads;
                     // Existing leases retain their original route and identity.
                     // New grants start fresh delivery history on the new route.
-                    if (saved.endpoint != offer.endpoint) it->second.histories.clear();
+                    if (saved.endpoint != offer.endpoint)
+                    { it->second.histories.clear(); it->second.route_since = Clock::now(); }
                     saved.endpoint = offer.endpoint;
                 }
                 else if (offer.capacity_revision == saved.capacity_revision)
@@ -1404,7 +1445,12 @@ struct BrokerServer::Impl
             auto& job = lease_job(lease);
             if (job.state != State::Running && job.state != State::Cancelled && job.state != State::Finished)
                 throw StaleLease("compute lease is not running");
-            if (job.state != State::Finished) update_capacity(lease, update, job);
+            if (job.state != State::Finished)
+            {
+                update_capacity(lease, update, job);
+                if (job.state == State::Running && !job.observed && lease.task.kind != Kind::Pack)
+                    job.unreported_finish = Clock::now();
+            }
             job.state = State::Finished; job.touched = Clock::now(); schedule(); break;
         }
         case Operation::Reject:
@@ -1430,7 +1476,7 @@ struct BrokerServer::Impl
             if (!active_owner(job)) throw StaleLease("abandoned lease owner was fenced");
             if (job.state == State::Running) job.state = State::Cancelled;
             else if (job.state == State::Granted) job.state = State::Finished;
-            job.touched = Clock::now();
+            job.unreported_finish = {}; job.touched = Clock::now();
             bool const known = std::any_of(job.failures.begin(), job.failures.end(), [&](Job::Failure const& failure)
             { return failure.worker == lease.worker_identity && failure.instance == lease.worker_instance && failure.kind == Kind::GenerateAny; });
             if (!known && job.failures.size() < max_retry_failures)
@@ -1450,9 +1496,9 @@ struct BrokerServer::Impl
                 auto worker = workers.find(lease.worker_identity);
                 if (worker == workers.end() || worker->second.offer.instance != lease.worker_instance)
                     throw StaleDelivery("delivery worker registration expired");
-                if (worker->second.offer.endpoint == lease.endpoint)
+                if (worker->second.offer.endpoint == lease.endpoint && job.granted_at >= worker->second.route_since)
                     history(worker->second, lease.task, lease.task.kind, job.owner, lease.task.resources.cpu_threads).add({elapsed, input, output}, lease.task.work_units);
-                job.observed = true; break;
+                job.observed = true; job.unreported_finish = {}; break;
             }
             catch (StaleLease const& error) { throw StaleDelivery(error.what()); }
         }

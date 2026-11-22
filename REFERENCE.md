@@ -1872,7 +1872,10 @@ For CPU and GPU generation, the broker measures service from worker selection
 through delivery, including connection setup. It keeps separate timings for
 packed members, encoded contributions and complete fresh groups, and uses
 the requested batch size when available. Changing a worker's data endpoint
-starts a new timing history for that route. The broker can wait when busy workers
+starts a new timing history for that route. A worker can finish sending
+before the owner reports its first delivery. During that interval the
+broker can use the time already spent on that route for the same owner,
+workload and batch size. The broker can wait when busy workers
 together can finish the owner's ready queue before an idle worker would
 deliver the waiting job. If a wide batch should wait, the broker checks whether the
 idle worker can help by taking a later, shorter job. The wide batch keeps
