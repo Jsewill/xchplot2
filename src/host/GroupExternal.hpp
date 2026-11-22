@@ -350,6 +350,7 @@ private:
     std::vector<size_t> disk_lanes_;
     std::vector<std::unique_ptr<OrderedWriter>> disk_workers_;
     uint64_t queue_bytes_ = 0;
+    bool single_scratch_writeback_ = false;
     std::vector<Run> runs_;
     Run summary_run_, pending_summary_;
     std::array<uint8_t, 32> summary_digest_{};
@@ -1958,9 +1959,10 @@ public:
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
             if (position_ == segment.bytes)
             {
-                // Start writeback while subsequent disks fill. finish()
+                // Start writeback while subsequent writes and receives run. finish()
                 // still verifies and synchronizes every completed extent.
-                if (!engine_.disk_workers_.empty() && !engine_.external_.io_governor)
+                if (!engine_.external_.io_governor && (!engine_.disk_workers_.empty() ||
+                    (gated_copy_ && engine_.contributions_ && engine_.single_scratch_writeback_)))
                     file_io::start_writeback(file_->fd, 0, 0);
                 ++segment_; position_ = 0;
             }
@@ -2748,6 +2750,10 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
         if (!merge_range(first, count)) return {};
     }
     auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound, final_capacity));
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+    single_scratch_writeback_ = config_.io_overlap && !external_.io_governor && roots_.size() == 1 &&
+        storage_device(file_io::native_path(roots_.front().path)).rotating;
+#endif
     contributions_ = input.get();
     uint64_t const summary_bytes = multiply(PlotGroupFile::getChunkCountForK(identity_.header.k), sizeof(Summary));
     uint64_t const member_bytes = (contribution_input_scratch_bytes(identity_.header.k, members, fragment_bound) - summary_bytes) / members;
