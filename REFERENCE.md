@@ -811,6 +811,11 @@ and finalization phases with elapsed time and read/write totals. Output-file
 counts do not imply separate physical drives. `--no-progress` disables these
 updates; the terminal defaults match `plot`.
 
+For fills with several destinations, `controller_wait_seconds.destination_lanes`
+reports time spent at the simultaneous destination limit. Engine RAM,
+producer RAM and storage leases have separate counters. Several destinations
+can wait on different resources during the same interval.
+
 ### Farming layout
 
 The directory planner chooses how many members to put in each file and assigns

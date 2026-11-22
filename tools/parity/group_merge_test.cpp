@@ -2848,6 +2848,10 @@ void destination_admission()
     require(finishing(9 * mib, {}).active == 2 && finishing(9 * mib, {1, mib}).active == 3 &&
         finishing(9 * mib - 1, {1, mib}).active == 2 && !finishing(9 * mib, {1, 7 * mib}).active,
         "a sealed pack retained a generation slot or spent more than the actual remaining RAM");
+    auto const occupied = finishing(9 * mib, {3, 3 * mib});
+    require(!occupied.active && occupied.empty_reason == ControllerWait::destination_lanes &&
+        finishing(9 * mib, {1, 7 * mib}).empty_reason == ControllerWait::engine_memory,
+        "destination admission did not distinguish occupied lanes from exhausted workspace");
     auto receivers = [&](uint64_t room, uint64_t publishing)
     {
         PackingGrant pack{3, 6 * mib, publishing};

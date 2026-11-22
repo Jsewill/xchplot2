@@ -2260,9 +2260,10 @@ size_t prefetch_group(GroupPrefetch& batch, Producer& producer, Identity const& 
 
 enum class ControllerWait : unsigned
 { consumer, cpu_workers, storage_lease, writer_queue, engine_memory, producer_memory, member_lease, generation_order,
-    batch_full, group_full, scratch_capacity, count };
+    batch_full, group_full, scratch_capacity, destination_lanes, count };
 constexpr std::array controller_wait_names{"consumer", "cpu_workers", "storage_lease", "writer_queue",
-    "engine_memory", "producer_memory", "member_lease", "generation_order", "batch_full", "group_full", "scratch_capacity"};
+    "engine_memory", "producer_memory", "member_lease", "generation_order", "batch_full", "group_full", "scratch_capacity",
+    "destination_lanes"};
 constexpr uint32_t wait_bit(ControllerWait reason) { return uint32_t(1) << unsigned(reason); }
 uint32_t fill_wait_reason(Producer::FillStop reason)
 {
@@ -3804,6 +3805,7 @@ struct DestinationPlan
     size_t active = 0;
     unsigned workers = 0;
     uint16_t batch = 0;
+    ControllerWait empty_reason = ControllerWait::engine_memory;
 };
 #if (defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK) || defined(GROW_TEST_CONSTRUCTION)
 unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsigned measured_slots, unsigned useful)
@@ -3850,6 +3852,11 @@ DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t gener
     uint64_t const room = budget - fixed - generation - packing.bytes;
     long double best_cost = std::numeric_limits<long double>::infinity();
     size_t const lanes = std::min(drive_groups, (active_limit ? active_limit : workers) + packing_writers);
+    if (packing.active >= lanes)
+    {
+        best.empty_reason = ControllerWait::destination_lanes;
+        return best;
+    }
     for (size_t active = packing.active + 1; active <= lanes; ++active)
     {
         unsigned share = std::max(1u, unsigned(workers / active));
@@ -13992,7 +13999,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (pool_prefetch.ready.valid() && pool_prefetch.batch.owner == d.owner)
             return blocked(ControllerWait::generation_order);
 #endif
-        if (!stream_cohort.may_admit(d.owner)) return false;
+        if (!stream_cohort.may_admit(d.owner)) return blocked(ControllerWait::generation_order);
         if (farm)
         {
             auto& lane = farm->lanes[d.owner]; auto const previous = lane.reserved_members;
@@ -14014,7 +14021,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         bool fresh_scratch = false;
         std::optional<group_grow::ScratchPool::IoLease> io;
         uint64_t prior_capacity = d.metrics.capacity_bytes;
-        auto defer = [&]
+        auto release_unused_grant = [&]
         {
             io.reset();
             if (fresh_scratch)
@@ -14024,7 +14031,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     "cannot restore an unused destination reservation");
                 d.metrics.capacity_bytes = prior_capacity; fresh_scratch = false; update_pool_memory();
             }
-            return false;
+        };
+        auto defer = [&](ControllerWait reason)
+        {
+            release_unused_grant();
+            return blocked(reason);
         };
         bool const pooled_generation = has_compute(args);
         if (pooled_generation && args.pool_writers && devices[d.owner].rotating &&
@@ -14359,7 +14370,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return plan;
         };
         auto plan = select_plan(shared_fixed);
-        if (!plan.active) return false;
+        if (!plan.active) return blocked(plan.empty_reason);
         // A partial in-memory plan can switch to scratch. Price its bounded
         // receivers before comparing the active writers with that plan.
         bool const request_scratch = fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) &&
@@ -14408,7 +14419,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
 #endif
         }
-        if (pooled_generation && fresh_hdd && active >= scratch_lanes) return false;
+        if (pooled_generation && fresh_hdd && active >= scratch_lanes) return blocked(ControllerWait::destination_lanes);
         if (d.deferred_output)
         {
             // A queued farming output can take over a scratch spindle after
@@ -14468,11 +14479,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         {
                             // The external workspace can make an otherwise fitting
                             // member too large. Regrant scratch for bounded input.
-                            input_required = true; storage = 0; (void)defer(); continue;
+                            input_required = true; storage = 0; release_unused_grant(); continue;
                         }
                         use_stream_input = false;
                     }
                     if (admitted) external_plan = select_plan(sum(sum(metadata, histories.memory_bytes()), pool_memory));
+                    else external_plan.empty_reason = ControllerWait::producer_memory;
                 }
                 // The first layout leaves spindles for the ordinary engine's
                 // projected peers. If external reader/codec memory excludes
@@ -14486,27 +14498,31 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         first_external = external_plan;
                         first_cost = cost(external_plan.active, external_plan.workers, external_plan.batch);
                         scratch_slots = open_slots(external_plan.active);
-                        (void)defer(); continue;
+                        release_unused_grant(); continue;
                     }
                 }
                 if (scratch_slots != initial_slots && (external_plan.active < first_external.active ||
                     external_plan.batch < first_external.batch || (std::isfinite(first_cost) &&
                         cost(external_plan.active, external_plan.workers, external_plan.batch) > first_cost)))
                 {
-                    scratch_slots = initial_slots; (void)defer(); continue;
+                    scratch_slots = initial_slots; release_unused_grant(); continue;
                 }
                 if (external_plan.active) plan = external_plan;
                 else
                 {
-                    (void)defer();
+                    auto const reason = d.scratch ? external_plan.empty_reason : ControllerWait::scratch_capacity;
+                    release_unused_grant();
                     if (args.construction == "external" || input_required)
-                    { d.output_capacity_rejected = capacity_rejected; return false; }
+                    {
+                        d.output_capacity_rejected = capacity_rejected;
+                        return capacity_rejected ? false : blocked(reason);
+                    }
                     if (pooled_hdd) size_pipeline(false);
                 }
                 break;
             }
         }
-        if (input_required && !d.scratch) return defer();
+        if (input_required && !d.scratch) return defer(ControllerWait::scratch_capacity);
         // A compact-input cohort may trade retained batches for another
         // independent physical writer. Its transport cost is unknown until
         // complete durable work has been compared with an ordinary cohort.
@@ -14515,7 +14531,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             { return other->engine && other->stream_input_active; });
         bool const compatible_active = scratch_pool && std::all_of(destinations.begin(), destinations.end(), [&](auto const& other)
             { return !other->engine || scratch_pool->io_compatible(d.scratch_owner, other->scratch_owner); });
-        if (live_stream && !compatible_active) return defer();
+        if (live_stream && !compatible_active) return defer(ControllerWait::storage_lease);
         bool const ordinary_peer = std::any_of(destinations.begin(), destinations.end(), [&](auto const& other)
             { return other->engine && other->stream_input_candidate && active < other->stream_input_active; });
         uint64_t const fragment_count = fragment_bound(d.requested.params) / sizeof(uint64_t);
@@ -14592,35 +14608,36 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 plan.workers = std::max(1u, unsigned(workers / plan.active)); plan.batch = 1;
             }
         }
-        if (!plan.active || active >= plan.active) return defer();
+        if (!plan.active) return defer(plan.empty_reason);
+        if (active >= plan.active) return defer(ControllerWait::destination_lanes);
         total.execution_active = plan.active; total.execution_batch = plan.batch;
         total.execution_estimate = use_stream_input ? group_grow::ExecutionEstimate{} :
             estimate(plan.active, plan.workers, plan.batch);
         unsigned const share = plan.workers;
         bool const checked_contributions = d.scratch && independent_input();
         auto const generation_held = checked_contributions ? fallback_held : other_held;
-        if (!admit_producer(memory(share, minimum), checked_contributions)) return defer();
-        if (fixed >= args.max_ram) return defer();
+        if (!admit_producer(memory(share, minimum), checked_contributions)) return defer(ControllerWait::producer_memory);
+        if (fixed >= args.max_ram) return defer(ControllerWait::engine_memory);
         uint64_t const available = args.max_ram - generation_fixed(checked_contributions);
-        if (generation_held > available || generation > available - generation_held) return defer();
+        if (generation_held > available || generation > available - generation_held) return defer(ControllerWait::producer_memory);
         uint64_t const resident_member = use_stream_input || checked_contributions ? 0 : storage;
         uint16_t const batch = admitted_batch_cap(std::min(maximum, plan.batch), minimum,
             available - generation_held - generation, resident_member,
             [&](uint16_t n) { return memory(share, n); });
-        if (!batch) return defer();
+        if (!batch) return defer(ControllerWait::engine_memory);
         uint64_t const lease = memory(share, batch);
-        if (!admit_producer(lease, checked_contributions)) return defer();
-        if (sum(sum(sum(fixed, lease), held), backend->retained()) > args.max_ram) return defer();
+        if (!admit_producer(lease, checked_contributions)) return defer(ControllerWait::producer_memory);
+        if (sum(sum(sum(fixed, lease), held), backend->retained()) > args.max_ram) return defer(ControllerWait::engine_memory);
         auto const host = available_host_bytes();
         uint64_t const growth = generation > backend->retained() ? generation - backend->retained() : 0;
-        if (host && sum(lease, growth) > *host) return defer();
+        if (host && sum(lease, growth) > *host) return defer(ControllerWait::engine_memory);
         check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
         auto options = args; options.workers = share;
         if (scratch_pool)
         {
             io = scratch_pool->try_io(d.scratch_owner);
-            if (!io) { blocked(ControllerWait::storage_lease); return defer(); }
+            if (!io) return defer(ControllerWait::storage_lease);
         }
         auto const history_before = histories.memory_bytes();
         // Rotating farming meta values introduce more contexts than lanes.
@@ -14634,7 +14651,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         { return sum(sum(sum(generation_fixed(checked_contributions), workspace), sum(generation_held, product(batch - 1, resident_member))), generation); };
         auto transfer_peak = [&](uint64_t workspace)
         { return sum(sum(sum(fixed, workspace), held), backend->retained()); };
-        if (std::max(generation_peak(memory(share, batch)), transfer_peak(memory(share, batch))) > args.max_ram) return defer();
+        if (std::max(generation_peak(memory(share, batch)), transfer_peak(memory(share, batch))) > args.max_ram)
+            return defer(ControllerWait::engine_memory);
         // Preserve every compact-input owner's ordinary singleton fallback
         // when a later peer needs a different engine envelope. Live
         // transfers still charge every packer until its lease is released.
@@ -14650,12 +14668,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto fits_fallback = [&](uint64_t workspace)
         { return !preserve_fallback || group_grow::execution_singleton_fallback(args.max_ram,
             generation_fixed(checked_contributions), workspace, fallback_generation); };
-        if (!fits_fallback(memory(share, batch))) return defer();
+        if (!fits_fallback(memory(share, batch))) return defer(ControllerWait::producer_memory);
         bool const initial_encoded = initial_pool_output(!pooled_hdd || d.scratch, startup_receivers);
         auto const choice = tune_pool ? pool_choice(bool(d.scratch)) : group_grow::PoolPublicationHistory::Choice{1, initial_encoded, false};
         auto& publications = pool_publications[bool(d.scratch)];
         if (tune_pool && std::any_of(destinations.begin(), destinations.end(), [&](auto const& peer)
-            { return peer->engine && peer->writer == d.writer; })) return defer();
+            { return peer->engine && peer->writer == d.writer; })) return defer(ControllerWait::writer_queue);
         auto cfg = configuration(options, d.metrics.capacity_bytes, sum(fixed, batch_metadata(batch)), cpu_scheduler, backend->remote_encoder());
         cfg.path_bindings = path_bindings;
         if (d.scratch) d.scratch->target_gate = target_gates[d.writer];
