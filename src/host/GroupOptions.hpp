@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; struct ProgressRegistry; class DiskIoGovernor; class WorkerIdentityReservation; class DashboardTerminal; class DashboardJob; }
+namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; struct ProgressRegistry; class DiskIoGovernor; struct WorkerIdentityReservation; class DashboardTerminal; class DashboardJob; }
 
 namespace pos2gpu {
 class ComputeSession;

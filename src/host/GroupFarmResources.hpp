@@ -14,7 +14,7 @@
 #include <time.h>
 #endif
 
-namespace group_grow { class WorkerIdentityReservation; }
+namespace group_grow { struct WorkerIdentityReservation; }
 namespace group_grow::farm
 {
 using Clock = std::chrono::steady_clock;
