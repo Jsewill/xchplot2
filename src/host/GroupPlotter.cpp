@@ -17239,6 +17239,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         progress_reporter.state->target=target;
         if (farm && farm->state.capacity_fill) farm_peak();
     }
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    group_grow::TerminalGenerationPlan terminal_plan;
+#endif
     while (complete < destinations.size())
     {
         if (progress_reporter.state) progress_reporter.state->waits = 0;
@@ -17531,7 +17534,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         bool const terminal = backend->mode == "pool" && active >= 2 && active <= forecast_lanes &&
             active == destinations.size() - complete && args.io_overlap && args.generation_overlap &&
-            args.member_storage == "compact" && prefetched.members.empty() && !pool_prefetch.ready.valid();
+            args.member_storage == "compact" && prefetched.members.empty() && !pool_prefetch.ready.valid() &&
+            (!args.disk_io || !args.disk_io->status().pressured);
+        std::array<group_grow::TerminalGenerationBatch, group_grow::exact_terminal_batches> terminal_batches{};
         std::vector<group_grow::ExecutionLane> final_lanes;
         std::shared_ptr<group_grow::pool::GenerationRoster const> final_roster;
         uint64_t final_receive = 0;
@@ -17607,6 +17612,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     auto const route = backend->pool_estimate(d.requested, GenerationOutput::Packed, 1, count, count);
                     if (final_roster && final_roster->complete && route.measured_slots == 1 && route.measured_packed_batch && !route.dated_prior && route.member_ns > 0)
                     {
+                        if (active <= terminal_batches.size()) terminal_batches[final_lanes.size()] = {candidate.index, d.writer,
+                            d.engine->config.workers, uint16_t(d.metrics.members), count,
+                            d.requested.params.get_plot_params_for_index(uint16_t(d.metrics.members)).get_plot_id().data(),
+                            {route.member_ns * count, work.cpu, work.serial, work.destination}};
                         final_lanes.push_back({work, d.writer}); final_lanes.back().work.generation = route.member_ns * count;
                         Producer producer{d.requested, nullptr, *backend, args, args.max_ram, fixed, fixed, d.path};
                         final_receive = sum(final_receive, sum(producer.pool_receive_bytes(uint16_t(d.metrics.members), count),
@@ -17630,26 +17639,63 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         size_t generation_first = !prefetched.members.empty() ? prefetched.owner :
             generation_ready.empty() ? next : group_grow::execution_generation_order(generation_ready);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        if (terminal && final_lanes.size() == active && generation_ready.size() == active &&
+        std::optional<size_t> terminal_first;
+        if (terminal && generation_ready.size() >= 2 && final_lanes.size() == generation_ready.size() &&
+            (generation_ready.size() == active || terminal_plan.count) &&
             sum(sum(sum(fixed, retained()), backend->retained()), final_receive) <= args.max_ram)
         {
             auto const& first = *destinations[generation_ready.front().index]; auto const& params = first.requested.params;
             unsigned const grant = first.engine->config.workers;
             auto const capacity = backend->acquire_pool_client()->generation_capacity(params.get_k(), params.get_strength());
             auto const available = available_host_bytes();
-            if (capacity.slots == 1 && capacity.roster == final_roster && (!available || final_receive <= *available) &&
+            bool receiving = false, prefix = true;
+            size_t published = 0;
+            for (auto const& prior : std::span(terminal_plan.batches).first(terminal_plan.issued))
+            {
+                auto const& d = *destinations[prior.index];
+                if (d.complete) ++published;
+                if (d.needs_resume || d.writer != prior.writer || d.maximum != prior.first + prior.count ||
+                    d.requested.params.get_plot_params_for_index(prior.first).get_plot_id().data() != prior.plot) prefix = false;
+                else if (d.metrics.members != d.maximum)
+                {
+                    if (!d.metrics.stop_reason.empty() || !d.engine || d.engine->config.workers != prior.workers ||
+                        !d.pending || d.pending->work != Work::append || d.pending->scheduled_members != prior.count ||
+                        d.pending->fresh_members || d.pending->contribution_input || d.pending->prepared_input) prefix = false;
+                    else receiving |= d.pending->generating.valid();
+                }
+            }
+            // A newly active destination can already be busy and absent from generation_ready.
+            if (terminal_plan.count && active != terminal_plan.count - published) prefix = false;
+            auto const& admission = capacity.availability.admission;
+            bool const uncontended = admission ? !admission->other_owner_tasks && (admission->available_slots || receiving) :
+                active > terminal_batches.size();
+            if (uncontended && capacity.slots == 1 && capacity.roster == final_roster && (!available || final_receive <= *available) &&
                 std::all_of(generation_ready.begin(), generation_ready.end(), [&](auto const& item)
                 {
                     auto const& d = *destinations[item.index];
                     return item.members_to_pack <= capacity.batch && d.engine->config.workers == grant &&
                         params.get_k() == d.requested.params.get_k() && params.get_strength() == d.requested.params.get_strength();
                 }))
-                if (auto winner = group_grow::execution_terminal_first(generation_ready, final_lanes, workers, grant))
-                    generation_first = *winner;
+            {
+                auto const inputs = std::span(terminal_batches).first(std::min(terminal_batches.size(), generation_ready.size()));
+                terminal_first = terminal_plan.choose(generation_ready, final_lanes, inputs, active, workers, grant,
+                    {capacity.slots, capacity.roster}, prefix, execution_now(), product(args.pool_timeout_ms, 1'000'000));
+            }
         }
+        if (terminal_first) generation_first = *terminal_first;
+        else terminal_plan.clear();
 #endif
         auto scheduled_generation = [&](size_t index)
         {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (terminal_plan.count)
+            {
+                auto const& task = destinations[index]->pending;
+                bool const packed = task && task->work == Work::append && task->generating.valid() &&
+                    !task->fresh_members && !task->contribution_input && !task->prepared_input;
+                terminal_plan.grant(index, packed ? task->scheduled_members : 0);
+            }
+#endif
             for (auto const& candidate : generation_ready)
                 if (candidate.index != index) ++destinations[candidate.index]->generation_deferrals;
             destinations[index]->generation_deferrals = 0;

@@ -1453,6 +1453,117 @@ void finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     next(GenerationOutput::Packed, 3);
     require(!owner.finite_packed_route(session, job), "a moved worker inherited its former finite placement");
 }
+void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& fast_tls, TlsOptions const& slow_tls)
+{
+    using Clock = std::chrono::steady_clock;
+    options.lease_ms = options.worker_ms = 1500; options.max_tasks = 64;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), fast(endpoint, fast_tls), slow(endpoint, slow_tls);
+    auto gpu = profile(Kind::GenerateGpu); gpu.max_batch_members = 3;
+    auto a = offer("idle-fast", 49462); a.capabilities |= capability(gpu.kind);
+    a.capacity.gpu_bytes = gpu.resources.gpu_bytes; a.generation_profiles = {gpu};
+    auto b = a; b.instance = "idle-slow"; ++b.endpoint.port;
+    auto const training = owner.open_owner("training"); uint64_t sequence = 0;
+    std::string const fast_path(64, 'a'), slow_path(64, 'b');
+    auto const fast_id = certificate_identity(fast_tls.cert_file), slow_id = certificate_identity(slow_tls.cert_file);
+    auto request = [&](GenerationOutput output, unsigned members)
+    {
+        ++sequence; auto t = task("idle-" + std::to_string(sequence), sequence); t.kind = gpu.kind;
+        t.generation_output = output; t.work_units = members; return t;
+    };
+    auto learn = [&](BrokerClient& worker, GenerationOutput output, unsigned members, uint64_t elapsed, std::string const& path)
+    {
+        auto lease = owner.acquire(training, request(output, members));
+        require(lease && worker.begin(*lease, lease->owner_identity), "long-idle generation sample did not begin");
+        worker.finish(*lease); owner.delivered(*lease, {elapsed, 32, 4096}, path);
+    };
+    fast.register_worker(a);
+    for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 3, cost, fast_path);
+    for (auto cost : {100000000, 300000000}) learn(fast, GenerationOutput::Packed, 3, cost, fast_path);
+    for (auto cost : {70000000, 90000000}) learn(fast, GenerationOutput::Packed, 2, cost, fast_path);
+    learn(fast, GenerationOutput::Fresh, 2, 100000000, fast_path);
+    for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 1, cost, fast_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused); slow.register_worker(b);
+    for (auto cost : {180000000, 230000000}) learn(slow, GenerationOutput::Packed, 3, cost, slow_path);
+    for (auto cost : {350000000, 400000000}) learn(slow, GenerationOutput::Packed, 2, cost, slow_path);
+    learn(slow, GenerationOutput::Fresh, 1, 800000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    auto const until = Clock::now() + std::chrono::milliseconds(options.lease_ms + 80);
+    do {
+        require(fast.heartbeat(a.instance, a.capacity_revision) && slow.heartbeat(b.instance, b.capacity_revision),
+            "a live worker expired during the repeat-job interval");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (Clock::now() < until);
+    // Make the slow worker the next ordinary trial regardless of certificate order.
+    auto rotate = [&]
+    {
+        require(fast.heartbeat(a.instance, a.capacity_revision) && slow.heartbeat(b.instance, b.capacity_revision),
+            "a live worker expired during repeat-job placement");
+        slow.worker_admission(b.instance, WorkerAdmission::Paused);
+        ++sequence; auto marker = pack_task("marker-" + std::to_string(sequence), sequence);
+        auto lease = owner.acquire(training, marker);
+        require(lease && fast.begin(*lease, lease->owner_identity), "could not set the next ordinary worker trial");
+        fast.finish(*lease); owner.delivered(*lease, {1000, 32, 64});
+        slow.worker_admission(b.instance, WorkerAdmission::Accepting);
+    };
+    auto repeat = [&](GenerationOutput output, unsigned members, bool finite, std::string const& path, BrokerClient* different = nullptr)
+    {
+        auto& issuer = different ? *different : owner;
+        auto repeat_job = issuer.open_owner("repeat-" + std::to_string(sequence));
+        BrokerClient::GenerationPaths paths{{fast_id, path}, {slow_id, slow_path}};
+        std::sort(paths.begin(), paths.end()); issuer.generation_paths(repeat_job, paths);
+        auto control = issuer.with_deadline(Clock::now() + std::chrono::seconds(5));
+        auto lease = control.acquire(repeat_job, request(output, members), finite ? Clock::now() : Clock::now() + std::chrono::seconds(4));
+        require(bool(lease), "a dated finite route delayed an immediately available grant");
+        auto& worker = lease->worker_instance == a.instance ? fast : slow;
+        require(worker.begin(*lease, lease->owner_identity), "repeat-job grant did not begin");
+        worker.finish(*lease); issuer.close_owner(repeat_job); return lease->worker_instance;
+    };
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == a.instance,
+        "a finite repeat job lost two matching whole deliveries after the fresh interval");
+    rotate(); require(repeat(GenerationOutput::Packed, 2, true, fast_path) == a.instance,
+        "separate dated intervals lost the faster available route");
+    rotate(); require(repeat(GenerationOutput::Packed, 3, true, fast_path) == b.instance,
+        "overlapping dated intervals overruled ordinary placement");
+    rotate(); require(repeat(GenerationOutput::Fresh, 2, true, fast_path) == b.instance,
+        "one dated delivery pinned the initial finite request");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, false, fast_path) == b.instance,
+        "dated service suppressed an independent-work trial");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, slow_path) == b.instance, "a changed path reused the dated bound");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path, &slow) == b.instance, "a different TLS principal reused the dated bound");
+    a.generation_profiles.front().member_host_bytes = 128; ++a.capacity_revision; fast.register_worker(a);
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "changed generation RAM demand reused old elapsed times");
+    a.generation_profiles.front().member_host_bytes = 0; ++a.capacity_revision; fast.register_worker(a);
+    auto occupy = [&](unsigned width)
+    {
+        slow.worker_admission(b.instance, WorkerAdmission::Paused);
+        auto lease = owner.acquire(training, request(GenerationOutput::Fresh, width));
+        require(lease && fast.begin(*lease, lease->owner_identity), "could not occupy the repeat-job route");
+        slow.worker_admission(b.instance, WorkerAdmission::Accepting); return *lease;
+    };
+    auto held = occupy(3);
+    require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "an idle worker waited for dated history on a busy peer");
+    fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    learn(slow, GenerationOutput::Fresh, 3, 400000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "an older faster estimate displaced a fresh receipt");
+    BrokerClient::GenerationPaths same_paths{{fast_id, fast_path}, {slow_id, slow_path}};
+    std::sort(same_paths.begin(), same_paths.end()); owner.generation_paths(training, same_paths);
+    auto singleton = [&](char const* failure)
+    {
+        auto immediate = owner.acquire(training, request(GenerationOutput::Fresh, 1), Clock::now());
+        require(immediate && slow.begin(*immediate, immediate->owner_identity), failure); slow.finish(*immediate);
+    };
+    held = occupy(1); singleton("a stable owner's finite grant waited on expired release timings"); fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    learn(slow, GenerationOutput::Fresh, 1, 800000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    slow.worker_admission(b.instance, WorkerAdmission::Paused);
+    learn(fast, GenerationOutput::Fresh, 1, 80000000, fast_path);
+    learn(fast, GenerationOutput::Fresh, 2, 1000000000, fast_path);
+    held = occupy(2); singleton("an older short delivery overruled the current running width's slower release"); fast.finish(held);
+}
 void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
                                  TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
@@ -2116,6 +2227,7 @@ int main() try
     other_owner_generation_release(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_pending_delivery(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
     finite_generation(options, a_tls, tls(ca, wa), tls(ca, wb));
+    dated_finite_generation(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);

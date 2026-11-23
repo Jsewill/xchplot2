@@ -827,10 +827,51 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
     result.known = !result.unmeasured && result.completion > 0;
     return result;
 }
-// Compare only the next grant. Other terminal batches retain ordinary priority
-// in both projections, including their shared CPU and distinct physical writers.
+inline constexpr size_t exact_terminal_batches = 6;
+
+struct TerminalGenerationBatch
+{
+    size_t index = 0, writer = 0;
+    unsigned workers = 0;
+    uint16_t first = 0, count = 0;
+    std::array<uint8_t, 32> plot{};
+    std::array<long double, 4> service{};
+    bool operator==(TerminalGenerationBatch const&) const = default;
+};
+
+// A short terminal plan can survive its own pending grants. The controller
+// still checks the current receive, CPU, writer and worker availability.
+struct TerminalGenerationPlan
+{
+    std::array<TerminalGenerationBatch, exact_terminal_batches> batches{};
+    size_t count = 0, issued = 0;
+    GenerationSupply supply;
+    uint64_t deadline = 0;
+    void clear() { count = issued = 0; supply = {}; }
+    std::optional<size_t> choose(std::span<ExecutionReady const> ready, std::span<ExecutionLane const> lanes,
+        std::span<TerminalGenerationBatch const> inputs, size_t active, unsigned workers, unsigned grant,
+        GenerationSupply const& current, bool prefix, uint64_t now, uint64_t timeout);
+    std::optional<size_t> next(std::span<TerminalGenerationBatch const> inputs, std::span<ExecutionReady const> ready,
+        GenerationSupply const& current, uint64_t now) const
+    {
+        if (!count || now >= deadline || current != supply || inputs.size() != count - issued || ready.size() != inputs.size()) return {};
+        for (size_t i = 0; i < inputs.size(); ++i)
+            if (ready[i].tight_capacity || ready[i].deferrals >= ready.size() ||
+                std::find(inputs.begin(), inputs.end(), batches[issued + i]) == inputs.end()) return {};
+        return batches[issued].index;
+    }
+    void grant(size_t index, uint16_t members)
+    {
+        if (!count) return;
+        if (batches[issued].index != index || batches[issued].count != members) { clear(); return; }
+        if (++issued == count) clear();
+    }
+};
+
+// Enumerate small cohorts in ordinary priority order to retain that priority
+// on equal completion. Larger cohorts compare one alternative first grant.
 inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady const> ready,
-    std::span<ExecutionLane const> lanes, unsigned workers, unsigned grant)
+    std::span<ExecutionLane const> lanes, unsigned workers, unsigned grant, std::span<size_t> exact_order = {})
 {
     if (ready.size() < 2 || ready.size() != lanes.size() || !workers || !grant) return {};
     std::vector<size_t> order(lanes.size());
@@ -848,7 +889,8 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
     }
     std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], true); });
     auto const longest = std::max_element(order.begin(), order.end(), [&](auto a, auto b) { return tail[a] < tail[b]; });
-    if (longest == order.begin()) return {};
+    bool const small = order.size() <= exact_terminal_batches;
+    if (!small && longest == order.begin()) return {};
     std::vector<ExecutionLane> schedule(lanes.size());
     auto estimate = [&]
     {
@@ -856,10 +898,53 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
         return pipeline_execution_estimate(schedule, schedule.size(), workers, grant, schedule.size(), true);
     };
     auto const ordinary = estimate();
+    if (!ordinary.known) return {};
+    if (small)
+    {
+        // Ranks preserve rotating priority even when two distinct batches have
+        // equal timing keys. Every permutation must remain distinguishable.
+        std::array<size_t, exact_terminal_batches> rank{};
+        for (size_t i = 0; i < order.size(); ++i) rank[order[i]] = i;
+        long double best = ordinary.completion;
+        std::optional<size_t> first;
+        while (std::next_permutation(order.begin(), order.end(), [&](auto a, auto b) { return rank[a] < rank[b]; }))
+        {
+            auto const candidate = estimate();
+            if (!candidate.known) return {};
+            if (candidate.completion >= best) continue;
+            best = candidate.completion; first = ready[order.front()].index;
+            if (exact_order.size() >= order.size()) std::copy(order.begin(), order.end(), exact_order.begin());
+        }
+        return first;
+    }
     std::rotate(order.begin(), longest, longest + 1);
     auto const changed = estimate();
-    if (ordinary.known && changed.known && changed.completion < ordinary.completion) return ready[order.front()].index;
+    if (changed.known && changed.completion < ordinary.completion) return ready[order.front()].index;
     return {};
+}
+
+inline std::optional<size_t> TerminalGenerationPlan::choose(std::span<ExecutionReady const> ready,
+    std::span<ExecutionLane const> lanes, std::span<TerminalGenerationBatch const> inputs, size_t active,
+    unsigned workers, unsigned grant, GenerationSupply const& current, bool prefix, uint64_t now, uint64_t timeout)
+{
+    if (count)
+    {
+        if (prefix) if (auto saved = next(inputs, ready, current, now)) return saved;
+        clear(); return {};
+    }
+    if (ready.size() != active || (active <= batches.size() && inputs.size() != active)) return {};
+    std::array<size_t, exact_terminal_batches> order{};
+    auto first = execution_terminal_first(ready, lanes, workers, grant, order);
+    if (first && active <= batches.size())
+    {
+        long double generation = 0;
+        count = active; issued = 0; supply = current;
+        for (size_t i = 0; i < count; ++i) { batches[i] = inputs[order[i]]; generation += lanes[i].work.generation; }
+        auto duration = std::min(timeout, UINT64_MAX - now);
+        if (generation < duration) duration = uint64_t(generation);
+        deadline = now + duration;
+    }
+    return first;
 }
 
 inline ConstructionRates construction_rates(ConstructionSample const& sample)

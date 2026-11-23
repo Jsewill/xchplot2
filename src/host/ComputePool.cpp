@@ -971,8 +971,19 @@ struct BrokerServer::Impl
         worker.histories.push_back(History{selected, task.k, task.strength, threads, owner, task.generation_output, task.independent_members});
         return worker.histories.back();
     }
+    struct DatedCost
+    {
+        uint64_t low = UINT64_MAX, high = 0;
+        unsigned samples = 0;
+        void observe(Clock::time_point at, Clock::time_point now, uint64_t elapsed)
+        {
+            // Use the same one-day limit as the owner's construction calibration.
+            if (at > now || now - at >= std::chrono::hours(24)) return;
+            low = std::min(low, elapsed); high = std::max(high, elapsed); ++samples;
+        }
+    };
     long double recent_cost(std::string const& identity, Worker const& worker, Task const& task, Kind kind, std::string const& owner,
-                            Resources const& resources, Clock::time_point now, bool lower = false) const
+                            Resources const& resources, Clock::time_point now, bool lower = false, DatedCost* dated = nullptr) const
     {
         auto const since = now - std::chrono::milliseconds(std::max(options.lease_ms, options.worker_ms));
         uint64_t result = 0;
@@ -982,11 +993,14 @@ struct BrokerServer::Impl
         for (auto const& history : worker.histories)
             if ((path != source.paths.end() || history.owner == owner) && history.matches(task, kind, history.owner, resources.cpu_threads))
                 for (auto const& sample : std::span(history.samples).first(history.count))
-                    if (((history.owner == owner && (sample.origin.empty() || path == source.paths.end())) ||
-                         (path != source.paths.end() && sample.origin == path->second)) &&
-                        sample.units == task.work_units && sample.at > since && sample.resources == resources)
-                        result = lower && result ? std::min(result, sample.observation.elapsed_ns) :
-                            std::max(result, sample.observation.elapsed_ns);
+                    if (sample.units == task.work_units && sample.resources == resources)
+                    {
+                        bool const bound = path != source.paths.end() && sample.origin == path->second;
+                        if (sample.at > since && (bound || (history.owner == owner && (sample.origin.empty() || path == source.paths.end()))))
+                            result = lower && result ? std::min(result, sample.observation.elapsed_ns) :
+                                std::max(result, sample.observation.elapsed_ns);
+                        else if (bound && dated) dated->observe(sample.at, now, sample.observation.elapsed_ns);
+                    }
         return result ? result : std::numeric_limits<long double>::max();
     }
     struct DeliveryCost { long double ns = std::numeric_limits<long double>::max(); uint64_t assigned = 0; };
@@ -1102,13 +1116,14 @@ struct BrokerServer::Impl
             // The current owner's delivery predicts when the lease releases.
             // Each queued owner still needs its own estimate on this route.
             auto const& held = lease.task.resources;
-            auto ready = remaining_on_lease(at->second, waiting, *running, now);
+            long double ready;
             if (recent)
             {
                 auto const upper = recent_cost(at->first, at->second, lease.task, lease.task.kind, running->owner, held, now);
                 if (upper == std::numeric_limits<long double>::max()) continue;
-                ready = std::min(ready, upper - Nanoseconds(now - running->granted_at).count());
+                ready = upper - Nanoseconds(now - running->granted_at).count();
             }
+            else ready = remaining_on_lease(at->second, waiting, *running, now);
             if (ready <= 0 || ready >= idle_ns || ready >= Nanoseconds(running->expires - now).count()) continue;
             auto capacity = free.at(at->first);
             capacity.slots += held.slots; capacity.cpu_threads += held.cpu_threads;
@@ -1196,6 +1211,8 @@ struct BrokerServer::Impl
                     bool const gpu = job->requested.kind == Kind::GenerateGpu || job->requested.kind == Kind::GenerateAny;
                     uint64_t oldest_age = 0;
                     bool explore = false, awaiting_first = false, incumbent = false;
+                    DatedCost fastest; uint64_t other_low = UINT64_MAX;
+                    std::string const* dated_worker = nullptr; Candidate dated_route{};
                     for (auto const& identity : candidates)
                     {
                         auto& worker = workers.at(identity);
@@ -1207,8 +1224,9 @@ struct BrokerServer::Impl
                             auto cost = sample.ns;
                             if (job->finite)
                             {
+                                DatedCost dated;
                                 auto const prior = recent_cost(identity, worker, job->requested, selected->kind, job->owner,
-                                    selected->resources, now);
+                                    selected->resources, now, false, pending_delivery.contains(identity) ? nullptr : &dated);
                                 if (prior < std::numeric_limits<long double>::max())
                                 {
                                     if (!incumbent || prior < best_cost)
@@ -1219,6 +1237,12 @@ struct BrokerServer::Impl
                                     continue;
                                 }
                                 if (incumbent) continue;
+                                if (dated.samples >= 2 && (!dated_worker || dated.high < fastest.high))
+                                {
+                                    other_low = std::min(other_low, fastest.low);
+                                    fastest = dated; dated_worker = &identity; dated_route = *selected;
+                                }
+                                else other_low = std::min(other_low, dated.low);
                             }
                             uint64_t const age = assignments - sample.assigned;
                             bool const unmeasured = sample.ns == std::numeric_limits<long double>::max();
@@ -1246,10 +1270,16 @@ struct BrokerServer::Impl
                     if (chosen.empty()) return false;
                     // A finite group has no independent delivery to hide a new route's trial.
                     // A recent exact-width route can release in time for every ready request.
-                    if (job->finite && waiting.size() == 1 &&
-                        earlier_on_release(queue, *job, active_generation, capacity, chosen, chosen_kind,
+                    if (job->finite)
+                    {
+                        if (waiting.size() == 1 && earlier_on_release(queue, *job, active_generation, capacity, chosen, chosen_kind,
                             incumbent ? best_cost : std::numeric_limits<long double>::max(), now, true)) return false;
-                    if (incumbent) return true;
+                        // Older receipts only compare immediately available workers.
+                        // Overlapping intervals leave the ordinary trial order in place.
+                        if (!incumbent && dated_worker && fastest.high < other_low)
+                        { chosen = *dated_worker; chosen_kind = dated_route.kind; chosen_resources = dated_route.resources; }
+                        return true;
+                    }
                     // The owner can see planned fill work beyond the jobs
                     // that currently have receive buffers and a scratch grant.
                     if (!awaiting_first && best_cost <= other_work) return true;
