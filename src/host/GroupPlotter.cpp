@@ -1767,6 +1767,27 @@ struct Producer
         uint64_t const bytes = group_grow::MemberBatchHash::memory_bytes(count);
         return peak <= budget && bytes <= budget - peak ? bytes : 0;
     }
+    void hash_pool_member(group_grow::MemberBatchHash& hash, group_grow::Member const& member,
+        size_t index, std::function<void()> const& check) const
+    {
+        group_grow::ConstructionTiming timing;
+        hash.append(member.view(), check);
+        timing.finish("receive_hash", identity.params.get_plot_group_id(), identity.params.get_meta_group(), target, index, 1);
+    }
+    std::unique_ptr<group_grow::MemberBatchHash> hash_pool_successor(
+        std::span<group_grow::Member const> members, std::atomic<bool> const& stop) const
+    {
+        std::unique_ptr<group_grow::MemberBatchHash> hash;
+        for (size_t i = 0; i < members.size(); ++i)
+        {
+            group_grow::CodecScheduler::Lease spare(*backend.cpu_scheduler, std::try_to_lock);
+            if (!spare) break;
+            if (!hash) hash = std::make_unique<group_grow::MemberBatchHash>(members.size());
+            hash_pool_member(*hash, members[i], i, [&]
+            { check_cancel(args); require(!stop.load(), "pool generation cancelled"); });
+        }
+        return hash;
+    }
     struct ContributionRange
     {
         uint16_t first = 0, count = 0;
@@ -2165,10 +2186,7 @@ struct Producer
         size_t next_hash = values.size();
         auto append_hash = [&](size_t member, auto const& check)
         {
-            group_grow::ConstructionTiming timing;
-            hash->append(values[member].view(), check);
-            timing.finish("receive_hash", identity.params.get_plot_group_id(), identity.params.get_meta_group(),
-                target, first + member, 1);
+            hash_pool_member(*hash, values[member], first + member, check);
         };
         auto collect = [&](size_t member, group_grow::Member result)
         {
@@ -2831,8 +2849,10 @@ struct GroupPrefetch
             incoming = std::move(members); incoming.resize(count);
             // The receiver's two-cache reservation covers the old and new
             // prefix arrays while enlarging a smaller producer's hash cache.
-            if (!hash_first) incoming_hash = std::move(hash);
-            if (incoming_hash) { incoming_hash->reserve(cap); incoming_hash->truncate(count); }
+            // The optional pool cache has a single, exact width reservation.
+            if (!hash_first && (!ram_rollover || capacity == cap)) incoming_hash = std::move(hash);
+            if (incoming_hash)
+            { incoming_hash->reserve(cap); incoming_hash->truncate(std::min(count, incoming_hash->size())); }
         }
         else
         {
@@ -16941,21 +16961,28 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             args.max_ram - occupied, member_storage_bound(args, identity), future_memory) : prefetched.capacity;
         if (!cap) return false;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        uint64_t pool_receive = 0;
+        uint64_t pool_receive = 0, hash_bytes = 0;
         if (backend->mode == "pool")
         {
             while (cap && sum(sum(sum(sum(fixed, held), future_memory(cap)), backend->retained()),
                 producer.pool_receive_bytes(0, cap)) > args.max_ram) --cap;
             if (!cap) return false;
             pool_receive = producer.pool_receive_bytes(0, cap);
-            if (ram_rollover)
-            {
-                auto const available = available_host_bytes();
-                if (cap != maximum || (available && pool_receive > *available)) return false;
-            }
         }
 #endif
         producer.fixed = sum(base, future_memory(cap));
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (ram_rollover)
+        {
+            auto const available = available_host_bytes();
+            if (cap != maximum || (available && pool_receive > *available)) return false;
+            if (cpu_scheduler->can_overlap())
+            {
+                auto const bytes = producer.pool_hash_bytes(cap, pool_receive, held);
+                if (!available || bytes <= *available - pool_receive) hash_bytes = bytes;
+            }
+        }
+#endif
         uint16_t previous_reservation = 0;
         if (farm)
         {
@@ -16975,19 +17002,22 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             pending.batch.ram_rollover = ram_rollover;
             pending.previous_reservation = previous_reservation;
             if (ram_rollover) d.pending->write_due.store(0, std::memory_order_relaxed);
-            pending.batch.metadata_bytes = batch_metadata(cap); pending.batch.members.reserve(cap);
+            pending.batch.metadata_bytes = sum(batch_metadata(cap), hash_bytes); pending.batch.members.reserve(cap);
             pending.receiving_bytes = pool_receive; pending.cancel.store(false);
-            uint64_t const reserved = producer.fixed;
+            uint64_t const reserved = sum(producer.fixed, hash_bytes);
+            auto const target = ram_rollover ? group_path(d.path.parent_path(), farm->lanes[d.owner].ordinal + 1) : d.path;
             std::string const progress = file_io::path_text(d.path) + ": prefetching pool member ";
             fixed = sum(fixed, pending.batch.metadata_bytes);
-            pending.ready = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, cap, held, reserved, progress, ram_rollover, receiver_limit]
+            pending.ready = group_grow::NotifiedFuture<Task::Generated>::launch(wake, [&, cap, held, reserved, progress, ram_rollover, receiver_limit, hash_bytes, target]
             {
                 ControllerTiming timing(ram_rollover ? "ram_successor_receive" : "prefetch_receive", pending.batch.owner);
-                Producer producer{*pending.batch.identity, nullptr, *backend, args, args.max_ram, reserved, reserved};
+                Producer producer{*pending.batch.identity, nullptr, *backend, args, args.max_ram, reserved, reserved, target};
                 producer.defer_pool_history = true;
                 auto receive = [&] { return producer.fill_pool(pending.batch.members, 0, cap, held,
                     progress, {}, &pending.cancel, nullptr, 1, {}, receiver_limit); };
                 auto const generated = ram_rollover ? receive_optional_successor(receive) : receive();
+                if (hash_bytes && generated == cap)
+                    pending.batch.hash = producer.hash_pool_successor(pending.batch.members, pending.cancel);
                 return Task::Generated{generated, producer.peak, producer.generation_peak,
                     producer.pool_elapsed_ns, producer.fill_stop};
             });
@@ -17477,7 +17507,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     {
                         task.members.pop_back(); task.lease.reset();
                         task.fill_stop = Producer::FillStop::requested;
-                        if (task.hash) task.hash->truncate(task.members.size());
+                        if (task.hash) task.hash->truncate(std::min(task.members.size(), task.hash->size()));
                         continue; // Resubmit after the drive's queue has room.
                     }
                     d.metrics.stop_reason = "capacity";
@@ -17959,6 +17989,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 same_identity(d.requested, *prefetched.identity);
                 uint64_t const metadata = prefetched.metadata_bytes;
                 prefetched.take(task.members, task.hash, wanted, d.batch_cap);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                if (task.hash && backend->mode == "pool")
+                    task.pool_hash_bytes = group_grow::MemberBatchHash::memory_bytes(d.batch_cap);
+#endif
                 fixed -= metadata - prefetched.metadata_bytes;
                 producer.fixed = fixed;
             }

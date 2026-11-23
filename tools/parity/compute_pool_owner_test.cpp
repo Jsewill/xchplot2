@@ -505,6 +505,89 @@ void late_packed_capacity()
             for (auto value : view.region(c)) raw.push_back(value);
         require(raw == worker_original_reference(18, 2, id), "packed rescheduling changed ordered CPU-reference output");
     }
+    // A successor hashes only with spare owner CPU. Its complete cache or
+    // the ordinary writer fallback must bind the very same sealed members.
+    std::atomic<bool> stop{false};
+    std::future<std::unique_ptr<MemberBatchHash>> skipped;
+    {
+        CodecScheduler::Lease writer(backend.cpu_scheduler.get());
+        skipped = std::async(std::launch::async, [&] { return producer.hash_pool_successor(members, stop); });
+        require(skipped.wait_for(std::chrono::seconds(2)) == std::future_status::ready && !skipped.get(),
+            "optional successor hash queued for the last foreground CPU");
+    }
+    unsigned checks = 0; args.cancelled = [&] { return ++checks == 3; };
+    bool interrupted = false;
+    try { (void)producer.hash_pool_successor(members, stop); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted, "optional packed successor hash lost cancellation");
+    args.cancelled = {};
+    std::promise<void> started_hash, foreground_ready, release_foreground;
+    auto foreground = std::async(std::launch::async, [&]
+    {
+        require(started_hash.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "successor did not start hashing its first member");
+        CodecScheduler::Lease writer(backend.cpu_scheduler.get());
+        foreground_ready.set_value();
+        require(release_foreground.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "optional hash blocked the foreground permit");
+    });
+    bool first = true;
+    args.cancelled = [&]
+    {
+        if (std::exchange(first, false))
+        {
+            started_hash.set_value();
+            require(foreground_ready.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "writer did not receive its reserved CPU during the optional hash");
+        }
+        return false;
+    };
+    GroupPrefetch partial; partial.capacity = 3; partial.ram_rollover = true;
+    partial.hash = producer.hash_pool_successor(members, stop);
+    release_foreground.set_value(); foreground.get(); args.cancelled = {};
+    require(partial.hash && partial.hash->size() == 1, "CPU pressure discarded a completed successor digest prefix");
+    partial.members = std::move(members);
+    std::unique_ptr<MemberBatchHash> prefix;
+    partial.take(members, prefix, 3, 3);
+    size_t suffix_polls = 0, writer_polls = 0;
+    (void)members_digest(18, Members(members).subspan(1), nullptr, [&] { ++suffix_polls; });
+    require(prefix && members_digest(18, Members(members), prefix.get(), [&] { ++writer_polls; }) ==
+        hash.digest_for(Members(members)) && writer_polls == suffix_polls,
+        "writer reread the confirmed prefix or changed the canonical digest");
+    interrupted = false;
+    try { (void)members_digest(18, Members(members), prefix.get(), [] { throw Interrupted{}; }); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted && prefix->digest_for(Members(members).subspan(0, 1)) == hash.digest_for(Members(members).subspan(0, 1)),
+        "cancelling suffix hashing changed the accepted digest prefix");
+    std::swap(members[0], members[1]);
+    require(members_digest(18, Members(members), prefix.get(), [] {}) ==
+        members_digest(18, Members(members), nullptr, [] {}), "writer trusted another member's digest prefix");
+    std::swap(members[0], members[1]);
+    GroupPrefetch split; split.capacity = 3; split.ram_rollover = true;
+    split.members = std::move(members); split.hash = std::move(prefix);
+    split.take(members, prefix, 1, 3);
+    require(members.size() == 1 && !prefix && !split.hash && split.first == 1 && split.members.size() == 2,
+        "short adoption exposed the original SHA state to a differently aligned batch");
+    std::vector<Member> remainder;
+    split.take(remainder, prefix, 2, 3);
+    require(!prefix && remainder.size() == 2, "remaining members inherited another range's digest");
+    for (auto& member : remainder) members.push_back(std::move(member));
+    require(bool(hash.digest_for(Members(members))), "short adoption reordered the immutable member identities");
+    for (uint16_t const cap : {4, 3, 2})
+    {
+        auto const count = std::min<size_t>(cap, members.size());
+        auto const expected = members_digest(18, Members(members).subspan(0, count), nullptr, [] {});
+        GroupPrefetch successor; successor.capacity = uint16_t(members.size()); successor.ram_rollover = true;
+        successor.hash = producer.hash_pool_successor(members, stop);
+        require(successor.hash && successor.hash->digest_for(Members(members)) == hash.digest_for(Members(members)),
+            "spare CPU failed to prepare the complete ordinary packed digest");
+        successor.members = std::move(members);
+        std::unique_ptr<MemberBatchHash> adopted;
+        successor.take(members, adopted, 3, cap);
+        require(members.size() == count && bool(adopted) == (cap == 3) &&
+            members_digest(18, Members(members), adopted.get(), [] {}) == expected,
+            "changed RAM grant reused an unadmitted cache or changed its member digest");
+    }
     auto second_cert = pool_test::issue(certificates.path, "packed-start-second", &ca);
     offered.tls = pool_test::tls(ca, second_cert); offered.tls.max_frame_bytes = tls.max_frame_bytes;
     WorkerService second(offered); second.start();

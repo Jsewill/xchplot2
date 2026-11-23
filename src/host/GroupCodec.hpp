@@ -123,6 +123,17 @@ public:
             current_permits_ = permits_;
             lock.unlock(); owner_->compute_.notify_all();
         }
+        // Optional preparation uses one idle permit, leaving another for
+        // foreground work. A queued codec job or waiter always goes first.
+        Lease(CodecScheduler& owner, std::try_to_lock_t)
+            : owner_(nullptr), previous_(current_), permits_(1), previous_permits_(current_permits_)
+        {
+            if (!owner.can_overlap() || owner.threads_.empty()) return;
+            std::lock_guard lock(owner.mutex_);
+            if (owner.first_waiter_ || owner.queued_ || owner.workers() - owner.active_ < 2) return;
+            ++owner.active_; current_ = owner_ = &owner; current_permits_ = 1;
+        }
+        explicit operator bool() const { return owner_ != nullptr; }
         ~Lease()
         {
             if (!owner_) return;

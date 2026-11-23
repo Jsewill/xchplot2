@@ -413,7 +413,7 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto legacy = std::async(std::launch::async, [&]
     {
         auto channel = listener.accept(3000);
-        for (auto operation : {23, 19, 18, 18, 2, 2, 2, 25, 2, 1, 24, 2, 26, 8})
+        for (auto operation : {23, 19, 18, 18, 2, 2, 2, 25, 2, 1, 24, 2, 26, 8, 23, 19, 18, 2, 2})
         {
             auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
             require(frame.type == Message::Control && input.u32() == 8 && input.u8() == operation,
@@ -463,6 +463,8 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     std::string const path(64, 'd');
     require(!owner.generation_paths(session, {{"old-worker", path}}), "an older broker accepted scoped paths");
     owner.delivered(Lease{}, {1, 4, 32}, path);
+    require(owner.generation_hint(session, request, &slots, &availability, {}, &roster) == 3 && !roster &&
+        !bounded.acquire(session, request, until), "new session lost the older broker's capacity fallback");
     legacy.get();
     Listener successor({"127.0.0.1", 0}, server_tls);
     auto upgraded = std::async(std::launch::async, [&]
@@ -470,10 +472,25 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
         auto channel = successor.accept(3000); auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
         require(frame.type == Message::Control && input.u32() == 8 && input.u8() == 25, "new endpoint skipped finite pricing");
         reply.string("known-worker"); reply.u8(uint8_t(Kind::GenerateGpu)); channel.send(Message::Reply, reply.data());
+        frame = channel.receive(); Reader hints(frame.payload);
+        require(hints.u32() == 8 && hints.u8() == 23, "new endpoint skipped detailed worker admission");
+        reply.clear(); reply.u32(0); reply.u32(0); reply.u32(0); reply.u8(0);
+        for (unsigned n = 1; n <= max_generation_batch_members; ++n) reply.u32(0);
+        reply.u8(1); reply.u8(0); // complete roster, no eligible routes
+        reply.u32(0); reply.u32(0); reply.u32(0); reply.u32(0);
+        for (auto count : GenerationAdmission{}.waiting) reply.u32(count);
+        reply.u8(0); channel.send(Message::Reply, reply.data());
+        frame = channel.receive(); Reader acquire(frame.payload), backlog(std::span<uint8_t const>(frame.payload).last(4));
+        require(acquire.u32() == 8 && acquire.u8() == 2 && backlog.u32() > 0, "new endpoint lost the owner's work horizon");
+        reply.clear(); reply.u8(0); channel.send(Message::Reply, reply.data());
     });
     owner.reroute(successor.endpoint());
     auto choice = owner.finite_packed_route(session, packed);
     require(choice && choice->first == "known-worker", "an old broker disabled its replacement's placement API");
+    auto const horizon = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    require(!owner.generation_hint(session, request, &slots, &availability, {}, &roster) && roster && roster->complete &&
+        availability.admission && !owner.with_deadline(horizon).acquire(session, request, horizon),
+        "a rerouted owner failed to discover its new broker's roster or queue");
     upgraded.get();
 }
 

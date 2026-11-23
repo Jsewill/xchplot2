@@ -11,7 +11,7 @@ std::atomic<unsigned> writes_before_failure{0};
 std::atomic<bool> reject_retired_receipt{false};
 std::atomic<bool> reject_atomic_retirement{false};
 std::atomic<unsigned> retirement_flags{0};
-std::atomic<bool> slow_checkpoint_writes{false};
+std::atomic<bool> slow_checkpoint_writes{false}, slow_next_sync{false};
 std::atomic<bool> observe_oversized_partial{false};
 std::atomic<uint64_t> oversized_partial_reads{0};
 std::atomic<bool> observe_index_writes{false};
@@ -170,6 +170,7 @@ extern "C" int __real_fsync(int);
 extern "C" int __wrap_fsync(int fd)
 {
     hold_shared_storage(fd, true);
+    if (slow_next_sync.exchange(false)) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     {
         std::lock_guard lock(segment_sync_failure.mutex); auto& state = segment_sync_failure;
         if (state.armed && (!state.after_payload || state.payload))
@@ -1117,6 +1118,48 @@ void packing_index(fs::path const& root, ExternalConfig const& ext)
     catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "external index buffer bypassed workspace admission");
 }
+void fresh_checkpoint_forecast(fs::path const& root)
+{
+#ifdef GROW_TEST_WRAP_PWRITE
+    auto raw = members(1, 8, 22);
+    std::vector<uint8_t> reference;
+    for (bool intermediate : {false, true})
+    {
+        auto cfg = config(); cfg.checkpoint_bytes = intermediate ? 1 : (uint64_t(64) << 20);
+        auto const path = root / (intermediate ? "refresh-durable-forecast" : "terminal-durable-forecast");
+        Engine engine(path.string(), cfg, false, initial_identity(22)); engine.confirm_identity();
+        unsigned observations = 0;
+        uint64_t first_sync = 0, measured_sync = 0;
+        long double revised = 0;
+        engine.fresh_write([&](uint64_t peak, long double remaining)
+        {
+            require(peak && remaining > 0, "fresh output offered an empty service forecast");
+            if (!observations++)
+            {
+                first_sync = engine.stats().sync_ns;
+                slow_next_sync = intermediate;
+            }
+            else
+            {
+                measured_sync = engine.stats().sync_ns - first_sync;
+                revised = remaining;
+            }
+        });
+        require(engine.append(Members(raw)).accepted, "fresh checkpoint forecast input was refused");
+        if (intermediate)
+            require(observations == 2 && measured_sync >= 10000000 && revised >= measured_sync &&
+                contents(path) == reference, "fresh output lost a measured future sync or changed ordinary bytes");
+        else
+        {
+            require(observations == 1, "the terminal checkpoint advertised a successor after the payload was complete");
+            reference = contents(path);
+        }
+    }
+#else
+    (void)root;
+#endif
+}
+
 void packing_checkpoints(fs::path const& root, Members input, ExternalConfig const& ext,
                          std::vector<uint8_t> const& reference)
 {
@@ -2943,7 +2986,11 @@ try
     if (argc == 1 || bulk_only) bulk_checkpoints(root, input, ext);
     if (bulk_only)
     { fs::remove_all(root); std::cout << "external bulk checkpoint tests passed\n"; return 0; }
-    if (argc == 1 || checkpoints_only) packing_index(root, ext);
+    if (argc == 1 || checkpoints_only)
+    {
+        fresh_checkpoint_forecast(root);
+        packing_index(root, ext);
+    }
     packing_transition(root, input, ext, reference);
     if (retirement_only)
     {

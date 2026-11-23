@@ -4346,28 +4346,43 @@ def check_compute(binary, root):
         peers = [root / ("ram-peer-" + str(i)) for i in range(2)]
         for peer in peers:
             peer.mkdir()
+        reference_peers = [root / ("ram-peer-reference-" + str(i)) for i in range(2)]
+        for peer in reference_peers:
+            peer.mkdir()
+        pool.run([binary, "fill", *reference_peers, *series, "--generation-overlap", "off"])
         process = pool.Process([binary, "fill", *peers, *series], root / "ram-peers.log", extra_env={"POS2GPU_PHASE_TIMING": "1"})
         processes.append(process)
         log = process.finish()
         report = json.loads(log.splitlines()[-1])
         assert report["members"] == report["generated_members"] == report["pool_packed_members"] == 6
         assert report["peak_modeled_bytes"] <= 1 << 30 and report["scratch_peak_bytes"] == 0
+        # The fixture's two directories share one physical writer. Both ready
+        # lanes must have a foreground grant before either gets its next group.
+        assert report["destinations"] == report["peak_active_destinations"] == 2 and report["writer_groups"] == 1
+        grants = [row for row in log.splitlines() if row.startswith("[grow-controller-timing] phase=grant ")]
+        assert len(grants) == 6 and all(any(peer.name in row for row in grants[:2]) for peer in peers)
         writes, publications = [], []
-        for peer in peers:
+        for peer, reference_peer in zip(peers, reference_peers):
             lane = "\n".join(row for row in log.splitlines() if peer.name in row)
             writes.append(intervals(lane, "fresh_payload"))
             publications.append(intervals(lane, "publish"))
             assert len(writes[-1]) == len(publications[-1]) == 3
             assert all(writes[-1][i][1] <= publications[-1][i][0] <= publications[-1][i][1] <= writes[-1][i + 1][0]
                        for i in range(2))
-            for path in sorted(peer.glob("*.gplot")):
+            outputs, ordinary = sorted(peer.glob("*.gplot")), sorted(reference_peer.glob("*.gplot"))
+            assert len(outputs) == len(ordinary) == 3
+            for path, reference_path in zip(outputs, ordinary):
+                assert digest(path) == digest(reference_path)
                 verify(path, 100)
-        # The final surviving lane could also use the single-device optimization.
-        # Require a receipt during this lane's write while the other still owns work.
-        receives = re.findall(r"phase=ram_successor_receive owner=(\d+) begin_ns=(\d+)", log)
+        # A fast writer may have no measured service left when the other lane
+        # relinquishes its receive slot. Any optional input still belongs to
+        # the interval between the start of its predecessor and its own write.
+        receives = re.findall(r"phase=ram_successor_receive owner=(\d+) begin_ns=(\d+) end_ns=(\d+)", log)
         assert report["generation_overlap_members"] == len(receives)
-        assert any(any(a <= int(when) < b for a, b in writes[int(owner)]) and
-                   int(when) < publications[1 - int(owner)][-1][1] for owner, when in receives)
+        for owner, begin, end in receives:
+            assert int(owner) < len(peers)
+            lane = writes[int(owner)]
+            assert any(lane[i][0] <= int(begin) < int(end) <= lane[i + 1][0] for i in range(len(lane) - 1))
         limited = root / "ram-limited"
         limited.mkdir()
         result = pool.run([binary, "fill", limited, *series, "-M", "120M", "--max-groups", 2, "--max-total-members", 2])
