@@ -2035,6 +2035,16 @@ void status_inspection()
     auto accepting = inspect(); auto after = control.status();
     require(accepting.status == "compatible-workers-observed" && accepting.accepting_generation == 1 && accepting.accepting_codec == 1 &&
         !after.owners && !after.jobs, "status inspection created owner sessions/tasks or failed to report compatible admission");
+    control.unregister_worker(offer.instance);
+    offer.admission = pool::WorkerAdmission::Accepting;
+    offer.capabilities |= pool::capability(pool::Kind::GenerateGpu);
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, {1, 1, 1, 1}, 1, 1}};
+    offer.gpu_recovery = "ZE_RESULT_ERROR_DEVICE_LOST";
+    control.register_worker(offer);
+    auto recovering = inspect();
+    require(recovering.accepting_generation == 1 && recovering.accepting_codec == 1 &&
+        recovering.worker_resources.size() == 1 && recovering.worker_resources.front().gpu_recovery == offer.gpu_recovery,
+        "live status dropped the GPU recovery cause or withdrew accepting CPU work");
     args.pool_broker = "localhost:" + std::to_string(broker.server.endpoint().port);
     auto hostname = inspect();
     require(!hostname.complete && !hostname.checked && !hostname.issues.empty() && hostname.issues.front().reason.find("numeric") != std::string::npos,

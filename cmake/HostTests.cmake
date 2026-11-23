@@ -116,7 +116,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
 endif()
 
 add_executable(pipeline_control_test tools/parity/pipeline_control_test.cpp
-    src/host/MultiGpuPipelineParallel.cpp src/host/Cancel.cpp)
+    src/host/MultiGpuPipelineParallel.cpp src/host/HostPinnedPool.cpp src/host/Cancel.cpp)
 target_include_directories(pipeline_control_test BEFORE PRIVATE tools/parity/pipeline_control_test src)
 target_compile_features(pipeline_control_test PRIVATE cxx_std_20)
 target_link_libraries(pipeline_control_test PRIVATE Threads::Threads)

@@ -3,6 +3,8 @@
 #include "host/MultiGpuPipelineParallel.hpp"
 #include "host/MultiGpuShardBufferPool.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/HostPinnedPool.hpp"
+#include "gpu/TwoPhaseScratch.hpp"
 #include "host/Cancel.hpp"
 #include "host/VramBudget.hpp"
 #include <atomic>
@@ -20,6 +22,47 @@ uint64_t free_vram = 8ULL << 30;
 std::atomic<int> calls{0};
 bool deny_host_reserve = false;
 bool device_boundary = false;
+
+void failed_native_frees()
+{
+    using namespace pos2gpu;
+    sycl::queue q;
+    GpuCleanupCharges retained;
+    ObserveGpuCleanup observe(retained);
+    {
+        HostPinnedPool pool;
+        sycl::fail_free = pool.acquire("grown", 64, q);
+        try { pool.acquire("grown", 128, q); assert(false); } catch (sycl::exception const&) {}
+        assert(!pool.live_bytes() && retained.host == 64);
+        sycl::fail_free = pool.acquire("teardown", 128, q);
+        pool.acquire("healthy", 256, q);
+    }
+    assert(retained.host == 192 && sycl::allocations.empty());
+    using namespace sycl_backend;
+    set_twophase_budget(q, 812);
+    auto* scratch = acquire_twophase_scratch(q, 100);
+    assert(scratch);
+    sycl::fail_free = scratch->d_cand_l;
+    try { set_twophase_budget(q, 0); assert(false); } catch (sycl::exception const&) {}
+    assert(!scratch->d_cand_l && retained.device == 400);
+    sycl::fail_free = scratch->d_cand_count;
+    retire_worker_twophase_scratch(q);
+    release_twophase_scratch(q); // The queue owner can still run after worker teardown.
+    assert(retained.device == 408 && sycl::allocations.empty() && twophase_map().find(&q) == twophase_map().end());
+
+    try {
+        HostPinnedPool pool;
+        pool.acquire("synchronous loss", 256, q);
+        throw sycl::exception("lost device before worker exception handler");
+    } catch (sycl::exception const&) {}
+    assert(retained.host == 192 && retained.unwinding_host == 256);
+    retained.confirm_loss();
+    {
+        HostPinnedPool pool;
+        pool.acquire("async return", 32, q);
+    }
+    assert(retained.host == 480 && sycl::allocations.empty());
+}
 
 void shard_pool_failures()
 {
@@ -96,6 +139,7 @@ int main(int argc, char** argv)
         std::this_thread::sleep_for(std::chrono::seconds{15});
         std::_Exit(1);
     }).detach();
+    failed_native_frees();
     shard_pool_failures();
     std::vector<GpuPipelineConfig> configs(5);
     for (auto& c : configs) c.k = 18;

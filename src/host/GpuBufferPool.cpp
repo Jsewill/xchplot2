@@ -329,7 +329,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
         // touch slot 0 so the other two 2.2 GB malloc_host calls
         // aren't paid at all.
     } catch (...) {
-        release_allocations();
+        release_allocations(true);
         throw;
     }
 }
@@ -387,11 +387,11 @@ void GpuBufferPool::release_pinned(int idx)
 
 GpuBufferPool::~GpuBufferPool() { release_allocations(); }
 
-void GpuBufferPool::release_allocations() noexcept
+void GpuBufferPool::release_allocations(bool partial) noexcept
 {
-    auto release = [](auto*& pointer, uint64_t bytes, auto kind) {
+    auto release = [&](auto*& pointer, uint64_t bytes, auto kind) {
         if (auto* owned = std::exchange(pointer, nullptr))
-            release_gpu_memory("GPU buffer pool", bytes, kind, [&] { sycl::free(owned, sycl_backend::queue()); });
+            release_gpu_memory("GPU buffer pool", bytes, kind, [&] { sycl::free(owned, sycl_backend::queue()); }, partial);
     };
     release(d_storage, storage_bytes, &GpuCleanupCharges::device);
     release(d_pair_a, pair_a_bytes, &GpuCleanupCharges::device);
