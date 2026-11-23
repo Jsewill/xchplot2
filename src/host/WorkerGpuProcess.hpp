@@ -18,7 +18,11 @@ namespace group_grow::worker_gpu
 {
 using calibration_process::check;
 struct Profile { uint64_t borrowed = 0, owning = 0, device = 0; char tier[16]{}; };
-struct ResourcesUnavailable : std::runtime_error { using std::runtime_error::runtime_error; };
+struct ResourcesUnavailable : std::runtime_error
+{
+    uint64_t host_bytes;
+    ResourcesUnavailable(char const* message, uint64_t bytes) : std::runtime_error(message), host_bytes(bytes) {}
+};
 struct DeviceLost : std::runtime_error { using std::runtime_error::runtime_error; };
 struct Request
 {
@@ -141,13 +145,22 @@ public:
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         check(job.value && ::SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits)),
               "cannot contain GPU worker process");
-        SIZE_T size = 0; ::InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+        SIZE_T size = 0; ::InitializeProcThreadAttributeList(nullptr, 2, 0, &size);
         std::vector<std::byte> storage(size);
         auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-        check(::InitializeProcThreadAttributeList(attrs, 1, 0, &size), "cannot initialize GPU worker handles");
+        check(::InitializeProcThreadAttributeList(attrs, 2, 0, &size), "cannot initialize GPU worker handles");
         struct Attributes { LPPROC_THREAD_ATTRIBUTE_LIST value; ~Attributes() { ::DeleteProcThreadAttributeList(value); } } cleanup{attrs};
         check(::UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handle_, sizeof(handle_), nullptr, nullptr),
               "cannot restrict GPU worker handle inheritance");
+        // Install the kill-on-close job during creation. A parent exit between
+        // CreateProcess and a separate assignment must not orphan a child.
+#ifdef PROC_THREAD_ATTRIBUTE_JOB_LIST
+        constexpr auto job_attribute = PROC_THREAD_ATTRIBUTE_JOB_LIST;
+#else
+        constexpr auto job_attribute = ProcThreadAttributeValue(13, FALSE, TRUE, FALSE);
+#endif
+        check(::UpdateProcThreadAttribute(attrs, 0, job_attribute, &job.value, sizeof(job.value), nullptr, nullptr),
+              "cannot attach GPU worker supervisor job");
         STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = attrs;
         std::wstring command = profile_detail::windows_argument(exe.wstring()) + L" compute worker --config NUL --gpu-recovery-worker " +
             std::to_wstring(reinterpret_cast<uintptr_t>(handle_)) + L" " + std::to_wstring(bytes_);
@@ -157,16 +170,14 @@ public:
                     ::CloseHandle(value.hThread); ::CloseHandle(value.hProcess); } }
         } child;
         check(::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo,
+            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo,
             &child.value), "cannot start isolated GPU worker");
-        check(::AssignProcessToJobObject(job.value, child.value.hProcess) &&
-              ::ResumeThread(child.value.hThread) != DWORD(-1), "cannot start contained GPU worker");
         DWORD state = WAIT_TIMEOUT;
         while ((state = ::WaitForSingleObject(child.value.hProcess, 20)) == WAIT_TIMEOUT) check_cancel();
         child.finished = state == WAIT_OBJECT_0;
         DWORD code = 1;
-        check(state == WAIT_OBJECT_0 && ::GetExitCodeProcess(child.value.hProcess, &code) && code == 0,
-              "isolated GPU worker exited unexpectedly");
+        check(state == WAIT_OBJECT_0 && ::GetExitCodeProcess(child.value.hProcess, &code), "cannot read GPU worker exit status");
+        if (code) throw DeviceLost("GPU executor exited with code " + std::to_string(code));
 #elif defined(__linux__)
         posix_spawn_file_actions_t actions;
         check(!::posix_spawn_file_actions_init(&actions), "cannot initialize GPU worker descriptors");
@@ -190,7 +201,9 @@ public:
             if (ret < 0 && errno != EINTR) { if (errno == ECHILD) child.pid = 0; throw std::runtime_error("cannot reap GPU worker"); }
             check_cancel(); std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "isolated GPU worker exited unexpectedly");
+        if (WIFSIGNALED(status)) throw DeviceLost("GPU executor terminated by signal " + std::to_string(WTERMSIG(status)));
+        check(WIFEXITED(status), "cannot read GPU worker exit status");
+        if (auto code = WEXITSTATUS(status)) throw DeviceLost("GPU executor exited with code " + std::to_string(code));
 #else
         throw std::runtime_error("isolated GPU recovery requires Windows or Linux");
 #endif
@@ -198,7 +211,12 @@ public:
         check(result.format == Request::identity && result.mapping_bytes == bytes_ && result.error[sizeof(result.error)-1] == 0,
               "invalid response from isolated GPU worker");
         if (result.lost) throw DeviceLost(result.error);
-        if (result.unavailable) throw ResourcesUnavailable(result.error);
+        if (result.unavailable)
+        {
+            auto const native = result.probe ? result.profiles.front().owning : 0;
+            throw ResourcesUnavailable(result.error, native && native <= UINT64_MAX - output().size_bytes() ?
+                native + output().size_bytes() : 0);
+        }
         if (result.error[0]) throw std::runtime_error(result.error);
         check(result.complete == 1 && result.count && result.count <= output().size(), "incomplete isolated GPU generation");
     }

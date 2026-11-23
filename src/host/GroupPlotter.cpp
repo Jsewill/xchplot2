@@ -764,9 +764,14 @@ public:
         // shared admission state and every sibling lane are still alive.
         for (auto& lane : devices) if (lane.service) lane.service->stop();
     }
+    void publish_devices()
+    {
+        std::lock_guard lock(mutex_); published_ = true;
+    }
     std::shared_ptr<void> reserve_probe(uint64_t bytes)
     {
         std::lock_guard lock(mutex_);
+        if (!published_) return {};
         unsigned used = probe_cpus_;
         uint64_t occupied = probe_host_;
         for (auto const& lane : devices)
@@ -962,6 +967,7 @@ private:
     };
     std::mutex mutex_;
     std::condition_variable released_;
+    bool published_ = false;
     unsigned probe_cpus_ = 0;
     uint64_t probe_host_ = 0;
     uint8_t hint_k_ = 0, hint_strength_ = 0;
@@ -1184,6 +1190,7 @@ struct Backend
             auto& lane = schedule->devices.emplace_back(); lane.selector = device.device;
             lane.service = std::make_shared<group_grow::WorkerService>(std::move(config));
         }
+        schedule->publish_devices();
         group_grow::WorkerClientConfig client;
         client.local_only = true; client.cpu_scheduler = cpu_scheduler;
         client.generation_kind = group_grow::pool::Kind::GenerateAny;
@@ -1718,6 +1725,12 @@ struct Producer
     FillStop fill_stop = FillStop::full;
 
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    struct Generated
+    {
+        size_t members;
+        uint64_t peak, generation_peak, elapsed;
+        FillStop stop;
+    };
     uint64_t pool_receive_bytes(uint16_t first, size_t count) const
     {
         uint64_t const raw = fragment_bound(identity.params);
@@ -4491,7 +4504,7 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
     uint64_t owner, fs::path const& directory, Identity const& identity, uint16_t maximum, uint16_t batch,
     group_grow::Config& config, bool automatic, bool* output_capacity_rejected = nullptr, bool preserve_output = false,
     bool input = false, size_t open_slots = SIZE_MAX, bool pool_contributions = false, bool pool_packed = false,
-    bool preview = false, bool spare_spindle = false)
+    bool preview = false, bool spare_spindle = false, long double successor_rate = 0)
 {
     uint64_t const batches = (uint64_t(maximum) + batch - 1) / batch;
     uint64_t const run = sum(canonical_bound(identity, batch),
@@ -4547,7 +4560,7 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
             return group_grow::ExternalEngine::striped_reader_bytes(k, config, external);
         };
         auto grant = pool.grant(owner, desired, minimum, segment, 4, automatic, packing_inputs,
-            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots, configure_stripes, preview, spare_spindle);
+            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots, configure_stripes, preview, spare_spindle, successor_rate);
         if (grant && group_grow::ExternalEngine::metadata_bytes(uint8_t(identity.params.get_k()), *grant) +
                 sizeof(group_grow::Header) + identity.memo.size() > config.capacity_bytes)
         {
@@ -4755,6 +4768,7 @@ struct GroupSuccessor
     uint16_t maximum = 0, batch_cap = 0;
     uint64_t capacity = 0, fixed = 0, engine_bytes = 0, owner = 0, pool_growth = 0, metadata_bytes = 0;
     unsigned workers = 0;
+    uint64_t contribution_bytes = 0;
     bool deferred = false, detached = false;
     std::optional<group_grow::ExternalConfig> scratch;
     std::optional<group_grow::ExternalEngine::Inspection> recovery;
@@ -4811,7 +4825,8 @@ bool prepare_successor(GroupSuccessor& next, Arguments const& args, Backend& bac
     unsigned workers, std::shared_ptr<std::recursive_mutex> const& gate, Fixtures const* fixture = nullptr,
     group_grow::ConstructionHistories* histories = nullptr,
     std::shared_ptr<group_grow::SharedConstructionHistory> const& demand = {}, uint64_t released_bytes = 0,
-    std::shared_ptr<group_grow::CodecScheduler> const& cpu_scheduler = {})
+    std::shared_ptr<group_grow::CodecScheduler> const& cpu_scheduler = {}, uint64_t receive_task_bytes = 0,
+    std::vector<group_grow::ConstructionPathBinding> const& bindings = {}, long double receive_rate = 0)
 {
     if (!workers || !next.maximum || !next.capacity ||
         (args.construction != "auto" && args.construction != "external") ||
@@ -4834,11 +4849,24 @@ bool prepare_successor(GroupSuccessor& next, Arguments const& args, Backend& bac
     auto options = args; options.workers = workers;
     auto cfg = configuration(options, capacity, current_fixed, cpu_scheduler, backend.remote_encoder());
     next.scratch = temporary_grant(pool, owner, next.path.parent_path(), next.requested, next.maximum,
-        uint16_t(std::min(args.batch, uint64_t(next.maximum))), cfg, false);
+        uint16_t(std::min(args.batch, uint64_t(next.maximum))), cfg, false, nullptr, bool(receive_task_bytes),
+        false, SIZE_MAX, bool(receive_task_bytes));
     if (!next.scratch) return cancel();
     next.scratch->target_gate = gate;
     next.io = pool.try_stage_io(owner);
     if (!next.io) return cancel();
+    if (receive_rate > 0)
+    {
+        auto const bandwidth = pool.bandwidth_feedback();
+        long double rate = 0;
+        if (bandwidth) for (auto const& disk : pool.scratch_devices(owner))
+        {
+            auto const measured = bandwidth->bandwidth(disk);
+            if (!disk.rotating || disk.drives.empty() || !measured) return cancel();
+            rate += measured;
+        }
+        if (rate < receive_rate) return cancel();
+    }
     next.metadata_bytes = sum(sizeof(GroupSuccessor),
         sum(next.path.native().capacity() + 1, next.requested.memo.capacity()));
     uint64_t const metadata = sum(sum(pool.memory_bytes() - pool_before, external_metadata(*next.scratch)),
@@ -4846,6 +4874,7 @@ bool prepare_successor(GroupSuccessor& next, Arguments const& args, Backend& bac
     if (metadata >= args.max_ram - std::min(args.max_ram, current_fixed)) return cancel();
     uint64_t const base = sum(current_fixed, metadata);
     cfg = configuration(options, cfg.capacity_bytes, base, cpu_scheduler, backend.remote_encoder());
+    cfg.path_bindings = bindings;
     auto memory = [&](uint16_t count)
     { return prefetch_memory(args, next.requested, cfg, count,
         group_grow::storage_device(next.path.parent_path()).nonrotating, next.scratch); };
@@ -4856,11 +4885,24 @@ bool prepare_successor(GroupSuccessor& next, Arguments const& args, Backend& bac
     if (occupied >= args.max_ram) return cancel();
     uint16_t const maximum = uint16_t(std::min(args.batch, uint64_t(next.maximum)));
     uint64_t const headroom = args.max_ram - occupied, storage = member_storage_bound(args, next.requested);
-    uint16_t const batch = successor_batch_cap(maximum, headroom, released_bytes, storage, memory);
+    uint16_t batch = successor_batch_cap(maximum, headroom, released_bytes, storage, memory);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (receive_task_bytes)
+    {
+        if (maximum != next.maximum || maximum > group_grow::ExternalEngine::max_runs ||
+            canonical_bound(next.requested, maximum) > cfg.capacity_bytes) return cancel();
+        // The sealed input is appended by the normal destination task. A failed
+        // provisional receive can restart through an ordinary admitted singleton.
+        auto const receive = sum(probe.contribution_bytes(cfg, maximum), receive_task_bytes);
+        if (sum(sum(sum(base, retained), memory(maximum)),
+                std::max(generation, sum(backend.retained(), receive))) > args.max_ram) return cancel();
+        batch = maximum; next.contribution_bytes = receive;
+    }
+#endif
     if (!batch) return cancel();
     uint64_t const workspace = memory(batch);
     auto const available = available_host_bytes();
-    if (!fixture && available && workspace > *available) return cancel();
+    if (!fixture && available && sum(workspace, next.contribution_bytes) > *available) return cancel();
     cfg.progress = progress_activity(backend.progress);
     auto engine = std::make_unique<Construction>(file_io::path_text(next.path), cfg, false,
         initial_identity(next.requested), "external", next.scratch, 0, detailed_output(args));
@@ -4877,10 +4919,39 @@ bool prepare_successor(GroupSuccessor& next, Arguments const& args, Backend& bac
     next.metrics.capacity_bytes = cfg.capacity_bytes;
     next.metrics.peak_file_bytes = engine->identity().pending_peak_bytes;
     next.metrics.engine_reserved_bytes = next.fixed;
-    next.metrics.peak_modeled_bytes = sum(sum(next.fixed, retained), generation);
+    next.metrics.peak_modeled_bytes = sum(sum(next.fixed, retained),
+        std::max(generation, sum(backend.retained(), next.contribution_bytes)));
     next.engine = std::move(engine);
     return true;
 }
+
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+// The input stays private to its independently admitted scratch until the
+// preceding file publishes. The ordinary append then checkpoints it in order.
+group_grow::NotifiedFuture<Producer::Generated> receive_successor_contributions(GroupSuccessor& next,
+    Arguments const& args, Backend& backend, uint64_t fixed, uint64_t held, group_grow::ControllerWake& wake,
+    std::atomic<bool>& stop, std::unique_ptr<group_grow::ExternalEngine::ContributionInput>& input)
+{
+    require(next.engine && next.io && next.contribution_bytes, "successor receive lost its scratch or RAM admission");
+    input = prepare_pool_contributions(*next.engine->external, next.requested, next.maximum, next.capacity);
+    if (!input) return {};
+    auto const progress = file_io::path_text(next.path) + ": receiving next group's contributions ";
+    return group_grow::NotifiedFuture<Producer::Generated>::launch(wake,
+        [&, sink = input.get(), requested = next.requested, bytes = next.contribution_bytes, owner = next.owner, fixed, held, progress]
+    {
+        ControllerTiming timing("successor_receive", owner);
+        Producer producer{requested, nullptr, backend, args, args.max_ram, fixed, fixed};
+        producer.defer_pool_history = true;
+        size_t count = 0;
+        try { count = producer.fill_contributions(*sink, 0, held, bytes, progress, &stop); }
+        catch (group_grow::WorkerAdmissionRejected const&) {}
+        catch (group_grow::WorkerTaskDeclined const&) {}
+        catch (group_grow::WorkerResourcesUnavailable const&) {}
+        catch (group_grow::pool::UnsupportedResources const&) {}
+        return Producer::Generated{count, producer.peak, producer.generation_peak, producer.pool_elapsed_ns, producer.fill_stop};
+    });
+}
+#endif
 
 uint32_t stage_successor(GroupSuccessor& next, Arguments const& args, Backend& backend,
     uint64_t retained, std::function<bool()> const& stop, Fixtures const* fixture = nullptr)
@@ -14567,12 +14638,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         group_grow::AppendResult appended;
         group_grow::Result finished;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        struct Generated
-        {
-            size_t members;
-            uint64_t peak, generation_peak, elapsed;
-            Producer::FillStop stop;
-        };
+        using Generated = Producer::Generated;
         std::atomic<bool> cancel_generation{false};
         group_grow::NotifiedFuture<Generated> generating;
         uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
@@ -14583,6 +14649,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         {
             cancel_generation.store(true);
             if (generating.valid()) generating.wait();
+            if (io) contribution_input.reset();
         }
 #endif
     };
@@ -14606,6 +14673,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t mode_started = 0;
         size_t writer = 0, owner = 0, scratch_owner = 0;
         std::unique_ptr<GroupSuccessor> successor;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        // Its private contribution input borrows the successor engine until adoption.
+        std::unique_ptr<Task> successor_receive;
+#endif
         size_t successor_target = 0, prefunded_rows = 0;
         bool successor_staged = false, staging_successor = false;
         uint32_t successor_wait_reason = 0, prefetch_wait_reason = 0;
@@ -14957,6 +15028,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t bytes = prefetched.resident_bytes();
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (pool_prefetch.ready.valid()) bytes = sum(bytes, pool_prefetch.receiving_bytes);
+        for (auto const& d : destinations) if (d->successor_receive)
+            bytes = sum(bytes, d->successor_receive->contribution_bytes);
 #endif
         for (auto const& d : destinations) if (d->pending)
         {
@@ -15073,6 +15146,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         return construction_history(&histories, args, d.path, initial_identity(d.requested), grant, false,
             d.scratch ? &*d.scratch : nullptr, {}, true, &devices[d.owner], scratch);
     };
+    auto successor_room = [&](Destination const& d)
+    {
+        auto const quota = std::min(farm->state.directories[d.owner].capacity_bytes, d.farm_capacity);
+        auto const remaining = quota - std::min(quota, farm->lanes[d.owner].completed_charge);
+        return remaining - std::min(remaining, d.metrics.capacity_bytes);
+    };
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     using group_grow::pool::GenerationOutput;
     auto generation_output = [&](Destination const& d, bool external, bool encoded, unsigned batch)
@@ -15097,6 +15176,31 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto const output = generation_output(d, external, encoded, batch);
         if (output == GenerationOutput::Fresh && d.pending) batch = d.pending->fresh_members;
         return backend->pool_estimate(d.requested, output, receivers, batch);
+    };
+    auto successor_rate = [&](Destination const& d)
+    {
+        if (!farm || !keys || !farm->state.capacity_fill || !farm->accepts_future(d.owner) ||
+            farm->scratch_grants_frozen || !devices[d.owner].rotating || !args.io_overlap || !args.generation_overlap ||
+            args.member_storage != "compact" || args.pool_output == "packed" || args.pool_writers ||
+            (args.disk_io && args.disk_io->status().pressured) || (args.construction != "auto" && args.construction != "external")) return 0.L;
+        auto const& lane = farm->lanes[d.owner]; auto const next = lane.ordinal + 1;
+        auto const count = d.maximum;
+        if (!count || count > args.batch || count > group_grow::ExternalEngine::max_runs || next >= args.max_groups ||
+            canonical_bound(d.requested, count) > successor_room(d) ||
+            sum(lane.completed_members, 2 * uint64_t(count)) > args.max_total_members ||
+            farm->file_maximum(d.owner, next) != count || !group_grow::farming_grant_covers(farm->state, d.owner, next, count)) return 0.L;
+        // Only forecast a route and member size already observed at this owner.
+        auto const k = d.requested.params.get_k(), strength = d.requested.params.get_strength();
+        auto const& cohort = group_grow::farming_cohort(farm->state, farm->state.directories[d.owner], next);
+        if (cohort.config.k != k || cohort.config.strength != strength) return 0.L;
+        auto const bytes = farm->published_member_bytes(d.owner, d.requested);
+        if (!bytes) return 0.L;
+        auto client = backend->acquire_pool_client();
+        auto const capacity = client->generation_capacity(k, strength);
+        if (!capacity.slots || client->local_available() || (count > 1 &&
+            client->independent_contribution_width(k, strength, count, 1) < count)) return 0.L;
+        auto const delivery = client->generation_estimate(k, strength, GenerationOutput::Contributions, 1, count, count);
+        return delivery.measured_slots && !delivery.dated_prior && delivery.member_ns > 0 ? bytes / delivery.member_ns : 0.L;
     };
 #endif
     auto admit_destination = [&](Destination& d)
@@ -15729,7 +15833,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             size_t const initial_slots = open_slots(scratch_lanes);
             size_t scratch_slots = initial_slots;
             bool spare_spindle = false;
+            long double stage_rate = 0;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (pooled_hdd && tune_pool && !farming_pressure)
+            {
+                auto const choice = pool_choice(true);
+                if (choice.encoded && !choice.trial) stage_rate = successor_rate(d);
+            }
             if (pooled_hdd && active && unfinished_groups > active + 1 && !args.pool_writers &&
                 startup_receivers > 1 && !farming_pressure)
             {
@@ -15759,7 +15869,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 cfg.path_bindings = path_bindings;
                 d.scratch = temporary_grant(*scratch_pool, d.scratch_owner, d.path.parent_path(), d.requested,
                     d.maximum, ram_plan.batch, cfg, true, nullptr, true, false, scratch_slots, pooled_generation,
-                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), true, spare_spindle);
+                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), true, spare_spindle, stage_rate);
                 if (d.scratch)
                 {
                     if (pipeline_hdd) size_pipeline(true);
@@ -15805,7 +15915,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 d.scratch = temporary_grant(*scratch_pool, d.scratch_owner, d.path.parent_path(), d.requested,
                     uint16_t(d.maximum), plan.batch, config, args.construction == "auto", &capacity_rejected,
                     compare_modes && !partial, input_required, scratch_slots, reserve_probe,
-                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), false, spare_spindle);
+                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), false, spare_spindle, stage_rate);
                 d.metrics.capacity_bytes = config.capacity_bytes; fresh_scratch = d.scratch.has_value();
                 update_pool_memory();
                 DestinationPlan external_plan;
@@ -16163,8 +16273,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (live)
         {
             d.scratch = std::move(next.scratch); d.engine = std::move(next.engine);
-            d.engine->external->run_shapes(d.execution_runs);
-            d.saved = d.engine->identity(); d.guard = snapshot(d.path, 0);
+            if (next.contribution_bytes) d.execution_runs.clear();
+            else d.engine->external->run_shapes(d.execution_runs);
+            d.saved = d.engine->identity(); d.guard = next.contribution_bytes ? next.guard : snapshot(d.path, 0);
             d.metrics = std::move(next.metrics); d.metrics.staged_batches = d.engine->staged_batches;
             d.batch_cap = next.batch_cap; d.lease_bytes = next.engine_bytes;
             d.engine_bytes = d.lease_bytes - batch_metadata(d.batch_cap);
@@ -16186,6 +16297,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     auto discard_farm_future = [&](Destination& d)
     {
         auto& lane = farm->lanes[d.owner];
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        d.successor_receive.reset();
+#endif
         if (d.successor && !d.successor->detached)
             accumulate(detach_successor(*d.successor, fixed, active, lane.successor_ordinal), "external");
         // The guarded output rows retain every acknowledged member. Drop
@@ -16276,12 +16390,31 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     };
     auto prepare_next = [&](Destination& d, unsigned available)
     {
-        if (farm && farm->state.capacity_fill) return false;
+        long double receive_rate = 0;
+        uint64_t receive_task_bytes = 0;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
-        // Pool prefetch keeps owning members in bounded RAM. It does not run
-        // the synchronous GPU successor-staging controller on this thread.
-        if (backend->mode == "pool") return false;
+        if (backend->mode == "pool")
+        {
+            if (!d.pool_encoded || !d.pool_comparable || d.needs_resume || d.metrics.recovered ||
+                !d.metrics.stream_input_batches || pool_prefetch.ready.valid()) return false;
+            receive_rate = successor_rate(d);
+            if (!receive_rate) return false;
+            auto const& lane = farm->lanes[d.owner];
+            if (lane.ordinal >= farm->state.directories[d.owner].sealed_files) return false;
+            auto const supply = construction_load(args, *backend, d.requested, d.maximum, 1).supply;
+            group_grow::PoolPublicationHistory::Shape const shape{unsigned(d.requested.params.get_k()),
+                unsigned(d.requested.params.get_strength()), d.maximum, supply};
+            // Preserve exploration and give other pending destinations the first
+            // claim on an idle worker before overlapping this writer's next file.
+            auto const mode = pool_publications[1].select(shape, 1, 1, 0, args.pool_output, true, true);
+            if (!mode.encoded || mode.trial || std::any_of(destinations.begin(), destinations.end(), [&](auto const& other)
+                { return other.get() != &d && !other->complete && !other->awaiting_extent &&
+                    (!other->ready.valid() || !other->pending || !other->pending->packing() || other->successor_receive); })) return false;
+            receive_task_bytes = sum(sizeof(Task) + sizeof(Identity) + 1024,
+                sum(d.path.native().capacity() * sizeof(fs::path::value_type), d.requested.memo.capacity()));
+        }
 #endif
+        if (farm && farm->state.capacity_fill && !receive_task_bytes) return false;
         if (stream_cohort.calibrating()) return false;
         if (d.successor || !prefetched.members.empty() || !scratch_pool || !d.engine->external || available < 2 ||
             (args.construction != "auto" && args.construction != "external") ||
@@ -16302,9 +16435,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             maximum = uint16_t(std::min<uint64_t>(farm->file_maximum(d.owner, lane.ordinal + 1),
                 args.max_total_members - members));
             if (!maximum) return false;
-            uint64_t const quota = std::min(farm->state.directories[d.owner].capacity_bytes, d.farm_capacity);
-            if (lane.completed_charge >= quota || d.metrics.capacity_bytes >= quota - lane.completed_charge) return false;
-            room = quota - lane.completed_charge - d.metrics.capacity_bytes;
+            room = successor_room(d);
+            if (!room) return false;
             owner = d.scratch_owner == d.owner ? paths.size() + d.owner : d.owner;
             path = group_path(d.path.parent_path(), lane.ordinal + 1);
             identity = farm->identity(*keys, d.owner, lane.ordinal + 1);
@@ -16346,7 +16478,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto next = std::make_unique<GroupSuccessor>(path, *identity, maximum, room);
         bool const admitted = prepare_successor(*next, args, *backend, *scratch_pool, owner, fixed, retained(),
             d.engine->staging_workers(available), target_gates[d.writer], nullptr, &histories,
-            d.engine->demand_history, d.packing_released_bytes, cpu_scheduler);
+            d.engine->demand_history, d.packing_released_bytes, cpu_scheduler, receive_task_bytes, path_bindings, receive_rate);
         if (!admitted)
         {
             if (farm) farm->lanes[d.owner].next_reserved_members = previous_reservation;
@@ -16359,7 +16491,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
             update_pool_memory(); return false;
         }
-        d.successor = std::move(next); d.successor_target = target; d.successor_staged = false;
+        d.successor = std::move(next); d.successor_target = target; d.successor_staged = receive_task_bytes != 0;
         metadata = sum(metadata, d.successor->metadata_bytes);
         fixed = sum(fixed, sum(d.successor->metadata_bytes, d.successor->engine_bytes));
         update_pool_memory(); ++active;
@@ -16389,6 +16521,20 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             auto& future = *destinations[target]; future.staging_successor = true;
             future.output_reserved = true;
         }
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (receive_task_bytes)
+        {
+            auto& successor = *d.successor;
+            auto task = std::make_unique<Task>();
+            task->generating = receive_successor_contributions(successor, args, *backend, fixed, retained(),
+                wake, task->cancel_generation, task->contribution_input);
+            successor.workers = 0;
+            if (!task->generating.valid()) { successor.io.reset(); return true; }
+            task->io = std::move(successor.io); successor.io.reset();
+            task->scheduled_members = successor.maximum; task->contribution_bytes = successor.contribution_bytes;
+            d.successor_receive = std::move(task); ++total.drive_overlap_batches; ++total.generation_overlap_batches;
+        }
+#endif
         return true;
     };
     auto packing_workers = [&](Destination const& d) -> unsigned
@@ -16466,7 +16612,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             task->io = scratch_pool->try_io(d.scratch_owner);
             if (!task->io) return blocked(ControllerWait::storage_lease);
         }
-        if (task->work == Work::finish && prepare_next(d, count))
+        if (task->work == Work::finish && prepare_next(d, count) && d.successor->workers)
             d.engine->admit_staging_workers(count, d.successor->workers);
         if (task->work != Work::prepare_finish && (d.engine->is_staging() ||
             (task->work != Work::finish && task->work != Work::recover_finish)))
@@ -16955,8 +17101,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (task.generating.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
                 auto const generated = task.generating.get();
                 task.receipt_due = 0; task.scheduled_members = uint16_t(generated.members);
-                task.receiving_bytes = 0; task.io.reset(); task.fill_stop = generated.stop;
+                task.receiving_bytes = 0; task.fill_stop = generated.stop;
                 d.metrics.generated_members = sum(d.metrics.generated_members, generated.members);
+                if (task.contribution_input && !generated.members)
+                {
+                    // An optional successor route declined after admission. Its
+                    // private input is discarded before ordinary generation retries.
+                    d.pending.reset(); progress = true; continue;
+                }
+                if (task.io && task.contribution_input)
+                    total.generation_overlap_members = sum(total.generation_overlap_members, generated.members);
+                task.io.reset();
                 if (task.prepared_input && !generated.members)
                 {
                     // Drop the private, unsealed stream before retrying through
@@ -17167,6 +17322,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 }
             }
             d.pending.reset();
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            // Once the predecessor publishes, the ordinary join/append path owns
+            // its successor's input, including any remaining receive and its lease.
+            if (!d.successor && d.successor_receive) d.pending = std::move(d.successor_receive);
+#endif
         }
         progress = revise_farming() || progress;
         std::vector<group_grow::ExecutionReady> generation_ready;

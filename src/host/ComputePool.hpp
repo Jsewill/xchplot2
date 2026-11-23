@@ -100,6 +100,7 @@ struct WorkerHardware
     uint64_t total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, standing_host_bytes = 0, observed_at_unix_ms = 0;
     bool operator==(WorkerHardware const&) const = default;
 };
+std::string gpu_recovery_reason(std::string);
 void write_worker_hardware(Writer&, WorkerHardware const&);
 WorkerHardware read_worker_hardware(Reader&);
 struct WorkerOffer

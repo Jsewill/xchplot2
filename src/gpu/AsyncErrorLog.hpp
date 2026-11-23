@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <functional>
+#include <initializer_list>
 #include <vector>
 #include <mutex>
 #include <string>
@@ -31,6 +32,7 @@ struct AsyncErrorLog {
     std::atomic<unsigned> count{0};
     std::mutex            mu;
     std::string           first, device_loss;   // guarded by mu
+    std::string_view      loss_backend;         // native backend of device_loss, guarded by mu
     std::string           backend;              // immutable while registered
     std::atomic<bool>     generating{false};
     std::function<void()> wake;
@@ -107,7 +109,11 @@ inline void record_async_error(char const* what) noexcept
                 std::lock_guard lock(log.mu);
                 if (log.first.empty() && what) log.first = what;
                 if (log.device_loss.empty() && !backend.empty())
-                    log.device_loss.assign(what, std::min<size_t>(std::string_view(what).size(), 240));
+                {
+                    log.loss_backend = backend;
+                    auto const message = std::string_view(what);
+                    log.device_loss = message.substr(message.size() > 240 ? message.size() - 240 : 0);
+                }
                 log.count.fetch_add(1, std::memory_order_relaxed);
             }
             if (!backend.empty() && log.wake) log.wake();
@@ -117,11 +123,11 @@ inline void record_async_error(char const* what) noexcept
         // to wait first. A native error names its backend, not necessarily that
         // queue's device. Fence all in-flight lanes of that backend when ambiguous.
         auto& list = WorkerErrorRegistration::registry(); std::lock_guard lock(list.mutex);
-        bool any = false;
+        bool any = false, reporting_lane = false;
         for (auto* log : list.workers) if (log->backend == backend && log->generating.load()) {
-            record(*log); any = true;
+            record(*log); any = true; reporting_lane |= log == &reported;
         }
-        if (!any && reported.backend == backend) { record(reported); any = true; }
+        if (!reporting_lane && reported.backend == backend) { record(reported); any = true; }
         if (!any) for (auto* log : list.workers) if (log->backend == backend) { record(*log); any = true; }
         if (reported.backend.empty()) record(reported);
         else if (!any) { ScopedAsyncErrors fallback(nullptr); record(async_errors()); }
@@ -134,12 +140,12 @@ inline unsigned async_error_count() noexcept
     return async_errors().count.load(std::memory_order_relaxed);
 }
 
-inline std::string async_device_loss()
+inline std::string async_device_loss(std::string_view backend = {})
 {
     auto& log = async_errors();
     if (!log.count.load(std::memory_order_relaxed)) return {};
     std::lock_guard lock(log.mu);
-    return log.device_loss;
+    return backend.empty() || log.loss_backend == backend ? log.device_loss : std::string{};
 }
 
 inline void clear_worker_allocation_error()

@@ -1,4 +1,5 @@
 #pragma once
+#include "host/GpuCleanup.hpp"
 
 #include <sycl/sycl.hpp>
 #include <cstdint>
@@ -77,10 +78,14 @@ inline std::unordered_map<sycl::queue*, TwoPhaseState>& twophase_map()
 
 inline void free_twophase_scratch(TwoPhaseScratch& s, sycl::queue& q)
 {
-    if (s.d_cand_l)     { sycl::free(s.d_cand_l, q);     s.d_cand_l     = nullptr; }
-    if (s.d_cand_r)     { sycl::free(s.d_cand_r, q);     s.d_cand_r     = nullptr; }
-    if (s.d_cand_count) { sycl::free(s.d_cand_count, q); s.d_cand_count = nullptr; }
-    if (s.d_overflow)   { sycl::free(s.d_overflow, q);   s.d_overflow   = nullptr; }
+    auto release = [&](auto*& ptr, uint64_t bytes) {
+        if (auto* owned = std::exchange(ptr, nullptr))
+            checked_gpu_free(bytes, &GpuCleanupCharges::device, [&] { sycl::free(owned, q); });
+    };
+    release(s.d_cand_l, s.cap * sizeof(uint32_t));
+    release(s.d_cand_r, s.cap * sizeof(uint32_t));
+    release(s.d_cand_count, sizeof(uint64_t));
+    release(s.d_overflow, sizeof(uint32_t));
     s.cap   = 0;
     s.bytes = 0;
 }
@@ -107,6 +112,25 @@ inline void release_twophase_scratch(sycl::queue& q)
     twophase_map().erase(it);
 }
 
+// Detach the old queue's cache before freeing individual allocations. Its
+// thread-local queue owner may also run cleanup when the worker eventually exits.
+inline void retire_worker_twophase_scratch(sycl::queue& q) noexcept
+{
+    std::lock_guard lock(twophase_mutex());
+    auto entry = twophase_map().extract(&q);
+    if (!entry) return;
+    auto& s = entry.mapped().scratch;
+    try { q.wait(); } catch (...) { /* Attempt each owned allocation independently. */ }
+    auto release = [&](auto* p, uint64_t bytes) {
+        if (p) release_gpu_memory("two-phase GPU scratch", bytes, &GpuCleanupCharges::device, [&] { sycl::free(p, q); });
+    };
+    uint64_t const array_bytes = s.cap * sizeof(uint32_t);
+    release(s.d_cand_l, array_bytes);
+    release(s.d_cand_r, array_bytes);
+    release(s.d_cand_count, sizeof(uint64_t));
+    release(s.d_overflow, sizeof(uint32_t));
+}
+
 // Returns nullptr when the scratch will not fit this queue's grant, or when
 // the allocation fails outright. Neither is fatal: the caller rewinds the
 // output counter and runs the single-kernel path, which allocates nothing and
@@ -128,6 +152,7 @@ inline TwoPhaseScratch* acquire_twophase_scratch(sycl::queue& q,
     if (s.cap >= cand_cap && s.bytes <= st.limit) return &s;
 
     free_twophase_scratch(s, q);
+    s.cap = cand_cap; // Also sizes partial allocations if the driver fails during cleanup.
     try {
         s.d_cand_l     = sycl::malloc_device<uint32_t>(cand_cap, q);
         s.d_cand_r     = sycl::malloc_device<uint32_t>(cand_cap, q);
@@ -141,7 +166,6 @@ inline TwoPhaseScratch* acquire_twophase_scratch(sycl::queue& q,
         free_twophase_scratch(s, q);
         return nullptr;
     }
-    s.cap   = cand_cap;
     s.bytes = want;
     return &s;
 }

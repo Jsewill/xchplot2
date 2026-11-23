@@ -144,8 +144,8 @@ struct GpuBufferPool {
 
     // Release an idle output slot when switching to a bounded consumer. The
     // caller must finish every host consumer and exclude concurrent slot use
-    // first. Waits for queued device work; leaves the slot accounted as live
-    // if waiting or freeing throws. Existing batch callers may keep all slots.
+    // first. A failed wait keeps the slot live. An unconfirmed driver free is
+    // charged to the owning worker without a second free of the same pointer.
     void release_pinned(int idx);
 
     // Returns pool.d_pair_a, allocating it on first use. Deferred
@@ -181,6 +181,7 @@ struct GpuBufferPool {
     void release_pair_a();
 
 private:
+    void release_allocations() noexcept;
     std::mutex pinned_mu_[kNumPinnedBuffers];
     std::mutex pair_a_mu_;
 };
