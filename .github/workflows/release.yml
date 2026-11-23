@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'f013b7ca270c033fd4fe15ed0d86b3bd4f7241c6' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '8098eeb27f48b1ba2a93c9b82c30d3d2edfb770c' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -339,7 +339,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: f013b7ca270c033fd4fe15ed0d86b3bd4f7241c6
+          ref: 8098eeb27f48b1ba2a93c9b82c30d3d2edfb770c
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -619,7 +619,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $zip[0].FullName).Hash -ne $hash) { throw 'Archive checksum mismatch' }
           Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath package
           $info = @(Get-ChildItem -LiteralPath package -Filter BUILDINFO.txt -Recurse)
-          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*f013b7ca270c033fd4fe15ed0d86b3bd4f7241c6\s*$' -Quiet)) { throw 'Archive source mismatch' }
+          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*8098eeb27f48b1ba2a93c9b82c30d3d2edfb770c\s*$' -Quiet)) { throw 'Archive source mismatch' }
       - name: Resume each native data boundary and verify published bytes and full proofs
         shell: pwsh
         run: |
