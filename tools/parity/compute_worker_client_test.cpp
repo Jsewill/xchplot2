@@ -595,6 +595,42 @@ void planning_feedback()
         now + std::chrono::nanoseconds(2000)) == 1, "an overdue worker committed a queued packed batch");
     resident.released(slow_packed.worker_identity, busy);
     resident.released(fast_packed.worker_identity, active);
+
+    auto& receiving = new_planner();
+    fast_packed.generation = {600, 400, 400, 0}; fast_packed.connect_ns = 0; fast_packed.worker_slots = 1;
+    auto roster = std::make_shared<pool::GenerationRoster>();
+    for (auto const& worker : {fast_packed, slow_packed})
+        roster->routes.push_back({worker.worker_identity, worker.worker_instance, route, {}, {}, 0, 1});
+    receiving.capacity(18, 2, roster, 0, now); train(receiving, fast_packed, route);
+    auto selected = receiving.selected(slow_packed, route, now);
+    pool::Lease first; first.worker_identity = slow_packed.worker_identity;
+    first.task.kind = slow_packed.kind; first.task.k = 18; first.task.strength = 2; first.task.work_units = 1;
+    WorkerPackedRoute planned;
+    auto width_after = [&](unsigned ns, unsigned slots = 2)
+    { return receiving.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Packed, 3, 3, slots, 3, 1,
+        now + std::chrono::nanoseconds(ns), 0, &planned); };
+    require(width_after(6000) == 1, "a cold grant still connecting to its worker justified a packed batch");
+    receiving.receiving_packed(first, selected, now + std::chrono::nanoseconds(2000));
+    require(width_after(4000) == 1, "a short first transfer was assumed to outlast a measured whole batch");
+    require(width_after(6000) == 3 && planned.route.identity == fast_packed.worker_identity,
+        "a long first singleton transfer kept a measured worker on singletons");
+    auto assigned = fast_packed; assigned.work_units = 3;
+    require(!receiving.needs_first_member(assigned, now, &planned), "the measured worker lost its sized packed batch");
+    assigned = slow_packed; assigned.work_units = 3;
+    require(receiving.needs_first_member(assigned, now, &planned), "a different worker received the wide batch after sizing");
+    auto in_progress = receiving.selected(fast_packed, route, now + std::chrono::nanoseconds(5900));
+    require(width_after(6000) == 3 && width_after(7000) == 1, "the measured worker's release horizon was ignored");
+    receiving.released(fast_packed.worker_identity, in_progress);
+    auto spare = std::make_shared<pool::GenerationRoster>(*roster); spare->routes.back().gpu_slots = 2;
+    receiving.capacity(18, 2, spare, receiving.selections(), now);
+    require(width_after(6000, 3) == 1, "an unmeasured worker with a second free slot was excluded from packed sizing");
+    receiving.capacity(18, 2, roster, receiving.selections(), now); receiving.released(slow_packed.worker_identity, selected);
+    require(width_after(6000) == 1, "a completed first singleton still occupied its worker");
+    auto moved = std::make_shared<pool::GenerationRoster>(*roster); moved->routes.back().endpoint = relocated;
+    auto replaced = receiving.selected(slow_packed, relocated, now); receiving.receiving_packed(first, selected, now);
+    receiving.capacity(18, 2, moved, receiving.selections(), now);
+    require(width_after(6000) == 1, "a stale member prelude from the old route occupied its replacement");
+    receiving.released(slow_packed.worker_identity, replaced);
 }
 
 struct RunningBroker
