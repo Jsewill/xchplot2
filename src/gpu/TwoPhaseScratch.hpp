@@ -116,8 +116,9 @@ inline void release_twophase_scratch(sycl::queue& q)
 // thread-local queue owner may also run cleanup when the worker eventually exits.
 inline void retire_worker_twophase_scratch(sycl::queue& q) noexcept
 {
-    std::lock_guard lock(twophase_mutex());
+    std::unique_lock lock(twophase_mutex());
     auto entry = twophase_map().extract(&q);
+    lock.unlock(); // Other devices can keep using their queues while this driver retires.
     if (!entry) return;
     auto& s = entry.mapped().scratch;
     try { q.wait(); } catch (...) { /* Attempt each owned allocation independently. */ }
