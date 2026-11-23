@@ -98,7 +98,10 @@ jobs:
     name: Windows AMD test archive
     if: inputs.phase == 'pushed-cli' || inputs.phase == 'candidate-cli'
     runs-on: windows-2022
-    timeout-minutes: 100
+    timeout-minutes: 160
+    permissions:
+      contents: read
+      actions: read
     strategy:
       matrix:
         arch: [x86_64]
@@ -143,12 +146,6 @@ jobs:
           }
           Remove-Item $installer, $unpacked -Recurse -Force
           "HIP_PATH=$env:ProgramFiles\AMD\ROCm\6.4" >> $env:GITHUB_ENV
-      - uses: actions/cache/restore@v6
-        id: toolchain
-        with:
-          fail-on-cache-miss: true
-          path: build/windows-toolchain/install
-          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Configure Visual Studio
         run: |
           $ErrorActionPreference = 'Stop'
@@ -176,6 +173,30 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
           cargo install --locked --features cli cargo-about --version 0.9.2
+      - name: Build pinned release OpenSSL
+        run: ./ci/release/build-openssl-windows.ps1 -BuildDir (Join-Path $PWD 'build/release-windows/openssl')
+      - name: Wait for the running main compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_KEY: windows-acpp25.10-llvm20.1.8-all-ptx-v2-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $until = [DateTime]::UtcNow.AddMinutes(65)
+          while ([DateTime]::UtcNow -lt $until) {
+            $key = gh cache list --repo $env:GITHUB_REPOSITORY --ref refs/heads/main --key $env:TOOLCHAIN_KEY --limit 1 --json key --jq '.[0].key'
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the shared compiler cache' }
+            if ($key -eq $env:TOOLCHAIN_KEY) { Write-Output 'The main compiler is ready'; return }
+            $state = gh run view 45101142952 --repo $env:GITHUB_REPOSITORY --json status --jq .status
+            if ($LASTEXITCODE -eq 0 -and $state -eq 'completed') { throw 'The main build finished without its compiler cache' }
+            Start-Sleep -Seconds 40
+          }
+          throw 'The main compiler was not available before the wait deadline'
+      - uses: actions/cache/restore@v6
+        id: toolchain
+        with:
+          fail-on-cache-miss: true
+          path: build/windows-toolchain/install
+          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Build the production executable and runtime for hardware testing
         env:
           ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
@@ -190,7 +211,13 @@ jobs:
           cmake --build $BuildDir --parallel 2 --target xchplot2
           cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')
           '@
-          [IO.File]::WriteAllText((Join-Path $PWD 'scripts/build-hardware-qualification.ps1'), $script.Substring(0,$end) + $commands)
+          $opensslLine = '& (Join-Path $PSScriptRoot ''../ci/release/build-openssl-windows.ps1'') -BuildDir (Join-Path $BuildDir ''openssl'')'
+          $prefix = $script.Substring(0,$end)
+          if (!$prefix.Contains($opensslLine)) { throw 'The normal OpenSSL build hook changed' }
+          foreach ($file in 'include/openssl/ssl.h','lib/libssl.lib','lib/libcrypto.lib','openssl-license.txt') {
+              if (!(Test-Path -PathType Leaf -LiteralPath "build/release-windows/openssl/install/$file")) { throw "Missing prebuilt TLS input $file" }
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'scripts/build-hardware-qualification.ps1'), $prefix.Replace($opensslLine,'') + $commands)
           & ./scripts/build-hardware-qualification.ps1
           git diff --exit-code HEAD --
           $source = (git rev-parse HEAD).Trim()
