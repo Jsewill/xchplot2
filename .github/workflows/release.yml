@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '60b6dc1d242f1f587a1f038af1a4ab3ffe8d0a13' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'ce8fd8fb86e117ee17978f21f07efb4ea2415770' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -292,6 +292,40 @@ jobs:
               c.set_last_error(0)
               ok = k.GetProcessGroupAffinity(p, c.byref(count), groups)
               print('Group output mod8', c.addressof(groups.contents) % 8, 'success', ok, 'error', c.get_last_error(), 'memberships', count.value)
+      - name: Read private resident memory for a held proof process
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import ctypes as c
+          from ctypes import wintypes as w
+          import json, platform, subprocess, sys
+          k = c.WinDLL('kernel32', use_last_error=True)
+          n = c.WinDLL('ntdll')
+          size = c.c_size_t
+          class Counters(c.Structure):
+              _fields_ = [('cb',w.DWORD),('pageFaults',w.DWORD)] + [(key,size) for key in ('peakWS','workingSet','quotaPeakPaged','quotaPaged','quotaPeakNonPaged','quotaNonPaged','pagefile','peakPagefile','commit','privateWS')] + [('sharedCommit',c.c_uint64)]
+          class Vm(c.Structure):
+              _fields_ = [('peakVirtual',size),('virtual',size),('pageFaults',w.ULONG)] + [(key,size) for key in ('peakWS','workingSet','quotaPeakPaged','quotaPaged','quotaPeakNonPaged','quotaNonPaged','pagefile','peakPagefile','commit','privateWS','sharedCommit')]
+          k.GetCurrentProcess.restype = w.HANDLE
+          k.K32GetProcessMemoryInfo.argtypes = [w.HANDLE,c.c_void_p,w.DWORD]
+          n.NtQueryInformationProcess.argtypes = [w.HANDLE,w.ULONG,c.c_void_p,w.ULONG,c.POINTER(w.ULONG)]
+          n.NtQueryInformationProcess.restype = w.LONG
+          def counters(handle):
+              value = Counters(); value.cb = c.sizeof(value); value.privateWS = size(-1).value
+              c.set_last_error(0); ok = k.K32GetProcessMemoryInfo(handle,c.byref(value),c.sizeof(value)); err = c.get_last_error()
+              vm = Vm(); vm.privateWS = size(-1).value; amount = w.ULONG()
+              status = n.NtQueryInformationProcess(handle,3,c.byref(vm),c.sizeof(vm),c.byref(amount))
+              return {'psapi':{'ok':ok,'lastError':err,'requested':c.sizeof(value),'cb':value.cb,'privateResident':value.privateWS,'workingSet':value.workingSet,'privateCommit':value.commit}, 'native':{'status':hex(status & 0xffffffff),'requested':c.sizeof(vm),'returned':amount.value,'privateResident':vm.privateWS,'workingSet':vm.workingSet,'privateCommit':vm.commit}}
+          with subprocess.Popen([sys.executable,'-c',"import sys,time; b=bytearray(8<<20); print('ready',flush=True); sys.stdin.readline()"],stdin=subprocess.PIPE,stdout=subprocess.PIPE) as proc:
+              try:
+                  print(json.dumps({'windows':platform.version(),'startup':counters(int(proc._handle)), 'owner':counters(k.GetCurrentProcess())}),flush=True)
+                  assert proc.stdout.readline().strip() == b'ready'
+                  print(json.dumps({'active':counters(int(proc._handle))}),flush=True)
+              finally:
+                  proc.stdin.write(b'\n'); proc.stdin.flush(); proc.wait(timeout=5)
+          '@ | python -B -
+          exit $LASTEXITCODE
   diagnostics:
     name: Native compute and construction fixtures
     if: inputs.phase == 'diagnose'
@@ -305,7 +339,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: 60b6dc1d242f1f587a1f038af1a4ab3ffe8d0a13
+          ref: ce8fd8fb86e117ee17978f21f07efb4ea2415770
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
