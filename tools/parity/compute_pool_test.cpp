@@ -578,6 +578,20 @@ void retry_eligibility(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     require(cpu && cpu->task.kind == Kind::GenerateCpu && cpu->worker_identity == gpu->worker_identity,
             "unsupported GPU did not fall back to same worker CPU");
     require(first.begin(*cpu, cpu->owner_identity), "CPU fallback did not begin"); first.finish(*cpu);
+    auto refusal_owner = owner.open_owner("unstarted-refusal");
+    auto refused = pack_task("unstarted", 1);
+    auto unstarted = owner.acquire(refusal_owner, refused); require(bool(unstarted), "unstarted codec grant missing");
+    rejects([&] { second.reject(*unstarted, FailureCode::RefusedBeforeBegin); });
+    auto altered = *unstarted; ++altered.task.attempt;
+    rejects([&] { first.reject(altered, FailureCode::RefusedBeforeBegin); });
+    first.reject(*unstarted, FailureCode::RefusedBeforeBegin);
+    rejects([&] { owner.abandon(*unstarted); });
+    ++refused.attempt; auto retry = owner.acquire(refusal_owner, refused);
+    require(retry && retry->worker_identity == unstarted->worker_identity && first.begin(*retry, retry->owner_identity),
+        "unread temporary refusal excluded the worker from the retry");
+    rejects([&] { first.reject(*unstarted, FailureCode::RefusedBeforeBegin); });
+    rejects([&] { first.reject(*retry, FailureCode::RefusedBeforeBegin); });
+    first.renew(*retry); first.finish(*retry);
     second.register_worker(offer("network-retry", 46002));
     auto request = task("network", 2); auto disconnected = owner.acquire(session, request); require(bool(disconnected), "network retry lease missing");
     auto worker = [&](Lease const& lease) -> BrokerClient&

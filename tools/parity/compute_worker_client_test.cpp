@@ -1222,6 +1222,36 @@ void temporary_worker_refusal()
         }
         require(client.stats().failed_tasks == 3, "temporary refusals lost their failure accounting");
     }
+    // An uploading owner can lose the direct error when the paused worker
+    // closes with unread codec data. Exercise Abandon without consuming it.
+    auto owner = worker_control.open_owner("unread-codec-refusal");
+    pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
+    payload.u16(0); payload.u16(1); payload.u32(fragments.size()); payload.words(fragments);
+    pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack);
+    task.kind = pool::Kind::Pack; task.k = 18; task.strength = 2; task.chunk_count = 1;
+    task.work_units = payload.data().size(); task.max_output_bytes = 4096;
+    task.resources = {1, 1, task.work_units * 20 + ChunkCodec::estimate_work(18, 0, 0), 0};
+    auto grant = worker_control.acquire(owner, task); require(bool(grant), "unread refusal fixture did not obtain its grant");
+    service.control(WorkerControl::Pause);
+    auto channel = pool::Channel::connect(grant->endpoint, tls, grant->worker_identity);
+    pool::Writer header(tls.max_frame_bytes); pool::write_lease(header, *grant); header.u32(3000);
+    header.u8(uint8_t(Operation::Encode)); header.u8(18); header.u8(2); header.u64(task.work_units); header.u64(task.max_output_bytes);
+    channel.send(pool::Message::Work, header.data());
+    auto const reply_by = Clock::now() + std::chrono::seconds(3);
+    while (!channel.readable() && Clock::now() < reply_by) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(channel.readable(), "paused worker did not signal its codec refusal");
+    try { channel.send(pool::Message::Data, payload.data()); } catch (pool::TransientTransport const&) {}
+    channel.close();
+    try { worker_control.abandon(*grant); } catch (pool::StaleLease const&) {}
+    service.control(WorkerControl::Resume); ++task.attempt;
+    std::optional<pool::Lease> next; auto const retry_by = Clock::now() + std::chrono::seconds(3);
+    do
+    {
+        next = worker_control.acquire(owner, task);
+        if (!next) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (!next && Clock::now() < retry_by);
+    require(next && next->worker_instance == instance, "lost codec refusal excluded the worker from the next attempt");
+    worker_control.cancel(owner, task.task_id, task.attempt);
 }
 
 void expired_cleanup()
