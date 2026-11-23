@@ -376,15 +376,15 @@ public:
         }
         return {};
     }
-    std::shared_ptr<SharedConstructionHistory> execution(ConstructionContext const& context) const
+    std::shared_ptr<SharedConstructionHistory> execution(ConstructionContext context) const
     {
         if (context.drives.empty()) return {};
         // Service demands retain their observed worker grants. Only execution
         // forecasts normalize that CPU term; engine tuning still uses find().
         for (auto const& entry : entries_)
         {
-            auto comparable = entry.context; comparable.workers = context.workers;
-            if (comparable == context) return entry.source;
+            context.workers = entry.context.workers;
+            if (entry.context == context) return entry.source;
         }
         return {};
     }

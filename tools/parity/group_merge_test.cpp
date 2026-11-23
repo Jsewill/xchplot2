@@ -2813,6 +2813,11 @@ void destination_admission()
         pooled_scratch_receivers(2, 2, 3, 1) == 2 && pooled_scratch_receivers(3, 0, 1, 1) == 3 &&
         pooled_scratch_receivers(1, 0, 0, 0) == 1,
         "pooled scratch discarded homogeneous capacity, used stale fleet timings or changed singleton fallback");
+    require(!packed_queue_fits_deadline(100'000'000, 1'200'000'000, 1e9L, 2000) &&
+        packed_queue_fits_deadline(1'100'000'000, 1'200'000'000, 1e9L, 2000) &&
+        !packed_queue_fits_deadline(1'200'000'000, 1'200'000'000, 1e9L, 2000) &&
+        !packed_queue_fits_deadline(1, 0, 1e9L, 2000) && !packed_queue_fits_deadline(50'000'000, 100'000'000, 1e9L, 1100),
+        "single-worker packed prequeue missed its grant poll, elapsed receipt or next batch deadline");
     auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
     require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
         "many destinations did not activate a bounded useful subset");
@@ -3424,6 +3429,9 @@ void construction_histories()
     require(histories.reuse_external(demand, phase) == demand && !histories.find(phase, false) &&
         histories.memory_bytes() == demand_memory,
         "changed phase grant lost compatible CPU evidence or weakened ordinary worker isolation");
+    require(histories.execution(unobserved) == first && histories.execution(phase) == demand &&
+        phase.workers == 1 && !histories.find(phase, false),
+        "forecast grant normalization changed the caller's key or crossed RAM and scratch histories");
     std::array<ConstructionContext, 8> incompatible{phase, phase, phase, phase, phase, phase, phase, phase};
     incompatible[0].scratch_drives = {"8:64"}; incompatible[1].drives.clear();
     incompatible[2].k = 20; incompatible[3].max_ram /= 2; incompatible[4].io_overlap = false;

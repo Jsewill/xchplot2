@@ -3024,14 +3024,14 @@ void preserve_retired(group_grow::ScratchPool& pool, fs::path const& target, uin
 
 group_grow::Config configuration(Arguments const& args, uint64_t capacity, uint64_t caller_fixed,
     std::shared_ptr<group_grow::CodecScheduler> const& scheduler = {},
-    std::shared_ptr<group_grow::RemoteEncoder> const& remote = {})
+    std::shared_ptr<group_grow::RemoteEncoder> const& remote = {}, unsigned granted_workers = 0)
 {
     group_grow::Config config;
     config.capacity_bytes = capacity;
     config.window_bytes = args.window;
     config.codec_bytes = std::min(args.max_ram / 16, 256 * mib);
-    config.workers = args.workers ? unsigned(args.workers) :
-        std::max(1u, std::thread::hardware_concurrency());
+    unsigned const workers = granted_workers ? granted_workers : unsigned(args.workers);
+    config.workers = workers ? workers : std::max(1u, std::thread::hardware_concurrency());
     config.cpu_scheduler = scheduler;
     config.remote_encoder = remote;
     config.checkpoint_bytes = args.checkpoint_bytes;
@@ -3068,7 +3068,7 @@ std::shared_ptr<group_grow::SharedConstructionHistory> construction_history(
     std::sort(context.scratch_drives.begin(), context.scratch_drives.end());
     context.scratch_drives.erase(std::unique(context.scratch_drives.begin(), context.scratch_drives.end()), context.scratch_drives.end());
     if (auto reused = histories->reuse_external(demand, context)) return reused;
-    if (execution) return histories->execution(context);
+    if (execution) return histories->execution(std::move(context));
     return histories->find(std::move(context), create);
 }
 
@@ -4516,6 +4516,13 @@ unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsign
 bool packing_cpu_consumer(bool receiving, std::future<void> const& writer)
 {
     return !receiving && (!writer.valid() || writer.wait_for(std::chrono::seconds(0)) != std::future_status::ready);
+}
+bool packed_queue_fits_deadline(uint64_t now, uint64_t receipt_due, long double batch_ns, uint64_t timeout_ms)
+{
+    // An overdue receipt has no measured remaining duration. A queued
+    // WorkerClient checks for its grant at 50 ms intervals.
+    return receipt_due > now && batch_ns > 0 &&
+        (receipt_due - now) + batch_ns + 50'000'000.L < timeout_ms * 1'000'000.L;
 }
 #endif
 struct PackingGrant
@@ -15220,6 +15227,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         };
         constexpr size_t forecast_lanes = 64;
         using ForecastCoverage = std::array<std::array<bool, 6>, forecast_lanes>;
+        // History membership stays fixed until the engine is admitted. RAM
+        // lookups ignore the proposed CPU grant; scratch previews and regrants
+        // still resolve their actual devices. Each estimate samples live rates.
+        std::array<std::optional<std::shared_ptr<group_grow::SharedConstructionHistory>>, forecast_lanes> ram_histories{};
+        static_assert(sizeof(ram_histories) < mib / 16); // Existing fixed controller reserve.
         auto estimate = [&](size_t count, unsigned grant, uint16_t batch, ForecastCoverage* coverage = nullptr)
         {
             auto const started = std::chrono::steady_clock::now();
@@ -15231,6 +15243,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             unsigned route_prior_samples = 0;
             uint64_t route_prior_oldest = 0;
             auto const now = execution_now();
+            auto cfg = configuration(args, 0, shared_fixed, cpu_scheduler, backend->remote_encoder(), grant);
+            cfg.path_bindings = path_bindings;
             auto append = [&](Destination const& other)
             {
                 if (lanes.size() == forecast_lanes) { ++omitted; return; }
@@ -15253,15 +15267,19 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto const accepted = std::min<uint64_t>(other.maximum, other.metrics.members);
                 auto const pending = other.pending ? other.pending->scheduled_members : 0;
                 auto const remaining = other.maximum - std::min<uint64_t>(other.maximum, accepted + pending);
-                auto options = args; options.workers = grant;
-                auto cfg = configuration(options, other.metrics.capacity_bytes, shared_fixed, cpu_scheduler, backend->remote_encoder());
-                cfg.path_bindings = path_bindings;
+                cfg.capacity_bytes = other.metrics.capacity_bytes;
                 group_grow::ExecutionWork work;
                 work.generation = other.needs_finish ? 0 : member_ns * remaining;
                 work.batches = std::max<uint64_t>(1, (other.maximum - accepted + lane_batch - 1) / lane_batch);
                 work.io_overlap = args.io_overlap;
                 auto source = other.mode_history;
-                if (!source) source = execution_history(other, grant);
+                if (!source && !other.scratch && other.owner < ram_histories.size())
+                {
+                    auto& cached = ram_histories[other.owner];
+                    if (!cached) cached = execution_history(other, grant);
+                    source = *cached;
+                }
+                else if (!source) source = execution_history(other, grant);
                 if (source && work.batches <= 4096 && !other.needs_resume && !other.needs_finish &&
                     !other.stream_input_bytes && accepted < other.maximum)
                 {
@@ -17162,6 +17180,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             unsigned generation_destinations = 1;
             long double delivery_member_ns = 0;
+            uint64_t packed_after = 0;
             std::chrono::steady_clock::time_point other_work_until{};
             if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
             {
@@ -17198,11 +17217,25 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     bool const queue = can_queue && contribution_members && d.pool_encoded &&
                         receiving <= std::max(receivers, std::min(2u, backend->acquire_pool_client()->independent_contribution_width(
                             d.requested.params.get_k(), d.requested.params.get_strength())));
-                    // A fresh RAM-backed HDD group can queue its already budgeted
-                    // packed results once a route has a measured service rate.
-                    bool const packed_queue = can_queue && offered_slots > 1 && forecast.measured_slots &&
+                    auto within_packed_deadline = [&]
+                    {
+                        if (offered_slots > 1 || !receiving) return true;
+                        if (pool_prefetch.ready.valid()) return false;
+                        uint64_t due = 0;
+                        for (auto const& other : destinations)
+                        {
+                            if (!other->pending || (!other->pending->generating.valid() && !other->pending->fresh_members)) continue;
+                            if (due || !other->pending->receipt_due) return false;
+                            due = other->pending->receipt_due;
+                        }
+                        if (!packed_queue_fits_deadline(execution_now(), due, delivery_member_ns * wanted, args.pool_timeout_ms)) return false;
+                        packed_after = due; return true;
+                    };
+                    // Queue one budgeted packed receiver behind a measured route.
+                    // A single GPU can take it as soon as the previous lease ends.
+                    bool const packed_queue = can_queue && forecast.measured_slots &&
                         receiving < args.pool_inflight && receiving <= receivers && devices[d.owner].rotating && d.engine->incremental &&
-                        !d.metrics.members && !d.needs_resume && !d.pool_encoded && args.member_storage == "compact";
+                        !d.metrics.members && !d.needs_resume && !d.pool_encoded && args.member_storage == "compact" && within_packed_deadline();
                     // A cold pool needs one probe per available slot. Keep the
                     // next destination intact until the first delivery prices
                     // the route, then allow it to queue behind a busy worker.
@@ -17236,7 +17269,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             task.other_work_until = other_work_until;
             if (delivery_member_ns > 0)
-                task.receipt_due = sum(execution_now(), uint64_t(std::min<long double>(
+                task.receipt_due = sum(std::max(execution_now(), packed_after), uint64_t(std::min<long double>(
                     delivery_member_ns * task.scheduled_members, args.pool_timeout_ms * 1000000.L)));
 #endif
             task.work = d.needs_resume ? Work::recover : Work::append;
