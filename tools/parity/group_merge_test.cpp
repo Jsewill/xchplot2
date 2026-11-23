@@ -3082,6 +3082,38 @@ void execution_planning()
     require(!execution_terminal_first(final, terminal, 3, 1), "partial final service was treated as a complete batch");
     terminal[1].work.batches = 1; terminal[1].work.known = false;
     require(!execution_terminal_first(final, terminal, 3, 1), "unmeasured final service changed generation order");
+    for (size_t i = 0; i < terminal.size(); ++i)
+    {
+        auto& work = terminal[i].work; work.known = true;
+        work.generation = std::array{4, 6, 9}[i]; work.cpu = std::array{9, 4, 9}[i]; work.destination = std::array{8, 5, 13}[i];
+        final[i].time_to_write = work.generation; final[i].remaining = work.cpu + work.destination;
+    }
+    std::array<size_t, 3> dispatch{};
+    require(execution_terminal_first(final, terminal, 1, 1, dispatch) == final[0].index && dispatch == std::array<size_t, 3>{0, 2, 1},
+        "the terminal schedule missed the 26-unit order after pricing 32 and 31 units");
+    TerminalGenerationPlan plan; std::array<TerminalGenerationBatch, 3> inputs{};
+    for (size_t i = 0; i < inputs.size(); ++i) inputs[i] = {final[i].index, terminal[i].destination, 1, 0, final[i].members_to_pack};
+    auto roster = std::make_shared<int>(1); GenerationSupply supply{1, roster};
+    require(plan.choose(final, terminal, inputs, 3, 1, 1, supply, true, 1, 100) == final[0].index,
+        "the controller omitted the first exact terminal grant");
+    plan.grant(final[0].index, inputs[0].count);
+    auto const pending = std::span(final).subspan(1); auto const remaining = std::span(inputs).subspan(1);
+    require(execution_generation_order(pending) == final[1].index &&
+        plan.choose(pending, std::span(terminal).subspan(1), remaining, 3, 1, 1, supply, true, 2, 100) == final[2].index,
+        "the first pending receive restored ordinary order before the second terminal grant");
+    auto accepted = plan; accepted.grant(final[2].index, inputs[2].count);
+    require(accepted.next(remaining.first(1), pending.first(1), supply, 3) == final[1].index,
+        "the final ordinary grant lost its planned member range");
+    accepted.grant(final[1].index, inputs[1].count); require(!accepted.count, "completed terminal grants kept an order");
+    inputs[2].plot[0] = 1; require(!plan.next(remaining, pending, supply, 2), "changed member kept the saved terminal order");
+    inputs[2].plot[0] = 0; final[2].deferrals = pending.size();
+    require(!plan.next(remaining, pending, supply, 2), "a saved terminal order bypassed an aged grant");
+    final[2].deferrals = 0; auto replacement = std::make_shared<int>(1);
+    require(!plan.next(remaining, pending, {1, replacement}, 2) && !plan.next(remaining, pending, supply, 100),
+        "a replaced worker or elapsed horizon kept the saved terminal order");
+    plan.grant(final[1].index, inputs[1].count); require(!plan.count, "a different actual grant retained a terminal plan");
+    for (auto& lane : terminal) { lane.work.generation = 1; lane.work.cpu = 1; lane.work.destination = 1; }
+    require(!execution_terminal_first(final, terminal, 1, 1, dispatch), "equal terminal completions changed ordinary priority");
 
     Config cfg; cfg.capacity_bytes = 1000000000000ull; cfg.window_bytes = mib;
     cfg.checkpoint_bytes = 16 * mib; cfg.workers = 24; cfg.merge_inputs = 4;
