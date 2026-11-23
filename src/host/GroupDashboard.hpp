@@ -121,7 +121,7 @@ class DashboardJob
     struct Progress
     {
         uint64_t fresh, inherited, files;
-        double first_seconds, last_seconds;
+        double first_seconds, last_seconds, elapsed_seconds;
     };
     using LaneFile = std::pair<size_t, uint64_t>;
     void published(uint64_t members, uint64_t inherited, std::optional<LaneFile> file = {})
@@ -159,7 +159,8 @@ class DashboardJob
         std::lock_guard lock(mutex_);
         return {fresh_, inherited_, files_,
                 fresh_ ? std::chrono::duration<double>(first_publication_ - started_).count() : 0,
-                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0};
+                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0,
+                std::chrono::duration<double>(Clock::now() - started_).count()};
     }
     void inherited_snapshot(uint64_t files, uint64_t members)
     {

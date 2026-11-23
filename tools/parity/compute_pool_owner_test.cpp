@@ -73,6 +73,57 @@ struct PrefetchEncoder final : RemoteEncoder
     void join() { if (pending.valid()) pending.get(); }
 };
 
+void failed_successor_publication(grow_controller_test::Arguments args, fs::path const& root,
+    WorkerService& original, WorkerConfig replacement)
+{
+    using namespace grow_controller_test;
+    // The already-authenticated worker stops admitting work during the
+    // next group's speculative receipt. Every foreground retry must return
+    // through the broker after the first file has published.
+    WorkerService survivor(replacement);
+    args.target = root / "refused-successor"; fs::create_directory(args.target);
+    args.command = "fill"; args.directory_farm = true; args.construction = "incremental";
+    args.temporary.clear(); args.temporary_capacity = 0; args.destination_temp = "off";
+    args.k = 22; args.workers = 2; args.window = args.checkpoint_bytes = uint64_t(64) << 10;
+    args.max_members = args.batch = args.group_members = 1; args.max_total_members = args.max_groups = 2;
+    args.capacity = uint64_t(256) << 20; args.headroom = 0; args.farming_detect_local = false;
+    args.farming_max_eligible_groups = 16; args.pool_output = "packed"; args.pool_codec_ram = 0;
+    args.pool_owner = "failed-successor";
+    auto const destination = args.target, first = group_path(destination, 0);
+    auto const worker = original.status().identity;
+    std::atomic<unsigned> selected{0}, before_publication{0}, after_publication{0};
+    args.compute_admit_task = [&](WorkerTaskAdmission const& admission)
+    {
+        auto const attempt = ++selected;
+        if (attempt == 1) return;
+        bool const published = fs::exists(first);
+        if (!published) ++before_publication;
+        else if (admission.worker.identity != worker) ++after_publication;
+        if (attempt == 2)
+        {
+            original.control(WorkerControl::Pause); survivor.start();
+            throw WorkerAdmissionRejected("declined provisional executor");
+        }
+    };
+    require(run_farming(args) == 0 && before_publication == 1 && after_publication == 1,
+        "a failed speculative receipt lost its predecessor or bypassed ordered admission on the surviving worker");
+    args.compute_admit_task = {}; args.generation_overlap = false;
+    args.target = root / "ordinary-successor"; fs::create_directory(args.target);
+    require(run_farming(args) == 0, "ordinary successor reference failed");
+    for (unsigned i = 0; i < 2; ++i)
+        require(contents(group_path(destination, i)) == contents(group_path(args.target, i)),
+            "a failed speculative receipt changed the canonical published prefix");
+
+    WorkerCancellation expired; expired.deadline = std::chrono::steady_clock::now();
+    require(!receive_optional_successor([&] { expired.check(); return 1; }), "optional receipt retained an expired task");
+    bool interrupted = false, invalid = false;
+    try { receive_optional_successor([]() -> size_t { throw Interrupted{}; }); }
+    catch (Interrupted const&) { interrupted = true; }
+    try { receive_optional_successor([]() -> size_t { throw std::logic_error("invalid receipt"); }); }
+    catch (std::logic_error const&) { invalid = true; }
+    require(interrupted && invalid, "optional receipt suppressed cancellation or a permanent validation failure");
+}
+
 void accepted_remote_publication(std::optional<fs::path> retained = {})
 {
     using namespace grow_controller_test;
@@ -156,6 +207,12 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     require(metrics.members == args.max_members && contents(args.target) == contents(canonical),
         "accepted remote codec changed complete canonical publication");
     if (retained) print_metrics(args, metrics, *backend);
+    else
+    {
+        auto replacement = pool_test::issue(certificates.path, "successor-worker", &ca);
+        offered.tls = pool_test::tls(ca, replacement); offered.tls.timeout_ms = tls.timeout_ms;
+        failed_successor_publication(args, directory.path, worker, std::move(offered));
+    }
 }
 
 void repartition_and_global_admission()
@@ -211,6 +268,11 @@ void repartition_and_global_admission()
     backend.initialize(args, requested, 0, false);
     {
         Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        auto const serial = Backend::fresh_receive_bytes(args), ahead = Backend::contribution_read_ahead_bytes(args);
+        auto const held = args.max_ram - serial;
+        require(ahead && Backend::fresh_receive_grant(args, held + 1) == 0 &&
+            Backend::fresh_receive_grant(args, held) == serial && Backend::fresh_receive_grant(args, held - ahead + 1) == serial &&
+            Backend::fresh_receive_grant(args, held - ahead) == serial + ahead, "fresh receiver lost its serial or read-ahead RAM boundary");
         uint64_t const receiving = producer.pool_receive_bytes(0, raw.size());
         uint64_t const cache = MemberBatchHash::memory_bytes(raw.size());
         producer.budget = producer.fixed + backend.retained() + receiving + cache;

@@ -641,6 +641,40 @@ void planning_feedback()
     require(width_after(6000) == 1, "a stale member prelude from the old route occupied its replacement");
     receiving.released(slow_packed.worker_identity, replaced);
 
+    {
+        auto& joining = new_planner();
+        auto extra = slow_packed; extra.worker_identity = "arriving-packed-worker";
+        auto mixed = std::make_shared<pool::GenerationRoster>(*roster);
+        mixed->routes.push_back({extra.worker_identity, extra.worker_instance, route, {}, {}, 0, 1});
+        joining.capacity(18, 2, mixed, 0, now);
+        train(joining, fast_packed, route);
+        auto slower = slow_packed; slower.generation = {8000, 1000, 1000, 0};
+        train(joining, slower, route);
+        auto trial = joining.selected(extra, route, now);
+        pool::Lease probe = first; probe.worker_identity = extra.worker_identity;
+        joining.receiving_packed(probe, trial, now);
+        auto width = [&](unsigned ns)
+        { return joining.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Packed, 3, 3, 3, 3, 1,
+            now + std::chrono::nanoseconds(ns), 0, &planned); };
+        require(width(100) == 1 && width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a second measured helper kept a fast route on singletons during another worker's long first transfer");
+        auto active_fast = joining.selected(fast_packed, route, now + std::chrono::nanoseconds(9700));
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a wide batch stopped following the earlier measured release when an unpriced slot was occupied");
+        auto prior_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(4000));
+        auto next_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(5960));
+        joining.observed(slower, route, prior_slow, now + std::chrono::nanoseconds(6000));
+        joining.released(slower.worker_identity, prior_slow);
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "an overlapped receipt on a slower measured worker broke a batch that beats its next singleton");
+        require(width(12000) == 1, "an overdue fast worker borrowed another worker's release estimate");
+        joining.released(slower.worker_identity, next_slow);
+        joining.released(fast_packed.worker_identity, active_fast);
+        auto changed = std::make_shared<pool::GenerationRoster>(*mixed); changed->routes.back().endpoint = relocated;
+        joining.capacity(18, 2, changed, joining.selections(), now);
+        require(width(10000) == 1, "a replaced worker inherited its predecessor's occupied first transfer");
+    }
+
     auto& final_group = new_planner();
     final_group.capacity(18, 2, roster, 0, now);
     auto triple = fast_packed; triple.work_units = 3; triple.generation = {1200, 600, 600, 0};
@@ -652,6 +686,32 @@ void planning_feedback()
     require(earlier(now) && planned.route.identity == triple.worker_identity,
         "a final measured batch was split although it beats a singleton on every alternative");
     require(!earlier(now + std::chrono::nanoseconds(2000)), "an overdue worker kept the final batch");
+    auto packed_pair = triple; packed_pair.work_units = 2; packed_pair.generation = {750, 450, 450, 0};
+    train(final_group, packed_pair, route);
+    final_group.released(triple.worker_identity, running);
+    running = final_group.selected(triple, route, now);
+    std::shared_ptr<void> assigned_singleton;
+    auto spare_fits = [&](unsigned ns) { return final_group.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2,
+        now, now + std::chrono::nanoseconds(ns), assigned_singleton); };
+    require(!spare_fits(0) && !spare_fits(7000) && spare_fits(12000) && !spare_fits(12000),
+        "packed work did not preserve the final fast batch or use the measured spare over a fitting independent horizon");
+    assigned_singleton.reset();
+    auto lost = std::make_shared<pool::GenerationRoster>(*roster); lost->routes.pop_back();
+    final_group.capacity(18, 2, lost, final_group.selections(), now);
+    require(!spare_fits(12000), "a withdrawn packed worker still supplied an idle singleton");
+    final_group.capacity(18, 2, roster, final_group.selections(), now);
+    {
+        auto& shared_link = new_planner();
+        shared_link.capacity(18, 2, roster, 0, now);
+        auto full = triple, shorter = packed_pair, helper = alternate;
+        full.generation = {1, 1800, 1800, 0}; shorter.generation = {1, 1200, 1200, 0};
+        helper.generation = {1, 8000, 8000, 0};
+        full.ingress_interface = shorter.ingress_interface = helper.ingress_interface = 7;
+        train(shared_link, full, route); train(shared_link, shorter, route); train(shared_link, helper, route);
+        shared_link.selected(full, route, now);
+        require(!shared_link.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2, now,
+            now + std::chrono::nanoseconds(12000), assigned_singleton), "a saturated shared ingress funded another packed receiver");
+    }
     final_group.released(triple.worker_identity, running);
     auto dual = std::make_shared<pool::GenerationRoster>(*roster); dual->routes.back().cpu_slots = 1;
     final_group.capacity(18, 2, dual, final_group.selections(), now);
@@ -1917,7 +1977,7 @@ void local_only_parallel()
             auto const affinity = pos2gpu::current_thread_cpus(); bool rejected = false;
             WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
             try { client.generate(18, 2, id, [](auto const&, auto) {}, cancel); }
-            catch (worker_detail::TaskCancelled const&) { rejected = true; }
+            catch (WorkerTaskTimeout const&) { rejected = true; }
             return rejected && pos2gpu::current_thread_cpus() == affinity;
         });
         completed = cancelled.wait_for(std::chrono::seconds(1)) == std::future_status::ready;

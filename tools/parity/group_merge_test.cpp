@@ -2813,6 +2813,13 @@ void destination_admission()
         pooled_scratch_receivers(2, 2, 3, 1) == 2 && pooled_scratch_receivers(3, 0, 1, 1) == 3 &&
         pooled_scratch_receivers(1, 0, 0, 0) == 1,
         "pooled scratch discarded homogeneous capacity, used stale fleet timings or changed singleton fallback");
+    auto future_members = [](uint64_t committed, uint16_t batch, bool unopened, uint64_t room)
+    { return independent_pool_members(9, committed, batch, unopened, room, [](uint16_t n) { return 100 * uint64_t(n); }); };
+    require(future_members(0, 0, true, 100) == 9 && !future_members(0, 0, true, 99) &&
+        future_members(0, 4, false, 400) == 4 && future_members(3, 4, false, 399) == 3 &&
+        future_members(8, 4, false, 400) == 1 && !future_members(9, 4, false, 400) &&
+        !future_members(3, 0, false, 400) && !future_members(3, 0, true, 400) && !future_members(0, 0, false, 400),
+        "independent packed work ignored an admitted next batch or counted ordered and unadmitted members");
     require(!packed_queue_fits_deadline(100'000'000, 1'200'000'000, 1e9L, 2000) &&
         packed_queue_fits_deadline(1'100'000'000, 1'200'000'000, 1e9L, 2000) &&
         !packed_queue_fits_deadline(1'200'000'000, 1'200'000'000, 1e9L, 2000) &&
@@ -3060,6 +3067,21 @@ void execution_planning()
     require(execution_generation_order(ready) == 7, "speculative capacity probes displaced a fitting destination");
     ready.back().deferrals = ready.size();
     require(execution_generation_order(ready) == 9, "generation order starved a deferred capacity probe");
+    std::array<ExecutionReady, 3> final{{{8, 0, 1, true, 1, false, 1}, {9, 0, 2, true, 2, false, 2}, {10, 0, 10, true, 3, false, 3}}};
+    std::array<ExecutionLane, 3> terminal{{{{1, 0, 0, 0, 0, 1, 1, true, true}, 4},
+        {{2, 0, 0, 0, 0, 2, 1, true, true}, 7}, {{3, 0, 0, 0, 0, 10, 1, true, true}, 12}}};
+    require(execution_generation_order(final) == 8 && execution_terminal_first(final, terminal, 3, 1) == 10 &&
+        execution_terminal_first(std::span(final).subspan(1), std::span(terminal).subspan(1), 2, 1) == 10,
+        "a short first receipt lengthened publication across independent idle disks");
+    final[0].deferrals = final.size(); require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering starved an aged destination");
+    final[0].deferrals = 0; final[1].tight_capacity = true;
+    require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering displaced a fitting destination");
+    final[1].tight_capacity = false; terminal[2].destination = terminal[0].destination;
+    require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering multiplied a shared physical writer");
+    terminal[2].destination = 12; terminal[1].work.batches = 2;
+    require(!execution_terminal_first(final, terminal, 3, 1), "partial final service was treated as a complete batch");
+    terminal[1].work.batches = 1; terminal[1].work.known = false;
+    require(!execution_terminal_first(final, terminal, 3, 1), "unmeasured final service changed generation order");
 
     Config cfg; cfg.capacity_bytes = 1000000000000ull; cfg.window_bytes = mib;
     cfg.checkpoint_bytes = 16 * mib; cfg.workers = 24; cfg.merge_inputs = 4;

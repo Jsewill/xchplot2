@@ -346,10 +346,13 @@ def check_dashboard(binary, root):
     assert metrics["new_durable_members"] == 2 and metrics["inherited_members"] == 0, metrics
     assert 0 < metrics["first_new_publication_seconds"] <= metrics["last_new_publication_seconds"]
     assert metrics["seconds_per_new_durable_member"] > 0
+    assert metrics["elapsed_seconds"] >= metrics["last_new_publication_seconds"]
+    assert abs(metrics["elapsed_seconds_per_new_durable_member"] * 2 - metrics["elapsed_seconds"]) < 0.000002
     result = subprocess.run(command("fill", "-r", *runtime, "--json"),
                             capture_output=True, check=True, timeout=90)
     metrics = json.loads(result.stdout.splitlines()[-1])
     assert metrics["new_durable_members"] == 0 and metrics["inherited_members"] == 2, metrics
+    assert metrics["elapsed_seconds"] > 0 and metrics["elapsed_seconds_per_new_durable_member"] is None
     assert all(metrics[name] is None for name in ("first_new_publication_seconds", "last_new_publication_seconds",
                                                    "seconds_per_new_durable_member"))
 
@@ -4302,6 +4305,76 @@ def check_compute(binary, root):
         plot, = destination.rglob("*.gplot")
         assert digest(plot) == digest(reference)
         print("PASS remote capacity probes preserve the published prefix across group rollover", flush=True)
+        # A remote worker can fill the next group's RAM pocket while the only
+        # destination is writing. Every successor still enters the ordinary writer.
+        series = ["-k", 22, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, "--group-members", 1,
+                  "--batch-members", 1, "--leave-free", 0, "--max-groups", 3, "--max-total-members", 3,
+                  "--capacity-bytes", "192M", "--destination-temp", "off", "--construction", "incremental",
+                  "--window-bytes", "64K", "--checkpoint-bytes", "64K", "-M", "1G", "-j", 2,
+                  "--compute-output", "packed", "--backend", "cpu", "--compute-local", "off", *network,
+                  "--json", "--config", os.devnull]
+        def intervals(log, phase):
+            return [(int(begin), int(end)) for begin, end in
+                    re.findall(r"phase=" + phase + r" [^\n]*?begin_ns=(\d+) end_ns=(\d+)", log)]
+
+        hashes = []
+        for name, overrides in (("serial", ["--generation-overlap", "off"]), ("overlap", [])):
+            target = root / ("ram-series-" + name)
+            target.mkdir()
+            process = pool.Process([binary, "fill", target, *series, *overrides], root / (target.name + ".log"),
+                                   extra_env={"POS2GPU_PHASE_TIMING": "1"})
+            processes.append(process)
+            log = process.finish()
+            report = json.loads(log.splitlines()[-1])
+            assert report["members"] == report["generated_members"] == report["pool_packed_members"] == 3
+            paths = sorted(target.rglob("*.gplot"))
+            assert len(paths) == 3
+            hashes.append([digest(path) for path in paths])
+            writes, publications, receives = (intervals(log, phase) for phase in ("fresh_payload", "publish", "ram_successor_receive"))
+            assert len(writes) == len(publications) == 3
+            assert all(writes[i][1] <= publications[i][0] <= publications[i][1] <= writes[i + 1][0] for i in range(2))
+            if name == "overlap":
+                assert receives and report["generation_overlap_members"] == len(receives)
+                assert any(start <= receiving < end for start, end in writes for receiving, _ in receives)
+                assert report["peak_modeled_bytes"] <= 1 << 30 and report["scratch_peak_bytes"] == 0
+                for path in paths:
+                    verify(path, 100)
+            else:
+                assert not receives and not report["generation_overlap_members"]
+        assert hashes[0] == hashes[1], "prefetched RAM successors differ from ordinary publication"
+        print("PASS authenticated RAM successor generation overlaps ordered single-destination writes with byte parity", flush=True)
+        peers = [root / ("ram-peer-" + str(i)) for i in range(2)]
+        for peer in peers:
+            peer.mkdir()
+        process = pool.Process([binary, "fill", *peers, *series], root / "ram-peers.log", extra_env={"POS2GPU_PHASE_TIMING": "1"})
+        processes.append(process)
+        log = process.finish()
+        report = json.loads(log.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == report["pool_packed_members"] == 6
+        assert report["peak_modeled_bytes"] <= 1 << 30 and report["scratch_peak_bytes"] == 0
+        writes, publications = [], []
+        for peer in peers:
+            lane = "\n".join(row for row in log.splitlines() if peer.name in row)
+            writes.append(intervals(lane, "fresh_payload"))
+            publications.append(intervals(lane, "publish"))
+            assert len(writes[-1]) == len(publications[-1]) == 3
+            assert all(writes[-1][i][1] <= publications[-1][i][0] <= publications[-1][i][1] <= writes[-1][i + 1][0]
+                       for i in range(2))
+            for path in sorted(peer.glob("*.gplot")):
+                verify(path, 100)
+        # The final surviving lane could also use the single-device optimization.
+        # Require a receipt during this lane's write while the other still owns work.
+        receives = re.findall(r"phase=ram_successor_receive owner=(\d+) begin_ns=(\d+)", log)
+        assert report["generation_overlap_members"] == len(receives)
+        assert any(any(a <= int(when) < b for a, b in writes[int(owner)]) and
+                   int(when) < publications[1 - int(owner)][-1][1] for owner, when in receives)
+        limited = root / "ram-limited"
+        limited.mkdir()
+        result = pool.run([binary, "fill", limited, *series, "-M", "120M", "--max-groups", 2, "--max-total-members", 2])
+        report = json.loads(result.stdout.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == 2 and report["peak_modeled_bytes"] <= 120 << 20
+        assert not report["generation_overlap_batches"] and not report["generation_overlap_members"]
+        print("PASS ready peer priority, ordered RAM successors on busy lanes and constrained-RAM fallback", flush=True)
         wide = common.copy()
         wide[wide.index("--group-members") + 1] = 65
         wide[wide.index("--max-host-ram") + 1] = "1G"

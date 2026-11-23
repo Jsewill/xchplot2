@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <tuple>
 
 namespace group_grow
@@ -652,6 +653,15 @@ inline bool execution_singleton_fallback(uint64_t budget, uint64_t fixed, uint64
 {
     return fixed <= budget && generation <= budget - fixed && workspace <= budget - fixed - generation;
 }
+inline bool execution_generation_precedes(ExecutionReady const& a, ExecutionReady const& b, bool timed_writes)
+{
+    if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
+    if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
+        a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
+    if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
+    if (a.known != b.known) return a.known;
+    return a.known && a.remaining > b.remaining;
+}
 inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
 {
     require(!ready.empty(), "generation order requires a ready destination");
@@ -665,14 +675,7 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
     bool const timed_writes = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
         { return item.members_to_pack == UINT16_MAX || item.time_to_write > 0 || (!all_tight && item.tight_capacity); });
     return std::min_element(ready.begin(), ready.end(), [&](auto const& a, auto const& b)
-    {
-        if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
-        if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
-            a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
-        if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
-        if (a.known != b.known) return a.known;
-        return a.known && a.remaining > b.remaining;
-    })->index;
+        { return execution_generation_precedes(a, b, timed_writes); })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
     size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap,
@@ -823,6 +826,40 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
     if (published != lanes.size() || !std::isfinite(result.completion)) return {};
     result.known = !result.unmeasured && result.completion > 0;
     return result;
+}
+// Compare only the next grant. Other terminal batches retain ordinary priority
+// in both projections, including their shared CPU and distinct physical writers.
+inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady const> ready,
+    std::span<ExecutionLane const> lanes, unsigned workers, unsigned grant)
+{
+    if (ready.size() < 2 || ready.size() != lanes.size() || !workers || !grant) return {};
+    std::vector<size_t> order(lanes.size());
+    std::vector<long double> tail(lanes.size());
+    std::set<size_t> writers;
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto const& work = lanes[i].work;
+        if (!ready[i].known || !work.known || work.generation <= 0 || work.destination <= 0 || work.batches != 1 ||
+            ready[i].tight_capacity || ready[i].deferrals >= ready.size() || !lanes[i].scratch.empty() ||
+            !writers.insert(lanes[i].destination).second) return {};
+        auto const cpu = work.cpu / std::min(workers, grant) + work.serial;
+        tail[i] = work.io_overlap ? std::max(cpu, work.destination) : cpu + work.destination;
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], true); });
+    auto const longest = std::max_element(order.begin(), order.end(), [&](auto a, auto b) { return tail[a] < tail[b]; });
+    if (longest == order.begin()) return {};
+    std::vector<ExecutionLane> schedule(lanes.size());
+    auto estimate = [&]
+    {
+        for (size_t i = 0; i < order.size(); ++i) schedule[i] = {lanes[order[i]].work, order[i]};
+        return pipeline_execution_estimate(schedule, schedule.size(), workers, grant, schedule.size(), true);
+    };
+    auto const ordinary = estimate();
+    std::rotate(order.begin(), longest, longest + 1);
+    auto const changed = estimate();
+    if (ordinary.known && changed.known && changed.completion < ordinary.completion) return ready[order.front()].index;
+    return {};
 }
 
 inline ConstructionRates construction_rates(ConstructionSample const& sample)

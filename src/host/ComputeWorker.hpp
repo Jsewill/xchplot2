@@ -16,6 +16,12 @@ struct WorkerStatus;
 struct WorkerTaskAdmission;
 namespace worker_detail { struct RetryHandle; class TaskRegistry; }
 
+class WorkerTaskTimeout : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct WorkerCancellation
 {
     std::atomic<bool> const* stop = nullptr;
@@ -78,6 +84,7 @@ struct WorkerPackedRoute
 {
     pool::GenerationRoute route;
     pool::Kind kind = pool::Kind::GenerateAny;
+    std::shared_ptr<void> reserved_singleton;
     bool matches(pool::Lease const& lease) const
     {
         return kind == lease.task.kind && route.identity == lease.worker_identity &&
@@ -153,6 +160,7 @@ struct WorkerTaskOptions
     // Expected completion of other known work on independent destinations.
     std::chrono::steady_clock::time_point other_work_until{};
     WorkerPackedRoute const* packed_route = nullptr;
+    bool fresh_read_ahead = true;
 };
 class WorkerAlreadyRunning : public std::runtime_error
 {
@@ -343,6 +351,9 @@ struct WorkerClientConfig
     // eligible routes. No network request is needed by a display observer.
     std::function<void(uint8_t, uint8_t, WorkerGenerationCapacity const&)> generation_capacity_changed;
     WorkerGenerationCalibration generation_calibration;
+    // The plotting host and its receive policy bind dated observations across
+    // logical jobs. The source address and adapter come from the actual data route.
+    std::function<std::string(pool::GenerationRoute const&, std::string const&, uint32_t)> generation_path;
     // Called after selection, before worker contact. A caller may reject an
     // optional task by throwing; the unbegun grant is then cancelled.
     std::function<void(WorkerTaskObservation const&)> selected;
@@ -376,7 +387,8 @@ public:
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
         WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {}, bool independent = false,
-        bool coalesce_singletons = true, std::chrono::steady_clock::time_point other_work_until = {});
+        bool coalesce_singletons = true, std::chrono::steady_clock::time_point other_work_until = {},
+        bool fresh_read_ahead = true);
     // Zero means all members were delivered. A positive width releases the
     // unstarted lease for independent delivery of that prefix and its remainder.
     unsigned try_contributions(uint8_t k, uint8_t strength,
@@ -399,7 +411,8 @@ public:
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
-                                     WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr) const;
+                                     WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr,
+                                     std::chrono::steady_clock::time_point other_work_until = {}) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     // A zero joint width selects the independent pipeline for this ready work.

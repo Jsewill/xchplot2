@@ -170,7 +170,11 @@ void transport(TlsOptions server_tls, TlsOptions const& client_tls, TlsOptions c
         auto channel = listener.accept(1000); require(bool(channel), "echo connection missing");
         auto frame = channel.receive(); channel.send(frame.type, frame.payload); return channel.peer_identity();
     });
-    auto channel = Channel::connect(listener.endpoint(), client_tls, identity); Writer message; message.string("direct result");
+    auto channel = Channel::connect(listener.endpoint(), client_tls, identity);
+    uint32_t ingress = UINT32_MAX;
+    require(local_address(listener.endpoint(), &ingress) == channel.local_address() && ingress == channel.ingress_interface(),
+        "the route forecast did not match the authenticated loopback socket");
+    Writer message; message.string("direct result");
     channel.send(Message::Data, message.data()); auto frame = channel.receive();
     require(frame.type == Message::Data && frame.payload == message.data(), "direct payload changed");
     require(echo.get() == certificate_identity(client_tls.cert_file), "direct owner identity changed"); channel.close();
@@ -409,13 +413,20 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto legacy = std::async(std::launch::async, [&]
     {
         auto channel = listener.accept(3000);
-        for (auto operation : {23, 19, 18, 18, 2, 2, 2})
+        for (auto operation : {23, 19, 18, 18, 2, 2, 2, 25, 2, 1, 24, 2, 26, 8})
         {
             auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
             require(frame.type == Message::Control && input.u32() == 8 && input.u8() == operation,
                 "client repeated an unsupported broker operation");
-            if (operation == 23 || operation == 19)
+            if (operation == 23 || operation == 19 || operation == 24 || operation == 25 || operation == 26)
             { reply.u8(1); reply.string("unknown broker operation"); channel.send(Message::Error, reply.data()); }
+            else if (operation == 8)
+                channel.send(Message::Reply, reply.data());
+            else if (operation == 1)
+            {
+                reply.string("new-owner"); reply.string("new-session"); reply.string("epoch"); reply.u64(2);
+                channel.send(Message::Reply, reply.data());
+            }
             else if (operation == 18)
             {
                 reply.u32(3); reply.u32(1); reply.u32(0); reply.u8(1);
@@ -442,7 +453,28 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto bounded = owner.with_deadline(until);
     require(!bounded.acquire(session, request, until) && !bounded.acquire(session, request, until),
         "older broker backlog fallback changed queued work");
+    auto const finite = std::chrono::steady_clock::now();
+    auto packed = request; packed.work_units = 3;
+    require(!owner.finite_packed_route(session, packed) && !owner.acquire(session, request, finite),
+        "older broker lost ordinary placement after declining finite pricing");
+    session = owner.open_owner("new-owner");
+    require(!owner.acquire(session, request, finite) && !owner.finite_packed_route(session, packed),
+        "finite generation did not renegotiate on a new owner session");
+    std::string const path(64, 'd');
+    require(!owner.generation_paths(session, {{"old-worker", path}}), "an older broker accepted scoped paths");
+    owner.delivered(Lease{}, {1, 4, 32}, path);
     legacy.get();
+    Listener successor({"127.0.0.1", 0}, server_tls);
+    auto upgraded = std::async(std::launch::async, [&]
+    {
+        auto channel = successor.accept(3000); auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
+        require(frame.type == Message::Control && input.u32() == 8 && input.u8() == 25, "new endpoint skipped finite pricing");
+        reply.string("known-worker"); reply.u8(uint8_t(Kind::GenerateGpu)); channel.send(Message::Reply, reply.data());
+    });
+    owner.reroute(successor.endpoint());
+    auto choice = owner.finite_packed_route(session, packed);
+    require(choice && choice->first == "known-worker", "an old broker disabled its replacement's placement API");
+    upgraded.get();
 }
 
 void selection(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls, TlsOptions const& second_tls)
@@ -1345,6 +1377,82 @@ void generation_pending_delivery(BrokerOptions options, TlsOptions const& owner_
     auto const preferred = start(slow, "authoritative");
     slow.finish(preferred);
 }
+void finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& fast_tls, TlsOptions const& entrant_tls)
+{
+    options.lease_ms = 5000; options.worker_ms = 10000;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), fast(endpoint, fast_tls), entrant(endpoint, entrant_tls);
+    auto offer_a = offer("established", 49452);
+    auto gpu = profile(Kind::GenerateGpu); gpu.max_batch_members = 3;
+    offer_a.generation_profiles = {gpu}; offer_a.capacity.gpu_bytes = gpu.resources.gpu_bytes;
+    offer_a.capabilities |= capability(Kind::GenerateGpu);
+    auto offer_b = offer_a; offer_b.instance = "arriving"; ++offer_b.endpoint.port;
+    fast.register_worker(offer_a);
+    auto session = owner.open_owner("finite-job");
+    std::string const path_a(64, 'a'), path_b(64, 'b');
+    auto job = task("finite"); job.kind = Kind::GenerateGpu; job.sequence = 0;
+    auto next = [&](GenerationOutput output, unsigned width)
+    {
+        job.generation_output = output; job.work_units = width;
+        job.task_id = "finite-" + std::to_string(++job.sequence);
+    };
+    auto accepted = [&](GenerationOutput output, unsigned width, uint64_t elapsed)
+    {
+        next(output, width); auto lease = owner.acquire(session, job);
+        require(lease && fast.begin(*lease, lease->owner_identity), "finite incumbent calibration did not begin");
+        fast.finish(*lease); owner.delivered(*lease, {elapsed, 32 * width, 1024 * width}, path_a);
+    };
+    accepted(GenerationOutput::Fresh, 3, 900000000);
+    accepted(GenerationOutput::Packed, 1, 300000000);
+    accepted(GenerationOutput::Packed, 3, 700000000);
+    owner.close_owner(session); session = owner.open_owner("finite-job");
+    entrant.register_worker(offer_b);
+    auto const finite = std::chrono::steady_clock::now();
+    next(GenerationOutput::Fresh, 3); auto whole = owner.acquire(session, job, finite);
+    require(whole && fast.begin(*whole, whole->owner_identity), "a new worker displaced a measured indivisible fresh group");
+    fast.finish(*whole);
+    next(GenerationOutput::Packed, 3); auto route = owner.finite_packed_route(session, job);
+    require(route && route->first == whole->worker_identity, "an unpriced arrival broke the measured final packed batch");
+    next(GenerationOutput::Packed, 1); auto first = owner.acquire(session, job, finite);
+    require(first && fast.begin(*first, first->owner_identity), "the first terminal member lost its measured route");
+    next(GenerationOutput::Packed, 1);
+    require(!owner.acquire(session, job, finite), "an unpriced terminal member outranked a measured imminent release");
+    fast.finish(*first); auto last = owner.acquire(session, job, finite);
+    require(last && fast.begin(*last, last->owner_identity), "the terminal member did not resume on release"); fast.finish(*last);
+    next(GenerationOutput::Fresh, 3);
+    auto parallel = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(5)).acquire(session, job,
+        std::chrono::steady_clock::now() + std::chrono::seconds(4));
+    require(parallel && entrant.begin(*parallel, parallel->owner_identity), "independent work stopped exploring an unpriced worker");
+    entrant.finish(*parallel);
+    auto different_job = owner.open_owner("different-logical-job");
+    next(GenerationOutput::Packed, 3);
+    owner.generation_paths(different_job, {{whole->worker_identity, path_a}});
+    require(owner.finite_packed_route(different_job, job).has_value(),
+        "the same authenticated host and direct route lost a recent incumbent across logical jobs");
+    owner.generation_paths(different_job, {{whole->worker_identity, path_b}});
+    require(!owner.finite_packed_route(different_job, job), "a changed data path reused another route's incumbent");
+    auto different_principal = entrant.open_owner("other-plotting-host");
+    entrant.generation_paths(different_principal, {{whole->worker_identity, path_a}});
+    require(!entrant.finite_packed_route(different_principal, job), "another TLS principal inherited the plotting host's incumbent");
+    // A second slot only shortens the finite batch when both grants fit.
+    offer_a.capacity.slots = 2; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    require(owner.finite_packed_route(session, job).has_value(), "two slots sharing one GPU grant broke the measured packed batch");
+    offer_a.capacity.gpu_bytes *= 2; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    require(!owner.finite_packed_route(session, job), "one worker's two available grants were forced into a slower packed batch");
+    next(GenerationOutput::Packed, 1); auto busy = owner.acquire(session, job, finite);
+    require(busy && fast.begin(*busy, busy->owner_identity), "the first of two finite grants did not begin");
+    next(GenerationOutput::Packed, 3);
+    require(owner.finite_packed_route(session, job).has_value(), "an occupied grant was counted towards a finite split");
+    fast.finish(*busy);
+    offer_a.capacity.slots = 1; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    entrant.worker_admission(offer_b.instance, WorkerAdmission::Paused);
+    accepted(GenerationOutput::Packed, 2, 300000000);
+    next(GenerationOutput::Packed, 3);
+    require(!owner.finite_packed_route(session, job), "a slower whole batch displaced its measured smaller batches");
+    ++offer_a.capacity_revision; offer_a.endpoint.port += 2; fast.register_worker(offer_a);
+    next(GenerationOutput::Packed, 3);
+    require(!owner.finite_packed_route(session, job), "a moved worker inherited its former finite placement");
+}
 void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
                                  TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
@@ -2007,6 +2115,7 @@ int main() try
     parallel_generation_tail(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
     other_owner_generation_release(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_pending_delivery(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
+    finite_generation(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);
