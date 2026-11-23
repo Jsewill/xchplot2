@@ -533,7 +533,7 @@ jobs:
                   path=work/key
                   path.mkdir(exist_ok=True)
                   env[key]=str(path)
-              cmd=["batch",str(manifest),"--devices","cpu","--workers","4","--compute","off","--no-auto-spill","--destination-temp","off","--member-storage","compact","--construction","incremental","--batch-members","2","--window-bytes","1M","--checkpoint-bytes","128K","--no-progress","--config",os.devnull]
+              cmd=["batch",str(manifest),"--devices","cpu","--workers","4","--compute","off","--no-auto-spill","--destination-temp","off","--member-storage","compact","--construction","incremental","--batch-members","2","--window-bytes","16M","--checkpoint-bytes","128K","--no-progress","--config",os.devnull]
               def run(name,args,expected,settings):
                   p=subprocess.run([str(exe),*args],cwd=work,env=settings,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=150)
                   (work/(name+".log")).write_bytes(p.stdout)
