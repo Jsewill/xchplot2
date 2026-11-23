@@ -1287,12 +1287,17 @@ void assigned_local_and_fencing()
     WorkerService scratch_limited(bounded); scratch_limited.start();
     config.broker = bounded.broker; config.owner_id = "batch-refusal-owner";
     config.local_service = nullptr; config.task_timeout_ms = 10000;
+    std::string failed_instance, failed_reason;
+    config.generation_failed = [&](auto const& task, std::string_view reason)
+        { failed_instance = task.worker_instance; failed_reason = reason; };
     WorkerClient refused(config);
     bool unsupported = false, emitted = false;
     try { refused.contributions(18, 2, ids, [&](auto, auto, auto) { emitted = true; }); }
     catch (pool::UnsupportedResources const&) { unsupported = true; }
     require(unsupported && !emitted,
         "refused contribution batch retried its excluded shape instead of returning before output");
+    require(failed_instance == scratch_limited.status().instance && failed_reason.find("scratch") != std::string::npos,
+        "failed generation lost its authenticated worker or resource diagnostic");
     chunks = 0;
     refused.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, auto bytes, uint16_t members)
     { require(ordinal == chunks++ && members == 1 && !bytes.empty(), "singleton split failed after a typed batch refusal"); });

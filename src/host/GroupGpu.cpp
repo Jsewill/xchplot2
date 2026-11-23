@@ -327,18 +327,25 @@ struct GpuProducer::Impl
         auto cleanup = [](char const* name, auto&& action)
         {
             try { action(); }
+            catch (sycl::exception const& error)
+            {
+                pos2gpu::record_async_error(error.what());
+                std::fprintf(stderr, "%s cleanup failed: %s\n", name, error.what());
+            }
             catch (std::exception const& error)
             { std::fprintf(stderr, "%s cleanup failed: %s\n", name, error.what()); }
             catch (...)
             { std::fprintf(stderr, "%s cleanup failed: unknown exception\n", name); }
         };
         cleanup("GPU output", [&] { handoff.finish(); });
+        // Borrowed and tiled pipelines can fail at a host-side check before
+        // their last wait. Surface pending driver errors before releasing USM.
+        cleanup("GPU generation queue", [&] { queue->wait_and_throw(); });
         if (device_output)
         {
             // A completed wait can still report an asynchronous error. Attempt
             // every remaining wait/free independently instead of leaking all
             // later resources after the first error.
-            cleanup("GPU generation queue", [&] { queue->wait_and_throw(); });
             cleanup("GPU copy queue", [&] { copy_queue->wait_and_throw(); });
             pos2gpu::release_gpu_memory("GPU device output", capacity * sizeof(uint64_t), &pos2gpu::GpuCleanupCharges::device,
                 [&] { sycl::free(device_output, *queue); });
@@ -353,6 +360,14 @@ struct GpuProducer::Impl
     void check_generation() const
     {
         handoff.check_generation();
+    }
+
+    void check_backend_result() const
+    {
+        queue->throw_asynchronous();
+        if (pos2gpu::async_error_count())
+            throw std::runtime_error("GPU member generation reported an asynchronous backend error: " +
+                                     pos2gpu::first_async_error());
     }
 
     uint64_t next_profile_member() { return profile ? ++profile_member : 0; }
@@ -639,6 +654,7 @@ GpuProducer::BorrowedFragments GpuProducer::generate_borrowed(std::array<uint8_t
         auto const scratch = impl_->scratch();
         result = pos2gpu::run_gpu_pipeline_streaming(config, impl_->output.get(), impl_->capacity, scratch);
     }
+    impl_->check_backend_result();
     auto const fragments = result.fragments();
     if (fragments.size() > impl_->capacity)
         throw std::runtime_error("GPU producer fragment count exceeds the admitted bound");
@@ -682,6 +698,7 @@ std::shared_future<uint64_t> GpuProducer::generate_borrowed_into_async(std::arra
     impl_->release(impl_->transfer);
     auto const result = pos2gpu::run_gpu_pipeline(impl_->config(plot_id), *impl_->pool, 0,
         [&] { before_copy(); wall.slot_wait_ns += impl_->finish_output(wall.member); });
+    impl_->check_backend_result();
     auto const fragments = result.fragments();
     if (!result.t3_fragments_storage.empty() || fragments.size() > impl_->capacity)
         throw std::logic_error("GPU producer returned invalid borrowed output");
@@ -724,6 +741,7 @@ uint64_t GpuProducer::generate_into(std::array<uint8_t, 32> const& plot_id,
     auto const config = impl_->config(plot_id);
     auto const result = impl_->pool ? pos2gpu::run_gpu_pipeline(config, *impl_->pool, sink) :
         pos2gpu::run_gpu_pipeline_streaming(config, sink, impl_->scratch(false));
+    impl_->check_backend_result();
     if (!result.fragments().empty() || result.t3_count > impl_->capacity)
         throw std::logic_error("GPU producer tiled output returned invalid fragment storage or count");
     wall.complete = true;
@@ -779,9 +797,7 @@ std::shared_future<uint64_t> GpuProducer::generate_output_async(
     try
     {
         auto const result = pos2gpu::run_gpu_pipeline(impl_->config(plot_id), *impl_->pool, output);
-        if (pos2gpu::async_error_count())
-            throw std::runtime_error("GPU member generation reported an asynchronous backend error: " +
-                                     pos2gpu::first_async_error());
+        impl_->check_backend_result();
         if (!result.fragments().empty() || result.t3_count > impl_->capacity)
             throw std::logic_error("GPU producer device output returned invalid fragment storage or count");
         auto pending = impl_->handoff.launch([impl = impl_.get(), count = result.t3_count, member = wall.member, scope = pos2gpu::scoped_async_errors(),

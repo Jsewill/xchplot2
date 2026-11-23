@@ -15,9 +15,9 @@
 
 namespace group_grow::pool
 {
-std::string gpu_recovery_reason(std::string text)
+std::string worker_diagnostic(std::string text)
 {
-    // Driver status is printed on terminals on the owner as well as the worker.
+    // Worker diagnostics are printed on terminals on the owner as well as the worker.
     // Keep a bounded ASCII line even when a peer sends arbitrary diagnostics.
     if (text.size() > 240) text.erase(0, text.size() - 240);
     for (char& c : text) if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) c = ' ';
@@ -463,7 +463,7 @@ uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& ta
             {
                 auto count = reader.u8(); require(count <= max_status_page_size && count <= admission.registered,
                     "invalid GPU recovery count");
-                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), gpu_recovery_reason(reader.string(240))});
+                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), worker_diagnostic(reader.string(240))});
             }
             availability->admission = admission;
             *roster = std::move(snapshot);
@@ -618,7 +618,7 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
             value.hardware = read_worker_hardware(in);
-            if (recovery) value.gpu_recovery = gpu_recovery_reason(in.string(240));
+            if (recovery) value.gpu_recovery = worker_diagnostic(in.string(240));
             result.worker_records.push_back(std::move(value));
         }
         else if (result.section == StatusSection::Owners)
@@ -758,7 +758,7 @@ struct BrokerServer::Impl
         Clock::time_point other_work_until{};
         Clock::time_point created = Clock::now();
         Clock::time_point unreported_finish{};
-        bool observed = false, finite = false;
+        bool observed = false, finite = false, abandoned = false;
         struct Failure { std::string worker, instance; Kind kind; };
         std::vector<Failure> failures;
     };
@@ -839,7 +839,10 @@ struct BrokerServer::Impl
     Job& lease_job(Lease const& lease)
     {
         if (lease.epoch != epoch) throw StaleLease("stale broker epoch");
-        auto it = jobs.find(task_key(owner_key(lease.owner_identity, lease.owner_id), lease.owner_session, lease.task.task_id));
+        auto const key = task_key(owner_key(lease.owner_identity, lease.owner_id), lease.owner_session, lease.task.task_id);
+        auto it = jobs.find(key);
+        if (it == jobs.end() || !it->second.lease || it->second.lease->token != lease.token)
+            it = jobs.find(key + '/' + lease.token);
         if (it == jobs.end() || !it->second.lease) throw StaleLease("compute lease is no longer registered");
         require(it->second.lease->token == lease.token &&
             it->second.lease->broker_identity == lease.broker_identity && it->second.lease->broker_node_id == lease.broker_node_id &&
@@ -1396,14 +1399,15 @@ struct BrokerServer::Impl
         if (update->generation_profiles) offer.generation_profiles = *update->generation_profiles;
         worker->second.seen = Clock::now();
     }
-    void make_room()
+    bool make_room()
     {
-        if (jobs.size() < options.max_tasks) return;
+        if (jobs.size() < options.max_tasks) return true;
         auto oldest = jobs.end();
         for (auto it = jobs.begin(); it != jobs.end(); ++it)
             if (!reserved(it->second) && it->second.state != State::Queued &&
                 (oldest == jobs.end() || it->second.touched < oldest->second.touched)) oldest = it;
-        require(oldest != jobs.end(), "broker task capacity is full"); jobs.erase(oldest);
+        if (oldest == jobs.end()) return false;
+        jobs.erase(oldest); return true;
     }
     static WaitReason reserved_reason(WaitReason reason)
     {
@@ -1582,7 +1586,8 @@ struct BrokerServer::Impl
             auto it = jobs.find(key);
             if (it == jobs.end())
             {
-                require(task.sequence > source.highest_sequence, "stale task sequence"); make_room();
+                require(task.sequence > source.highest_sequence, "stale task sequence");
+                require(make_room(), "broker task capacity is full");
                 source.highest_sequence = task.sequence;
                 require(next_status_id != UINT64_MAX, "broker diagnostic sequence exhausted");
                 Job job; job.status_id = ++next_status_id; job.owner = owner_key(identity, session.owner_id); job.requested = task; job.touched = Clock::now();
@@ -1595,14 +1600,21 @@ struct BrokerServer::Impl
                         "task identity has been reused");
                 if (task.attempt > job.requested.attempt)
                 {
-                    // Do not release a running worker on owner retry. It must
-                    // finish or expire before the retry can consume its share.
                     auto same_task = task; same_task.attempt = job.requested.attempt;
                     require(same_task == job.requested, "retry changes task body");
                     require(job.failures.size() < max_retry_failures, "task retry capacity is exhausted");
-                    if (reserved(job)) { response.u8(0); return response; }
+                    if (reserved(job))
+                    {
+                        if (job.state != State::Cancelled || !job.abandoned || !make_room())
+                        { response.u8(0); return response; }
+                        // The data peer disappeared. Keep its fenced reservation charged until
+                        // Finish or expiry while the retry competes for a different worker.
+                        require(next_status_id != UINT64_MAX, "broker diagnostic sequence exhausted");
+                        require(jobs.emplace(key + '/' + job.lease->token, job).second, "duplicate abandoned lease");
+                        job.status_id = ++next_status_id;
+                    }
                     job.requested = task; job.lease.reset(); job.state = State::Queued;
-                    job.observed = false; job.unreported_finish = {};
+                    job.observed = job.abandoned = false; job.unreported_finish = {};
                     job.start_by = Clock::time_point::max();
                 }
                 else require(task == job.requested, "stale or changed task attempt");
@@ -1636,7 +1648,7 @@ struct BrokerServer::Impl
             bool retain_route = operation == Operation::RegisterWorkerRoute;
             if (operation == Operation::RegisterGpuRecovery)
             {
-                auto const flag = reader.u8(); offer.gpu_recovery = gpu_recovery_reason(reader.string(240));
+                auto const flag = reader.u8(); offer.gpu_recovery = worker_diagnostic(reader.string(240));
                 require(flag <= 1 && !offer.capacity.gpu_bytes && !offer.gpu_recovery.empty() &&
                     (offer.capabilities & capability(Kind::GenerateGpu)), "invalid withdrawn GPU registration");
                 retain_route = flag;
@@ -1836,7 +1848,7 @@ struct BrokerServer::Impl
             if (!active_owner(job)) throw StaleLease("abandoned lease owner was fenced");
             if (job.state == State::Running) job.state = State::Cancelled;
             else if (job.state == State::Granted) job.state = State::Finished;
-            job.unreported_finish = {}; job.touched = Clock::now();
+            job.abandoned = true; job.unreported_finish = {}; job.touched = Clock::now();
             bool const known = std::any_of(job.failures.begin(), job.failures.end(), [&](Job::Failure const& failure)
             { return failure.worker == lease.worker_identity && failure.instance == lease.worker_instance && failure.kind == Kind::GenerateAny; });
             if (!known && job.failures.size() < max_retry_failures)
@@ -1858,7 +1870,7 @@ struct BrokerServer::Impl
             try
             {
                 auto& job = lease_job(lease);
-                if (!active_owner(job) || (job.state != State::Running && job.state != State::Finished))
+                if (!active_owner(job) || job.abandoned || (job.state != State::Running && job.state != State::Finished))
                     throw StaleDelivery("delivery observation owner or lease was fenced");
                 require(elapsed && output && !job.observed, "invalid or repeated delivery observation");
                 auto worker = workers.find(lease.worker_identity);

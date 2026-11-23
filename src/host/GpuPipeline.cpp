@@ -305,10 +305,13 @@ inline bool spill_announce(bool quiet, std::atomic<bool>& announced)
 // path is theoretically more compatible than the AOT spoof but has
 // been observed to miscompile the matcher). Only the OOM further down
 // was visible before this check.
-inline void validate_t1_count(uint64_t t1_count, int k)
+inline void validate_t1_count(uint64_t t1_count, int k, sycl::queue& q)
 {
     uint64_t const min_plausible = (1ULL << k) >> 6;
     if (t1_count >= min_plausible) return;
+    // The counter copy has completed. An event wait alone does not dispatch
+    // its asynchronous errors to the queue handler.
+    q.throw_asynchronous();
 
     // Did the kernels run at all? A device that faulted mid-run reaches this
     // check with the same t1_count == 0 as a device that miscompiled the
@@ -316,29 +319,16 @@ inline void validate_t1_count(uint64_t t1_count, int k)
     // problem the parity tests cannot reproduce, the other is exactly what
     // they exist to catch. The async error count decides it.
     if (unsigned const n = async_error_count(); n > 0) {
-        std::string const first = first_async_error();
-        throw std::runtime_error(
-            "T1 match produced " + std::to_string(t1_count) + " entries, and " +
-            std::to_string(n) + " asynchronous backend error(s) were reported "
-            "during the run. The kernels did not compute a wrong answer — they "
-            "did not execute. This is a driver or device fault, NOT a codegen "
-            "or parity problem, and the parity tests will not reproduce it.\n"
-            "  First backend error: " + first + "\n"
-            "  Reading Level Zero codes: 0x70000001 (ze:1879048193) is "
-            "DEVICE_LOST and is the ROOT event. The 0x70000003 "
-            "(ze:1879048195) OUT_OF_DEVICE_MEMORY storm that follows it is a "
-            "dead context reporting on every subsequent call — it is not a "
-            "memory shortage, and chasing it wastes time.\n"
-            "  DEVICE_LOST part-way through a run usually means a kernel "
-            "outran the GPU's job/preemption timeout and the driver reset the "
-            "engine. Check `dmesg` for xe/i915 reset or hangcheck lines. On "
-            "the Xe driver the limit is "
-            "/sys/class/drm/card*/device/tile0/gt0/engines/*/job_timeout_ms "
-            "(and preempt_timeout_us); i915 uses "
-            "i915.enable_hangcheck / preempt_timeout_ms. Re-running at a "
-            "smaller k shortens every kernel and is the fastest way to confirm "
-            "the diagnosis: if a small k completes and k=28 does not, it is "
-            "the timeout, not the code.");
+        auto const loss = async_device_loss();
+        auto message = "T1 match produced " + std::to_string(t1_count) + " entries after " +
+            std::to_string(n) + " asynchronous backend error(s). First error: " + first_async_error();
+        if (!loss.empty())
+        {
+            message += "\nDevice loss: " + loss;
+            if (lost_gpu_backend(loss) == "level_zero")
+                message += "\nOn Linux, check the xe or i915 kernel log for an engine reset.";
+        }
+        throw std::runtime_error(message);
     }
 
     throw std::runtime_error(
@@ -613,7 +603,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     uint64_t t1_count = 0;
     q.memcpy(&t1_count, d_count, sizeof(uint64_t)).wait();
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
-    validate_t1_count(t1_count, cfg.k);
+    validate_t1_count(t1_count, cfg.k, q);
 
 
     // Sort T1 by match_info (low k bits). d_storage is now repurposed
@@ -1640,7 +1630,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "[t1-debug] plain post-launch t1_count=%llu\n",
                 (unsigned long long)t1_count);
         }
-        validate_t1_count(t1_count, cfg.k);
+        validate_t1_count(t1_count, cfg.k, q);
 
         s_free(stats, d_t1_match_temp);
         s_free(stats, d_xs);
@@ -2067,7 +2057,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "[t1-debug] sliced post-launch t1_count=%llu (sum across %u sections)\n",
                 (unsigned long long)t1_count, t1_num_sections);
         }
-        validate_t1_count(t1_count, cfg.k);
+        validate_t1_count(t1_count, cfg.k, q);
 
         s_free(stats, d_t1_meta_stage);
         s_free(stats, d_t1_mi_stage);

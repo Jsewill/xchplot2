@@ -1092,6 +1092,9 @@ struct Backend
                     announce("First validated delivery from "+*name+" ("+std::to_string(task.work_units)+
                         (task.work_units == 1 ? " member)" : " members)"));
         };
+        if (args.dashboard_job) client.generation_failed = [job=args.dashboard_job](
+            group_grow::WorkerTaskObservation const& task, std::string_view cause)
+            { job->failed_delivery(task.worker_identity, task.worker_instance, cause); };
         if (args.dashboard_job) client.generation_capacity_changed =
             [job=args.dashboard_job, announce](uint8_t k, uint8_t strength, group_grow::WorkerGenerationCapacity const& available)
         {
@@ -2337,6 +2340,7 @@ struct Producer
                     uint64_t const occupied = pending.empty() && completed.empty() ? sum(other_retained, resident(values)) : held;
                     uint64_t const reserved = sum(sum(fixed, backend.retained()), occupied);
                     while (n > 1 && sum(reserved, pool_receive_bytes(index, n)) > budget) --n;
+                    if (route.paid_width && route.paid_width != n) n = 1;
                     if (n > 1)
                     {
                         if (receive_packed(scheduled, n, route))

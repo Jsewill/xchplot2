@@ -85,6 +85,9 @@ struct WorkerPackedRoute
     pool::GenerationRoute route;
     pool::Kind kind = pool::Kind::GenerateAny;
     std::shared_ptr<void> reserved_singleton;
+    struct Placement;
+    std::shared_ptr<Placement> placement;
+    unsigned paid_width = 0;
     bool matches(pool::Lease const& lease) const
     {
         return kind == lease.task.kind && route.identity == lease.worker_identity &&
@@ -347,6 +350,7 @@ struct WorkerClientConfig
         WorkerCancellation const&)> acquire_private_generation;
     std::function<WorkerGenerationCapacity(uint8_t, uint8_t)> private_generation_capacity;
     std::function<void(WorkerTaskObservation const&)> observe;
+    std::function<void(WorkerTaskObservation const&, std::string_view)> generation_failed;
     // The plotting client's normal cached broker query publishes changed
     // eligible routes. No network request is needed by a display observer.
     std::function<void(uint8_t, uint8_t, WorkerGenerationCapacity const&)> generation_capacity_changed;
