@@ -181,7 +181,7 @@ uint64_t multiply(uint64_t a, uint64_t b)
 { require(!a || b <= UINT64_MAX / a, "worker memory estimate overflow"); return a * b; }
 uint64_t broker_registration_bytes()
 {
-    return add(pool::BrokerClient::memory_bytes(1),
+    return add(add(pool::BrokerClient::memory_bytes(1), sizeof(std::string) + 254),
         multiply(max_broker_routes, sizeof(pool::Endpoint) + 2 * 254));
 }
 uint64_t service_overhead(WorkerConfig const& config, size_t brokers)
@@ -676,6 +676,7 @@ struct WorkerService::Impl
         std::string epoch;
         std::string identity, node_id;
         pool::Endpoint advertised_endpoint;
+        std::string alternate_source;
         bool healthy = false;
         bool retired = false;
         Clock::time_point seen = Clock::now();
@@ -1066,13 +1067,22 @@ struct WorkerService::Impl
             try
             {
                 pool::Endpoint address, advertised_endpoint;
+                std::string alternate_source;
                 uint64_t revision;
                 { std::lock_guard lock(brokers_mutex); address = broker->endpoint; advertised_endpoint = broker->advertised_endpoint;
-                  revision = broker->revision; }
+                  revision = broker->revision; alternate_source = broker->alternate_source; }
                 auto client = broker->client.with_deadline(Clock::now() + std::chrono::milliseconds(config.broker_refresh_ms));
                 auto value = offer();
                 bool const routed = value.endpoint.host == "0.0.0.0" || value.endpoint.host == "::";
-                if (routed) value.endpoint.host = pool::local_address(address);
+                std::string source;
+                if (routed)
+                {
+                    source = pool::local_address(address);
+                    // Simultaneous aliases can return in a different order than the
+                    // broker accepted them. Keep its working endpoint on this source.
+                    if (source == alternate_source) value.endpoint = advertised_endpoint;
+                    else value.endpoint.host = source;
+                }
                 if (revision == value.capacity_revision && value.endpoint == advertised_endpoint &&
                     client.heartbeat(instance, value.capacity_revision, value.admission))
                 {
@@ -1099,6 +1109,7 @@ struct WorkerService::Impl
                     {
                         registered.client.reroute(address); registered.endpoint = address;
                         registered.route_cursor = registered.routes.size() - 1;
+                        registered.alternate_source.clear();
                     }
                     registered.seen = Clock::now(); registered.healthy = true;
                     registered.revision = value.capacity_revision;
@@ -1108,6 +1119,7 @@ struct WorkerService::Impl
                 broker->epoch = std::move(epoch); broker->revision = value.capacity_revision;
                 broker->identity = peer; broker->node_id = node;
                 broker->advertised_endpoint = value.endpoint;
+                broker->alternate_source = routed && source != value.endpoint.host ? std::move(source) : std::string{};
                 broker->seen = Clock::now(); broker->healthy = true;
             }
             catch (...)
@@ -1117,6 +1129,7 @@ struct WorkerService::Impl
                 {
                     broker->route_cursor = (broker->route_cursor + 1) % broker->routes.size();
                     broker->endpoint = broker->routes[broker->route_cursor]; broker->client.reroute(broker->endpoint);
+                    broker->alternate_source.clear();
                 }
             }
         }));

@@ -1658,11 +1658,26 @@ void automatic_pool_growth()
     // first output. Both normal plotting sessions advertise on loopback.
     auto invitation = directory.path / "addition.invite"; pool::invite_pool(owner_id, invitation, "addition");
     auto helper_id = pool::join_pool(invitation, directory.path / "addition");
+    auto const helper_identity = pool::certificate_identity(helper_id.tls.cert_file);
     std::vector<uint64_t> remote;
+    size_t receipts_before_release;
     {
         auto helper_args = options(helper_id); pos2gpu::ComputeSession helper(helper_args);
         helper.offer_local(offer(helper_args));
         remote = generate(false, 2);
+        std::lock_guard lock(mutex);
+        require(!deliveries.empty() && deliveries.front().local_direct && deliveries.front().work_units == 1,
+            "the cold member did not finish on the original worker");
+        unsigned members = 0;
+        for (auto const& received : std::span(deliveries).subspan(1))
+        {
+            require(received.worker_identity == helper_identity && !received.local_direct &&
+                received.member_id_count && received.work_units == received.member_id_count,
+                "a held original worker or another executor supplied the helper's members");
+            members += received.member_id_count;
+        }
+        require(members == 2, "the authenticated helper did not deliver both members while the original worker was held");
+        receipts_before_release = deliveries.size();
     }
     release.set_value(); auto local = original.get();
     require(!local.empty() && local == baseline && remote.size() == local.size() * 2 &&
@@ -1675,9 +1690,9 @@ void automatic_pool_growth()
     require(current.roster && *current.roster == *initial.roster && generate(false) == local,
         "the same plotting owner did not continue on its original worker after departure");
     std::lock_guard lock(mutex);
-    auto const helper = pool::certificate_identity(helper_id.tls.cert_file);
-    require(deliveries.size() == 5 && deliveries[1].worker_identity == helper && deliveries[2].worker_identity == helper &&
-        deliveries[1].work_units == 1 && !deliveries[1].local_direct && deliveries.back().local_direct &&
+    require(deliveries.size() == receipts_before_release + 2 &&
+        std::all_of(deliveries.begin() + receipts_before_release, deliveries.end(), [&](auto const& value)
+        { return value.worker_identity == initial.roster->routes.front().identity && value.local_direct && value.work_units == 1; }) &&
         std::find(rosters.begin(), rosters.end(), 2) != rosters.end() && rosters.back() == 1,
         "active job did not report and delegate to the late authenticated node before its departure");
 }
