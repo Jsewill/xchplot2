@@ -563,7 +563,9 @@ int main(int argc, char** argv)
     assert(last_group_options.destination_temp == "off" && last_group_options.destination_temp_set);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--destination-temp", "on"}) == 0);
     assert(last_group_options.destination_temp == "on" && last_group_options.destination_temp_set);
-    put(config, "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=\"" + dir.string() + "\"\n");
+    std::ostringstream fill_config;
+    fill_config << "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=" << std::quoted(dir.string()) << '\n';
+    put(config, fill_config.str());
     assert(cli({"fill", dir.string(), "--config", config.string()}) == 0);
     assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set &&
         last_group_options.temporary == std::vector<std::filesystem::path>{dir});

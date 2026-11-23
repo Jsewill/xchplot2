@@ -4,6 +4,9 @@
 #pragma once
 #include "host/GroupFarmInventory.hpp"
 #include "host/GroupFarmMigration.hpp"
+#ifdef _WIN32
+#include <winternl.h>
+#endif
 
 namespace group_grow::farm
 {
@@ -67,9 +70,12 @@ inline inventory_detail::Handle private_directory(int root, std::string const& n
 }
 inline bool exists(int root, std::string const& relative)
 {
+    auto const path = handle_path(root) / inventory_detail::relative(relative);
     file_io::Stat value{};
-    if (!file_io::inspect_link(handle_path(root) / inventory_detail::relative(relative), &value)) return true;
-    inventory_detail::require(errno == ENOENT, "cannot inspect retirement source or claim"); return false;
+    if (!file_io::inspect_link(path, &value)) return true;
+    int const error = errno;
+    if (error == ENOENT) return false;
+    throw std::system_error(error, std::generic_category(), "cannot inspect retirement source or claim: " + relative);
 }
 inline void rename_claim(InventorySourcePin const& pin, int directory, std::string const& name)
 {
@@ -79,10 +85,22 @@ inline void rename_claim(InventorySourcePin const& pin, int directory, std::stri
     rename->ReplaceIfExists = FALSE; rename->RootDirectory = file_io::handle(directory);
     rename->FileNameLength = DWORD(filename.size() * sizeof(wchar_t));
     std::memcpy(rename->FileName, filename.data(), rename->FileNameLength);
-    // FileRenameInfo operates on this DELETE-access handle, with a simple name
-    // relative to the held target directory. A collision never replaces a file.
-    inventory_detail::require(::SetFileInformationByHandle(file_io::handle(pin.source_fd()), FileRenameInfo,
-        rename, DWORD(buffer.size())), "cannot claim retirement source without replacing another file");
+    // Native FileRenameInformation accepts a simple name relative to the held
+    // directory. The Win32 FileRenameInfo wrapper can reject that directory
+    // handle, and resolving the destination by pathname would lose the pin.
+    using SetInformation = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+    auto const module = ::GetModuleHandleW(L"ntdll.dll");
+    auto const set = module ? reinterpret_cast<SetInformation>(::GetProcAddress(module, "NtSetInformationFile")) : nullptr;
+    inventory_detail::require(set, "native handle-relative retirement rename is unavailable");
+    constexpr ULONG file_rename_information = 10;
+    HANDLE const file = file_io::handle(pin.source_fd()); IO_STATUS_BLOCK completion{};
+    NTSTATUS status = set(file, &completion, rename, ULONG(buffer.size()), file_rename_information);
+    if (status == STATUS_PENDING)
+    {
+        inventory_detail::require(::WaitForSingleObject(file, INFINITE) == WAIT_OBJECT_0, "cannot wait for native retirement claim");
+        status = completion.Status;
+    }
+    inventory_detail::require(status == 0, "cannot claim retirement source without replacing another file (NTSTATUS " + std::to_string(status) + ')');
     // NTFS write-through handles flush metadata changes including rename;
     // FlushFileBuffers additionally commits this file's cached metadata before
     // the controller can publish its claimed revision (CreateFileW/File Caching).

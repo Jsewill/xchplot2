@@ -30,7 +30,15 @@ struct CpuTime
 };
 inline std::optional<uint64_t> thread_cpu_nanoseconds()
 {
-#ifdef CLOCK_THREAD_CPUTIME_ID
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetThreadTimes(::GetCurrentThread(), &created, &exited, &kernel, &user)) return {};
+    auto ticks = [](FILETIME time) { return (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+    uint64_t const kernel_ticks = ticks(kernel), user_ticks = ticks(user);
+    constexpr uint64_t max_ticks = UINT64_MAX / 100; // FILETIME counts 100 ns intervals.
+    if (kernel_ticks <= max_ticks && user_ticks <= max_ticks - kernel_ticks)
+        return (kernel_ticks + user_ticks) * 100;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
     struct timespec value{};
     if (!::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) && value.tv_sec >= 0 && value.tv_nsec >= 0 &&
         uint64_t(value.tv_sec) <= (UINT64_MAX - uint64_t(value.tv_nsec)) / 1000000000ull)
