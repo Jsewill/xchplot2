@@ -889,8 +889,8 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
     }
     std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], true); });
     auto const longest = std::max_element(order.begin(), order.end(), [&](auto a, auto b) { return tail[a] < tail[b]; });
-    bool const small = order.size() <= exact_terminal_batches;
-    if (!small && longest == order.begin()) return {};
+    bool const enumerate_orders = order.size() <= exact_terminal_batches;
+    if (!enumerate_orders && longest == order.begin()) return {};
     std::vector<ExecutionLane> schedule(lanes.size());
     auto estimate = [&]
     {
@@ -899,7 +899,7 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
     };
     auto const ordinary = estimate();
     if (!ordinary.known) return {};
-    if (small)
+    if (enumerate_orders)
     {
         // Ranks preserve rotating priority even when two distinct batches have
         // equal timing keys. Every permutation must remain distinguishable.

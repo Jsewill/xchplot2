@@ -1891,7 +1891,16 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
     PackingCheckpointHistory checkpoint_history;
     auto interval = std::chrono::steady_clock::now();
     uint64_t buffered = 0, writeback = record.new_frontier;
-    bool observed_write = false;
+    bool observed_write = false, observed_checkpoint = false;
+    auto const initial_write_ns = stats_.write_ns;
+    auto report_write = [&](uint64_t remaining, uint64_t checkpoint_sync_ns)
+    {
+        file_io::Stat file{};
+        if (file_io::inspect_fd(fd_, &file) || file.st_blocks < 0 || uint64_t(file.st_blocks) > UINT64_MAX / 512) return;
+        auto const measured_write = stats_.write_ns - initial_write_ns;
+        auto const remaining_write = static_cast<long double>(measured_write) * remaining / (writes.chunks - remaining);
+        fresh_write_(std::max(record.storage_bytes, uint64_t(file.st_blocks) * 512), remaining_write + checkpoint_sync_ns);
+    };
 #ifdef _WIN32
     std::unique_ptr<uint8_t[]> output;
 #endif
@@ -1939,10 +1948,7 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
         if (fresh_write_ && !observed_write && length && next.remaining > count && stats_.write_ns > before_write)
         {
             observed_write = true;
-            file_io::Stat file{};
-            if (!file_io::inspect_fd(fd_, &file) && file.st_blocks >= 0 && uint64_t(file.st_blocks) <= UINT64_MAX / 512)
-                fresh_write_(std::max(record.storage_bytes, uint64_t(file.st_blocks) * 512),
-                    static_cast<long double>(stats_.write_ns - before_write) * (next.remaining - count) / count);
+            report_write(next.remaining - count, 0);
         }
         if (next.remaining == count) writes.last_write = ConstructionTiming::now();
         buffered = grow_add(buffered, offset - next.new_frontier);
@@ -1951,9 +1957,17 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
         if (buffered >= config_.checkpoint_bytes || !next.remaining)
         {
             auto const flushing = std::chrono::steady_clock::now();
+            auto const before_sync = stats_.sync_ns;
             sync();
             grow_failpoint("direct-target");
             checkpoint(next);
+            if (fresh_write_ && !observed_checkpoint && next.remaining && stats_.sync_ns > before_sync)
+            {
+                // Buffered writes can complete well before their durable checkpoint. At
+                // least one further payload and record sync remains, even after tuning.
+                observed_checkpoint = true;
+                report_write(next.remaining, stats_.sync_ns - before_sync);
+            }
             release_clean(record.new_frontier, next.new_frontier);
             auto const cost = elapsed_ns(flushing);
             tune_checkpoint(checkpoint_history, buffered, elapsed_ns(interval), cost, next.remaining ? payload_bound - next.new_frontier : 0);
