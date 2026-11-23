@@ -795,14 +795,16 @@ void late_packed_capacity()
         { return std::string(64, route.identity == fast ? 'b' : 'c'); };
     Backend constrained; constrained.mode = "pool"; constrained.cpu_scheduler = parallel.cpu_scheduler;
     constrained.pool_client_config = settings; constrained.pool_client_config.owner_id = "constrained-paid-batch";
-    Producer small{requested, nullptr, constrained, parallel_args, args.max_ram, uint64_t(64) << 20};
-    small.budget = small.fixed + constrained.retained() + small.pool_receive_bytes(0, 3) - 1;
+    Producer constrained_producer{requested, nullptr, constrained, parallel_args, args.max_ram, uint64_t(64) << 20};
+    constrained_producer.budget = constrained_producer.fixed + constrained.retained() +
+        constrained_producer.pool_receive_bytes(0, 3) - 1;
     std::vector<Member> limited;
-    auto count = small.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
-    require(count && !delivered.empty() && delivered.front().work_units == 1 && small.peak <= small.budget,
+    auto count = constrained_producer.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    require(count && !delivered.empty() && delivered.front().work_units == 1 &&
+        constrained_producer.peak <= constrained_producer.budget,
         "an unfunded exact width committed its unpriced remainder or exceeded owner RAM");
-    small.budget = args.max_ram;
-    if (count < 3) small.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    constrained_producer.budget = args.max_ram;
+    if (count < 3) constrained_producer.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
     require(members_digest(18, Members(limited), nullptr, [] {}) == canonical_packed,
         "the smaller receive grant did not preserve the canonical member set");
 
