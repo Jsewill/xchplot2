@@ -831,6 +831,8 @@ struct WorkerService::Impl
     }
     ~Impl() { stop(); }
 
+    struct AdmissionRefused : pool::TransientTransport
+    { AdmissionRefused() : pool::TransientTransport("worker is not accepting new work") {} };
     class Acceptance
     {
     public:
@@ -838,7 +840,7 @@ struct WorkerService::Impl
         {
             std::lock_guard lock(owner_.admission_mutex);
             if (owner_.admission != pool::WorkerAdmission::Accepting || owner_.stopping.load())
-                throw pool::TransientTransport("worker is not accepting new work");
+                throw AdmissionRefused();
             ++owner_.accepted_tasks;
         }
         ~Acceptance()
@@ -968,8 +970,16 @@ struct WorkerService::Impl
         }
         throw pool::StaleLease("worker does not recognize the lease's broker epoch");
     }
-    void begin_assigned(pool::BrokerClient const& broker, pool::Lease const& lease, std::string const& owner, WorkerCancellation cancel)
+    void report_refusal(pool::Lease const& lease, std::string const& owner, Clock::time_point deadline) const
     {
+        if (lease.worker_instance != instance || lease.owner_identity != owner) return;
+        try { cleanup_control(control_for(lease), config.tls).with_deadline(deadline).reject(lease, pool::FailureCode::RefusedBeforeBegin); }
+        catch (...) { /* Older brokers and failed control routes still use the direct refusal. */ }
+    }
+    void begin_assigned(std::optional<Acceptance>& accepted, pool::BrokerClient const& broker, pool::Lease const& lease,
+        std::string const& owner, WorkerCancellation cancel) try
+    {
+        accepted.emplace(*this);
         for (;;)
         {
             cancel.check();
@@ -983,7 +993,7 @@ struct WorkerService::Impl
             {
                 std::lock_guard lock(admission_mutex);
                 if (admission != pool::WorkerAdmission::Accepting)
-                    throw pool::TransientTransport("worker is not accepting new work");
+                    throw AdmissionRefused();
             }
             // A delayed pause can reach the broker after local resume. Let
             // the next heartbeat reconcile it, then recheck the original grant.
@@ -991,6 +1001,7 @@ struct WorkerService::Impl
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
+    catch (AdmissionRefused const&) { report_refusal(lease, owner, cancel.deadline); throw; }
     void refresh_brokers()
     {
         auto addresses = config.brokers;
@@ -1816,8 +1827,7 @@ struct WorkerService::Impl
             channel.set_deadline(cancel.deadline);
             broker = control_for(*lease, &registered_revision);
             auto active = broker->with_deadline(cancel.deadline);
-            accepted.emplace(*this);
-            begin_assigned(*broker, *lease, channel.peer_identity(), cancel);
+            begin_assigned(accepted, *broker, *lease, channel.peer_identity(), cancel);
             begun = true;
             Renewal renewal(active, *lease, cancelled, renewal_failure, [&]
             {
@@ -2089,6 +2099,10 @@ struct WorkerService::Impl
                 }
                 if (full)
                 {
+                    // Work can be followed immediately by codec data. Record a
+                    // verified refusal before closing a potentially unread upload.
+                    try { pool::Reader input(frame.payload); report_refusal(pool::read_lease(input), channel.peer_identity(), Clock::time_point::max()); }
+                    catch (...) { /* Malformed or stale requests cannot release a grant. */ }
                     pool::Writer out(config.tls.max_frame_bytes); out.u8(uint8_t(WorkerError::Transport)); out.string("worker admission queue is full");
                     channel.send(pool::Message::Error, out.data()); continue;
                 }
@@ -2160,8 +2174,8 @@ unsigned WorkerService::generate_assigned(pool::Lease const& lease,
     uint64_t registered_revision = 0;
     auto control = impl_->control_for(lease, &registered_revision);
     auto active = control.with_deadline(cancel.deadline);
-    Impl::Acceptance accepted(*impl_);
-    impl_->begin_assigned(control, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
+    std::optional<Impl::Acceptance> accepted;
+    impl_->begin_assigned(accepted, control, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
     std::exception_ptr renewal_failure;
     try
     {
@@ -2236,8 +2250,8 @@ void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t 
         "local packing lease targets another task or exceeds its resources");
     cancel = impl_->cancellation(cancel); auto control = impl_->control_for(lease);
     auto active = control.with_deadline(cancel.deadline);
-    Impl::Acceptance accepted(*impl_);
-    impl_->begin_assigned(control, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
+    std::optional<Impl::Acceptance> accepted;
+    impl_->begin_assigned(accepted, control, lease, pool::certificate_identity(impl_->config.tls.cert_file), cancel);
     std::exception_ptr renewal_failure;
     try
     {

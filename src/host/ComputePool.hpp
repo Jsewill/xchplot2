@@ -21,7 +21,7 @@ inline constexpr uint64_t default_codec_task_bytes = uint64_t(64) << 20;
 // A serialized codec window begins with its count. Each chunk then carries
 // ordinal, old membership/blob length and contribution/new-member counts.
 inline constexpr uint32_t codec_window_header_bytes = 4, codec_chunk_header_bytes = 18;
-enum class FailureCode : uint8_t { UnsupportedResources = 1 };
+enum class FailureCode : uint8_t { UnsupportedResources = 1, RefusedBeforeBegin };
 class UnsupportedResources : public std::runtime_error
 {
 public:

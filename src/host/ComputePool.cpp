@@ -664,6 +664,16 @@ struct BrokerServer::Impl
     }
     bool reserved(Job const& job) const
     { return job.lease && (job.state == State::Granted || job.state == State::Running || job.state == State::Cancelled); }
+    void release_unstarted(Job& job)
+    {
+        // A cold batch that never began learned nothing about its worker.
+        auto const& lease = *job.lease;
+        auto worker = workers.find(lease.worker_identity);
+        if (job.requested.work_units > 1 && worker != workers.end() && worker->second.offer.instance == lease.worker_instance)
+            for (auto& sample : worker->second.histories)
+                if (!sample.count && sample.assigned == job.assignment) sample.assigned = 0;
+        job.state = State::Finished;
+    }
     void expire()
     {
         auto const now = Clock::now();
@@ -1386,18 +1396,7 @@ struct BrokerServer::Impl
             {
                 require(it->second.requested.attempt == attempt, "stale cancellation attempt");
                 auto& job = it->second;
-                if (job.state == State::Granted)
-                {
-                    // Repartitioning a cold batch before Begin has learned
-                    // nothing. Let the replacement singleton try this route
-                    // immediately without discarding any later assignment.
-                    auto const& lease = *job.lease;
-                    auto worker = workers.find(lease.worker_identity);
-                    if (job.requested.work_units > 1 && worker != workers.end() && worker->second.offer.instance == lease.worker_instance)
-                        for (auto& sample : worker->second.histories)
-                            if (!sample.count && sample.assigned == job.assignment) sample.assigned = 0;
-                    job.state = State::Finished;
-                }
+                if (job.state == State::Granted) release_unstarted(job);
                 else if (job.state == State::Running) job.state = State::Cancelled;
                 else if (job.state == State::Queued) job.state = State::Finished;
                 job.unreported_finish = {}; job.touched = Clock::now();
@@ -1570,8 +1569,17 @@ struct BrokerServer::Impl
         {
             auto lease = read_lease(reader); auto reason = FailureCode(reader.u8()); auto update = read_update(reader);
             reader.finish();
-            require(identity == lease.worker_identity && reason == FailureCode::UnsupportedResources, "invalid worker admission rejection");
+            require(identity == lease.worker_identity && (reason == FailureCode::UnsupportedResources ||
+                (reason == FailureCode::RefusedBeforeBegin && !update)), "invalid worker admission rejection");
             auto& job = lease_job(lease);
+            if (reason == FailureCode::RefusedBeforeBegin)
+            {
+                if (job.state != State::Granted || !active_owner(job)) throw StaleLease("worker refusal needs a current unstarted grant");
+                release_unstarted(job);
+                // The worker attested that it never began this exact lease.
+                // An owner whose upload connection closed cannot abandon it later.
+                job.lease.reset(); job.touched = Clock::now(); schedule(); break;
+            }
             if (job.state != State::Running) throw StaleLease("rejected compute lease is not running");
             update_capacity(lease, update, job);
             job.state = State::Finished; job.touched = Clock::now();
