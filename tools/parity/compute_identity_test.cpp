@@ -29,7 +29,38 @@ int main()
             !authority.certificate_expires.empty() && !authority.authority_expires.empty(), "pool initialization omitted authority, identity or validity");
         rejects([&] { (void)create_pool(root / "authority", "replacement"); });
         auto invitation = root / "worker.invite";
-        invite_pool(authority, invitation, "shared worker");
+        {
+#ifdef _WIN32
+            struct Reader { HANDLE file; ~Reader() { ::CloseHandle(file); } };
+            auto const path = authority.directory / "credentials.pem";
+            Reader old{pos2gpu::create_private_file_handle(path, GENERIC_READ | DELETE, OPEN_EXISTING)};
+            BY_HANDLE_FILE_INFORMATION before{};
+            require(::GetFileInformationByHandle(old.file, &before), "cannot inspect held credential bundle");
+            validate_tls_credentials(authority.tls);
+            require(!certificate_identity(authority.tls.cert_file).empty() && certificate_node_id(authority.tls.cert_file) == authority.node_id,
+                "certificate lookup denied a delete-sharing reader");
+#endif
+            invite_pool(authority, invitation, "shared worker");
+#ifdef _WIN32
+            Reader current{pos2gpu::create_private_file_handle(path, GENERIC_READ, OPEN_EXISTING)};
+            BY_HANDLE_FILE_INFORMATION after{}, held{};
+            require(::GetFileInformationByHandle(current.file, &after) && ::GetFileInformationByHandle(old.file, &held) &&
+                (before.nFileIndexLow != after.nFileIndexLow || before.nFileIndexHigh != after.nFileIndexHigh) &&
+                before.nFileIndexLow == held.nFileIndexLow && before.nFileIndexHigh == held.nFileIndexHigh,
+                "credential publication did not preserve the old reader and expose the new bundle");
+#endif
+        }
+#ifdef _WIN32
+        {
+            auto const path = authority.directory / "credentials.pem";
+            auto held = pos2gpu::create_private_file_handle(path, GENERIC_READ, OPEN_EXISTING, 0, FILE_SHARE_READ | FILE_SHARE_WRITE);
+            auto const generation = load_pool(authority.directory)->policy_generation;
+            rejects([&] { invite_pool(authority, root / "blocked.invite", "blocked"); });
+            ::CloseHandle(held);
+            require(load_pool(authority.directory)->policy_generation == generation && !std::filesystem::exists(root / "blocked.invite"),
+                "denied credential replacement changed enrollment");
+        }
+#endif
         rejects([&] { invite_pool(authority, invitation, "replacement"); });
         auto worker = join_pool(invitation, root / "worker");
         require(load_worker_intent(worker) == WorkerIntent::Active && !std::filesystem::exists(worker.directory / "worker-control"),
