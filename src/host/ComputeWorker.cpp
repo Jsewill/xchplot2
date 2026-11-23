@@ -2831,6 +2831,8 @@ public:
         apply_offer(*at);
         bool const bounded = value.work_units <= pool::max_generation_batch_members;
         at->delivered = bounded;
+        if (bounded && !value.independent_members && value.generation_output != GenerationOutput::Contributions)
+            at->elapsed_ns[value.work_units] = value.elapsed_ns;
         bool const contributions = value.generation_output == GenerationOutput::Contributions;
         if (bounded && contributions && (value.work_units == 1 || value.independent_members))
             at->delivered_contribution = true;
@@ -2902,7 +2904,7 @@ public:
         if (at == histories_.begin() + count_) return;
         at->plan.batch = std::max(1u, at->plan.batch / 2); at->plan.concurrency = std::max(1u, at->plan.concurrency / 2);
         at->votes = 0; at->direction = 0;
-        at->rates = {}; at->independent = {}; at->prior = {}; at->independent_prior = {};
+        at->rates = {}; at->elapsed_ns = {}; at->independent = {}; at->prior = {}; at->independent_prior = {};
         at->delivered = at->delivered_contribution = false; at->joint_trial = 0; at->deferred_joint = false;
         at->independent_width = 0;
     }
@@ -2967,6 +2969,34 @@ public:
         }
         return {1 / (horizon_members ? throughput(fleet, worker_slots, low) : fastest), low, slots,
             prior_samples != 0, prior_samples, oldest_utc, measured_packed_batch};
+    }
+    long double publication_trial_ns(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output,
+        unsigned width, unsigned members, unsigned receivers, pool::GenerationRoster const& roster,
+        WorkerPackedRoute const& selected, Clock::time_point now = Clock::now())
+    {
+        retire(now);
+        if (!width || width > pool::max_generation_batch_members || (width != 1 && width != members) ||
+            !receivers || roster_.get() != &roster || !roster.complete || roster_k_ != k || roster_strength_ != strength) return 0;
+        long double slowest = 0;
+        for (auto const& route : roster.routes)
+        {
+            if (!selected.route.identity.empty() && selected.route != route) continue;
+            for (auto backend : {pool::Kind::GenerateCpu, pool::Kind::GenerateGpu})
+            {
+                if (!(backend == pool::Kind::GenerateGpu ? route.gpu_slots : route.cpu_slots) ||
+                    (kind != pool::Kind::GenerateAny && kind != backend) ||
+                    (!selected.route.identity.empty() && selected.kind != backend)) continue;
+                auto const end = histories_.begin() + count_;
+                auto const at = std::find_if(histories_.begin(), end, [&](auto const& item)
+                { return item.matches(k, strength, backend, output) && item.peer.worker == text<64>(route.identity) &&
+                    same_route(item.peer, route); });
+                if (at == end || !at->elapsed_ns[width]) return 0;
+                slowest = std::max<long double>(slowest, at->elapsed_ns[width]);
+            }
+        }
+        // An unpinned singleton can go to any eligible backend. The slowest
+        // such receipt controls the wave even when fleet throughput is high.
+        return slowest * (width == members ? 1 : 1 + (members - 1) / receivers);
     }
     bool probe_contribution_route(uint8_t k, uint8_t strength, Clock::time_point now = Clock::now())
     {
@@ -3466,6 +3496,7 @@ private:
         Clock::time_point trial_until{};
         bool offered = true, delivered = false, delivered_contribution = false, deferred_joint = false;
         std::array<Rate, pool::max_generation_batch_members + 1> rates{};
+        std::array<uint64_t, pool::max_generation_batch_members + 1> elapsed_ns{};
         Rate independent;
         struct Prior : Rate { Clock::time_point until{}; unsigned dated_samples = 0; uint64_t oldest_utc = 0; };
         std::array<Prior, pool::max_generation_batch_members + 1> prior{}, independent_prior{};
@@ -4869,6 +4900,22 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     if (destinations < std::min(hint.slots, impl_->config.max_active_generation)) return 1;
     return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, GenerationOutput::Packed,
         ready, destinations, hint.slots, width, 1, Clock::now(), 0, batch_route);
+}
+std::optional<long double> WorkerClient::publication_trial_ns(uint8_t k, uint8_t strength, GenerationOutput output, unsigned members,
+    bool joint_packed, WorkerGenerationCapacity const& capacity) const
+{
+    if (!members || !capacity.roster || !capacity.roster->complete) return {};
+    WorkerPackedRoute route;
+    auto width = members;
+    if (output == GenerationOutput::Packed)
+        width = joint_packed ? packed_generation_width(k, strength, members, 1, &route, nullptr, Clock::now()) : 1;
+    auto const receivers = width == 1 ? suggested_generation_concurrency(k, strength, members, output) : 1u;
+    std::lock_guard lock(impl_->planning_mutex);
+    auto const& hint = impl_->generation_capacity;
+    if (hint.k != k || hint.strength != strength || hint.value.roster != capacity.roster || hint.value.batch != capacity.batch ||
+        hint.value.slots != capacity.slots || hint.value.availability.admission != capacity.availability.admission) return {};
+    return impl_->planning.publication_trial_ns(k, strength, impl_->config.generation_kind, output,
+        width, members, receivers, *capacity.roster, route);
 }
 bool WorkerClient::codec_probe_available(uint8_t k, uint64_t timeout_ns) const
 {

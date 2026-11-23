@@ -96,6 +96,14 @@ struct GenerationSupply
     { return slots == other.slots && !roster.owner_before(other.roster) && !other.roster.owner_before(roster); }
 };
 
+// Current work and future files on one writer, bounded by both hard quotas.
+inline uint64_t remaining_publication_members(uint64_t member_limit, uint64_t completed, uint64_t file_limit,
+                                                 uint64_t ordinal, uint64_t file_members)
+{
+    uint64_t const members = member_limit - std::min(member_limit, completed), files = file_limit - std::min(file_limit, ordinal);
+    return file_members && files > members / file_members ? members : files * file_members;
+}
+
 // Compare complete waves of like-sized groups on rotating destinations. A wave
 // starts before the first generation request and ends after its last publication.
 // This charges transfer, temporary I/O and contention across overlapping writers.
@@ -193,6 +201,25 @@ public:
                 return Choice{right >= left ? best.width + right / 2 : best.width - left / 2, best.encoded, true};
         }
         return best;
+    }
+    template<class TrialCost>
+    std::optional<bool> finite_output(Shape shape, uint64_t remaining_members, uint64_t deadline_ns,
+                                      TrialCost const& trial_cost) const
+    {
+        if (shape != shape_) return {};
+        for (auto const& result : results_) if (result.width == 1)
+        {
+            auto const packed = result.times[false].member_ns(), fresh = result.times[true].member_ns();
+            if (bool(packed) == bool(fresh)) return {};
+            // Even instantaneous future publications cannot save more than
+            // this sole writer's measured time for the remaining hard quota.
+            auto const remaining_ns = std::max(packed, fresh) * std::max<uint64_t>(shape.members, remaining_members);
+            if (remaining_ns > deadline_ns) return {};
+            // No current incumbent, unknown trial, or a measured first wave.
+            auto const cost = trial_cost(!fresh);
+            if (cost && (*cost ? *cost : deadline_ns) >= remaining_ns) return fresh != 0;
+        }
+        return {};
     }
     bool final_group_encoded(Shape shape, bool encoded, bool fixed_width,
                              long double packed_member_ns, long double fresh_member_ns) const

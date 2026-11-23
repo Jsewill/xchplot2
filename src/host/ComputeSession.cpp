@@ -409,7 +409,8 @@ struct ComputeSession::Impl
         }
         else
         {
-            if (identity.defaults.discovery) discovery = std::make_shared<pool::ComputeDiscovery>(discovery_options(identity));
+            if (identity.defaults.discovery && args.automatic_local_compute)
+                discovery = std::make_shared<pool::ComputeDiscovery>(discovery_options(identity));
             if (verbose) std::cerr << "[compute] Using broker " << args.pool_broker << '\n';
         }
         if (discovery && discovery->status() != "LAN discovery active")
