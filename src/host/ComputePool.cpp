@@ -981,9 +981,12 @@ struct BrokerServer::Impl
         for (auto const* running : active)
         {
             auto const& lease = *running->lease;
-            if (running->owner != waiting.owner || (lease.worker_identity == idle && lease.task.kind == idle_kind)) continue;
+            if (lease.worker_identity == idle && lease.task.kind == idle_kind) continue;
             auto const at = workers.find(lease.worker_identity);
-            if (at == workers.end() || at->second.offer.instance != lease.worker_instance || at->second.offer.endpoint != lease.endpoint) continue;
+            if (at == workers.end() || at->second.offer.instance != lease.worker_instance ||
+                at->second.offer.endpoint != lease.endpoint || running->granted_at < at->second.route_since) continue;
+            // The current owner's delivery predicts when the lease releases.
+            // Each queued owner still needs its own estimate on this route.
             auto const ready = remaining_on_lease(at->second, waiting, *running, now);
             if (ready <= 0 || ready >= idle_ns || ready >= Nanoseconds(running->expires - now).count()) continue;
             auto capacity = free.at(at->first); auto const& held = lease.task.resources;

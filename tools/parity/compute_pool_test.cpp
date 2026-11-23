@@ -1224,6 +1224,63 @@ void parallel_generation_tail(BrokerOptions options, TlsOptions const& owner_tls
     require(extra && third.begin(*extra, extra->owner_identity), "an idle third worker was held after it could shorten delivery");
     third.finish(*extra); first.finish(*active_first); second.finish(*active_second);
 }
+void other_owner_generation_release(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& fast_tls,
+                                    TlsOptions const& slow_tls)
+{
+    options.lease_ms = 120000; options.worker_ms = 30000; options.max_tasks = 32;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), fast(endpoint, fast_tls), slow(endpoint, slow_tls);
+    auto batch = owner.open_owner("batch-destination"), single = owner.open_owner("single-destination");
+    auto enroll = [&](BrokerClient& worker, char const* instance, uint16_t port, unsigned members)
+    {
+        auto advertised = offer(instance, port); auto model = profile(Kind::GenerateGpu);
+        model.k = 28; model.max_batch_members = members; advertised.generation_profiles = {model};
+        advertised.capabilities |= capability(Kind::GenerateGpu); advertised.capacity.gpu_bytes = model.resources.gpu_bytes;
+        worker.register_worker(advertised);
+    };
+    enroll(fast, "wide", 49502, 4); enroll(slow, "narrow", 49503, 1);
+    auto generation = [](uint64_t sequence, unsigned members)
+    {
+        auto request = task("generation-" + std::to_string(sequence), sequence); request.kind = Kind::GenerateGpu;
+        request.k = 28; request.work_units = members; request.generation_output = GenerationOutput::Fresh;
+        return request;
+    };
+    auto start = [&](BrokerClient& worker, OwnerSession const& session, Task const& request)
+    {
+        auto lease = owner.acquire(session, request);
+        require(lease && worker.begin(*lease, lease->owner_identity), "generation did not start on its expected worker");
+        return *lease;
+    };
+    auto complete = [&](BrokerClient& worker, Lease const& lease, uint64_t elapsed)
+    { worker.finish(lease); owner.delivered(lease, {elapsed, 32, 1024}); };
+
+    // The receiver first measures the idle route. Even with the batch
+    // owner's timings, it still needs its own delivery on the wide worker.
+    for (uint64_t sequence = 1; sequence <= 2; ++sequence)
+    {
+        auto active = start(fast, batch, generation(sequence, 4));
+        auto first = start(slow, single, generation(sequence, 1));
+        complete(slow, first, 96000000000ULL); complete(fast, active, 19000000000ULL);
+    }
+    auto measured = start(fast, single, generation(3, 1)); complete(fast, measured, 6000000000ULL);
+
+    auto active = start(fast, batch, generation(3, 4)); auto waiting = generation(4, 1);
+    require(!owner.acquire(single, waiting), "an idle worker took a measured singleton that would finish sooner after another owner's lease");
+    complete(fast, active, 19000000000ULL);
+    auto released = start(fast, single, waiting); complete(fast, released, 6000000000ULL);
+
+    active = start(fast, batch, generation(4, 4)); auto urgent = generation(5, 1);
+    auto bounded = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+    auto immediate = bounded.acquire(single, urgent);
+    require(immediate && slow.begin(*immediate, immediate->owner_identity), "another owner's predicted release exceeded the start deadline");
+    complete(slow, *immediate, 96000000000ULL);
+    waiting = generation(6, 1);
+    require(!owner.acquire(single, waiting), "a measured lone owner did not wait for the busy route");
+    auto competing = generation(5, 4);
+    require(!owner.acquire(batch, competing), "a queued competing batch overcommitted its worker");
+    auto shared = start(slow, single, waiting);
+    owner.cancel(batch, competing.task_id, competing.attempt); slow.finish(shared); fast.finish(active);
+}
 void generation_pending_delivery(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& slow_tls,
                                  TlsOptions const& fast_tls, TlsOptions const& spare_tls)
 {
@@ -1948,6 +2005,7 @@ int main() try
     batched_profiles(options, a_tls, tls(ca, wa));
     independent_members(options, a_tls, tls(ca, wa), tls(ca, wb));
     parallel_generation_tail(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
+    other_owner_generation_release(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_pending_delivery(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
     generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));

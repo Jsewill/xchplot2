@@ -220,6 +220,9 @@ bool device_memory_probe(int device_ordinal,
                          size_t& total_bytes,
                          bool    physical_space = false);
 
+// Auto-detected GPU bytes a compute worker can offer. Zero means unavailable.
+size_t worker_gpu_available_bytes(int device_ordinal);
+
 // VRAM the picker holds back beyond a path's model peak, shared by the pool
 // gate and the streaming tier picker.
 //

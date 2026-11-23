@@ -642,9 +642,7 @@ void default_worker_resources(WorkerConfig& config)
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     if (config.backend != "cpu" && !config.capacity.gpu_bytes)
     {
-        size_t available = 0, total = 0;
-        if (pos2gpu::device_memory_probe(config.device, available, total))
-            config.capacity.gpu_bytes = std::min(available, total);
+        config.capacity.gpu_bytes = pos2gpu::worker_gpu_available_bytes(config.device);
         require(config.backend != "gpu" || config.capacity.gpu_bytes,
             "cannot determine worker GPU memory; set --gpu-bytes");
     }
