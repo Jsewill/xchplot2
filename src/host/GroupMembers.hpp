@@ -456,6 +456,7 @@ public:
 private:
     friend class CompactMemberBuilder;
     friend class CompactMemberReceiver;
+    friend std::array<uint8_t, 32> members_digest(uint8_t, Members, MemberBatchHash const*, std::function<void()> const&);
     static void update(pos2_sha256_state* state, MemberView view, size_t& offset, size_t& chunk,
                        size_t available, std::function<void()> const& check_running = {})
     {
@@ -965,7 +966,21 @@ inline std::array<uint8_t, 32> members_digest(uint8_t k, Members members,
         catch (...) { reader.error = std::current_exception(); return -1; }
     };
     std::array<uint8_t, 32> result{};
-    int const status = pos2_sha256_stream(next, &reader, result.data());
+    int status;
+    if (hash && hash->size() && hash->size() < members.size() && hash->digest_for(members.subspan(0, hash->size())))
+    {
+        // Foreground CPU interrupted the producer between members. Resume the
+        // ordinary digest reader at the first member outside its sealed prefix.
+        reader.member = hash->size();
+        MemberBatchHash::State state(pos2_sha256_state_clone(hash->prefixes_[reader.member - 1].state.get()));
+        group_tools::require(bool(state), "cannot clone group hash state");
+        pos2_sha256_segment segment{};
+        while (next(&reader, &segment) == 1)
+            group_tools::require(pos2_sha256_state_update(state.get(), segment.data, segment.len) == POS2_OK,
+                "cannot hash incoming group members");
+        status = pos2_sha256_state_digest(state.get(), result.data());
+    }
+    else status = pos2_sha256_stream(next, &reader, result.data());
     if (reader.error) std::rethrow_exception(reader.error);
     group_tools::require(status == POS2_OK, "cannot hash incoming group members");
     return result;

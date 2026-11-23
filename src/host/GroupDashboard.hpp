@@ -312,7 +312,7 @@ class DashboardJob
         auto const elapsed = std::chrono::duration<double>(now - started_).count();
         auto const last = std::chrono::duration<double>(last_publication_ - started_).count();
         frame.summary = std::to_string(fresh_) + " new durable members   " +
-                        (fresh_ ? dashboard_number(last / fresh_) + " s/member through publication"
+                        (fresh_ ? dashboard_number(elapsed / fresh_) + " s/member since start"
                                 : "Waiting for first new publication");
         frame.add(DashboardFrame::overview,
                   std::to_string(files_) + " published files   " + std::to_string(inherited_) + " inherited members");

@@ -200,11 +200,12 @@ struct BrokerClient::Connections
     ControlMetrics metrics;
     Endpoint endpoint;
     uint64_t route_revision = 1;
-    std::atomic<bool> generation_routes{true}, gpu_recovery{true};
-    std::atomic<bool> generation_backlog{true};
-    // An answer from the previous broker must not disable its replacement.
-    // Pricing and finite acquisition were introduced together on protocol 8.
-    struct GenerationApi { std::atomic<bool> finite{true}, paths{true}; };
+    // Each request records unsupported operations against the broker it queried.
+    // An older reply in flight must not disable them on the replacement.
+    struct GenerationApi
+    {
+        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true};
+    };
     std::atomic<std::shared_ptr<GenerationApi>> generation_api{std::make_shared<GenerationApi>()};
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
     {
@@ -312,7 +313,6 @@ OwnerSession BrokerClient::open_owner(std::string const& owner_id, bool ephemera
 {
     auto writer = request(Operation::OpenOwner); writer.string(owner_id); writer.u8(ephemeral); auto bytes = call(writer);
     Reader reader(bytes); auto result = read_session(reader); reader.finish();
-    connections_->generation_routes.store(true); connections_->generation_backlog.store(true);
     connections_->generation_api.store(std::make_shared<Connections::GenerationApi>()); return result;
 }
 void BrokerClient::close_owner(OwnerSession const& session)
@@ -332,7 +332,7 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
         auto const left = std::chrono::ceil<std::chrono::milliseconds>(tls_.deadline - now).count();
         if (left <= 0) throw TransientTransport("broker control request timed out");
         remaining = uint32_t(std::min<int64_t>(left, UINT32_MAX));
-        if (task.kind != Kind::Pack && (task.independent_members || connections_->generation_backlog.load()) && other_work_until > now)
+        if (task.kind != Kind::Pack && (task.independent_members || api->backlog.load()) && other_work_until > now)
         {
             auto const ahead = std::chrono::duration_cast<std::chrono::milliseconds>(other_work_until - now).count();
             backlog = uint32_t(std::min<int64_t>(remaining, ahead));
@@ -351,7 +351,7 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
         // Older protocol-8 brokers reject this optional field before opening
         // or granting the job. Only that explicit rejection permits fallback.
         if (task.independent_members || !backlog) throw;
-        connections_->generation_backlog.store(false); return acquire(owner, task);
+        api->backlog.store(false); return acquire(owner, task);
     }
     Reader reader(bytes); auto const present = reader.u8(); require(present <= 1, "invalid broker grant flag");
     std::optional<Lease> result; if (present)
@@ -397,17 +397,18 @@ uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& ta
         if (availability) writer.string(codec);
         return call(writer);
     };
-    bool routes = roster && connections_->generation_routes.load();
+    auto const api = connections_->generation_api.load();
+    bool routes = roster && api->routes.load();
     std::vector<uint8_t> bytes;
-    bool recovery = routes && connections_->gpu_recovery.load();
+    bool recovery = routes && api->gpu_recovery.load();
     if (recovery) try { bytes = query(Operation::GenerationRoutesGpuRecovery); }
-    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); recovery = false; }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); recovery = false; }
     if (routes && !recovery) try { bytes = query(Operation::GenerationRoutes); }
     catch (UnknownOperation const&)
     {
         // Older compatible brokers still supply the aggregate capacity. Only
         // an explicitly unknown advisory operation selects this fallback.
-        connections_->generation_routes.store(false); routes = false;
+        api->routes.store(false); routes = false;
     }
     if (!routes) bytes = query(availability ? Operation::GenerationAvailability : Operation::GenerationHint);
     Reader reader(bytes); auto const result = reader.u32(), parallel = reader.u32();
@@ -482,7 +483,9 @@ void BrokerClient::renew(Lease const& lease)
 std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recovering_gpu(WorkerOffer const& offer,
     bool retain_route, std::string* peer_identity, std::string* peer_node_id)
 {
-    if (offer.gpu_recovery.empty() || !connections_->gpu_recovery.load()) return {};
+    if (offer.gpu_recovery.empty()) return {};
+    auto const api = connections_->generation_api.load();
+    if (!api->gpu_recovery.load()) return {};
     auto writer = request(Operation::RegisterGpuRecovery); write_offer(writer, offer);
     writer.u8(retain_route); writer.string(offer.gpu_recovery);
     try
@@ -492,7 +495,7 @@ std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recoverin
         require(!epoch.empty() && endpoint.port, "invalid GPU recovery registration");
         return std::pair{std::move(epoch), std::move(endpoint)};
     }
-    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); return {}; }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); return {}; }
 }
 std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string* peer_identity, std::string* peer_node_id)
 {
@@ -593,10 +596,11 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
         auto writer = request(op); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
         return call(writer, &result.identity);
     };
-    bool recovery = query.section == StatusSection::Workers && connections_->gpu_recovery.load();
+    auto const api = connections_->generation_api.load();
+    bool recovery = query.section == StatusSection::Workers && api->gpu_recovery.load();
     std::vector<uint8_t> bytes;
     if (recovery) try { bytes = page(Operation::StatusGpuRecovery); }
-    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); recovery = false; }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); recovery = false; }
     if (!recovery) bytes = page(Operation::Status);
     Reader in(bytes); result.section = StatusSection(in.u8());
     require(result.section == query.section, "broker status section mismatch");
