@@ -2763,14 +2763,12 @@ For boundary tests and the limits of software caps, see
 Lower VRAM tiers keep more intermediate data in host RAM. A tier can fit
 the GPU and still exceed the host's available memory.
 
-xchplot2 models each tier's host peak and checks it before allocating
-anything. When the tier does not fit, it **tries to spill eligible cold tables to a
-usable temporary directory** by default. If the remaining working set still does not fit, it refuses.
-Automatic spill is used only when admission would otherwise fail.
+xchplot2 checks each tier's estimated host peak before allocation. If the tier
+would exceed available host RAM, the plotter automatically tries to reduce its
+working set. If the remaining working set still does not fit, it refuses the plot.
 
 ```bash
-# Nothing to do — this is the default. A host that is short on RAM
-# spills, announces it, and plots.
+# Use the default automatic host RAM budget when RAM is tight.
 xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-address>
 
 # Put the spill somewhere specific (a fast NVMe, not the array).
@@ -2785,29 +2783,26 @@ xchplot2 plot ... --max-host-ram min
 xchplot2 plot ... --no-auto-spill
 ```
 
-`--auto-spill` re-enables automatic spilling after an earlier
-`--no-auto-spill` flag or configuration setting. The environment override
-`XCHPLOT2_NO_AUTO_SPILL=1` still disables it; unset that variable to re-enable it.
+`--no-auto-spill` disables this automatic fallback. An explicit `--max-host-ram`
+budget still applies and can route tables to disk. Use `--auto-spill` to re-enable
+the fallback after an earlier flag or configuration setting. If you set
+`XCHPLOT2_NO_AUTO_SPILL=1`, unset it to re-enable the fallback.
 
-What gets spilled, in order, largest first — and only as far as the
-budget requires:
+The plotter makes these adjustments in order until the budget fits.
 
-1. the cold cap-sized tables, streamed through two shared 32 MiB staging
-   windows (64 MiB in total, however many tables spill) so the disk I/O
-   overlaps compute. Which tables depends on the tier: `tiny` and `pinned` route
-   `h_t1_meta`, `h_t3`, `h_t2_meta`, `h_t2_xbits`; `compact` and
-   `minimal` route `h_t3`, `h_frags`, `h_t2_xbits`;
-2. the D2H drain slots, 3 → 1, **last**. Spilling a table costs disk
-   I/O per plot; a drain slot costs producer/consumer overlap across
-   plots, which is the more expensive of the two in a batch.
+1. Spill the cold cap-sized tables largest first. Two shared 32 MiB staging
+   windows let disk I/O overlap compute. The `tiny` and `pinned` tiers can route
+   `h_t1_meta`, `h_t3`, `h_t2_meta` and `h_t2_xbits`. The `compact` and
+   `minimal` tiers can route `h_t3`, `h_frags` and `h_t2_xbits`.
+2. Reduce the D2H drain slot count from three toward one. Fewer slots use less
+   pinned host RAM and reduce producer/consumer overlap across plots.
 
 Notes:
 
-- **The temp dir must be real disk.** `/tmp` is tmpfs on most systemd
-  distributions, i.e. RAM — spilling there consumes the memory the
-  budget exists to bound. xchplot2 refuses a RAM-backed temp dir up
-  front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow RAM-backed spill), and checks the dir exists and is writable before
-  starting rather than failing mid-batch.
+- **Only spilled tables need a temp directory.** Before spilling, xchplot2
+  checks that the directory is writable and disk-backed. Spilling to a
+  RAM-backed directory such as a `/tmp` mounted on tmpfs consumes host memory.
+  Set `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow it.
 - **Budget ~7.1 GiB of free space** for tiny at k=28, ~5.1 GiB for
   compact or minimal — the latter two route `h_frags` as well, a full
   2.03 GiB table even though it makes no engine I/O. This is checked
@@ -2988,9 +2983,9 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny\|pinned` | Force a streaming tier even when the pool fits. A non-auto `--tier` takes precedence. See [memory requirements](#memory-requirements). |
-| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's unswappable (pinned + anonymous) host peak, spilling the cold cap-sized tables to `--temp-dir` largest-first — and then the D2H drain slots, 3 → 1 — until the model fits. `min` takes everything this tier can. Equivalent CLI flag: `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
-| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then `/tmp`. **Must be real disk** — a RAM-backed dir is refused up front, since spilling to tmpfs consumes the memory the budget exists to bound. Equivalent CLI flag: `--temp-dir`. |
-| `XCHPLOT2_NO_AUTO_SPILL=1`    | Refuse to plot when the tier does not fit host RAM, instead of spilling automatically. The automatic spill only ever fires where the run would otherwise be rejected, so this trades a slower plot for a clear error. Equivalent CLI flag: `--no-auto-spill`. |
+| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's pinned and anonymous host memory. The plotter spills eligible tables largest first, then reduces the D2H drain slot count until the model fits. `min` spills every eligible table and uses one drain slot unless its count was set explicitly. Equivalent to `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
+| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then the system temp directory. The plotter checks this directory when it routes tables to disk. Equivalent CLI flag: `--temp-dir`. |
+| `XCHPLOT2_NO_AUTO_SPILL=1`    | Disable the automatic host-RAM fallback. An explicit host RAM budget can still route tables to disk. Equivalent to `--no-auto-spill`. |
 | `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` | Allow a RAM-backed spill directory with a warning. The spilled bytes consume RAM outside the stated host budget. No override is needed for a disk-backed directory. |
 | `XCHPLOT2_HOST_RESERVE_MB=N`  | Host RAM left for the rest of the box when admitting a streaming tier. Default 512. |
 | `XCHPLOT2_DRAIN_SLOTS=N`      | Pin the D2H drain slot count (1-3) and skip the budget's automatic reduction. Fewer slots means less pinned host memory and less producer/consumer overlap. |

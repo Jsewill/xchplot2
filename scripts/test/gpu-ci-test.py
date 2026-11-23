@@ -169,6 +169,10 @@ if kind == "batch":
         sys.exit(19)
     if failure == "correctness":
         assert int(os.environ["POS2GPU_MAX_VRAM_MB"]) > 0
+    if "--temp-dir" in sys.argv and Path(sys.argv[sys.argv.index("--temp-dir") + 1]).is_file():
+        if sys.argv[sys.argv.index("--max-host-ram") + 1] == "min":
+            print("unrelated failure" if failure == "spill-rejection" else "no spill file can be created")
+            sys.exit(1)
     tier = sys.argv[sys.argv.index("--tier") + 1]
     print(f"streaming tier: {tier} (")
     print("-> disk")
@@ -213,6 +217,7 @@ if kind == "verify":
              ("zero-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("missing-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("vector-parity", "index-meta-max-tiny-parity", "RuntimeError", None),
+             ("spill-rejection", "index-meta-max-tiny-unusable-spill", "RuntimeError", None),
              ("none", "complete", None, None),
              ("shared-quick", "complete", None, None),
              ("correctness", "complete", None, None))
@@ -261,7 +266,7 @@ if kind == "verify":
             assert summary["reference_sha256"] == summary["vectors"][0]["reference_sha256"]
             calls = [json.loads(line) for line in (root / f"{failure}-calls.jsonl").read_text().splitlines()]
             assert sum(command[0] == "test" for command in calls) == 3
-            assert sum(command[0] == "batch" for command in calls) == 27
+            assert sum(command[0] == "batch" for command in calls) == 28
             assert sum(command[0] == "verify" for command in calls) == 27
             for vector in summary["vectors"]:
                 prefix = "" if vector["name"] == "baseline" else vector["name"] + "-"

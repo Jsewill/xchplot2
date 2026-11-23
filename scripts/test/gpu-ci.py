@@ -177,13 +177,15 @@ def main():
         env["TMPDIR"] = str(scratch)
         binary = args.binary.resolve() if args.binary else build / "tools/xchplot2/xchplot2"
 
-        def run(label, command, run_env=None, cwd=None):
+        def run(label, command, run_env=None, cwd=None, expect_error=None):
             summary["stage"] = label
             summary["log"] = f"{label}.log"
             print(f"Running {label}", flush=True)
             with (logs / f"{label}.log").open("w") as log:
-                subprocess.run([str(v) for v in command], env=run_env or env, cwd=cwd,
-                               stdout=log, stderr=subprocess.STDOUT, check=True)
+                result = subprocess.run([str(v) for v in command], env=run_env or env, cwd=cwd,
+                                        stdout=log, stderr=subprocess.STDOUT, check=expect_error is None)
+            if expect_error and (not result.returncode or expect_error not in (logs / f"{label}.log").read_text()):
+                raise RuntimeError(f"{label}: expected rejection containing '{expect_error}'")
 
         def verify(label, plot):
             run(label, [binary, "verify", plot, "--full", "--trials", "100", "--config", "/dev/null"])
@@ -268,10 +270,16 @@ def main():
                                 f"{vector['group_id']} {vector['memo']} . {plot.name}\n")
                             command = [binary, "batch", manifest, "--devices", "0", "--tier", tier,
                                        "--verbose", "--no-progress", "--config", "/dev/null"]
-                            if spill:
-                                command += ["--max-host-ram", "min", "--temp-dir", work]
                             plot_env = (dict(env, POS2GPU_MAX_VRAM_MB=str(caps[tier]))
                                         if args.suite in ("correctness", "vram") else env)
+                            if spill:
+                                command += ["--max-host-ram", "min", "--temp-dir", work]
+                            elif vector["name"] == "index-meta-max" and tier == "tiny" and tier in info["spill_tiers"]:
+                                # The manifest is a regular file. Only a plan routing tables to disk needs a directory.
+                                command += ["--temp-dir", manifest, "--no-auto-spill"]
+                                run(f"{label}-unusable-spill", [*command, "--max-host-ram", "min"], plot_env, cwd=work,
+                                    expect_error="no spill file can be created")
+                                command += ["--max-host-ram", env.get("XCHPLOT2_MAX_HOST_RAM", "2G")]
                             run(label, command, plot_env, cwd=work)
                             summary["stage"] = f"{label}-parity"
                             trace = (logs / f"{label}.log").read_text()

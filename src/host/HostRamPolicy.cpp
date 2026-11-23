@@ -97,7 +97,7 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
                         Passes passes, bool mmap_class = false) {
         if (!available) return;
         routable_total += table;
-        if (B == 0 || est > B) {
+        if (bit || B == 0 || est > B) {
             bit = true;
             est -= std::min(table, est);
             out.spilled_bytes += table;
@@ -114,6 +114,7 @@ HostRamSpillPlan plan_host_ram_spill(HostRamSpillInputs const& in)
 
     // Which tables are routable per tier, and why the rest are not, is
     // documented at the call site in BatchPlotter::run().
+    out.tables.h_t1_meta = in.tier_tiny && in.force_t1_meta;
     consider(table8, in.tier_tiny,                        out.tables.h_t1_meta,
              kT1MetaPasses);
     consider(table8, in.tier_streams,                     out.tables.h_t3,
