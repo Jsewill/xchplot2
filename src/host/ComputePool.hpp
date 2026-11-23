@@ -310,6 +310,9 @@ public:
         std::chrono::steady_clock::time_point other_work_until = {});
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
+    using GenerationPaths = std::vector<std::pair<std::string, std::string>>;
+    bool generation_paths(OwnerSession const&, GenerationPaths const&);
+    std::optional<std::pair<std::string, Kind>> finite_packed_route(OwnerSession const&, Task const&);
     struct GenerationAvailability
     {
         // Common width for planning, or the largest eligible width when
@@ -353,7 +356,7 @@ public:
     void finish(Lease const&, std::optional<CapacityUpdate> const& update = {});
     // Owner reports successful receipt and validation, independently of local
     // durable plot commit. Failure to report must not discard accepted data.
-    void delivered(Lease const&, DeliveryObservation const&);
+    void delivered(Lease const&, DeliveryObservation const&, std::string const& generation_path = {});
     // Worker rejects unsupported admission before starting compute or output.
     // A retry of this logical task skips that concrete worker/backend pair.
     void reject(Lease const&, FailureCode, std::optional<CapacityUpdate> const& update = {});

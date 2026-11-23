@@ -139,6 +139,7 @@ public:
     // Physical adapter associated with this socket's local address, when
     // unique. Virtual, ambiguous and unavailable paths return zero.
     uint32_t ingress_interface() const noexcept;
+    std::string local_address() const;
     bool generation_timing() const;
     std::string const& peer_node_id() const;
     explicit operator bool() const noexcept { return bool(impl_); }
@@ -176,5 +177,5 @@ void validate_tls_credentials(TlsOptions const&);
 std::string certificate_node_id(std::string const& cert_file);
 Endpoint parse_endpoint(std::string const&);
 // Address of the local interface used to reach this peer; sends no data.
-std::string local_address(Endpoint const&);
+std::string local_address(Endpoint const&, uint32_t* physical_interface = nullptr);
 } // namespace group_grow::pool

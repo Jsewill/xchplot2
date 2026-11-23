@@ -162,6 +162,7 @@ std::exception_ptr task_failure(std::exception_ptr original, std::exception_ptr 
 {
     if (renewal) try { std::rethrow_exception(original); }
     catch (TaskCancelled const&) { return renewal; }
+    catch (WorkerTaskTimeout const&) { return renewal; }
     catch (...) {}
     return original;
 }
@@ -567,7 +568,7 @@ void WorkerCancellation::check() const
     if ((stop && stop->load(std::memory_order_acquire)) ||
         (upstream_stop && upstream_stop->load(std::memory_order_acquire))) throw TaskCancelled("worker task cancelled");
     if (service_stop && service_stop->load(std::memory_order_acquire)) throw TaskCancelled("worker service stopped");
-    if (Clock::now() >= deadline) throw TaskCancelled("worker task deadline expired");
+    if (Clock::now() >= deadline) throw WorkerTaskTimeout("worker task deadline expired");
 }
 uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
 {
@@ -2769,7 +2770,7 @@ public:
         if (at->peer != peer)
         {
             erase([&](History const& item) { return item.peer.worker == peer.worker; });
-            at->peer = peer; at->first = selection; at->in_flight = 0;
+            at->peer = peer; at->first = selection; at->in_flight = 0; at->packed_singleton.reset();
         }
         at->last = selection; at->seen = now; at->sequence = sequence_; ++at->in_flight;
         at->delivery_ns = 0; at->packed_since = {};
@@ -3130,6 +3131,56 @@ public:
         }
         return first;
     }
+    bool useful_packed_singleton(uint8_t k, uint8_t strength, pool::Kind kind, unsigned width, unsigned receivers,
+                                 Clock::time_point now, Clock::time_point other_work_until, std::shared_ptr<void>& reservation)
+    {
+        if (other_work_until <= now || width < 2 || width > pool::max_generation_batch_members ||
+            !roster_ || !roster_->complete || roster_k_ != k || roster_strength_ != strength) return false;
+        retire(now);
+        auto const horizon = std::chrono::duration<long double, std::nano>(other_work_until - now).count();
+        std::array<History const*, maximum> workers{};
+        std::array<unsigned, maximum> slots{};
+        std::array<Route, maximum> routes{};
+        size_t count = 0, entries = 0, spare = maximum;
+        long double earliest = std::numeric_limits<long double>::max(), singleton = earliest;
+        for (auto const& item : std::span(histories_).first(count_))
+        {
+            if (!item.matches(k, strength, kind, GenerationOutput::Packed)) continue;
+            auto const& rate = item.packed_rate(width, 1);
+            if (!rate.samples) continue;
+            size_t worker = 0;
+            while (worker < count && workers[worker]->peer.worker != item.peer.worker) ++worker;
+            if (worker == count) workers[count++] = &item;
+            slots[worker] = std::max(slots[worker], item.slots);
+            auto const peer = current(item.peer.worker);
+            auto const& one = item.rates[1];
+            auto const& full = item.rates[width];
+            auto const& rest = item.rates[width - 1];
+            bool const idle = peer->in_flight < item.slots;
+            // Divert an ID only if the busy route has actually delivered the
+            // shorter packed shape sooner. Compare the spare's actual singleton.
+            if (!idle && peer->remaining_ns(now) && full.samples && rest.samples &&
+                (width - 1) * rest.service < width * full.service)
+                earliest = std::min(earliest, peer->remaining_ns(now) + width * full.service);
+            if (idle && one.samples && one.service < singleton && peer->packed_singleton.expired())
+            { singleton = one.service; spare = worker; }
+            auto const& delivery = idle && one.samples ? one : rate;
+            routes[entries++] = {1 / delivery.service, delivery.link / delivery.service, item.slots, worker, item.ingress};
+        }
+        if (count != roster_->routes.size() || spare == maximum || earliest >= singleton || singleton > horizon) return false;
+        // A second receiver must add a whole delivery in the independent
+        // interval after accounting for each worker's slots and shared ingress.
+        auto const fleet = std::span(routes).first(entries);
+        auto const with = throughput(fleet, slots, receivers);
+        --slots[spare];
+        auto const without = throughput(fleet, slots, receivers);
+        if ((with - without) * horizon < 1 - 8 * std::numeric_limits<long double>::epsilon()) return false;
+        // Several destination threads can size work before the first acquires its
+        // lease. Reserve this one sizing decision until that singleton finishes.
+        reservation = std::make_shared<char>();
+        current(workers[spare]->peer.worker)->packed_singleton = reservation;
+        return true;
+    }
     bool packed_before_singletons(uint8_t k, uint8_t strength, pool::Kind kind, unsigned width,
                                   WorkerPackedRoute& batch_route, Clock::time_point now = Clock::now())
     {
@@ -3192,6 +3243,9 @@ public:
         unsigned slots = 0;
         long double throughput = 0, fastest = 0, available = 0;
         long double next_rate = 0, next_finish = std::numeric_limits<long double>::max();
+        long double uncertain_singleton = std::numeric_limits<long double>::max();
+        History const* idle = nullptr;
+        History const* next = nullptr;
         bool known = true;
         for (auto peer : std::span(peers).first(count))
         {
@@ -3201,29 +3255,40 @@ public:
             if (!fastest || rate.service < fastest) fastest = rate.service;
             auto const active = current(item.peer.worker);
             if (active->in_flight < item.slots)
-            { if (!available || rate.service < available) available = rate.service; }
+            { if (!available || rate.service < available) { available = rate.service; idle = peer; } }
             else
             {
                 auto const wait = active->remaining_ns(now);
-                if (!wait) known = false;
+                if (!wait)
+                {
+                    known = false;
+                    auto const& one = item.rates[1];
+                    uncertain_singleton = std::min(uncertain_singleton, one.samples ? one.service : 0.L);
+                }
                 else if (auto const finish = wait + rate.service; finish < next_finish)
-                { next_finish = finish; next_rate = rate.service; }
+                { next_finish = finish; next_rate = rate.service; next = peer; }
             }
         }
-        if (packed && batch_route && count == 1 && slots < offered && roster_ && roster_->complete &&
+        // A new single-slot grant can overlap acknowledgement of its predecessor.
+        // Even immediate release on that unclocked route would still cost its
+        // measured singleton before it could complete a new member.
+        bool const earlier_batch = !known && packed && batch_route && slots < offered && next &&
+            next_finish - next_rate + std::min(ready, limit) * next_rate < uncertain_singleton;
+        bool const queue = (known || earlier_batch) && (!available || (packed && destinations > slots && next_finish < available));
+        auto const* selected = queue ? next : idle;
+        bool occupied_first = false;
+        if (packed && batch_route && selected && slots < offered && roster_ && roster_->complete &&
             roster_k_ == k && roster_strength_ == strength)
         {
-            auto const& measured = *peers.front();
-            auto const* target = offered_route(measured.peer.worker);
             auto const width = std::min(ready, limit);
-            auto const finish = (available ? available : next_rate) * width +
-                (available || !next_rate ? 0 : next_finish - next_rate);
-            if (target && same_route(measured.peer, *target) && finish > 0 && roster_->routes.size() == 1 + (offered - slots))
+            auto const finish = rates(*selected).service * width + (queue ? next_finish - next_rate : 0);
+            if (roster_->routes.size() == count + (offered - slots))
             {
                 unsigned occupied = 0;
                 for (auto const& route : roster_->routes)
                 {
-                    if (route.identity == target->identity) continue;
+                    if (std::any_of(peers.begin(), peers.begin() + count, [&](auto const* peer)
+                        { return peer->peer.worker == text<64>(route.identity) && same_route(peer->peer, route); })) continue;
                     auto at = current(text<64>(route.identity));
                     if (at == peers_.begin() + peer_count_ || !same_route(at->peer, route) || at->in_flight != 1 ||
                         std::max(route.cpu_slots, route.gpu_slots) != 1 || at->packed_since == Clock::time_point{} ||
@@ -3232,24 +3297,24 @@ public:
                         std::chrono::duration<long double, std::nano>(now - at->packed_since).count() <= finish) break;
                     ++occupied;
                 }
-                // Every other slot is delivering its first member. Its observed
-                // service has already taken longer than this route's whole batch.
-                // Recheck the actual assignment before any plot ID is sent.
-                if (slots + occupied == offered) { *batch_route = {*target, measured.kind}; return width; }
+                // Only the unpriced slots need a lower bound from their first
+                // transfer. Continue sizing across all remaining measured routes.
+                occupied_first = slots + occupied == offered;
             }
         }
         // Another packed destination can supply a singleton to the idle route.
         // Size this batch for the busy worker if it can deliver first.
-        if (known && (!available || (packed && destinations > offered && next_finish < available)))
-            available = next_rate;
+        if (queue) available = next_rate;
         // Keep the caller's ordinary width until the route set and the
         // worker likely to accept more work have both been measured.
-        if (slots != offered || !available) return fallback;
+        if ((slots != offered && !occupied_first) || !available) return fallback;
         // Give the next free worker its share of ready work, bounded by the
         // time the fastest route needs for one full lease.
         long double const horizon = std::min(std::min(ready, limit) * fastest,
             static_cast<long double>(ready) * std::max(1u, destinations) / throughput);
-        return std::clamp(unsigned(std::ceil(horizon / available)), 1u, std::min(ready, limit));
+        auto const width = std::clamp(unsigned(std::ceil(horizon / available)), 1u, std::min(ready, limit));
+        if (width > 1 && occupied_first) *batch_route = {*offered_route(selected->peer.worker), selected->kind};
+        return width;
     }
     Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, Clock::time_point now = Clock::now())
     {
@@ -3466,6 +3531,7 @@ private:
     }
     struct ActivePeer
     {
+        std::weak_ptr<void> packed_singleton;
         Peer peer;
         uint64_t first = 0, last = 0, sequence = 0;
         uint64_t ingress_selected = 0;
@@ -3626,7 +3692,9 @@ struct WorkerClient::Impl
     std::timed_mutex sequence_mutex;
     worker_detail::TaskRegistry task_states;
     mutable std::mutex planning_mutex;
-    std::mutex capacity_refresh_mutex;
+    std::mutex capacity_refresh_mutex, paths_mutex;
+    std::string paths_session;
+    pool::BrokerClient::GenerationPaths generation_paths;
     worker_detail::GenerationPlanning planning;
     struct CapacityHint { uint8_t k = 0, strength = 0; Clock::time_point expires{}; WorkerGenerationCapacity value; };
     CapacityHint generation_capacity;
@@ -3707,7 +3775,7 @@ struct WorkerClient::Impl
     {
         cancel.check();
         auto const remaining = std::chrono::duration_cast<std::chrono::milliseconds>(cancel.deadline - Clock::now()).count();
-        require(remaining > 0, "compute task deadline expired");
+        if (remaining <= 0) throw WorkerTaskTimeout("compute task deadline expired");
         return unsigned(std::min<uint64_t>(uint64_t(remaining), config.task_timeout_ms));
     }
     void prepare_session_locked(pool::BrokerClient& control, pool::OwnerSession& session, bool refresh)
@@ -3741,6 +3809,31 @@ struct WorkerClient::Impl
         ~GenerationLease() { impl.active_generation.fetch_sub(1); }
         GenerationLease(GenerationLease const&) = delete;
     };
+    bool bind_generation_paths(pool::BrokerClient& control, pool::OwnerSession const& session)
+    {
+        if (!config.generation_path) return true;
+        try
+        {
+            std::shared_ptr<pool::GenerationRoster const> roster;
+            { std::lock_guard lock(planning_mutex); roster = generation_capacity.value.roster; }
+            pool::BrokerClient::GenerationPaths paths;
+            if (roster && roster->complete) for (auto const& route : roster->routes)
+                if (pool::numeric_host(route.endpoint.host))
+                    try
+                    {
+                        uint32_t adapter = 0;
+                        auto const local = pool::local_address(route.endpoint, &adapter);
+                        paths.emplace_back(route.identity, config.generation_path(route, local, adapter));
+                    }
+                    catch (...) {} // A missing route can still take ordinary leases.
+            std::lock_guard lock(paths_mutex);
+            if (paths_session == session.token && generation_paths == paths) return true;
+            if (control.generation_paths(session, paths))
+            { paths_session = session.token; generation_paths = std::move(paths); }
+            return true; // An older broker has no cross-job origin to invalidate.
+        }
+        catch (...) { return false; } // Do not apply the previous origin if this update failed.
+    }
     void observed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection)
     {
         { std::lock_guard lock(planning_mutex); planning.observed(value, route, selection); }
@@ -3898,8 +3991,17 @@ struct WorkerClient::Impl
             auto const end = Clock::now();
             auto const elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
             auto const service = std::chrono::duration_cast<std::chrono::nanoseconds>(end - selected_at).count();
+            std::string path;
+            if (!local_direct && impl.config.generation_path && pool::numeric_host(lease.endpoint.host) &&
+                (operation == Operation::Packed || operation == Operation::Fresh))
+                try
+                {
+                    if (auto local = channel.local_address(); !local.empty())
+                        path = impl.config.generation_path({lease.worker_identity, lease.worker_instance, lease.endpoint}, local, ingress);
+                }
+                catch (...) {} // A missing path cannot discard the accepted result.
             if (service > 0) try { control.delivered(lease, {uint64_t(service),
-                local_direct ? logical_input_bytes : input_bytes, local_direct ? logical_output_bytes : output_bytes}); }
+                local_direct ? logical_input_bytes : input_bytes, local_direct ? logical_output_bytes : output_bytes}, path); }
             catch (pool::TransientTransport const&)
             { /* A broker outage does not invalidate accepted data. */ }
             completed = true;
@@ -3942,6 +4044,13 @@ struct WorkerClient::Impl
         pool::OwnerSession session;
         std::shared_ptr<worker_detail::TaskState> state;
         bool submitted = false, declined = false;
+        auto acquire = [&]
+        {
+            auto horizon = options.other_work_until;
+            if (horizon != Clock::time_point{} && horizon <= Clock::now() && !bind_generation_paths(control, session))
+                horizon = {};
+            return control.acquire(session, task, horizon);
+        };
         auto submit = [&](bool refresh)
         {
             auto lock = sequence_lock(cancel);
@@ -3949,7 +4058,7 @@ struct WorkerClient::Impl
             state = task_states.acquire(identity, session.token);
             task.sequence = state->sequence; task.attempt = std::max(identity.attempt, state->next_attempt);
             require(task.attempt < UINT64_MAX, "compute task attempt exhausted"); state->next_attempt = task.attempt + 1;
-            submitted = true; lease = control.acquire(session, task, options.other_work_until);
+            submitted = true; lease = acquire();
         };
         try
         {
@@ -3979,7 +4088,7 @@ struct WorkerClient::Impl
                     next_hint = Clock::now() + std::chrono::seconds(1);
                 }
                 cancel.check(); std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                try { lease = control.acquire(session, task, options.other_work_until); }
+                try { lease = acquire(); }
                 catch (pool::StaleOwnerSession const&) { submit(true); }
             }
             cancel.check();
@@ -4270,7 +4379,7 @@ struct WorkerClient::Impl
             else if (type == DataKind::Contributions)
             {
                 require(contribution_sink && (!manifest || received_manifest), "unexpected compute contribution stream");
-                if (overlap && config.contribution_read_ahead && contribution_window && !manifest)
+                if (overlap && config.contribution_read_ahead && contribution_window && (!manifest || options.fresh_read_ahead))
                 {
                     if (!reader) reader.emplace([] {});
                     auto ready = resume_read.emplace().get_future().share();
@@ -4469,7 +4578,7 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
     WorkerContributionWindowSink const& window, WorkerFreshManifest const& manifest, bool independent, bool coalesce_singletons,
-    Clock::time_point other_work_until)
+    Clock::time_point other_work_until, bool fresh_read_ahead)
 {
     if (independent)
     {
@@ -4486,7 +4595,7 @@ void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::arr
             return;
         }
     }
-    WorkerTaskOptions options; options.other_work_until = other_work_until;
+    WorkerTaskOptions options; options.other_work_until = other_work_until; options.fresh_read_ahead = fresh_read_ahead;
     if (manifest && ids.size() > 1)
         options.selected = [&](auto const& assigned)
         { std::lock_guard lock(impl_->planning_mutex); return !impl_->planning.needs_first_member(assigned); };
@@ -4697,7 +4806,7 @@ WorkerGenerationCapacity WorkerClient::Impl::capacity(uint8_t k, uint8_t strengt
     return result;
 }
 unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
-                                              WorkerPackedRoute* batch_route, unsigned* singleton_limit) const
+                                              WorkerPackedRoute* batch_route, unsigned* singleton_limit, Clock::time_point other_work_until) const
 {
     if (batch_route) *batch_route = {};
     if (singleton_limit) *singleton_limit = impl_->config.max_active_generation;
@@ -4721,7 +4830,30 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     unsigned const width = std::min(ready, unsigned(hint.batch));
     if (!hint.slots || width < 2) return 1;
     if (hint.slots == 1) return width;
+    if (destinations == 1 && batch_route && other_work_until != Clock::time_point{} && other_work_until <= Clock::now() &&
+        hint.roster && hint.roster->complete && !impl_->config.local_only)
+    {
+        try
+        {
+            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(250);
+            auto control = impl_->broker.with_deadline(cancel.deadline);
+            pool::OwnerSession session; pool::Task shape; shape.compatibility = impl_->config.compatibility;
+            shape.kind = impl_->config.generation_kind; shape.k = k; shape.strength = strength; shape.work_units = width;
+            shape.resources.cpu_threads = impl_->config.generation_threads;
+            { auto lock = impl_->sequence_lock(cancel); impl_->prepare_session_locked(control, session, false); }
+            auto const best = impl_->bind_generation_paths(control, session) ? control.finite_packed_route(session, shape) : std::nullopt;
+            if (best)
+                for (auto const& route : hint.roster->routes)
+                    if (route.identity == best->first)
+                    { *batch_route = {route, best->second}; return width; }
+        }
+        catch (std::exception const&) {} // Advisory placement does not own the real lease.
+    }
     std::lock_guard lock(impl_->planning_mutex);
+    if (batch_route && singleton_limit && hint.availability.admission && hint.availability.admission->available_slots &&
+        impl_->planning.useful_packed_singleton(k, strength, impl_->config.generation_kind, width,
+            std::min(hint.slots, impl_->config.max_active_generation), Clock::now(), other_work_until, batch_route->reserved_singleton))
+    { *singleton_limit = 1; return 1; }
     if (destinations <= hint.slots && batch_route &&
         impl_->planning.packed_before_singletons(k, strength, impl_->config.generation_kind, width, *batch_route)) return width;
     // Only form a packed batch when the other slots can serve independent
@@ -4822,7 +4954,7 @@ uint64_t WorkerClient::memory_bytes()
     // Also reserve hash nodes/buckets (including replacement growth), shared
     // retry records and allocator overhead. Session TLS is per-call.
     // Bound the retained route strings/rows and their replacement snapshot.
-    return sizeof(Impl) + 2 * (65536 + pool::max_status_page_size * sizeof(pool::GenerationRoute)) +
+    return sizeof(Impl) + 2 * (65536 + pool::max_status_page_size * (sizeof(pool::GenerationRoute) + 256)) +
         pool::BrokerClient::memory_bytes() + uint64_t(worker_detail::TaskRegistry::maximum) *
         (sizeof(worker_detail::TaskState) + sizeof(worker_detail::RetryHandle) + sizeof(std::shared_ptr<worker_detail::TaskState>) + 1024);
 }

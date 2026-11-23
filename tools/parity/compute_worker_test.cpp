@@ -701,7 +701,7 @@ void network(char const* ca, char const* cert, char const* key)
         for (size_t i = 0; i < incoming.size(); ++i)
             require(unpack(incoming[i]->finish(checked)) == reference[i], "packed lease changed member order or content");
         auto const reference_digest = members_digest(18, Members(reference), nullptr, [] {});
-        auto collect_fresh = [&](WorkerClient& source)
+        auto collect_fresh = [&](WorkerClient& source, bool ahead = true)
         {
             size_t ordinal = 0, largest_window = 0;
             uint64_t size = 0, peak = 0, budget = 0, largest = 0;
@@ -724,6 +724,7 @@ void network(char const* ca, char const* cert, char const* key)
             auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> batch, uint16_t count)
             {
                 require(!batch.empty() && batch.size() <= fresh_group_window_chunks, "fresh group receive window exceeds admission");
+                require(caller == std::this_thread::get_id(), "fresh read-ahead changed the contribution sink thread");
                 // A shared scheduler must accept owner validation after the
                 // worker releases its codec permits, including in-process.
                 if (!largest_window) client_options.cpu_scheduler->submit([] {}).get();
@@ -735,7 +736,7 @@ void network(char const* ca, char const* cert, char const* key)
                 {
                     require(!budget && digest == reference_digest, "fresh lease changed the recovery digest");
                     budget = payload; largest = max_chunk;
-                });
+                }, false, true, {}, ahead);
             require(ordinal == PlotGroupFile::getChunkCountForK(18) && largest_window > 1 && size <= budget && peak <= largest,
                 "fresh lease lost window batching, chunks or storage bounds");
             return std::array{budget, largest, size};
@@ -745,7 +746,22 @@ void network(char const* ca, char const* cert, char const* key)
         WorkerTaskObservation observation;
         local_options.observe = [&](auto const& value) { observation = value; };
         WorkerClient local(local_options);
+        bool accepted = false, stopped = false;
+        try
+        {
+            client.contributions(18, 2, ids, [](auto, auto, auto) {}, {}, {},
+                [&](auto, auto, auto) { require(accepted, "fresh window preceded manifest"); throw WorkerTaskDeclined(); },
+                [&](auto, auto, auto const&) { accepted = true; });
+        }
+        catch (WorkerTaskDeclined const&) { stopped = true; }
+        require(accepted && stopped, "fresh read-ahead lost the sink decline");
+        auto const before_serial = client.stats().generation;
+        auto const serial_manifest = collect_fresh(client, false);
+        auto const serial = client.stats().generation;
+        require(serial.frame_wait_ns - before_serial.frame_wait_ns == serial.frame_read_ns - before_serial.frame_read_ns,
+            "one-frame fresh receive prefetched without an owner grant");
         auto const remote_manifest = collect_fresh(client);
+        require(serial_manifest == remote_manifest, "fresh read-ahead changed the serial reference");
         require(collect_fresh(local) == remote_manifest, "direct and TLS fresh leases differ in bounds or size");
         auto const completed = local.stats();
         require(completed.completed_contributions == 1 && completed.local_tasks == 1 &&
