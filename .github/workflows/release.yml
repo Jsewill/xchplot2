@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '3a155a5d71c0618b5840caea3b214029465bc158' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'd7bfbc5d77a3ccee1bafffebfe83774be60feae9' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -339,7 +339,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: 3a155a5d71c0618b5840caea3b214029465bc158
+          ref: d7bfbc5d77a3ccee1bafffebfe83774be60feae9
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -527,12 +527,12 @@ jobs:
                   remote = generate(false, 2);
                   std::cerr << "growth helper delivered" << std::endl;''')
           s=replace_one(s,"    release.set_value(); auto local = original.get();","    std::cerr << \"growth release original\" << std::endl;\n    release.set_value(); auto local = original.get();")
-          s=replace_one(s,"    require(deliveries.size() == 5 && deliveries[1].worker_identity == helper",r"""    std::cerr << "growth evidence";
-              for (auto const& item : deliveries) std::cerr << " [helper=" << (item.worker_identity == helper) << " local=" << item.local_direct << " members=" << item.work_units << "]";
+          s=replace_one(s,"    require(deliveries.size() == receipts_before_release + 2 &&",r"""    std::cerr << "growth evidence";
+              for (auto const& item : deliveries) std::cerr << " [helper=" << (item.worker_identity == helper_identity) << " local=" << item.local_direct << " members=" << item.work_units << "]";
               std::cerr << " rosters=";
               for (auto count : rosters) std::cerr << count << ",";
               std::cerr << std::endl;
-              require(deliveries.size() == 5 && deliveries[1].worker_identity == helper""")
+              require(deliveries.size() == receipts_before_release + 2 &&""")
           path.write_text("#include <cstdio>\n"+s)
       - name: Identify the native worker phase which reaches its deadline
         if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal' || inputs.phase == 'trace-growth'
@@ -619,7 +619,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $zip[0].FullName).Hash -ne $hash) { throw 'Archive checksum mismatch' }
           Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath package
           $info = @(Get-ChildItem -LiteralPath package -Filter BUILDINFO.txt -Recurse)
-          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*3a155a5d71c0618b5840caea3b214029465bc158\s*$' -Quiet)) { throw 'Archive source mismatch' }
+          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*d7bfbc5d77a3ccee1bafffebfe83774be60feae9\s*$' -Quiet)) { throw 'Archive source mismatch' }
       - name: Resume each native data boundary and verify published bytes and full proofs
         shell: pwsh
         run: |
