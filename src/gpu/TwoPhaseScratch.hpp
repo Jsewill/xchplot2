@@ -76,18 +76,18 @@ inline std::unordered_map<sycl::queue*, TwoPhaseState>& twophase_map()
     return m;
 }
 
-inline void free_twophase_scratch(TwoPhaseScratch& s, sycl::queue& q)
+inline void free_twophase_scratch(TwoPhaseScratch& s, sycl::queue& q, bool partial = false)
 {
+    s.bytes = 0; // A partial release cannot serve a subsequent match.
     auto release = [&](auto*& ptr, uint64_t bytes) {
         if (auto* owned = std::exchange(ptr, nullptr))
-            checked_gpu_free(bytes, &GpuCleanupCharges::device, [&] { sycl::free(owned, q); });
+            checked_gpu_free(bytes, &GpuCleanupCharges::device, [&] { sycl::free(owned, q); }, partial);
     };
     release(s.d_cand_l, s.cap * sizeof(uint32_t));
     release(s.d_cand_r, s.cap * sizeof(uint32_t));
     release(s.d_cand_count, sizeof(uint64_t));
     release(s.d_overflow, sizeof(uint32_t));
-    s.cap   = 0;
-    s.bytes = 0;
+    s.cap = 0;
 }
 
 // Lowering a grant releases oversized cached buffers before the next plot.
@@ -149,7 +149,7 @@ inline TwoPhaseScratch* acquire_twophase_scratch(sycl::queue& q,
     if (cand_cap == 0 || st.limit < fixed ||
         cand_cap > (st.limit - fixed) / per_candidate) return nullptr;
     uint64_t const want = cand_cap * per_candidate + fixed;
-    if (s.cap >= cand_cap && s.bytes <= st.limit) return &s;
+    if (s.bytes && s.cap >= cand_cap && s.bytes <= st.limit) return &s;
 
     free_twophase_scratch(s, q);
     s.cap = cand_cap; // Also sizes partial allocations if the driver fails during cleanup.
@@ -163,7 +163,7 @@ inline TwoPhaseScratch* acquire_twophase_scratch(sycl::queue& q,
         // OOM, but throws for other allocation errors.
     }
     if (!s.d_cand_l || !s.d_cand_r || !s.d_cand_count || !s.d_overflow) {
-        free_twophase_scratch(s, q);
+        free_twophase_scratch(s, q, true);
         return nullptr;
     }
     s.bytes = want;

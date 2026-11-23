@@ -251,7 +251,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
                 pool::admission_name(worker.admission), hardware.partition.cpu_threads, hardware.partition.slots,
                 hardware.partition.host_bytes, hardware.partition.gpu_bytes, hardware.standing_host_bytes,
                 hardware.logical_cpus, hardware.total_host_bytes, hardware.available_host_bytes, hardware.total_gpu_bytes, capabilities,
-                hardware.observed_at_unix_ms});
+                hardware.observed_at_unix_ms, worker.gpu_recovery});
             bool const offers_generation = capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu));
             bool const offers_codec = capabilities & pool::capability(pool::Kind::Pack);
             bool const generation = offers_generation && worker.compatibility == generation_contract;

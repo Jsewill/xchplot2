@@ -13059,8 +13059,11 @@ group_grow::DashboardFrame status_dashboard(StatusDiagnosis const& diagnosis, St
         frame.add(Frame::workers,std::to_string(live.accepting_generation)+" accepting generation   "+
             std::to_string(live.paused)+" paused   "+std::to_string(live.draining)+" draining");
         for (auto const& worker : live.worker_resources)
+        {
             frame.add(Frame::workers,worker.host+"   "+worker.gpu_identity+"   "+worker.admission,
                 worker.identity+"   "+std::to_string(worker.slots)+" slots offered");
+            if (!worker.gpu_recovery.empty()) frame.add(Frame::workers,"GPU recovering",worker.gpu_recovery);
+        }
     }
 #endif
     return frame;
@@ -13093,6 +13096,14 @@ void print_status_compute(std::ostream& out, StatusComputeObservation const& val
             for (size_t i = 0; i < live.issues.size(); ++i)
             { if (i) out << ','; out << "{\"endpoint\":" << json_string(live.issues[i].endpoint) << ",\"reason\":" << json_string(live.issues[i].reason) << '}'; }
             out << ']';
+            bool first = true;
+            for (auto const& worker : live.worker_resources) if (!worker.gpu_recovery.empty())
+            {
+                out << (first ? ",\"recovering_gpus\":[" : ",") << "{\"worker\":" << json_string(worker.identity)
+                    << ",\"gpu_recovery\":" << json_string(worker.gpu_recovery) << '}';
+                first = false;
+            }
+            if (!first) out << ']';
         }
         else
         {
@@ -13107,6 +13118,8 @@ void print_status_compute(std::ostream& out, StatusComputeObservation const& val
             if (!live.authority_expires.empty()) out << "  Pool authority expires: " << live.authority_expires << (live.authority_expired ? " (re-enrollment required)" : "") << '\n';
             if (!live.service_lifecycle.empty()) out << "  Service lifecycle: " << live.service_lifecycle << '\n';
             if (live.local_worker_intent != "not-selected") out << "  Saved local worker intent: " << live.local_worker_intent << "; " << live.local_worker_intent_action << '\n';
+            for (auto const& worker : live.worker_resources) if (!worker.gpu_recovery.empty())
+                out << "  " << worker.host << " GPU recovering: " << worker.gpu_recovery << '\n';
             for (auto const& issue : live.issues) out << "  " << issue.endpoint << ": " << issue.reason << '\n';
         }
     }

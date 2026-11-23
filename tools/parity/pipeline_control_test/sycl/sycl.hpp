@@ -14,6 +14,7 @@ enum class allocation_failure { none, null, exception };
 inline allocation_failure fail_allocation = allocation_failure::none;
 inline std::mutex allocation_mutex;
 inline std::map<void*, bool> allocations;
+inline void* fail_free = nullptr;
 inline void* allocate(std::size_t n, bool device)
 {
     if (fail_allocation == allocation_failure::exception) throw exception("injected allocation failure");
@@ -36,10 +37,13 @@ template<class T> T* malloc_device(std::size_t n,queue& q){return static_cast<T*
 inline void free(void* p,queue&)
 {
     if (!p) return;
+    bool fail = false;
     {
         std::lock_guard lock(allocation_mutex);
         if (allocations.erase(p) != 1) std::abort();
+        if (p == fail_free) { fail = true; fail_free = nullptr; }
     }
     std::free(p);
+    if (fail) throw exception("injected deallocation failure");
 }
 }

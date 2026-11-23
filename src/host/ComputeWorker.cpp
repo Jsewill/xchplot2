@@ -369,11 +369,12 @@ private:
         auto const remaining = remaining_locked(used_);
         if (!available_) return remaining;
         auto const free = available_();
-        auto const bytes = add(free, owned_resident_ ? std::min(used_, owned_resident_()) : 0);
+        auto const charged = capacity_ - remaining;
+        auto const bytes = add(free, owned_resident_ ? std::min(charged, owned_resident_()) : 0);
         // Charge the complete outstanding model until release. Standalone
         // services can identify their own resident allocations. Embedded
         // owner pages cannot be attributed to this worker's leases.
-        return std::min(remaining, bytes - std::min(bytes, capacity_ - remaining));
+        return std::min(remaining, bytes - std::min(bytes, charged));
     }
 };
 
@@ -1372,9 +1373,10 @@ struct WorkerService::Impl
     {
         resource_sampler.locked_output(0);
         gpu.reset();
-        if (unconfirmed_gpu_frees.host) budget->hold_unconfirmed_host(unconfirmed_gpu_frees.host);
         if ((unconfirmed_gpu_frees.host || unconfirmed_gpu_frees.device) && !gpu_recovery.load())
             lost_gpu("GPU driver could not confirm allocation cleanup");
+        if (unconfirmed_gpu_frees.host) budget->hold_unconfirmed_host(unconfirmed_gpu_frees.host);
+        unconfirmed_gpu_frees.clear_unwind();
         if (gpu_retained.budget) gpu_retained.resize(GpuProducer::runtime_host_allowance_bytes());
         retained_gpu_host.store(gpu_retained.bytes); idle_generation_bytes.store(0);
     }
@@ -1462,6 +1464,7 @@ struct WorkerService::Impl
     }
     void lost_gpu(std::string cause)
     {
+        unconfirmed_gpu_frees.confirm_loss();
         auto state = std::make_shared<Recovery>();
         state->cause = pool::gpu_recovery_reason(std::move(cause));
         { std::lock_guard lock(advertisement_mutex); gpu_recovery.store(std::move(state)); }
@@ -1533,6 +1536,12 @@ struct WorkerService::Impl
         auto log = std::make_shared<pos2gpu::AsyncErrorLog>();
         pos2gpu::ScopedAsyncErrors errors(log);
         pos2gpu::ObserveGpuCleanup cleanup(unconfirmed_gpu_frees);
+        unconfirmed_gpu_frees.reported_loss = []() noexcept {
+            auto& log = pos2gpu::async_errors();
+            if (!log.count.load(std::memory_order_relaxed)) return false;
+            std::lock_guard lock(log.mu);
+            return !log.device_loss.empty() && log.loss_backend == log.backend;
+        };
         pos2gpu::WorkerErrorRegistration registration(*log, gpu_identity.backend, [this]
         {
             { std::lock_guard lock(jobs_mutex); check_idle_output = true; } jobs_ready.notify_one();
@@ -2044,6 +2053,7 @@ struct WorkerService::Impl
                 // broker takes its next capacity snapshot.
                 memory.resize(0);
                 update_idle_gpu_output();
+                unconfirmed_gpu_frees.clear_unwind();
 #endif
             }
             catch (...)

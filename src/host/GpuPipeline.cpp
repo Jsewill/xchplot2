@@ -17,6 +17,7 @@
 #include "host/TempFile.hpp"   // P1 host-RAM disk-offload (XCHPLOT2_SPILL_T1META)
 #include "host/SpillCoverage.hpp"  // spill read guard — see header
 #include "host/SpillEngine.hpp"   // SpillEngine / SpillBuffer — see header
+#include "host/GpuCleanup.hpp"
 #include "host/HostGuard.hpp"      // pinned-host redzones — see header
 
 #include "gpu/AesGpu.cuh"
@@ -51,7 +52,6 @@
 #include <deque>
 #include <set>          // SpillEngine's out-of-order completion set
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -90,7 +90,7 @@ struct StreamingStats {
     // GB of pinned host memory per failure, starving peer workers.
     // Buffers owned by the caller (scratch fields / HostPinnedPool) are
     // never tracked here.
-    std::unordered_set<void*> host_ptrs;
+    std::unordered_map<void*, size_t> host_ptrs;
     bool        verbose = false;
     char const* phase   = "(init)";
 
@@ -99,16 +99,12 @@ struct StreamingStats {
     // succeeded), this dtor releases the still-live device and pinned-
     // host buffers instead of leaking them across batch iterations.
     ~StreamingStats() {
-        if (sizes.empty() && host_ptrs.empty()) return;
-        auto& q = sycl_backend::queue();
-        for (auto& [ptr, _bytes] : sizes) {
-            if (ptr) sycl::free(ptr, q);
-        }
-        sizes.clear();
-        for (void* ptr : host_ptrs) {
-            if (ptr) sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), q);
-        }
-        host_ptrs.clear();
+        for (auto const& [ptr, bytes] : sizes)
+            release_gpu_memory("streaming device allocation", bytes, &GpuCleanupCharges::device,
+                [&] { sycl::free(ptr, sycl_backend::queue()); });
+        for (auto const& [ptr, bytes] : host_ptrs)
+            release_gpu_memory("streaming pinned allocation", bytes, &GpuCleanupCharges::host,
+                [&] { sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), sycl_backend::queue()); });
     }
 };
 
@@ -203,7 +199,7 @@ inline void* s_malloc_host_raw(StreamingStats& s, size_t bytes,
             std::string("sycl::malloc_host(") + what + ") failed");
     }
     p = pos2gpu::host_guard_arm(p, bytes, what);
-    s.host_ptrs.insert(p);
+    s.host_ptrs.emplace(p, bytes + 2 * pad);
     return p;
 }
 
@@ -219,30 +215,30 @@ inline T* s_malloc_host(StreamingStats& s, size_t bytes,
 inline void s_free_host(StreamingStats& s, void* p, sycl::queue& q)
 {
     if (!p) return;
-    s.host_ptrs.erase(p);
+    auto const owned = s.host_ptrs.extract(p);
     // Checks the redzones and hands back the real base to free. A no-op
     // returning `p` unchanged when the guard is off or never armed it.
-    sycl::free(pos2gpu::host_guard_disarm(p, "s_free_host"), q);
+    checked_gpu_free(owned ? owned.mapped() : 0, &GpuCleanupCharges::host,
+        [&] { sycl::free(pos2gpu::host_guard_disarm(p, "s_free_host"), q); });
 }
 
 template <typename T>
 inline void s_free(StreamingStats& s, T*& ptr)
 {
     if (!ptr) return;
-    void* raw = static_cast<void*>(ptr);
-    auto it = s.sizes.find(raw);
-    if (it != s.sizes.end()) {
-        s.live -= it->second;
+    void* raw = static_cast<void*>(std::exchange(ptr, nullptr));
+    auto const owned = s.sizes.extract(raw);
+    if (owned) {
+        s.live -= owned.mapped();
         if (s.verbose) {
             std::fprintf(stderr,
                 "[stream %-8s] -%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
-                s.phase, it->second / 1048576.0, "(free)",
+                s.phase, owned.mapped() / 1048576.0, "(free)",
                 s.live / 1048576.0, s.peak / 1048576.0);
         }
-        s.sizes.erase(it);
     }
-    sycl::free(raw, sycl_backend::queue());
-    ptr = nullptr;
+    checked_gpu_free(owned ? owned.mapped() : 0, &GpuCleanupCharges::device,
+        [&] { sycl::free(raw, sycl_backend::queue()); });
 }
 
 // ---------------------------------------------------------------------

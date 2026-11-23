@@ -7,7 +7,8 @@
 namespace worker_gpu_test
 {
 inline bool child = false;
-inline constexpr uint64_t failed_host_free = 1ull << 20, failed_device_free = 40ull << 20;
+inline constexpr uint64_t failed_host_free = 1ull << 20, failed_device_free = 36ull << 20;
+inline constexpr uint64_t async_host_free = 2ull << 20, async_device_free = 4ull << 20;
 inline std::atomic<bool> lose_preflight{false};
 inline std::filesystem::path directory()
 {
@@ -52,8 +53,11 @@ GpuProducer::~GpuProducer()
     auto fail = [] { throw std::runtime_error("injected driver deallocation failure"); };
     pos2gpu::release_gpu_memory("test pinned output", worker_gpu_test::failed_host_free, &pos2gpu::GpuCleanupCharges::host, fail);
     pos2gpu::release_gpu_memory("test device output", worker_gpu_test::failed_device_free, &pos2gpu::GpuCleanupCharges::device, fail);
-    pos2gpu::release_gpu_memory("test remaining allocation", 4096, &pos2gpu::GpuCleanupCharges::device,
-        [] { worker_gpu_test::mark("last-free-attempted"); });
+    // Native allocators can queue an error and return normally from sycl::free.
+    auto report = [] { pos2gpu::record_async_error("ze_allocator: zeMemFree() failed (error code = ze:1879048193)"); };
+    pos2gpu::release_gpu_memory("test async free", worker_gpu_test::async_host_free, &pos2gpu::GpuCleanupCharges::host, report);
+    pos2gpu::release_gpu_memory("test remaining allocation", worker_gpu_test::async_device_free, &pos2gpu::GpuCleanupCharges::device,
+        [&] { report(); worker_gpu_test::mark("last-free-attempted"); });
 }
 GpuProducerPreflight GpuProducer::preflight(int k, int, GpuProducerOptions const& options)
 {
@@ -216,7 +220,7 @@ inline void recovery(bool network)
     rejects([&] { generate(service,kind,0xfd); });
     auto status = service.status();
     require(std::filesystem::exists(directory.path / "last-free-attempted") &&
-        status.baseline_host_bytes == baseline + failed_host_free, "failed frees skipped cleanup or released uncertain host pages");
+        status.baseline_host_bytes == baseline + failed_host_free + async_host_free, "failed frees skipped cleanup or released uncertain host pages");
     require(status.admission == pool::WorkerAdmission::Accepting && status.accepted_tasks == 1 && !status.capacity.gpu_bytes &&
         status.capacity.cpu_threads > 0 && status.gpu_recovery == "ZE_RESULT_ERROR_DEVICE_LOST" &&
         !service.local_generation_offer(18,2,1).demand.slots, "fault did not withdraw only the GPU");
@@ -247,8 +251,8 @@ inline void recovery(bool network)
     require(paused.admission == pool::WorkerAdmission::Paused && !paused.gpu_recovery.empty(), "operator pause masked device loss");
     service.control(WorkerControl::Resume);
     wait_until([&] { return service.status().capacity.gpu_bytes; }, "verified fresh GPU was never re-admitted");
-    require(service.status().capacity.gpu_bytes == (64ull<<20) - failed_device_free &&
-        service.status().baseline_host_bytes == baseline + failed_host_free && service.status().gpu_recovery.empty() &&
+    require(service.status().capacity.gpu_bytes == (64ull<<20) - failed_device_free - async_device_free &&
+        service.status().baseline_host_bytes == baseline + failed_host_free + async_host_free && service.status().gpu_recovery.empty() &&
         service.local_generation_offer(18,2,1).demand.slots == 1, "recovery ignored live GPU capacity");
     if (network)
         wait_until([&] { auto peers = routes(); return peers && peers->recovering_gpus.empty() &&

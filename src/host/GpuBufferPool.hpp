@@ -181,7 +181,7 @@ struct GpuBufferPool {
     void release_pair_a();
 
 private:
-    void release_allocations() noexcept;
+    void release_allocations(bool partial = false) noexcept;
     std::mutex pinned_mu_[kNumPinnedBuffers];
     std::mutex pair_a_mu_;
 };
