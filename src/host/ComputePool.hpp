@@ -326,6 +326,9 @@ public:
     // The authenticated broker epoch selects the correct authority when one
     // executor accepts work from several independent brokers.
     std::string register_worker(WorkerOffer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
+    // On a newly observed broker route, retain the endpoint that this worker
+    // instance already advertises to that authority. Returns it in the offer.
+    std::string register_worker_route(WorkerOffer&, std::string* peer_identity, std::string* peer_node_id);
     void unregister_worker(std::string const& instance);
     // Graceful rotation never releases granted or accepted work. False keeps
     // this authority and its transport reservation until the leases finish.

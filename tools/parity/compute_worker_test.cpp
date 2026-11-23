@@ -218,6 +218,34 @@ struct RunningBroker
 void multiple_brokers(char const* ca, char const* cert, char const* key)
 {
     pool::TlsOptions tls{ca, cert, key, 10000, 65536};
+    {
+        pool::BrokerOptions options; options.listen = {"::", 0}; options.tls = tls;
+        RunningBroker home(options), later(options);
+        pool::Endpoint primary{"127.0.0.1", home.server.endpoint().port, "localhost"};
+        pool::Endpoint alternate{"::1", primary.port, "localhost"};
+        pool::Endpoint addition{"127.0.0.1", later.server.endpoint().port, "localhost"};
+        auto dual = config(); dual.broker = primary; dual.listen = {"::", 0}; dual.tls = tls; dual.max_brokers = 2;
+        dual.available_resources = [capacity = dual.capacity](unsigned) { return capacity; };
+        unsigned browse = 0;
+        dual.discover_brokers = [&]
+        {
+            if (++browse == 1) return std::vector<pool::Endpoint>{};
+            if (browse == 2) return std::vector<pool::Endpoint>{alternate};
+            return std::vector<pool::Endpoint>{alternate, addition};
+        };
+        WorkerService worker(dual); worker.start();
+        pool::BrokerClient original(primary, tls), alias(alternate, tls), peer(addition, tls);
+        auto const advertised = original.status().worker_records.at(0).endpoint;
+        require(advertised.host == primary.host && alias.status().worker_records.at(0).endpoint == advertised,
+            "dual-stack broker fixture did not establish its primary worker route");
+        auto const until = Clock::now() + std::chrono::seconds(3);
+        while ((worker.status().healthy_brokers != 2 || !peer.status().workers) && Clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto const status = worker.status();
+        require(peer.status().workers == 1 && status.known_brokers == 2 && status.healthy_brokers == 2 &&
+            original.status().worker_records.at(0).endpoint == advertised,
+            "a second address for the first broker displaced its working route or deferred a distinct broker");
+    }
     pool::BrokerOptions broker_options; broker_options.listen = {"127.0.0.1", 0}; broker_options.tls = tls;
     RunningBroker first(broker_options), second(broker_options);
     auto options = config(); options.broker = first.server.endpoint();

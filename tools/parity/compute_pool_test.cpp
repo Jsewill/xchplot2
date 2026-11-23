@@ -765,6 +765,15 @@ void worker_route_change(BrokerOptions options, TlsOptions const& owner_tls, Tls
     require(first && worker.begin(*first, first->owner_identity), "old-route lease did not begin");
     auto updated = original; updated.endpoint.port = 47003;
     permanent_rejects([&] { worker.register_worker(updated); });
+    auto alias = updated; alias.endpoint.host = "::1";
+    auto const epoch = worker.register_worker_route(alias, nullptr, nullptr);
+    require(epoch == first->epoch && alias.endpoint == original.endpoint,
+        "an alternate control route changed the primary endpoint at the same revision");
+    alias = updated; ++alias.capacity_revision; alias.endpoint.host = "::1";
+    require(worker.register_worker_route(alias, nullptr, nullptr) == epoch && alias.endpoint == original.endpoint &&
+        worker.status().worker_records.at(0).endpoint == original.endpoint,
+        "an alternate control address replaced the working endpoint with a newer capacity revision");
+    updated.capacity_revision = alias.capacity_revision;
     ++updated.capacity_revision; worker.register_worker(updated);
     worker.renew(*first);
     auto second = owner.acquire(session, task("new-route", 2));

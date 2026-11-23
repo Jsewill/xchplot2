@@ -38,7 +38,7 @@ constexpr char broker_restarted[] = "broker restarted; open a new owner session"
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute };
 class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
 constexpr uint8_t independent_flag = 0x80;
@@ -428,6 +428,33 @@ std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string*
     auto bytes = call(writer, peer_identity, peer_node_id);
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
     require(!epoch.empty(), "broker registration omitted its epoch"); return epoch;
+}
+std::string BrokerClient::register_worker_route(WorkerOffer& offer, std::string* peer_identity, std::string* peer_node_id)
+{
+    auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer);
+    try
+    {
+        auto bytes = call(writer, peer_identity, peer_node_id);
+        Reader reader(bytes); auto epoch = reader.string(64); auto endpoint = read_endpoint(reader); reader.finish();
+        require(!epoch.empty() && !endpoint.host.empty() && endpoint.port, "broker route registration omitted its endpoint or epoch");
+        offer.endpoint = std::move(endpoint); return epoch;
+    }
+    catch (UnknownOperation const&) {}
+    // Older brokers can expose the same worker's current endpoint through
+    // authenticated status. The caller's registration deadline bounds every page.
+    auto const identity = certificate_identity(tls_.cert_file);
+    StatusRequest query;
+    for (;;)
+    {
+        auto page = status(query);
+        auto found = std::find_if(page.worker_records.begin(), page.worker_records.end(),
+            [&](auto const& worker) { return worker.identity == identity && worker.instance == offer.instance; });
+        if (found != page.worker_records.end()) { offer.endpoint = found->endpoint; break; }
+        if (!page.next_cursor) break;
+        require(page.next_cursor > query.cursor && page.next_cursor <= 4096, "invalid broker worker status cursor");
+        query.cursor = page.next_cursor;
+    }
+    return register_worker(offer, peer_identity, peer_node_id);
 }
 void BrokerClient::unregister_worker(std::string const& instance)
 { auto writer = request(Operation::Unregister); writer.string(instance); auto bytes = call(writer); Reader(bytes).finish(); }
@@ -1404,6 +1431,7 @@ struct BrokerServer::Impl
             schedule(); break;
         }
         case Operation::Register:
+        case Operation::RegisterWorkerRoute:
         {
             auto offer = read_offer(reader);
             if (offer.independent_k_mask)
@@ -1452,6 +1480,7 @@ struct BrokerServer::Impl
             else
             {
                 auto& saved = it->second.offer;
+                if (operation == Operation::RegisterWorkerRoute) offer.endpoint = saved.endpoint;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
                     saved.capabilities == offer.capabilities && saved.independent_k_mask == offer.independent_k_mask &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
@@ -1476,7 +1505,9 @@ struct BrokerServer::Impl
                 saved.admission = offer.admission; saved.producer_build = offer.producer_build;
                 saved.hardware = std::move(offer.hardware); it->second.seen = Clock::now();
             }
-            response.string(epoch); schedule(); break;
+            response.string(epoch);
+            if (operation == Operation::RegisterWorkerRoute) write_endpoint(response, workers.at(identity).offer.endpoint);
+            schedule(); break;
         }
         case Operation::Unregister:
         {
