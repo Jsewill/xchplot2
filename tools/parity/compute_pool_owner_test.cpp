@@ -389,17 +389,25 @@ void owner_broker_restart()
     auto const raw_reference = directory.path / "restart-raw-reference.gplot";
     { Engine engine(raw_reference.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(Members(expected).subspan(0, 1)).accepted, "restart raw reference did not fit"); }
+    auto restart_after_retries = [&](auto& task, uint64_t before)
+    {
+        // A refused connection can take a full socket timeout. Bring the
+        // broker back after two observed retries with the task still pending.
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        while (backend.pool_retries.load() < before + 2 && std::chrono::steady_clock::now() < until &&
+            task.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout) {}
+        bool const pending = backend.pool_retries.load() >= before + 2 &&
+            task.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+        broker = std::make_unique<RunningBroker>(options);
+        return pending;
+    };
     uint64_t const raw_retries = backend.pool_retries.load();
     broker.reset();
     auto raw = std::async(std::launch::async, [&] { return backend.generate_pool(requested, 0, args); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_raw = raw.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_raw, "raw owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(raw, raw_retries), "raw owner did not stay pending across two broker retries");
     require(raw.wait_for(std::chrono::seconds(8)) == std::future_status::ready,
         "raw owner did not recover within its original task deadline");
     std::vector<Member> member; member.push_back(raw.get());
-    require(backend.pool_retries.load() > raw_retries + 1, "raw owner did not survive the old retry limit");
     auto const raw_path = directory.path / "restart-raw.gplot";
     { Engine engine(raw_path.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(member).accepted, "restarted raw owner append did not fit"); }
@@ -419,13 +427,10 @@ void owner_broker_restart()
         producer.defer_pool_history = true;
         return producer.fill_contributions(*input, 0, 0, producer.contribution_bytes(cfg, 2), "restart member ");
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_contribution = contribution.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_contribution, "contribution owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(contribution, contribution_retries),
+        "contribution owner did not stay pending across two broker retries");
     require(contribution.wait_for(std::chrono::seconds(8)) == std::future_status::ready && contribution.get() == 2,
         "contribution owner did not recover its complete membership");
-    require(backend.pool_retries.load() > contribution_retries + 1, "contribution owner did not survive the old retry limit");
     require(engine.append(*input).accepted, "restarted contribution append did not fit"); input.reset(); engine.finish();
     auto const contribution_reference = directory.path / "restart-contributions-reference.gplot";
     { Engine reference(contribution_reference.string(), cfg, false, initial); reference.confirm_identity();
