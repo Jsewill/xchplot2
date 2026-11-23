@@ -5,6 +5,7 @@
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
 #include "compute_pool_fixture.hpp"
+#include <deque>
 #include <iostream>
 
 using namespace group_grow;
@@ -67,6 +68,10 @@ void planning_feedback()
 {
     using Planning = worker_detail::GenerationPlanning;
     using Output = pool::GenerationOutput;
+    // Each planner carries its fixed worker histories. Keep the independent
+    // scenarios off the test thread's stack, as the client does in its Impl.
+    std::deque<Planning> planners;
+    auto new_planner = [&]() -> Planning& { return planners.emplace_back(1000); };
     auto const now = Clock::now(); pool::Endpoint route{"127.0.0.1", 49101};
     WorkerTaskObservation fast; fast.worker_identity = "local-worker"; fast.worker_instance = "first";
     fast.kind = pool::Kind::GenerateCpu; fast.k = 18; fast.strength = 2; fast.work_units = 1;
@@ -81,7 +86,7 @@ void planning_feedback()
     };
     auto train = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
     { for (unsigned i = 0; i < 3; ++i) observe(planning, value, endpoint); };
-    Planning planning(1000);
+    auto& planning = new_planner();
     auto missing = fast; missing.transfer_ns = 0; train(planning, missing, route);
     require(hint(planning).batch == 1 && hint(planning).concurrency == 2,
         "missing delivery phase evidence trained a generation policy");
@@ -113,7 +118,7 @@ void planning_feedback()
     require(hint(planning, 18, 2, pool::Kind::GenerateAny).batch == 1,
         "mixed-backend aggregation ignored its active worker majority");
 
-    Planning replacement(1000); train(replacement, fast, route);
+    auto& replacement = new_planner(); train(replacement, fast, route);
     auto changed = fast; changed.worker_instance = "replacement";
     observe(replacement, changed, route);
     require(hint(replacement).batch == 1, "a replacement worker inherited an old incarnation's feedback");
@@ -126,7 +131,7 @@ void planning_feedback()
     require(replacement.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, now + std::chrono::milliseconds(1001)).concurrency == 2,
         "an idle worker retained stale pressure beyond the task timeout");
 
-    Planning bounded(1000);
+    auto& bounded = new_planner();
     for (unsigned i = 0; i < 256; ++i) observe(bounded, fast, route);
     require(hint(bounded).batch == pool::max_generation_batch_members && hint(bounded).concurrency == 64,
         "generation feedback exceeded or failed to reach its bounded policy");
@@ -140,12 +145,12 @@ void planning_feedback()
     bounded.observed(older_workload, route, retired_selection, now);
     bounded.failed(older_workload, route, retired_selection, now);
     require(hint(bounded, 20).batch == 1, "late feedback resurrected a worker after bounded history eviction");
-    Planning invalid(1000); auto oversized = fast; oversized.worker_identity.assign(65, 'x');
+    auto& invalid = new_planner(); auto oversized = fast; oversized.worker_identity.assign(65, 'x');
     train(invalid, oversized, route); auto invalid_route = route; invalid_route.host.assign(254, 'x');
     train(invalid, fast, invalid_route);
     require(hint(invalid).batch == 1, "invalid protocol keys entered fixed planning storage");
 
-    Planning late(1000); auto old_selection = late.selected(fast, route, now);
+    auto& late = new_planner(); auto old_selection = late.selected(fast, route, now);
     train(late, fast, route); changed = fast; changed.worker_instance = "new-process";
     train(late, changed, route);
     for (unsigned i = 0; i < 3; ++i) late.observed(pressure, route, old_selection, now);
@@ -163,7 +168,7 @@ void planning_feedback()
     require(late.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, expired).batch == 1,
         "a delayed completion revived a peer after its monotonic observation timeout");
 
-    Planning measured(1000);
+    auto& measured = new_planner();
     auto remote = slow; remote.generation_output = Output::Contributions; remote.worker_slots = 1;
     remote.generation = {300, 100, 80, 120};
     auto price = [&](unsigned lanes, unsigned batch = 1, Output output = Output::Contributions)
@@ -179,7 +184,7 @@ void planning_feedback()
     require(hint(measured, 18, 2, remote.kind, Output::Contributions).batch == 1,
         "a slower measured batch displaced the faster singleton");
     {
-        Planning output_modes(1000);
+        auto& output_modes = new_planner();
         auto fresh = remote; fresh.kind = pool::Kind::GenerateGpu; fresh.generation_output = Output::Fresh;
         auto estimate = [&](Output output, unsigned batch)
         { return output_modes.estimate(18, 2, fresh.kind, output, 1, batch, now); };
@@ -205,7 +210,7 @@ void planning_feedback()
     require(price(2).receivers == 2 && price(2).member_ns == 200 && price(1).member_ns == 400,
         "independent worker service did not improve the two-receiver forecast");
     {
-        Planning wave(1000);
+        auto& wave = new_planner();
         auto const kind = pool::Kind::GenerateGpu;
         auto quick = remote; quick.kind = kind; quick.work_units = 2; quick.independent_members = true;
         quick.generation = {1800, 200, 200, 0};
@@ -232,12 +237,12 @@ void planning_feedback()
             "the slow receiver changed the short scratch wave or was ignored for a longer wave");
     }
     peer.generation = remote.generation = {10, 990, 990, 10};
-    Planning shared(1000);
+    auto& shared = new_planner();
     remote.worker_slots = 8; train(shared, remote, route);
     auto const limited = shared.estimate(18, 2, remote.kind, Output::Contributions, 8, 1, now);
     require(limited.receivers == 2 && std::abs(limited.member_ns - 990) < 1e-6L,
         "multiple worker slots multiplied shared link bandwidth");
-    Planning prefetched(1000);
+    auto& prefetched = new_planner();
     remote.generation.frame_read_ns = remote.generation.frame_wait_ns;
     remote.generation.frame_wait_ns = 10;
     train(prefetched, remote, route);
@@ -249,7 +254,7 @@ void planning_feedback()
     auto const unequal = shared.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(unequal.receivers == 2 && std::abs(unequal.member_ns - 550) < 1e-6L,
         "the individually fastest slots crowded out a faster combination on the shared link");
-    Planning mixed_link(1000);
+    auto& mixed_link = new_planner();
     auto link_heavy = peer; link_heavy.worker_slots = 2; link_heavy.generation = {100, 900, 900, 0};
     auto link_light = compute_bound; link_light.worker_identity = "light-worker";
     link_light.generation = {1200, 300, 300, 0};
@@ -260,7 +265,7 @@ void planning_feedback()
     require(partial.receivers == 2 && std::abs(partial.member_ns - 10500.L / 17) < 1e-6L,
         "the forecast did not time-share workers at the shared link limit");
     {
-        Planning adapters(1000);
+        auto& adapters = new_planner();
         auto first = link_heavy, second = link_heavy; second.worker_identity = "second-adapter-worker";
         first.ingress_interface = second.ingress_interface = 7; train(adapters, first, route); train(adapters, second, route);
         auto estimate = [&] { return adapters.estimate(18, 2, first.kind, Output::Contributions, 2, 1, now); };
@@ -283,7 +288,7 @@ void planning_feedback()
         require(std::abs(estimate().member_ns - 550) < 1e-6L, "receiver stalls were charged again as link occupancy");
     }
     {
-        Planning widths(1000); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
+        auto& widths = new_planner(); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
         packed.generation = {70, 30, 30, 0}; train(widths, packed, route);
         packed.work_units = 2; packed.generation = {100, 20, 20, 0}; train(widths, packed, route);
         auto price = [&](unsigned width) { return widths.estimate(18, 2, packed.kind, Output::Packed, 1, width, now); };
@@ -291,7 +296,7 @@ void planning_feedback()
             price(3).member_ns > 0 && !price(3).measured_packed_batch,
             "packed widths lost their delivery cost or treated other widths as an exact measured batch");
     }
-    Planning dual_backend(1000);
+    auto& dual_backend = new_planner();
     link_heavy.worker_slots = 1;
     auto efficient_cpu = link_heavy; efficient_cpu.generation = {1080, 120, 120, 0};
     link_heavy.kind = pool::Kind::GenerateGpu;
@@ -303,7 +308,7 @@ void planning_feedback()
         "a hybrid worker lost its low-link backend or offered the same slot twice");
     // Independently enumerate integer allocations and all time shares between
     // two allocations that straddle the link limit, for several receiver caps.
-    Planning three_workers(1000);
+    auto& three_workers = new_planner();
     std::array<unsigned, 3> const service{1000, 1000, 1500}, wire{900, 650, 300};
     for (unsigned i = 0; i < service.size(); ++i)
     {
@@ -338,7 +343,7 @@ void planning_feedback()
         require(estimate.receivers == needed && std::abs(estimate.member_ns - 1 / best) < 1e-6L,
             "worker rate or receiver count differed from the feasible allocation search");
     }
-    Planning direct(1000);
+    auto& direct = new_planner();
     auto local = compute_bound; local.local_direct = true; local.generation_output = Output::Contributions;
     local.execution_ns = 1000; local.transfer_ns = 100; local.worker_slots = 1;
     remote.worker_slots = 1; train(direct, remote, route); train(direct, local, route);
@@ -353,7 +358,7 @@ void planning_feedback()
     require(price(2).receivers == 1 && price(2).measured_slots == 1 && price(2).member_ns == 400,
         "a failed route must leave the other worker's measured service available");
 
-    Planning fleet(1000);
+    auto& fleet = new_planner();
     require(fleet.probe_contribution_route(18, 2, now), "a cold GPU route was assumed to have a delivery sample");
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
     pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
@@ -362,11 +367,11 @@ void planning_feedback()
     packed.generation_output = Output::Packed; packed.work_units = 1;
     train(fleet, packed, route);
     require(fleet.probe_contribution_route(18, 2, now), "packed delivery suppressed an unmeasured contribution probe");
-    Planning legacy(1000); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
+    auto& legacy = new_planner(); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
     require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now).receivers,
         "an untimed delivery kept probing or supplied an unmeasured link rate");
     train(fleet, pipeline, route);
-    Planning whole_group(1000);
+    auto& whole_group = new_planner();
     train(whole_group, pipeline, route);
     require(!whole_group.joint_contribution_members(18, 2, 2, now, 3) &&
         whole_group.joint_contribution_members(18, 2, 3, now, 3) == 3 &&
@@ -386,7 +391,7 @@ void planning_feedback()
     auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
     auto single = pipeline; single.independent_members = false; single.work_units = 1; single.generation = {400, 50, 25, 25};
     {
-        Planning optional(1000);
+        auto& optional = new_planner();
         auto joint_width = [&](unsigned maximum = 2) { return optional.joint_contribution_members(18, 2, maximum, now); };
         require(!joint_width(), "a cold GPU split a ready independent batch");
         observe(optional, single, route);
@@ -410,7 +415,7 @@ void planning_feedback()
         require(!optional.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)),
             "expired GPU measurements changed a fresh contribution choice");
 
-        Planning coalesced(1000);
+        auto& coalesced = new_planner();
         train(coalesced, pipeline, route);
         auto const occupied = coalesced.selected(pipeline, route, now);
         require(!coalesced.joint_contribution_members(18, 2, 2, now),
@@ -422,7 +427,7 @@ void planning_feedback()
         observe(coalesced, joint, route);
         require(!coalesced.joint_contribution_members(18, 2, 2, now),
             "an independently delivered destination continued splitting after a slower joint trial");
-        Planning mixed_routes(1000);
+        auto& mixed_routes = new_planner();
         train(mixed_routes, pipeline, route);
         auto slow_joint = joint; slow_joint.worker_identity = "joint-only";
         observe(mixed_routes, slow_joint, route);
@@ -435,7 +440,7 @@ void planning_feedback()
             "a busy pipeline must justify its wait without displacing a free encoder after an overrun");
         mixed_routes.released(pipeline.worker_identity, occupied_pipeline);
 
-        Planning assigned(1000);
+        auto& assigned = new_planner();
         train(assigned, pipeline, route);
         auto slow_single = single; slow_single.worker_identity = "slow-uplink";
         slow_single.generation = {1100, 700, 500, 300};
@@ -477,7 +482,7 @@ void planning_feedback()
         require(!assigned.repartition_contributions(slow_pair, now),
             "a measured faster joint delivery was displaced by the worker's old singleton cost");
 
-        Planning pipeline_only(1000);
+        auto& pipeline_only = new_planner();
         train(pipeline_only, pipeline, route);
         auto prior = slow_stream; prior.generation = {3600, 1800, 600, 300};
         observe(pipeline_only, prior, route);
@@ -485,7 +490,7 @@ void planning_feedback()
             !pipeline_only.joint_contribution_members(18, 2, 2, now),
             "a worker first measured in a pipeline took or repeatedly requested a slower joint trial");
 
-        Planning queued(1000);
+        auto& queued = new_planner();
         train(queued, pipeline, route);
         require(!queued.defer_queued_joint(18, 2, 2, now) && queued.joint_contribution_members(18, 2, 3, now) == 2 &&
             queued.defer_queued_joint(18, 2, 2, now) && !queued.defer_queued_joint(18, 2, 3, now),
@@ -497,7 +502,7 @@ void planning_feedback()
             !queued.defer_queued_joint(18, 2, 2, now + std::chrono::milliseconds(1001)),
             "a withdrawn calibration immediately retried or outlived its history");
 
-        Planning balanced(1000);
+        auto& balanced = new_planner();
         auto second = pipeline; second.worker_identity = "second-pipeline"; second.generation = {1200, 150, 100, 50};
         train(balanced, second, route);
         auto wide = second; wide.work_units = 8;
@@ -510,7 +515,7 @@ void planning_feedback()
             "the busy GPU's unfinished delivery was omitted from a two-way split");
         balanced.released(pipeline.worker_identity, fast_busy);
 
-        Planning abandoned(1000);
+        auto& abandoned = new_planner();
         train(abandoned, pipeline, route);
         require(abandoned.joint_contribution_members(18, 2, 2, now) == 2, "missing initial joint trial");
         auto later = now + std::chrono::milliseconds(900);
@@ -520,7 +525,7 @@ void planning_feedback()
             abandoned.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)) == 2,
             "an undelivered joint trial suppressed new calibration past its deadline");
 
-        Planning bounded(1000);
+        auto& bounded = new_planner();
         auto triple = joint; triple.work_units = 3; triple.generation = {300, 150, 50, 50};
         train(bounded, single, route); train(bounded, joint, route); train(bounded, triple, route);
         require(bounded.estimate(18, 2, pipeline.kind, Output::Contributions, 1, 2, now).member_ns == 450 &&
@@ -533,7 +538,7 @@ void planning_feedback()
     }
     for (bool singleton_first : {false, true})
     {
-        Planning mixed(1000);
+        auto& mixed = new_planner();
         if (singleton_first) observe(mixed, single, route);
         observe(mixed, pipeline, route); observe(mixed, pipeline, route);
         if (!singleton_first) observe(mixed, single, route);
@@ -568,7 +573,7 @@ void planning_feedback()
     require(width() == 1, "a late release freed the replacement route's running slot");
     fleet.released(pipeline.worker_identity, new_route);
 
-    Planning resident(1000);
+    auto& resident = new_planner();
     auto packed_width = [&] { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 2, 2, 3, 1, now); };
     auto fast_packed = single, slow_packed = singleton;
     fast_packed.generation_output = slow_packed.generation_output = Output::Packed;

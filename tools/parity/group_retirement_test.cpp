@@ -192,7 +192,7 @@ int main(int argc, char** argv)
     {
         std::ifstream in(file_io::native_path(argv[2]), std::ios::binary); auto inventory = read_farm_inventory(in);
 #ifdef _WIN32
-        require(::SetEnvironmentVariableW(L"XCHPLOT2_GROW_FAILPOINT", file_io::native_path(argv[3]).c_str()), "cannot inject native retirement interruption");
+        require(!::_putenv_s("XCHPLOT2_GROW_FAILPOINT", argv[3]), "cannot inject native retirement interruption");
 #else
         ::setenv("XCHPLOT2_GROW_FAILPOINT", argv[3], 1);
 #endif
