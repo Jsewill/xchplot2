@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli]
+        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery]
 
 permissions:
   contents: read
@@ -446,3 +446,88 @@ jobs:
           path: build/qa-host/Testing/Temporary/LastTest.log
           retention-days: 3
           if-no-files-found: ignore
+  recovery:
+    name: Interrupted native fresh compact publication
+    if: inputs.phase == 'archive-recovery'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify the source-pinned production archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          gh run download 45119299025 --repo Jsewill/xchplot2 -n windows-hardware-x86_64 -D archive
+          $zip = @(Get-ChildItem -Path archive/*.zip)
+          if ($zip.Count -ne 1) { throw 'Expected one Windows qualification archive' }
+          $hash = ((Get-Content -LiteralPath ($zip[0].FullName + '.sha256') -Raw) -split '\s+')[0]
+          if ((Get-FileHash -LiteralPath $zip[0].FullName).Hash -ne $hash) { throw 'Archive checksum mismatch' }
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath package
+          $info = @(Get-ChildItem -LiteralPath package -Filter BUILDINFO.txt -Recurse)
+          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*ce8fd8fb86e117ee17978f21f07efb4ea2415770\s*$' -Quiet)) { throw 'Archive source mismatch' }
+      - name: Resume each native data boundary and verify published bytes and full proofs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          """Interrupt native fresh compact output at each data boundary and reproduce the CPU reference."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          exe=Path(sys.argv[1]).resolve()
+          root=Path(sys.argv[2]).resolve()
+          root.mkdir()
+          base_env=dict(os.environ, XCHPLOT2_NO_AUTO_SPILL="1", PATH=str(exe.parent)+os.pathsep+os.environ["PATH"])
+          full=[]
+          for point in ("direct-target-partial","direct-target","direct-committed"):
+              work=root/point
+              work.mkdir()
+              manifest=work/"fixture.tsv"
+              manifest.write_text("18 2 0 0 gplot-v2-grouped "+"ab"*32+" "+"00"*112+" . final.gplot 2\n",encoding="ascii")
+              env=dict(base_env,XCHPLOT2_TEMP_DIR=str(manifest))
+              for key in ("TEMP","TMP","TMPDIR","XDG_CONFIG_HOME","XDG_CACHE_HOME","XDG_STATE_HOME"):
+                  path=work/key
+                  path.mkdir(exist_ok=True)
+                  env[key]=str(path)
+              cmd=["batch",str(manifest),"--devices","cpu","--workers","4","--compute","off","--no-auto-spill","--destination-temp","off","--member-storage","compact","--construction","incremental","--batch-members","2","--window-bytes","1M","--checkpoint-bytes","128K","--no-progress","--config",os.devnull]
+              def run(name,args,expected,settings):
+                  p=subprocess.run([str(exe),*args],cwd=work,env=settings,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=150)
+                  (work/(name+".log")).write_bytes(p.stdout)
+                  assert p.returncode==expected,(name,p.returncode,p.stdout[-1000:])
+                  return p.stdout.decode("utf-8","replace")
+              run("interrupted",cmd,86,dict(env,XCHPLOT2_GROW_FAILPOINT=point))
+              out=work/"final.gplot"
+              assert not out.exists() and (work/"final.gplot.partial").is_file()
+              run("resumed",cmd+["--resume"],0,env)
+              assert out.stat().st_size==1297757 and not (work/"final.gplot.partial").exists()
+              with out.open("rb") as source: digest=hashlib.file_digest(source,"sha256").hexdigest()
+              assert digest=="bf3471eb57ced71e255f2d11842b4ee39a2bdf92bc80f4570fb80e828eb6470a"
+              checked=run("proofs",["verify",str(out),"--full","--trials","60","--config",os.devnull],0,env)
+              proofcounts=[int(v) for v in re.findall(r"(\d+) full proofs validated",checked)]
+              assert len(proofcounts)==1 and proofcounts[0]>0
+              full.append({"point":point,"sha256":digest,"proofs":proofcounts[0]})
+              print(json.dumps(full[-1]),flush=True)
+          (root/"results.json").write_text(json.dumps(full,indent=2))
+          '@ | Set-Content -LiteralPath native-recovery.py -Encoding utf8
+          $exe = @(Get-ChildItem -LiteralPath package -Filter xchplot2.exe -Recurse)
+          if ($exe.Count -ne 1) { throw 'Expected one native executable' }
+          python -B -u native-recovery.py $exe[0].FullName native-evidence
+      - uses: actions/upload-artifact@v7
+        if: '!cancelled()'
+        with:
+          name: native-recovery-results
+          path: |
+            native-evidence/**/*.log
+            native-evidence/results.json
+          if-no-files-found: ignore
+          retention-days: 3
