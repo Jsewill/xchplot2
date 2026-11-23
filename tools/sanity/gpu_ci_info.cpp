@@ -2,6 +2,7 @@
 #include "host/GpuBufferPool.hpp"
 #ifdef XCHPLOT2_GPU_CI_SYCL
 #include "gpu/SyclDeviceList.hpp"
+#include "host/GroupHarvesterProfile.hpp"
 #else
 #include "gpu/CudaDeviceList.hpp"
 #include "host/VramBudget.hpp"
@@ -16,8 +17,9 @@
 int main(int argc, char** argv)
 {
     try {
-        if (argc != 2)
-            throw std::runtime_error("usage: gpu_ci_info cuda|hip|level_zero");
+        bool const group_pool = argc == 3 && std::string(argv[2]) == "--group-pool-k18";
+        if (argc != 2 && !group_pool)
+            throw std::runtime_error("usage: gpu_ci_info cuda|hip|level_zero [--group-pool-k18]");
         if (std::getenv("POS2GPU_MAX_VRAM_MB"))
             throw std::runtime_error("CI inventory requires uncapped physical VRAM");
 #ifdef XCHPLOT2_GPU_CI_SYCL
@@ -53,6 +55,17 @@ int main(int argc, char** argv)
 #endif
         if (!free_bytes || !devices.front().vram_bytes)
             throw std::runtime_error("GPU memory inventory is empty");
+        if (group_pool) {
+#ifdef XCHPLOT2_GPU_CI_SYCL
+            auto const pool = pos2gpu::GpuBufferPool::sizing(18);
+            std::printf("pool_bytes=%llu free_bytes=%zu host_available_bytes=%llu\n",
+                        static_cast<unsigned long long>(pool.device_bytes()), free_bytes,
+                        static_cast<unsigned long long>(group_grow::profile_detail::available_memory()));
+            return 0;
+#else
+            throw std::runtime_error("grouped GPU construction requires the SYCL backend");
+#endif
+        }
         std::fprintf(stderr, "GPU: %s (%s)\n", devices.front().name.c_str(), backend.c_str());
         std::printf("backend=%s\nmemory_kind=%s\ntotal_bytes=%llu\nfree_bytes=%zu\nmargin_bytes=%zu\n",
                     backend.c_str(), shared_memory ? "shared" : "dedicated",

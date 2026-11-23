@@ -122,6 +122,65 @@ def tier_caps(info, physical_mib=0):
     return fits
 
 
+def grouped_handoff(binary, probe, args, info, env, work, logs, run, verify):
+    if "pinned" not in info:
+        return dict(status="skipped", reason="grouped construction requires the SYCL build")
+    # The ordinary k=18 two-member RAM route fits in 2 GiB. Keep a smaller
+    # operator limit and skip this optional route check on a constrained host.
+    if args.max_host_ram_gib is not None and args.max_host_ram_gib < 2:
+        return dict(status="skipped", reason="host RAM budget below 2 GiB")
+    run("group-pool-k18", [probe, args.backend, "--group-pool-k18"])
+    match = re.search(r"^pool_bytes=(\d+) free_bytes=(\d+) host_available_bytes=(\d+)$",
+                      (logs / "group-pool-k18.log").read_text(), re.MULTILINE)
+    if not match:
+        raise ValueError("Missing grouped pool memory inventory")
+    pool, free, host = map(int, match.groups())
+    cap = (pool + info["margin_bytes"] + MIB - 1) // MIB
+    # Integrated devices draw their pool and the host working set from the
+    # same physical memory. Keep both inside the observed host headroom.
+    host_needed = 2 * 1024 * MIB + (cap * MIB if info["memory_kind"] == "shared" else 0)
+    if cap * MIB > free or host < host_needed:
+        return dict(status="skipped", reason="insufficient live memory for the two-member pool case")
+
+    # Rounding the pool up to MiB leaves less room than the additional k=18
+    # device output. A fresh RAM batch can use one full host output instead.
+    plot_env = dict(env, POS2GPU_MAX_VRAM_MB=str(cap), POS2GPU_PHASE_TIMING="1")
+    manifest = work / "group-pool.tsv"
+    reference = work / "group-cpu.gplot"
+    result = dict(status="passed", cap_mib=cap)
+    for case in ("cpu", "off", "auto"):
+        label = "group-" + case
+        plot = work / (label + ".gplot")
+        manifest.write_text(f"18 2 0 0 gplot-v2-grouped {'ab' * 32} {'00' * 112} . {plot.name} 2\n")
+        command = [binary, "batch", manifest, "--devices", "cpu" if case == "cpu" else "gpu0",
+                   "--compute", "off", "--batch-members", "2", "--construction", "incremental",
+                   "--member-storage", "compact", "--workers", "2", "--max-host-ram", "2G",
+                   "--destination-temp", "off", "--no-auto-spill", "--no-progress", "--config", "/dev/null"]
+        if case != "cpu":
+            command += ["--tier", "pool", "--generation-overlap", case]
+        run(label, command, env if case == "cpu" else plot_env, cwd=work)
+        if case == "cpu":
+            continue
+        if not filecmp.cmp(reference, plot, shallow=False):
+            raise RuntimeError(f"{label}: grouped bytes differ from the CPU reference")
+        trace = (logs / f"{label}.log").read_text()
+        events = re.findall(r"^\[grow-gpu-timing\] event=([\w-]+) member=(\d+) .*? status=(\w+)",
+                            trace, re.MULTILINE)
+        if case == "off" and any(event == "host-output-allocation" for event, _, _ in events):
+            raise RuntimeError(f"{label}: overlap off attempted a host output slot")
+        pin_failed = case == "auto" and ("host-output-allocation", "0", "failed") in events
+        expected = ("generation-tiled",) if case == "off" or pin_failed else ("generation-borrowed", "output-borrowed")
+        routes = [(event, member, status) for event, member, status in events
+                  if event.startswith("generation-") or event == "output-borrowed"]
+        if sorted(routes) != sorted((event, member, "complete") for event in expected for member in ("1", "2")):
+            raise RuntimeError(f"{label}: expected {' and '.join(expected)} for both members")
+        if case == "auto":
+            if pin_failed:
+                result.update(status="skipped", reason="host slot allocation refused")
+            result["full_proofs_validated"] = verify("group-proofs", plot)
+    return result
+
+
 def archive_binary(archive, build, work):
     package, digest = extract_archive(archive, work)
     buildinfo = (package / "BUILDINFO.txt").read_bytes()
@@ -299,6 +358,9 @@ def main():
                     reference.unlink()
                     vector["status"] = "passed"
                 summary.pop("vector")
+                if args.suite == "correctness":
+                    summary["group_handoff"] = grouped_handoff(
+                        binary, build / "tools/sanity/gpu_ci_info", args, info, env, work, logs, run, verify)
                 if args.suite == "physical":
                     # No software cap: exercise automatic selection on the real card.
                     run("physical-auto", [binary, "bench", "--devices", "0", "-k", "28", "-n", "3",

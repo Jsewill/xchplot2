@@ -1574,6 +1574,12 @@ void automatic_pool_growth()
         args.pool_frame_bytes = args.window = 65536; args.pool_timeout_ms = 20000;
         pos2gpu::prepare_group_compute(args); return args;
     };
+    auto offer = [](pos2gpu::GroupOptions const& args)
+    {
+        auto config = pos2gpu::make_group_compute_offer(args);
+        config.available_resources = [capacity = config.capacity](unsigned) { return capacity; };
+        return config;
+    };
     auto args = options(owner_id);
     pos2gpu::ComputeSession session(args);
     WorkerClientConfig config; config.broker = pool::parse_endpoint(args.pool_broker);
@@ -1610,7 +1616,7 @@ void automatic_pool_growth()
     auto const queued_by = Clock::now() + std::chrono::seconds(5);
     while (!control.status().queued && Clock::now() < queued_by) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     require(control.status().queued == 1, "empty broker failed to retain the pending owner's request");
-    session.offer_local(pos2gpu::make_group_compute_offer(args));
+    session.offer_local(offer(args));
     auto baseline = cold.get();
     auto original = std::async(std::launch::async, [&] { return generate(true); });
     require(receiving.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready, "original executor never began its delivery");
@@ -1625,7 +1631,7 @@ void automatic_pool_growth()
     std::vector<uint64_t> remote;
     {
         auto helper_args = options(helper_id); pos2gpu::ComputeSession helper(helper_args);
-        helper.offer_local(pos2gpu::make_group_compute_offer(helper_args));
+        helper.offer_local(offer(helper_args));
         remote = generate(false, 2);
     }
     release.set_value(); auto local = original.get();
