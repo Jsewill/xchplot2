@@ -43,12 +43,14 @@ struct GpuProducer::Impl
     int k, strength, device;
     std::atomic<bool> borrowed{false};
     std::vector<uint64_t> words;
-    bool fail_cleanup = false;
+    bool fail_cleanup = false, pending_queue_loss = false;
 };
 GpuProducer::GpuProducer(int k,int strength,GpuProducerOptions options)
     : impl_(new Impl{k,strength,options.device_id}) {}
 GpuProducer::~GpuProducer()
 {
+    if (impl_->pending_queue_loss)
+        pos2gpu::record_async_error("ze_node_event: Could not wait for event (error code = ze:1879048193)");
     if (!impl_->fail_cleanup) return;
     auto fail = [] { throw std::runtime_error("injected driver deallocation failure"); };
     pos2gpu::release_gpu_memory("test pinned output", worker_gpu_test::failed_host_free, &pos2gpu::GpuCleanupCharges::host, fail);
@@ -91,6 +93,11 @@ std::vector<uint64_t> GpuProducer::generate(std::array<uint8_t,32> const& id)
     {
         pos2gpu::record_async_error("ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY");
         throw pos2gpu::InsufficientVramError("out of test GPU memory");
+    }
+    if (!impl_->device && !worker_gpu_test::child && id[0] == 0xfa)
+    {
+        impl_->pending_queue_loss = true;
+        throw std::runtime_error("unexpected generation output");
     }
     if (pos2gpu::async_error_count()) throw std::runtime_error("synthetic device retained an async error");
     if (!impl_->device && !worker_gpu_test::child && id[0] == 0xfd)
@@ -186,7 +193,7 @@ inline void recovery(bool network)
         uint64_t count = 0; worker.generate_local(18,2,key,[&](auto const&,uint64_t total) { count = total; },cancel,kind);
         require(count, "worker produced no fragments");
     };
-    require(pool::gpu_recovery_reason("lost\n\x1b[2J") == "lost  [2J", "peer GPU diagnostics contain terminal controls");
+    require(pool::worker_diagnostic("lost\n\x1b[2J") == "lost  [2J", "peer GPU diagnostics contain terminal controls");
     auto const kind = pool::Kind::GenerateGpu;
     {
         auto cuda = std::make_shared<pos2gpu::AsyncErrorLog>();
@@ -201,6 +208,17 @@ inline void recovery(bool network)
         pos2gpu::ScopedAsyncErrors late(idle);
         pos2gpu::record_async_error("ZE_RESULT_ERROR_DEVICE_LOST");
         require(idle->count == 1 && ze->count == 2, "late device loss skipped its own reporting queue");
+    }
+    {
+        auto isolated = options; isolated.broker = {}; isolated.brokers.clear();
+        WorkerService late(isolated);
+        bool retry = false;
+        try { generate(late,kind,0xfa); }
+        catch (pool::TransientTransport const&) { retry = true; }
+        catch (std::runtime_error const&) {}
+        auto const status = late.status();
+        require(retry && !status.capacity.gpu_bytes && status.gpu_recovery.find("ze:1879048193") != std::string::npos,
+            "late queue loss did not release the first task for retry with the native GPU withdrawn");
     }
     rejects([&] { generate(service,kind,0xfe); });
     require(service.status().gpu_recovery.empty() && service.status().capacity.gpu_bytes, "an allocation failure withdrew the GPU");
@@ -286,5 +304,28 @@ inline void recovery(bool network)
     published.store(true);
     wait_until([&] { return interrupted.status().capacity.gpu_bytes; }, "worker could not recover without an original GPU profile");
     generate(interrupted,kind,42);
+
+    if (network)
+    {
+        service.stop(); healthy.stop();
+        auto same_budget = options; same_budget.capacity.gpu_bytes = 32ull << 20;
+        WorkerService late_registration(same_budget);
+        auto const original = late_registration.local_generation_offer(18,2,1);
+        rejects([&] { generate(late_registration,kind,0xfa); });
+        wait_until([&] { return late_registration.status().capacity.gpu_bytes; }, "late registration never recovered");
+        auto const current = late_registration.local_generation_offer(18,2,1);
+        require(current.capacity == original.capacity && current.demand.host_bytes > original.demand.host_bytes,
+            "fixture missed the isolated host allocation at unchanged capacity");
+        late_registration.start();
+        pool::Task task; task.task_id = "same-budget-recovery"; task.sequence = 1;
+        task.compatibility = worker_compatibility(); task.kind = kind; task.k = 18; task.strength = 2;
+        task.resources.host_bytes = worker_cpu_task_bytes(18,2,1,same_budget.max_task_bytes);
+        std::optional<pool::Lease> lease;
+        wait_until([&] { if (!lease) lease = control->acquire(session,task); return bool(lease); },
+            "broker did not admit the recovered worker");
+        require(lease->worker_instance == late_registration.status().instance && lease->task.resources == current.demand,
+            "broker reissued the native grant after recovery changed the required host memory");
+        control->cancel(session,task.task_id,task.attempt);
+    }
 }
 }

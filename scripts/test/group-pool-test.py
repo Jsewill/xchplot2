@@ -149,11 +149,11 @@ def check(args, root):
         wait_listener(process, number)
         return process
 
-    def broker(name):
+    def broker(name, lease_ms=3000):
         cert, key = identities["broker"]
         return service([args.broker, "--listen", endpoint, "--tls-ca", ca,
                         "--tls-cert", cert, "--tls-key", key, "--timeout-ms", 1500,
-                        "--lease-ms", 3000, "--worker-ms", 2500], name, broker_port)
+                        "--lease-ms", lease_ms, "--worker-ms", 2500], name, broker_port)
 
     def worker(identity, name, cpus=2, slots=2, **options):
         number = port()
@@ -497,6 +497,25 @@ def check(args, root):
         assert digest(path) == expected["owner-a"][0], value
         results["recovery"].append({"point": "broker unavailable with embedded executor", **value})
         print("PASS embedded compute sharing and local fallback obey owner budgets", flush=True)
+        # A physically lost data peer cannot finish its running lease. The
+        # replacement must publish within an owner deadline shorter than that lease.
+        broker("broker-lost-packed", lease_ms=60000)
+        slow = worker("worker-a", "lost-packed", cpus=1, slots=1, point="worker-generation-paused")
+        target, reference = targets("lost-packed-owner")
+        run([*common(reference, 1, scoped), "--construction", "incremental"])
+        command = [*common(target, 1), *network("owner-a"),
+                   "--construction", "incremental", "--pool-output", "packed"]
+        command[command.index("--pool-timeout-ms") + 1] = 15000
+        interrupted = Process(command, root / "lost-packed-owner.log")
+        services.append(interrupted)
+        wait_stopped(slow)
+        worker("worker-b", "lost-packed-survivor", cpus=1, slots=1)
+        slow.process.kill()
+        slow.finish(code=-signal.SIGKILL)
+        value = json.loads(interrupted.finish().splitlines()[-1])
+        assert value["pool_retries"] and value["pool_failed_tasks"] and value["pool_packed_members"] == 1, value
+        assert digest(target) == digest(reference), value
+        results["recovery"].append({"point": "packed worker lost before lease expiry", **value})
         return results
     finally:
         for process in reversed(services):

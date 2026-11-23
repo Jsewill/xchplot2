@@ -613,6 +613,7 @@ void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
 }
 void retry_eligibility(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
+    options.lease_ms = 5000;
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls);
     auto gpu_offer = offer("gpu-rejection", 46001); gpu_offer.capacity.gpu_bytes = 8192;
@@ -647,12 +648,43 @@ void retry_eligibility(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     { return lease.worker_identity == certificate_identity(first_tls.cert_file) ? first : second; };
     require(worker(*disconnected).begin(*disconnected, disconnected->owner_identity), "network retry lease did not begin");
     owner.abandon(*disconnected); request.attempt = 2;
-    require(!owner.acquire(session, request), "retry released an abandoned running reservation early");
-    rejects([&] { worker(*disconnected).renew(*disconnected); });
-    worker(*disconnected).finish(*disconnected);
     auto replacement = owner.acquire(session, request);
-    require(replacement && replacement->worker_identity != disconnected->worker_identity, "network retry did not try an alternative worker");
-    owner.cancel(session, "network", 2);
+    require(replacement && replacement->worker_identity != disconnected->worker_identity &&
+        worker(*replacement).begin(*replacement, replacement->owner_identity), "network retry waited for the lost worker's lease");
+    auto third = owner.open_owner("competing-owner"); auto waiting = task("waiting");
+    require(!owner.acquire(third, waiting), "retry released the lost worker's physical reservation early");
+    stale_lease_rejects([&] { worker(*disconnected).renew(*disconnected); });
+    worker(*disconnected).finish(*disconnected);
+    bool stale = false;
+    try { owner.delivered(*disconnected, {1000000, 0, 1024}); } catch (StaleDelivery const&) { stale = true; }
+    require(stale, "late output from the abandoned worker was accepted");
+    auto next = owner.acquire(third, waiting);
+    require(next && next->worker_identity == disconnected->worker_identity, "old Finish changed the replacement reservation");
+    rejects([&] { owner.cancel(session, request.task_id, 1); });
+    worker(*replacement).renew(*replacement); worker(*replacement).finish(*replacement);
+    owner.delivered(*replacement, {1000000, 0, 1024}); owner.cancel(third, waiting.task_id, 1);
+
+    auto cancelled = task("ordinary-cancellation", 3); auto original = owner.acquire(session, cancelled);
+    require(original && worker(*original).begin(*original, original->owner_identity), "ordinary cancellation did not begin");
+    owner.cancel(session, cancelled.task_id, cancelled.attempt); ++cancelled.attempt;
+    require(!owner.acquire(session, cancelled), "ordinary cancellation detached an unacknowledged lease");
+    worker(*original).finish(*original);
+    require(bool(owner.acquire(session, cancelled)), "completed cancellation retained its reservation");
+
+    // A second attempt also needs space for its own broker record. At the
+    // configured limit the same retry waits for the lost reservation to expire.
+    options.max_tasks = 1; options.lease_ms = 800;
+    RunningBroker limited(options); auto address = limited.server.endpoint();
+    BrokerClient client(address, owner_tls), lost(address, first_tls), survivor(address, second_tls);
+    lost.register_worker(offer("bounded-lost", 46003)); auto active = client.open_owner("bounded-retry");
+    auto work = task("bounded"); auto held = client.acquire(active, work);
+    require(held && lost.begin(*held, held->owner_identity), "bounded lost worker did not begin");
+    survivor.register_worker(offer("bounded-survivor", 46004)); client.abandon(*held); ++work.attempt;
+    require(!client.acquire(active, work) && client.status({StatusSection::Jobs}).jobs == 1, "retry exceeded the broker task limit");
+    std::this_thread::sleep_for(std::chrono::milliseconds(options.lease_ms + 100));
+    auto resumed = client.acquire(active, work);
+    require(resumed && resumed->worker_instance == "bounded-survivor" && client.status({StatusSection::Jobs}).jobs == 1,
+        "expired physical reservation prevented the bounded retry");
 }
 void queued_eligibility(BrokerOptions options, TlsOptions const& owner_tls,
                         TlsOptions const& first_tls, TlsOptions const& second_tls)

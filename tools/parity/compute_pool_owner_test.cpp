@@ -495,6 +495,7 @@ void late_packed_capacity()
     require(filling.get() == 3 && members.size() == 3 && hash.size() == 3 && receipts.size() == 2 &&
         hash.digest_for(Members(members)) == members_digest(18, Members(members), nullptr, [] {}),
         "newly available packed capacity did not batch and hash the unsent pair");
+    auto const canonical_packed = members_digest(18, Members(members), nullptr, [] {});
     worker_detail::CpuLimit cpu(1);
     for (unsigned i = 0; i < 3; ++i)
     {
@@ -675,6 +676,145 @@ void late_packed_capacity()
     auto const concurrent = relief.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     release.set_value();
     require(filling_two.get() == 3 && concurrent, "a held first probe kept another compatible worker idle");
+    // Train an exact delivery on the direct data route, then start a fresh
+    // owner and add a third, unpriced worker. Use actual owner/worker receipts.
+    auto settings = config;
+    settings.selected = {}; settings.observe = {};
+    settings.generation_path = [](auto const&, auto const&, uint32_t) { return std::string(64, 'b'); };
+    settings.owner_id = "training-batch"; settings.ephemeral_owner = true; settings.max_active_generation = 3;
+    auto admission = [&](WorkerService& service, WorkerControl operation)
+    {
+        auto const expected = service.control(operation);
+        auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;)
+        {
+            auto const status = control.status();
+            if (std::any_of(status.worker_records.begin(), status.worker_records.end(), [&](auto const& row)
+                { return row.identity == expected.identity && row.instance == expected.instance && row.admission == expected.admission; })) return;
+            require(std::chrono::steady_clock::now() < end, "signed worker admission did not reach the broker");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+    admission(second, WorkerControl::Pause);
+    std::array<std::array<uint8_t, 32>, 3> ids;
+    for (unsigned i = 0; i < ids.size(); ++i) ids[i] = requested.params.get_plot_params_for_index(i).get_plot_id().data();
+    {
+        WorkerClient training(settings);
+        for (unsigned i = 0; i < 2; ++i) training.generate_packed(18, 2, ids, [](auto const&, uint64_t) {});
+    }
+    admission(second, WorkerControl::Resume);
+    auto third_cert = pool_test::issue(certificates.path, "packed-third", &ca);
+    offered.tls = pool_test::tls(ca, third_cert); offered.tls.max_frame_bytes = tls.max_frame_bytes;
+    WorkerService third(offered); third.start();
+
+    auto const fast = worker.status().identity;
+    std::promise<WorkerTaskObservation> first_grant; auto first_future = first_grant.get_future().share();
+    std::promise<void> release_batch; auto batch_done = release_batch.get_future().share();
+    std::once_flag initial_selection;
+    std::vector<WorkerTaskObservation> delivered;
+    settings.owner_id = "independent-batches";
+    settings.selected = [&](auto const& value)
+    {
+        bool first = false;
+        std::call_once(initial_selection, [&] { first = true; first_grant.set_value(value); });
+        if (first) require(batch_done.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+            "the independent packed batch never resumed");
+    };
+    settings.observe = [&](auto const& value) { std::lock_guard lock(mutex); delivered.push_back(value); };
+    auto fenced_settings = settings; fenced_settings.owner_id = "changed-packed-worker"; fenced_settings.selected = {};
+    std::vector<WorkerTaskObservation> fenced_receipts;
+    fenced_settings.observe = [&](auto const& value) { fenced_receipts.push_back(value); };
+    WorkerClient changed(fenced_settings);
+    WorkerPackedRoute fenced_route; unsigned fenced_limit = 0;
+    auto const fenced_capacity = changed.generation_capacity(18, 2);
+    auto const priced_width = changed.packed_generation_width(18, 2, 3, 3, &fenced_route, &fenced_limit,
+        std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    require(fenced_capacity.slots == 3 && priced_width == 3 && fenced_route.route.identity == fast,
+        "the established route was not priced before withdrawing it");
+    std::promise<void> pricing, other_sizing;
+    auto price_started = pricing.get_future(); auto other_started = other_sizing.get_future().share();
+    std::once_flag first_price;
+    std::atomic<bool> grant_before_price{false};
+    settings.generation_path = [&](auto const&, auto const&, uint32_t)
+    {
+        std::call_once(first_price, [&]
+        {
+            pricing.set_value();
+            require(other_started.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "no independent pricing peer");
+            grant_before_price = first_future.wait_for(std::chrono::milliseconds(75)) == std::future_status::ready;
+        });
+        return std::string(64, 'b');
+    };
+    Backend parallel; parallel.mode = "pool"; parallel.cpu_scheduler = backend.cpu_scheduler;
+    parallel.pool_client_config = settings;
+    auto const ready = parallel.acquire_pool_client()->generation_capacity(18, 2);
+    require(ready.roster && ready.roster->complete && ready.roster->routes.size() == 3,
+        "the third compatible worker did not join the authenticated roster");
+    auto parallel_args = args; parallel_args.pool_inflight = 3;
+    Producer established{requested, nullptr, parallel, parallel_args, args.max_ram, uint64_t(64) << 20};
+    std::vector<Member> first_members, peer_members;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto first_task = std::async(std::launch::async, [&]
+        { return established.fill_pool(first_members, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline); });
+    bool const pricing_seen = price_started.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    grow_controller_test::Identity peer_ids{PlotGroupParams(PlotGroupId(std::string(64, '8')), 18, 2, 0), {}};
+    Producer newcomer{peer_ids, nullptr, parallel, parallel_args, args.max_ram, uint64_t(64) << 20};
+    auto peer_task = std::async(std::launch::async, [&]
+        { other_sizing.set_value(); return newcomer.fill_pool(peer_members, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline); });
+    auto first_ready = first_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    auto chosen = first_ready ? first_future.get() : WorkerTaskObservation{};
+    if (!pricing_seen || grant_before_price || chosen.worker_identity != fast || chosen.work_units != 3)
+    {
+        release_batch.set_value(); first_task.get(); peer_task.get();
+        throw std::runtime_error("an independent probe preempted the established exact packed batch");
+    }
+    bool const peer_finished = peer_task.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release_batch.set_value();
+    require(first_task.get() == 3 && peer_task.get() == 3 && peer_finished &&
+        std::any_of(delivered.begin(), delivered.end(), [&](auto const& value)
+            { return value.worker_identity == third.status().identity && value.work_units == 1; }),
+        "a paid batch on the busy route suppressed a newly eligible worker's independent delivery");
+    require(members_digest(18, Members(first_members), nullptr, [] {}) == canonical_packed,
+        "the paid route changed the ordinary canonical packed digest");
+
+    // Size from the same verified price, then retire its actual worker before
+    // the request. No ID was sent under the earlier offer. Receive the three
+    // originals as ordinary grants under their original deadline.
+    settings.selected = {}; settings.owner_id = "limited-packed-owner";
+    settings.max_active_generation = 1;
+    {
+        WorkerClient serial(settings);
+        WorkerPackedRoute route; unsigned singles = 0;
+        require(serial.packed_generation_width(18, 2, 3, 3, &route, &singles, deadline) == 1,
+            "one owner receiver claimed an independent packed batch");
+    }
+    settings.max_active_generation = 3; delivered.clear();
+    // Isolate the already measured worker from the now-paid helpers using a
+    // new route fingerprint for each helper, as on an owner interface change.
+    settings.generation_path = [fast](auto const& route, auto const&, uint32_t)
+        { return std::string(64, route.identity == fast ? 'b' : 'c'); };
+    Backend constrained; constrained.mode = "pool"; constrained.cpu_scheduler = parallel.cpu_scheduler;
+    constrained.pool_client_config = settings; constrained.pool_client_config.owner_id = "constrained-paid-batch";
+    Producer small{requested, nullptr, constrained, parallel_args, args.max_ram, uint64_t(64) << 20};
+    small.budget = small.fixed + constrained.retained() + small.pool_receive_bytes(0, 3) - 1;
+    std::vector<Member> limited;
+    auto count = small.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    require(count && !delivered.empty() && delivered.front().work_units == 1 && small.peak <= small.budget,
+        "an unfunded exact width committed its unpriced remainder or exceeded owner RAM");
+    small.budget = args.max_ram;
+    if (count < 3) small.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    require(members_digest(18, Members(limited), nullptr, [] {}) == canonical_packed,
+        "the smaller receive grant did not preserve the canonical member set");
+
+    admission(worker, WorkerControl::Pause);
+    changed.generate_packed(18, 2, ids, [](auto const&, uint64_t) {}, {}, {},
+        std::chrono::steady_clock::now() + std::chrono::seconds(10), &fenced_route);
+    require(fenced_receipts.size() == ids.size(), "withdrawing a priced worker issued unmeasured wide work elsewhere");
+    for (size_t i = 0; i < ids.size(); ++i)
+        require(fenced_receipts[i].worker_identity != fast && fenced_receipts[i].work_units == 1 &&
+            fenced_receipts[i].member_id_count == 1 && fenced_receipts[i].member_ids[0] == ids[i],
+            "a changed packed grant lost or duplicated an ordered member");
+
 }
 
 void owner_broker_restart()
@@ -922,6 +1062,18 @@ int run_dashboard_reader(FarmingOwnerHealth const& owner, fs::path const& marker
 #endif
 void owner_dashboard_feed()
 {
+    DashboardJob progress;
+    progress.roster(18, 2, 1, true, true, true, {{"id", "process", "helper", "GPU", "endpoint", 1}});
+    progress.failed_delivery("id", "process", "insufficient memory");
+    DashboardFrame snapshot;
+    progress.fill(snapshot, true);
+    auto const& worker_rows = snapshot.rows[DashboardFrame::workers];
+    require(std::any_of(worker_rows.begin(), worker_rows.end(), [](auto const& row)
+        { return row.value.find("helper   1 failed assignment") != row.value.npos && row.detail == "insufficient memory"; }) &&
+        std::none_of(worker_rows.begin(), worker_rows.end(), [](auto const& row) { return row.value.find(" delivered") != row.value.npos; }),
+        "an unsuccessful helper did not show its failure separately from delivered work");
+    require(progress.delivery("id", "process", 1, 100, 10, 4, 2, 3, 0) == "helper",
+        "a failed assignment consumed the helper's first validated delivery announcement");
 #if defined(__linux__) || defined(_WIN32)
     std::string const job(64, 'f');
     DashboardFeed feed(job);
