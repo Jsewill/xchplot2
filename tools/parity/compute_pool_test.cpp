@@ -954,11 +954,11 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
         execute(*running_pair).begin(*running_pair, running_pair->owner_identity), "fast pipeline did not start");
     large.sequence = 10; large.task_id = "waiting-pair";
     require(!owner.acquire(session, large), "idle GPU claimed a pair that would finish earlier on the busy GPU");
-    auto small = request; small.sequence = 11; small.task_id = "waiting-single";
-    require(!owner.acquire(session, small), "short queue was overestimated");
-    auto last = small; last.sequence = 12; last.task_id = "last-single";
+    auto waiting_single = request; waiting_single.sequence = 11; waiting_single.task_id = "waiting-single";
+    require(!owner.acquire(session, waiting_single), "short queue was overestimated");
+    auto last = waiting_single; last.sequence = 12; last.task_id = "last-single";
     (void)owner.acquire(session, last);
-    auto useful = owner.acquire(session, small);
+    auto useful = owner.acquire(session, waiting_single);
     require(useful && useful->worker_identity != fast && execute(*useful).begin(*useful, useful->owner_identity),
         "a deferred pair blocked useful singleton work on the idle GPU");
     owner.cancel(session, last.task_id, 1); execute(*running_pair).finish(*running_pair);
