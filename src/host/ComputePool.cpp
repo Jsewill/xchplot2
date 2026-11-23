@@ -986,6 +986,23 @@ struct BrokerServer::Impl
             low = std::min(low, elapsed); high = std::max(high, elapsed); ++samples;
         }
     };
+    struct DatedRoutes
+    {
+        DatedCost fastest;
+        uint64_t other_low = UINT64_MAX;
+        std::string const* worker = nullptr;
+        Candidate route{};
+        void observe(std::string const& id, Candidate candidate, DatedCost const& cost)
+        {
+            if (cost.samples >= 2 && (!worker || cost.high < fastest.high))
+            {
+                other_low = std::min(other_low, fastest.low);
+                fastest = cost; worker = &id; route = candidate;
+            }
+            else other_low = std::min(other_low, cost.low);
+        }
+        bool separated() const { return worker && fastest.high < other_low; }
+    };
     long double recent_cost(std::string const& identity, Worker const& worker, Task const& task, Kind kind, std::string const& owner,
                             Resources const& resources, Clock::time_point now, bool lower = false, DatedCost* dated = nullptr) const
     {
@@ -1215,8 +1232,7 @@ struct BrokerServer::Impl
                     bool const gpu = job->requested.kind == Kind::GenerateGpu || job->requested.kind == Kind::GenerateAny;
                     uint64_t oldest_age = 0;
                     bool explore = false, awaiting_first = false, incumbent = false;
-                    DatedCost fastest; uint64_t other_low = UINT64_MAX;
-                    std::string const* dated_worker = nullptr; Candidate dated_route{};
+                    DatedRoutes dated_routes;
                     for (auto const& identity : candidates)
                     {
                         auto& worker = workers.at(identity);
@@ -1241,12 +1257,7 @@ struct BrokerServer::Impl
                                     continue;
                                 }
                                 if (incumbent) continue;
-                                if (dated.samples >= 2 && (!dated_worker || dated.high < fastest.high))
-                                {
-                                    other_low = std::min(other_low, fastest.low);
-                                    fastest = dated; dated_worker = &identity; dated_route = *selected;
-                                }
-                                else other_low = std::min(other_low, dated.low);
+                                dated_routes.observe(identity, *selected, dated);
                             }
                             uint64_t const age = assignments - sample.assigned;
                             bool const unmeasured = sample.ns == std::numeric_limits<long double>::max();
@@ -1280,8 +1291,8 @@ struct BrokerServer::Impl
                             incumbent ? best_cost : std::numeric_limits<long double>::max(), now, true)) return false;
                         // Older receipts only compare immediately available workers.
                         // Overlapping intervals leave the ordinary trial order in place.
-                        if (!incumbent && dated_worker && fastest.high < other_low)
-                        { chosen = *dated_worker; chosen_kind = dated_route.kind; chosen_resources = dated_route.resources; }
+                        if (!incumbent && dated_routes.separated())
+                        { chosen = *dated_routes.worker; chosen_kind = dated_routes.route.kind; chosen_resources = dated_routes.route.resources; }
                         return true;
                     }
                     // The owner can see planned fill work beyond the jobs
@@ -1882,13 +1893,31 @@ struct BrokerServer::Impl
                 t.work_units > 1 && t.work_units <= max_generation_batch_members, "invalid finite packed width");
             auto const room = available(); auto const now = Clock::now();
             std::pair<std::string, Kind> best; long double finish = std::numeric_limits<long double>::max();
+            DatedRoutes dated_routes;
             for (auto const& [id, worker] : workers)
                 for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
                     if (auto ready = eligible(job, id, worker, room.at(id), kind))
                     {
-                        auto const cost = recent_cost(id, worker, t, kind, job.owner, ready->resources, now);
+                        DatedCost dated;
+                        auto const cost = recent_cost(id, worker, t, kind, job.owner, ready->resources, now, false,
+                            room.at(id) == worker.offer.capacity ? &dated : nullptr);
                         if (cost < finish) { finish = cost; best = {id, kind}; }
+                        dated_routes.observe(id, *ready, dated);
                     }
+            bool const dated_batch = best.first.empty() && dated_routes.separated();
+            if (dated_batch)
+            {
+                best = {*dated_routes.worker, dated_routes.route.kind};
+                finish = dated_routes.fastest.high;
+            }
+            auto split_cost = [&](std::string const& id, Worker const& worker, Candidate const& next, bool lower = false)
+            {
+                DatedCost dated;
+                auto const cost = recent_cost(id, worker, t, next.kind, job.owner, next.resources, now, lower,
+                    dated_batch ? &dated : nullptr);
+                // An older full-batch upper bound must beat the possible split.
+                return cost == std::numeric_limits<long double>::max() && dated.samples ? static_cast<long double>(dated.low) : cost;
+            };
             if (!best.first.empty())
             {
                 // A worker can offer several slots under one identity. Compare
@@ -1903,7 +1932,7 @@ struct BrokerServer::Impl
                     for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
                         if (auto next = eligible(job, best.first, worker, free, kind))
                         {
-                            auto const cost = recent_cost(best.first, worker, t, kind, job.owner, next->resources, now);
+                            auto const cost = split_cost(best.first, worker, *next);
                             if (cost >= finish) continue;
                             auto const lanes = free.parallel_tasks(next->resources);
                             for (uint32_t filled = members; filled <= width; ++filled)
@@ -1921,8 +1950,8 @@ struct BrokerServer::Impl
                 for (auto const& [id, worker] : workers)
                     for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
                         if (id != best.first)
-                            if (auto next = eligible(job, id, worker, worker.offer.capacity, kind))
-                                if (recent_cost(id, worker, t, kind, job.owner, next->resources, now, true) <= finish)
+                            if (auto next = eligible(job, id, worker, dated_batch ? room.at(id) : worker.offer.capacity, kind))
+                                if (split_cost(id, worker, *next, true) <= finish)
                                     best.first.clear();
             }
             response.string(best.first); if (!best.first.empty()) response.u8(uint8_t(best.second)); break;

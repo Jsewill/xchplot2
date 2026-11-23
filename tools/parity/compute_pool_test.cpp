@@ -1536,6 +1536,20 @@ void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls,
         require(worker.begin(*lease, lease->owner_identity), "repeat-job grant did not begin");
         worker.finish(*lease); issuer.close_owner(repeat_job); return lease->worker_instance;
     };
+    auto packed_batch = [&](unsigned members, std::string const& origin)
+    {
+        auto session = owner.open_owner("price-" + std::to_string(sequence));
+        BrokerClient::GenerationPaths paths{{fast_id, origin}, {slow_id, slow_path}};
+        std::sort(paths.begin(), paths.end()); owner.generation_paths(session, paths);
+        auto route = owner.finite_packed_route(session, request(GenerationOutput::Packed, members));
+        owner.close_owner(session); return route;
+    };
+    auto full = packed_batch(2, fast_path);
+    require(full && full->first == fast_id && full->second == Kind::GenerateGpu,
+        "a finite packed group split into unpriced singleton trials after its whole-batch receipts aged");
+    require(!packed_batch(3, fast_path), "overlapping dated batch times pinned a packed route");
+    auto moved = packed_batch(2, slow_path);
+    require(!moved || moved->first != fast_id, "a new receiving path reused an old packed-batch estimate");
     rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == a.instance,
         "a finite repeat job lost two matching whole deliveries after the fresh interval");
     rotate(); require(repeat(GenerationOutput::Packed, 2, true, fast_path) == a.instance,
@@ -1559,6 +1573,8 @@ void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls,
         slow.worker_admission(b.instance, WorkerAdmission::Accepting); return *lease;
     };
     auto held = occupy(3);
+    auto busy = packed_batch(2, fast_path);
+    require(!busy || busy->first != fast_id, "dated packed pricing waited on a busy worker");
     require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "an idle worker waited for dated history on a busy peer");
     fast.finish(held);
     fast.worker_admission(a.instance, WorkerAdmission::Paused);
@@ -1580,6 +1596,11 @@ void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls,
     learn(fast, GenerationOutput::Fresh, 1, 80000000, fast_path);
     learn(fast, GenerationOutput::Fresh, 2, 1000000000, fast_path);
     held = occupy(2); singleton("an older short delivery overruled the current running width's slower release"); fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    slow.worker_admission(b.instance, WorkerAdmission::Accepting);
+    learn(slow, GenerationOutput::Packed, 1, 30000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    require(!packed_batch(2, fast_path), "a slower dated batch displaced a measured idle singleton");
 }
 void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
                                  TlsOptions const& first_tls, TlsOptions const& second_tls)

@@ -1148,6 +1148,26 @@ struct Backend
             uint8_t(identity.params.get_strength()), output, active, batch, horizon_members);
     }
 
+    std::optional<bool> finite_publication(group_grow::PoolPublicationHistory const& history,
+        group_grow::PoolPublicationHistory::Shape shape, Arguments const& args, uint64_t remaining_members)
+    {
+        using Output = group_grow::pool::GenerationOutput;
+        return history.finite_output(shape, remaining_members, product(args.pool_timeout_ms, 1'000'000),
+            [&](bool encoded) -> std::optional<long double>
+            {
+                auto client = acquire_pool_client();
+                auto const capacity = client->generation_capacity(shape.k, shape.strength);
+                auto const& admission = capacity.availability.admission;
+                if (pool_client_config.local_only || !capacity.slots || !capacity.roster || !capacity.roster->complete ||
+                    shape.supply != group_grow::GenerationSupply{capacity.slots, capacity.roster} ||
+                    !admission || admission->available_slots != capacity.slots) return {};
+                // The measured whole fresh stream must still fit a live offer.
+                if (shape.members > capacity.batch) return encoded ? std::optional<long double>(0) : std::nullopt;
+                return client->publication_trial_ns(shape.k, shape.strength, encoded ? Output::Fresh : Output::Packed,
+                    shape.members, args.member_storage == "compact", capacity);
+            });
+    }
+
     unsigned pool_receivers(Identity const& identity, group_grow::WorkerGenerationEstimate const& measured,
         unsigned* offered_slots = nullptr)
     {
@@ -1822,6 +1842,23 @@ struct Producer
     // A fill may run beside other destinations. The owner records its timing
     // only after joining, keeping the construction history on its controller.
     bool defer_pool_history = false;
+    std::atomic<bool> const* waiting_receiver = nullptr;
+    // A waiting receiver must fit beside the extant input, including both
+    // digest caches, before another destination moves its hash to the writer.
+    bool fits_waiting_receiver(uint16_t first, size_t count, uint64_t held) const
+    {
+        auto const bytes = pool_receive_bytes(first, count);
+        auto const cache = pool_hash_bytes(count, bytes, held);
+        if (!cache) return false;
+        auto const available = available_host_bytes();
+        return !available || sum(bytes, cache) <= *available;
+    }
+    bool writer_can_hash() const
+    {
+        if (!waiting_receiver || !waiting_receiver->load(std::memory_order_relaxed) || !backend.cpu_scheduler) return false;
+        group_grow::CodecScheduler::Lease spare(*backend.cpu_scheduler, std::try_to_lock);
+        return bool(spare);
+    }
     uint64_t pool_elapsed_ns = 0;
     void record_pool_generation(size_t count, std::chrono::steady_clock::time_point begin)
     {
@@ -2226,15 +2263,20 @@ struct Producer
             if (!complete) return false;
             require(received.size() == n, "truncated packed batch");
             size_t member = start;
+            // A partial or out-of-order delivery can still hide its prefix
+            // hash behind outstanding generation.
+            bool const final = start == values.size() && start + n == wanted;
+            bool on_writer = false;
             for (auto& receiver : received)
             {
+                if (hash && final && !on_writer) on_writer = writer_can_hash();
                 auto check = [&] { check_cancel(args); cancel.check(); };
                 group_grow::CodecScheduler::Lease cpu(backend.cpu_scheduler.get(), 1, check);
                 auto result = receiver->finish(checked);
                 if (member == values.size())
                 {
                     values.push_back(std::move(result));
-                    if (hash) { append_hash(next_hash++, check); }
+                    if (hash && !on_writer) { append_hash(next_hash++, check); }
                 }
                 else collect(member, std::move(result));
                 ++member;
@@ -2273,6 +2315,7 @@ struct Producer
             // The futures never borrow the hash or the controller's member vector.
             for (; hash && next_hash < values.size(); ++next_hash)
             {
+                if (values.size() == wanted && writer_can_hash()) break;
                 auto check = [&] { check_cancel(args); require(!stopped || !stopped->load(), "pool generation cancelled"); };
                 group_grow::CodecScheduler::Lease compute(backend.cpu_scheduler.get(), 1, check);
                 append_hash(next_hash, check);
@@ -3403,6 +3446,12 @@ CachedPublication comparable_publications(Backend& backend, Arguments const& arg
     }
     catch (...) { return {}; }
 }
+bool same_publication_drives(std::span<group_grow::StorageDevice const> devices)
+{
+    return devices.size() == 1 || (!devices.empty() && !devices.front().drives.empty() &&
+        std::all_of(devices.begin(), devices.end(), [&](auto const& device) { return device.drives == devices.front().drives; }));
+}
+
 PublicationShape construction_load(Arguments const& args, Backend& backend, Identity const& identity,
     uint16_t members, size_t width)
 {
@@ -5160,7 +5209,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                   std::function<uint32_t(uint64_t, uint16_t, uint64_t, std::function<bool()> const&)> const& prefetch_next = {},
                   GroupSuccessor* successor = nullptr,
                   std::shared_ptr<std::recursive_mutex> const& target_gate = {},
-                  PublishedRetirements const& published_retirements = {})
+                  PublishedRetirements const& published_retirements = {}, uint64_t remaining_job_members = 0)
 {
     ProgressReporter progress(args);
     bool const compact = args.member_storage == "compact";
@@ -5618,7 +5667,10 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             incoming.empty() && wanted == maximum && backend->fresh_group_slots(identity, wanted);
         if (direct && args.pool_output == "auto" && group_grow::storage_device(target.parent_path()).rotating)
         {
-            publication_choice = backend->single_publications.select(pool_shape, 1, 1, 1, args.pool_output);
+            auto& history = backend->single_publications;
+            publication_choice = history.select(pool_shape, 1, 1, 1, args.pool_output);
+            if (auto incumbent = backend->finite_publication(history, pool_shape, args, remaining_job_members))
+                publication_choice = group_grow::PoolPublicationHistory::Choice{1, *incumbent, false};
             publication_start = std::chrono::steady_clock::now();
             comparable_publication = !publication_choice->encoded;
         }
@@ -6578,7 +6630,8 @@ int rollover(Arguments const& args, Keys const& keys)
         auto const part = run_group(current_args, path, nullptr, keys.derive(ordinal), maximum,
                                     active_capacity, sum(metadata, histories.memory_bytes()), backend, &histories,
                                     {}, existing ? outputs[ordinal] : Output{}, &prefetched, prefetch_next,
-                                    successor.get(), target_gate);
+                                    successor.get(), target_gate, {}, group_grow::remaining_publication_members(
+                                        args.max_total_members, prior_members, args.max_groups, ordinal, args.group_members));
         total.members = sum(prior_members, part.members);
         total.final_bytes = sum(prior_bytes, part.final_bytes);
         total.peak_file_bytes = std::max(total.peak_file_bytes, sum(prior_charge, part.peak_file_bytes));
@@ -14732,7 +14785,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         group_grow::Result finished;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         using Generated = Producer::Generated;
-        std::atomic<bool> cancel_generation{false};
+        std::atomic<bool> cancel_generation{false}, waiting_receiver{false};
         group_grow::NotifiedFuture<Generated> generating;
         uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
         std::atomic<uint64_t> accepted_peak{0}, write_due{0};
@@ -14760,6 +14813,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         std::future<void> ready;
         bool fresh_declined = false, packed_declined = false;
         bool pool_encoded = true, pool_comparable = true;
+        uint64_t remaining_pool_members = 0;
         group_grow::PoolPublicationHistory* pool_trial = nullptr;
         std::shared_ptr<group_grow::SharedConstructionHistory> mode_history;
         PublicationShape publication_shape;
@@ -14807,6 +14861,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     group_grow::ConstructionHistories histories(2 * paths.size());
     group_grow::StreamingInputCohort stream_cohort(paths.size());
     std::array<group_grow::PoolPublicationHistory, 2> pool_publications; // incremental and external
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    bool const single_pool_device = same_publication_drives(devices);
+#endif
     metadata = sum(metadata, sum(stream_cohort.memory_bytes(), sizeof(pool_publications)));
     auto const execution_begin = std::chrono::steady_clock::now();
     auto execution_now = [&] { return sum(1, group_grow::elapsed_ns(execution_begin)); };
@@ -15557,9 +15614,30 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             auto const status = args.disk_io->status();
             farming_pressure = status.farming_known && status.pressured;
         }
+        uint64_t remaining_pool_members = 0;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        std::optional<bool> finite_output;
+        if (single_pool_device && tune_pool && unfinished_groups == 1 && args.pool_output == "auto")
+        {
+            remaining_pool_members = d.maximum;
+            if (farm && farm->accepts_future(d.owner))
+            {
+                auto const& lane = farm->lanes[d.owner];
+                auto const limit = farm->state.fixed_extent && !farm->state.capacity_fill ?
+                    std::min(args.max_total_members, group_grow::farming_layout_members(farm->state.directories[d.owner])) :
+                    args.max_total_members;
+                remaining_pool_members = group_grow::remaining_publication_members(limit, lane.completed_members, args.max_groups,
+                    lane.ordinal, args.group_members ? args.group_members : UINT16_MAX);
+            }
+            finite_output = backend->finite_publication(pool_publications[0], pool_shape, args, remaining_pool_members);
+        }
+#endif
         auto pool_choice = [&](bool external)
         {
             auto const maximum = std::min(writer_count, unfinished_groups);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (!external && finite_output) return group_grow::PoolPublicationHistory::Choice{1, *finite_output, false};
+#endif
             return pool_publications[external].select(pool_shape, maximum,
                 std::max(size_t(1), startup_receivers + startup_writers), args.pool_writers, args.pool_output,
                 external || maximum == 1, allow_trial);
@@ -16270,6 +16348,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         d.engine = std::move(engine); d.batch_cap = batch;
         d.fresh_declined = d.packed_declined = false;
         d.pool_encoded = choice.encoded;
+        d.remaining_pool_members = !d.scratch ? remaining_pool_members : 0;
         d.pool_trial = !prefetched_rollover && tune_pool && !farming_pressure && publications.begin(pool_shape, choice, execution_now()) ? &publications : nullptr;
         d.pool_comparable = true;
         d.stream_input_candidate = use_stream_input; d.stream_input_batch = use_stream_input ? batch : 0;
@@ -17577,6 +17656,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         for (size_t step = 0; step < destinations.size(); ++step)
         {
             size_t const index = (next + step) % destinations.size(); auto& d = *destinations[index];
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (d.pending && d.pending->generating.valid()) d.pending->waiting_receiver.store(false, std::memory_order_relaxed);
+#endif
             if (d.complete || d.awaiting_extent || d.ready.valid() || d.pending || d.needs_resume || d.needs_finish || !d.metrics.stop_reason.empty() ||
                 (d.engine && d.metrics.members == d.maximum)) continue;
             // The first activation sizes the destination plan. Ready peers
@@ -17889,10 +17971,11 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         return other->requested.params.get_k() == d.requested.params.get_k() &&
                             other->requested.params.get_strength() == d.requested.params.get_strength();
                     };
-                    auto const receiving = std::count_if(destinations.begin(), destinations.end(), [&](auto const& other)
-                    {
-                        return other->pending && other->pending->generating.valid() && same_shape(other);
-                    });
+                    size_t receiving = 0;
+                    Destination const* receiver = nullptr;
+                    for (auto const& other : destinations)
+                        if (other->pending && other->pending->generating.valid() && same_shape(other))
+                        { ++receiving; receiver = other.get(); }
                     auto const ready = std::count_if(generation_ready.begin(), generation_ready.end(), [&](auto const& candidate)
                     {
                         return candidate.index != index && same_shape(destinations[candidate.index]);
@@ -17930,7 +18013,16 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     // the route, then allow it to queue behind a busy worker.
                     if (receiving >= receivers && !packed_queue && (!queue || backend->acquire_pool_client()->probe_contribution_route(
                         d.requested.params.get_k(), d.requested.params.get_strength())))
-                    { blocked(ControllerWait::generation_order); continue; }
+                    {
+                        // The sole receiver can hand its sealed input to an idle
+                        // writer while this independent, fully funded peer receives.
+                        if (can_queue && receiving == 1 && receivers == 1 && d.engine->incremental && !d.pool_encoded && !select_merged &&
+                            receiver->writer != d.writer && receiver->pending->pool_hash_bytes &&
+                            (!writers[d.writer] || !writers[d.writer]->busy()) && (!writers[receiver->writer] || !writers[receiver->writer]->busy()) &&
+                            producer.fits_waiting_receiver(first, wanted, held))
+                            receiver->pending->waiting_receiver.store(true, std::memory_order_relaxed);
+                        blocked(ControllerWait::generation_order); continue;
+                    }
                     if (can_queue && total.execution_active > 1 && offered_slots > 1 && forecast.member_ns > 0)
                     {
                         // Only independent, fitting work can hide a slower
@@ -18017,10 +18109,14 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     unsigned const batch = unsigned(wanted);
                     auto const packed = backend->pool_estimate(d.requested, GenerationOutput::Packed, 1, batch, batch);
                     auto const fresh = backend->pool_estimate(d.requested, GenerationOutput::Fresh, 1, batch, batch);
-                    direct = pool_publications[0].final_group_encoded({unsigned(d.requested.params.get_k()),
+                    group_grow::PoolPublicationHistory::Shape const shape{unsigned(d.requested.params.get_k()),
                         unsigned(d.requested.params.get_strength()), d.maximum,
-                        construction_load(args, *backend, d.requested, d.maximum, 1).supply}, direct, args.pool_writers != 0,
+                        construction_load(args, *backend, d.requested, d.maximum, 1).supply};
+                    direct = pool_publications[0].final_group_encoded(shape, direct, args.pool_writers != 0,
                         packed.member_ns, fresh.member_ns);
+                    if (d.remaining_pool_members)
+                        if (auto incumbent = backend->finite_publication(pool_publications[0], shape, args, d.remaining_pool_members))
+                            direct = *incumbent;
                 }
                 if (auto slots = direct ? backend->fresh_group_slots(d.requested, wanted) : 0)
                 {
@@ -18114,6 +18210,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 {
                     Producer producer{d.requested, nullptr, *backend, args, args.max_ram, reserved, reserved, d.path};
                     producer.defer_pool_history = true;
+                    producer.waiting_receiver = &pending->waiting_receiver;
                     auto const generated = producer.fill_pool(pending->members, first, wanted, other_held,
                         file_io::path_text(d.path) + ": generating pool member ", {}, &pending->cancel_generation,
                         pending->hash.get(), generation_destinations, pending->other_work_until);

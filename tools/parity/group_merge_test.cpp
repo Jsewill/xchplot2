@@ -3282,6 +3282,49 @@ void execution_planning()
         !cold.final_group_encoded(shape, true, false, 20, 30) &&
         cold.final_group_encoded(shape, false, false, 0, 0),
         "the final group did not preserve a faster fresh stream or the cold startup choice");
+    {
+        std::array<StorageDevice, 2> volumes{{{"fs-a", {"disk-a"}}, {"fs-b", {"disk-a"}}}};
+        require(same_publication_drives(volumes), "two volumes on one disk lost their comparable publication history");
+        volumes.back().drives = {"disk-b"};
+        require(!same_publication_drives(volumes), "a single remaining disk inherited the other disk's publication latency");
+        volumes.front().drives.clear(); volumes.back().drives.clear();
+        require(!same_publication_drives(volumes) && same_publication_drives(std::span(volumes).first(1)),
+            "serialization of unknown topology made distinct destinations comparable");
+        PoolPublicationHistory finite;
+        auto const offer = std::make_shared<int>(0);
+        PoolPublicationHistory::Shape const finite_shape{28, 2, 3, {3, offer}};
+        auto const incumbent = finite.select(finite_shape, 1, 1, 0, "auto");
+        require(incumbent.encoded && finite.begin(finite_shape, incumbent, 1), "could not enroll the incumbent publication");
+        finite.publish(3, 1 + 18'000'000'000, true);
+        auto const packed_trial = finite.select(finite_shape, 1, 1, 0, "auto");
+        auto const job_members = remaining_publication_members(12, 3, 4, 1, 3);
+        size_t queries = 0;
+        auto price = [&](std::optional<long double> ns)
+        { return [&, ns](bool encoded) { require(!encoded, "the incumbent was priced as its own trial"); ++queries; return ns; }; };
+        auto bounded = [&](uint64_t members, std::optional<long double> wave, uint64_t timeout = 300'000'000'000)
+        { return finite.finite_output(finite_shape, members, timeout, price(wave)); };
+        require(!packed_trial.encoded && packed_trial.trial && job_members == 9 &&
+            bounded(job_members, 0) == true && bounded(job_members, 111'000'000'000) == true &&
+            !bounded(job_members, 8'000'000'000) && !bounded(job_members, std::nullopt),
+            "the sole writer failed to compare the exact trial wave with its remaining durable publications");
+        require(bounded(50, 0) == true && !bounded(51, 0) && !bounded(job_members, 0, 30'000'000'000) &&
+            !finite.finite_output({28, 2, 3, {3, std::make_shared<int>(0)}}, job_members, 300'000'000'000, price(0)) &&
+            remaining_publication_members(UINT64_MAX, 3, 4, 1, 3) == 9 &&
+            remaining_publication_members(12, 3, UINT64_MAX, 1, UINT16_MAX) == 9 && queries == 5,
+            "a changed worker supply, a fitting deadline or a long job inherited a short writer's trial limit");
+        // Recheck the actual grant: an aggregate RTX singleton forecast remains
+        // positive even when the Fresh estimator has no strict worker sample.
+        auto const terminal = finite.final_group_encoded(finite_shape, true, false, 3'500'000'000, 0);
+        require(!terminal && finite.begin(finite_shape, {1, true, false}, 21'000'000'000) &&
+            bounded(3, 0).value_or(terminal) && !bounded(3, 8'000'000'000).value_or(terminal),
+            "the actual final grant overrode its bounded incumbent or hid a cheaper measured wave");
+        finite.publish(3, 39'000'000'000, true);
+        require(!finite.select(finite_shape, 1, 1, 1, "packed").encoded && finite.begin(finite_shape, packed_trial, 41'000'000'000),
+            "the explicit packed output or a new measured trial was lost");
+        finite.publish(3, 49'000'000'000, true);
+        require(!bounded(3, 0) && !finite.final_group_encoded(finite_shape, true, false, 0, 1),
+            "an earlier incumbent displaced a faster durable comparison");
+    }
     PoolPublicationHistory final_wave;
     auto const packed_tail = final_wave.select(shape, 1, 1, 1, "auto", false);
     require(!packed_tail.encoded && final_wave.begin(shape, packed_tail, 10), "could not enroll a packed tail publication");

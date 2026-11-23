@@ -413,6 +413,10 @@ public:
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
                                      WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr,
                                      std::chrono::steady_clock::time_point other_work_until = {}) const;
+    // Measured whole elapsed time of the next eligible batch or singleton wave.
+    // An incomplete live route or width has no price.
+    std::optional<long double> publication_trial_ns(uint8_t k, uint8_t strength, pool::GenerationOutput output, unsigned members,
+        bool joint_packed, WorkerGenerationCapacity const& capacity) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     // A zero joint width selects the independent pipeline for this ready work.

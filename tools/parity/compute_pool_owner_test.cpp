@@ -478,6 +478,8 @@ void late_packed_capacity()
     config.max_active_generation = args.pool_inflight; config.task_timeout_ms = args.pool_timeout_ms;
     std::mutex mutex; std::vector<WorkerTaskObservation> receipts;
     config.observe = [&](auto const& value) { std::lock_guard lock(mutex); receipts.push_back(value); };
+    std::function<void()> on_selected;
+    config.selected = [&](auto const&) { if (on_selected) on_selected(); };
     auto client = backend.acquire_pool_client();
     auto empty = client->generation_capacity(18, 2);
     require(empty.roster && empty.roster->complete && !empty.slots, "packed owner did not start with an empty broker");
@@ -504,6 +506,60 @@ void late_packed_capacity()
         for (size_t c = 0; c < PlotGroupFile::getChunkCountForK(18); ++c)
             for (auto value : view.region(c)) raw.push_back(value);
         require(raw == worker_original_reference(18, 2, id), "packed rescheduling changed ordered CPU-reference output");
+    }
+    {
+        // A waiting independent receiver must fit with every extant byte grant.
+        // Holding the last foreground CPU keeps the final digest on its receiver.
+        uint64_t const held_bytes = producer.pool_receive_bytes(0, 3) + MemberBatchHash::memory_bytes(3);
+        auto const full = producer.budget;
+        producer.budget = producer.fixed + backend.retained() + 2 * held_bytes - 1;
+        require(!producer.fits_waiting_receiver(0, 3, held_bytes), "independent receiver exceeded its RAM grant");
+        ++producer.budget;
+        require(producer.fits_waiting_receiver(0, 3, held_bytes), "independent receiver lost its exact RAM grant");
+        producer.budget = full;
+        std::atomic<bool> waiting{true}; producer.waiting_receiver = &waiting;
+        {
+            CodecScheduler::Lease foreground(backend.cpu_scheduler.get(), 1);
+            auto check = std::async(std::launch::async, [&] { return producer.writer_can_hash(); });
+            require(!check.get(), "handed a digest to a writer without spare CPU");
+        }
+        // Preserve an already computed prefix while the final authenticated pair
+        // goes to the writer. A second real lease must finish before it resumes.
+        std::vector<Member> handed;
+        handed.push_back(backend.generate_pool(requested, 0, args));
+        MemberBatchHash partial_hash(3); partial_hash.append(handed.front().view(), [] {});
+        std::promise<void> selected, release;
+        auto selected_future = selected.get_future(); auto resume = release.get_future().share();
+        std::once_flag first_lease;
+        on_selected = [&] { std::call_once(first_lease, [&]
+        {
+            selected.set_value();
+            require(resume.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "handed receipt never resumed");
+        }); };
+        waiting.store(false);
+        auto pair = std::async(std::launch::async, [&] { return producer.fill_pool(handed, 0, 3, held_bytes, "", {}, nullptr, &partial_hash); });
+        require(selected_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "handed pair did not receive an authenticated grant");
+        waiting.store(true); release.set_value();
+        require(pair.get() == 2 && partial_hash.size() == 1, "receiver consumed or lost the final writer digest");
+        on_selected = {}; producer.waiting_receiver = nullptr;
+        std::promise<void> hashing, received_peer;
+        auto hashing_future = hashing.get_future(); auto peer_done = received_peer.get_future().share();
+        auto writer = std::async(std::launch::async, [&]
+        {
+            CodecScheduler::Lease cpu(backend.cpu_scheduler.get(), 1);
+            bool started = false;
+            return members_digest(18, Members(handed), &partial_hash, [&]
+            {
+                if (std::exchange(started, true)) return;
+                hashing.set_value();
+                require(peer_done.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "next receiver waited for writer hashing");
+            });
+        });
+        require(hashing_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "writer did not resume its digest");
+        grow_controller_test::Identity peer_identity{PlotGroupParams(PlotGroupId(std::string(64, '9')), 18, 2, 0), {}};
+        auto peer_member = backend.generate_pool(peer_identity, 0, args); received_peer.set_value();
+        require(peer_member.view().size() && writer.get() == hash.digest_for(Members(members)),
+            "overlapping independent receipt changed the canonical writer digest");
     }
     // A successor hashes only with spare owner CPU. Its complete cache or
     // the ordinary writer fallback must bind the very same sealed members.

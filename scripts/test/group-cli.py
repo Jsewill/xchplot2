@@ -4548,9 +4548,13 @@ def check_automatic_compute(binary, root):
             port = port_socket.getsockname()[1]
         broker, broker_log = start("first", "dedicated-broker", "compute", "broker", "--listen", f"127.0.0.1:{port}",
                                    "--worker-ms", 3000, "--lease-ms", 3000)
-        run("second", "compute", "configure", "--broker", f"127.0.0.1:{port}")
+        # A remote-only owner with a dedicated broker needs no LAN discovery.
+        run("second", "compute", "configure", "--broker", f"127.0.0.1:{port}",
+            "--interface", f"xch-no-if-{port}")
         result = run("second", *plot, "--compute-local", "off", "-o", directory / "dedicated", "--no-quiet", "-v")
         assert "Using broker 127.0.0.1:" in result.stderr and "Automatic broker" not in result.stderr
+        assert "LAN discovery" not in result.stderr, result.stderr
+        run("second", "compute", "configure", "--interface", "lo")
         assert Path(result.stdout.strip()).is_file()
         assert broker.poll() is None, broker_log.read_text(encoding="utf-8")
         explicit = [*plot, "--compute-owner-id", "storage-test", "--compute-local", "off",

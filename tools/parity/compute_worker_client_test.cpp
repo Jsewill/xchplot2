@@ -675,6 +675,31 @@ void planning_feedback()
         require(width(10000) == 1, "a replaced worker inherited its predecessor's occupied first transfer");
     }
 
+    {
+        auto& costs = new_planner();
+        auto routes = std::make_shared<pool::GenerationRoster>(*roster);
+        auto third = slow_packed; third.worker_identity = "wireless";
+        routes->routes.push_back({third.worker_identity, third.worker_instance, route, {}, {}, 0, 1});
+        costs.capacity(18, 2, routes, 0, now);
+        auto quick = fast_packed, medium = slow_packed, whole = quick;
+        quick.elapsed_ns = 3'500'000'000; medium.elapsed_ns = 25'000'000'000; third.elapsed_ns = 111'000'000'000;
+        whole.work_units = 3; whole.elapsed_ns = 8'000'000'000;
+        whole.generation = {}; // Older workers still deliver the measured owner receipt.
+        auto wave = [&](unsigned width, WorkerPackedRoute const& target = {}, unsigned receivers = 3)
+        { return costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, width, 3,
+            receivers, *routes, target, now); };
+        observe(costs, quick, route); observe(costs, whole, route);
+        WorkerPackedRoute target{routes->routes.front(), pool::Kind::GenerateGpu};
+        require(!wave(1) && wave(3, target) == whole.elapsed_ns && !wave(2, target),
+            "a fast worker priced unmeasured singleton peers or an unobserved split");
+        observe(costs, medium, route); observe(costs, third, route);
+        require(wave(1) == third.elapsed_ns && wave(1, {}, 1) == 3.L * third.elapsed_ns && !wave(3),
+            "a fast fleet rate concealed the slowest receipt or an unpriced whole-group route");
+        auto changed = std::make_shared<pool::GenerationRoster>(*routes); changed->routes.back().endpoint = relocated;
+        costs.capacity(18, 2, changed, costs.selections(), now);
+        require(!wave(1) && !costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, 1, 3, 3, *changed, {}, now),
+            "a replacement route inherited an earlier publication trial price");
+    }
     auto& final_group = new_planner();
     final_group.capacity(18, 2, roster, 0, now);
     auto triple = fast_packed; triple.work_units = 3; triple.generation = {1200, 600, 600, 0};
