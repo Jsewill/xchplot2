@@ -2485,6 +2485,7 @@ public:
         unsigned prior_samples = 0;
         uint64_t oldest_utc = 0;
         unsigned const samples = horizon_members ? 1 : 3;
+        bool measured_packed_batch = output == GenerationOutput::Packed && batch <= pool::max_generation_batch_members;
         for (size_t i = 0; i < count_; ++i)
         {
             auto const& item = histories_[i];
@@ -2506,6 +2507,7 @@ public:
                 }
             }
             if (rate.samples < samples) continue;
+            if (measured_packed_batch && item.rates[batch].samples < samples) measured_packed_batch = false;
             // GenerateAny can use either measured backend of one worker.
             // Both consume the same advertised slots.
             size_t worker = 0; while (worker < workers && peers[worker]->peer.worker != item.peer.worker) ++worker;
@@ -2531,7 +2533,7 @@ public:
             else low = middle + 1;
         }
         return {1 / (horizon_members ? throughput(fleet, worker_slots, low) : fastest), low, slots,
-            prior_samples != 0, prior_samples, oldest_utc};
+            prior_samples != 0, prior_samples, oldest_utc, measured_packed_batch};
     }
     bool probe_contribution_route(uint8_t k, uint8_t strength, Clock::time_point now = Clock::now())
     {

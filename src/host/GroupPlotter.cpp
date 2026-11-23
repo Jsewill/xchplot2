@@ -4501,6 +4501,7 @@ struct DestinationPlan
     uint16_t batch = 0;
     ControllerWait empty_reason = ControllerWait::engine_memory;
     long double cost = std::numeric_limits<long double>::infinity();
+    bool packed_successor = false;
 };
 #if (defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK) || defined(GROW_TEST_CONSTRUCTION)
 unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsigned measured_slots, unsigned useful)
@@ -4523,6 +4524,10 @@ bool packed_queue_fits_deadline(uint64_t now, uint64_t receipt_due, long double 
     // WorkerClient checks for its grant at 50 ms intervals.
     return receipt_due > now && batch_ns > 0 &&
         (receipt_due - now) + batch_ns + 50'000'000.L < timeout_ms * 1'000'000.L;
+}
+bool packed_successor_lane(size_t active, size_t receivers, size_t writers, size_t groups, uint64_t inflight)
+{
+    return receivers == 1 && inflight > 1 && active == receivers + writers && active + 1 < groups;
 }
 #endif
 struct PackingGrant
@@ -15146,6 +15151,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             (args.construction == "auto" || args.construction == "external" ||
                 (pooled_generation && args.construction == "incremental"));
         size_t startup_receivers = receiving_lanes, startup_writers = packing_writers, writing = packing_writers;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        group_grow::WorkerGenerationEstimate packed_route;
+#endif
         bool const pipeline_hdd = fresh_hdd && (pooled_generation || backend->generation_overlap);
         auto size_pipeline = [&](bool external)
         {
@@ -15156,6 +15164,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 unsigned const limit = unsigned(std::min(unfinished_groups, receiving_lanes));
                 auto const output = generation_output(d, external, initial_pool_output(external, 1), maximum);
                 auto const forecast = backend->pool_estimate(d.requested, output, limit, maximum);
+                if (!external) packed_route = output == GenerationOutput::Packed ? forecast : group_grow::WorkerGenerationEstimate{};
                 unsigned slots = backend->pool_receivers(d.requested, forecast);
                 if (!slots) slots = backend->acquire_pool_client()->suggested_generation_concurrency(
                     d.requested.params.get_k(), d.requested.params.get_strength(), limit, output);
@@ -15372,6 +15381,42 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return packing_grant.can_recover(args.max_ram, reserved, engines, generation, encoded && can_stream) ?
                 neutral(active, grant, batch) : std::numeric_limits<long double>::infinity();
         };
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        auto can_queue_packed_receiver = [&]
+        {
+            if (!pooled_hdd || d.scratch || input_required || (args.construction != "auto" && args.construction != "incremental") ||
+                tune_pool || args.pool_writers || args.protected_resources || (farm && !farm->all_replicas) ||
+                pool_prefetch.ready.valid() || !prefetched.members.empty() || supply.slots != 1 || supply.roster.expired() ||
+                packed_route.measured_slots != 1 || !packed_route.measured_packed_batch ||
+                (args.disk_io && args.disk_io->status().pressured) || canonical_bound(d.requested, maximum) > d.capacity_limit) return false;
+            auto same = [&](Destination const& other)
+            { return other.maximum == maximum && other.requested.params.get_k() == pool_shape.k &&
+                other.requested.params.get_strength() == pool_shape.strength; };
+            uint64_t receipt_due = 0;
+            // The unfinished-group count already consumed this physical-writer scratchpad.
+            std::fill(seen.begin(), seen.end(), false);
+            seen[d.writer] = true;
+            for (auto const& other : destinations) if (other->engine)
+            {
+                if (other->writer == d.writer || other->scratch || other->successor || other->pool_trial ||
+                    other->needs_resume || other->needs_finish || other->guard || (other->pending && other->pending->fresh_members)) return false;
+                seen[other->writer] = true;
+                if (other->ready.valid()) continue;
+                auto const& task = other->pending;
+                if (receipt_due || !task || !task->generating.valid() || !task->receiving_bytes || !task->receipt_due ||
+                    !same(*other) || other->pool_encoded || other->publication_shape.supply != supply || task->scheduled_members != maximum)
+                    return false;
+                receipt_due = task->receipt_due;
+            }
+            if (!packed_queue_fits_deadline(execution_now(), receipt_due, packed_route.member_ns * maximum, args.pool_timeout_ms)) return false;
+            return std::any_of(destinations.begin(), destinations.end(), [&](auto const& other)
+            {
+                return !seen[other->writer] && !other->complete && !other->guard && !other->needs_resume && !other->needs_finish &&
+                    !other->awaiting_extent && !other->output_capacity_rejected && other->metrics.stop_reason.empty() && same(*other) &&
+                    canonical_bound(other->requested, maximum) <= other->capacity_limit;
+            });
+        };
+#endif
         auto select_plan = [&](uint64_t reserved)
         {
             size_t groups = unfinished_groups, receivers = startup_receivers, writers = startup_writers;
@@ -15392,6 +15437,16 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 workers, maximum, minimum, memory, neutral, receivers, writers, whole, packing_grant);
             if (!plan.active) return plan;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            // A packed receiver still owns its engine while hashing the delivered
+            // batch, before its writer becomes busy. Budget one waiting receiver
+            // separately from the actual GPU slots and physical writers.
+            if (plan.active == active && plan.batch == maximum && maximum == d.maximum &&
+                packed_successor_lane(active, receivers, writers, groups, args.pool_inflight) && can_queue_packed_receiver())
+            {
+                auto queued = destination_plan(args.max_ram, reserved, generation, storage, groups,
+                    workers, maximum, maximum, memory, neutral, receivers + 1, writers, false, packing_grant);
+                if (queued.active > active) { queued.packed_successor = true; plan = queued; }
+            }
             if (fresh_hdd && d.scratch && backend->mode == "pool" && args.io_overlap && args.generation_overlap &&
                 !owns_prefetch && plan.batch <= group_grow::ExternalEngine::max_runs)
             {
@@ -15764,7 +15819,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const available = args.max_ram - generation_fixed(checked_contributions);
         if (generation_held > available || generation > available - generation_held) return defer(ControllerWait::producer_memory);
         uint64_t const resident_member = use_stream_input || checked_contributions ? 0 : storage;
-        uint16_t const batch = admitted_batch_cap(std::min(maximum, plan.batch), minimum,
+        uint16_t const batch = admitted_batch_cap(std::min(maximum, plan.batch), plan.packed_successor ? maximum : minimum,
             available - generation_held - generation, resident_member,
             [&](uint16_t n) { return memory(share, n); });
         if (!batch) return defer(ControllerWait::engine_memory);
@@ -15772,7 +15827,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (!admit_producer(lease, checked_contributions)) return defer(ControllerWait::producer_memory);
         if (sum(sum(sum(fixed, lease), held), backend->retained()) > args.max_ram) return defer(ControllerWait::engine_memory);
         auto const host = available_host_bytes();
-        uint64_t const growth = generation > backend->retained() ? generation - backend->retained() : 0;
+        uint64_t growth = generation > backend->retained() ? generation - backend->retained() : 0;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (plan.packed_successor)
+        {
+            growth = std::max(growth, probe.pool_receive_bytes(0, batch));
+            if (sum(sum(sum(fixed, lease), held), sum(backend->retained(), growth)) > args.max_ram)
+                return defer(ControllerWait::producer_memory);
+        }
+#endif
         if (host && sum(lease, growth) > *host) return defer(ControllerWait::engine_memory);
         check_farm(retained());
         for (auto const& other : destinations) check_guard(*other);
@@ -15853,6 +15916,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             load.width = plan.active; d.publication_shape = load; d.mode_started = execution_now();
             if (d.mode_history) d.mode_history->publication.begin(load);
         }
+        else if (pooled_hdd) d.publication_shape.supply = supply;
         d.admission_wait = ControllerWait::count; d.admission_holder = nullptr;
         d.engine = std::move(engine); d.batch_cap = batch;
         d.fresh_declined = d.packed_declined = false;

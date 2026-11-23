@@ -82,6 +82,7 @@ struct WorkerGenerationEstimate
     bool dated_prior = false;
     unsigned prior_min_samples = 0;
     uint64_t prior_oldest_utc = 0;
+    bool measured_packed_batch = false;
 };
 struct WorkerStats
 {

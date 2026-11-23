@@ -286,8 +286,10 @@ void planning_feedback()
         Planning widths(1000); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
         packed.generation = {70, 30, 30, 0}; train(widths, packed, route);
         packed.work_units = 2; packed.generation = {100, 20, 20, 0}; train(widths, packed, route);
-        auto price = [&](unsigned width) { return widths.estimate(18, 2, packed.kind, Output::Packed, 1, width, now).member_ns; };
-        require(price(1) == 150 && price(2) == 85, "packed widths lost their own delivery and connection setup costs");
+        auto price = [&](unsigned width) { return widths.estimate(18, 2, packed.kind, Output::Packed, 1, width, now); };
+        require(price(1).member_ns == 150 && price(2).member_ns == 85 && price(2).measured_packed_batch &&
+            price(3).member_ns > 0 && !price(3).measured_packed_batch,
+            "packed widths lost their delivery cost or treated other widths as an exact measured batch");
     }
     Planning dual_backend(1000);
     link_heavy.worker_slots = 1;

@@ -2818,6 +2818,18 @@ void destination_admission()
         !packed_queue_fits_deadline(1'200'000'000, 1'200'000'000, 1e9L, 2000) &&
         !packed_queue_fits_deadline(1, 0, 1e9L, 2000) && !packed_queue_fits_deadline(50'000'000, 100'000'000, 1e9L, 1100),
         "single-worker packed prequeue missed its grant poll, elapsed receipt or next batch deadline");
+    auto packed_lanes = [&](size_t unfinished, uint64_t inflight, uint64_t bytes)
+    {
+        // One full receiver and one independent busy writer occupy both ordinary lanes.
+        size_t const receiving = 1 + packed_successor_lane(2, 1, 1, unfinished, inflight);
+        return destination_plan(bytes, metadata, generation, member, unfinished, 8, 3, 3, memory,
+            neutral, receiving, 1);
+    };
+    require(packed_lanes(4, 2, budget).active == 3 && packed_lanes(4, 2, budget).batch == 3 &&
+        packed_lanes(4, 1, budget).active == 2 && packed_lanes(3, 2, budget).active == 2 &&
+        packed_lanes(4, 2, metadata + generation + 6 * member + 2 * memory(4, 3)).active == 2 &&
+        !packed_successor_lane(3, 1, 1, 8, 3),
+        "a measured packed successor exceeded RAM, the inflight cap or the remaining disjoint work");
     auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
     require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
         "many destinations did not activate a bounded useful subset");
