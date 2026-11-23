@@ -883,7 +883,10 @@ updates; the terminal defaults match `plot`.
 For fills with several destinations, `controller_wait_seconds.destination_lanes`
 reports time spent at the simultaneous destination limit. Engine RAM,
 producer RAM and storage leases have separate counters. Several destinations
-can wait on different resources during the same interval.
+can wait on different resources during the same interval. The JSON fields
+`controller_wait_seconds.consumer` and `storage_queue_wait_seconds` both
+measure time the controller spends waiting for outstanding work, including
+GPU deliveries, owner processing and disk writes.
 
 ### Farming layout
 
@@ -1972,9 +1975,12 @@ The scheduler prioritizes the next batch that can start an idle output drive.
 Compatible worker slots and measured transfer rates limit concurrent receivers.
 When enough destinations are ready to keep the pool occupied, a compact
 in-memory receiver can request several packed members from a fast worker.
-The owner sizes these requests from measured packed deliveries. Once a route
-has a measured packed delivery rate, a fresh HDD destination can queue one more
-RAM-backed receive within the memory and inflight limits. If a busy worker
+The owner sizes these requests from measured packed deliveries. A fresh HDD
+destination can queue another packed batch within the memory and inflight
+limits. With one GPU slot, automatic admission uses deliveries at the same
+batch size to check that the remaining wait and the next delivery fit the
+task deadline. It can then open an independent HDD destination early and
+keep the GPU working while the owner hashes the previous batch. If a busy worker
 can deliver before an idle worker and another destination can feed the idle
 one, the owner sizes the batch for the earlier delivery. When all slots are
 busy, it can also size queued work for the next known delivery. A cold pool
@@ -2005,9 +2011,12 @@ In construction JSON, `pool_partial_capacity_probes` counts compressed
 transfers stopped early for capacity. `pool_timed_generation_tasks` counts
 measured tasks.
 The destination scheduler reports its most recent generation estimate in
-`pool_generation_seconds_per_member` and its receiver count in
-`pool_receiving_destinations`. Both start at zero. The `phases` object gives
-the logical bytes read and written in each construction phase.
+`pool_generation_seconds_per_member`. `pool_receiving_destinations` is the
+number of receivers it sized for the available worker capacity at that
+decision. Both fields start at zero. `pool_peak_active_generation` counts
+the most generation requests the owner had outstanding at once, including
+requests waiting for a worker. The `phases` object gives the logical bytes
+read and written in each construction phase.
 
 On the first machine, create a pool and an invitation for another machine:
 

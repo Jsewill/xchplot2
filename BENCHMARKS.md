@@ -1369,7 +1369,7 @@ the three-worker fill. Ten still got one packing thread. The wired pair
 took 165.37 s and all three took 175.08 s. The Arc delivered one member
 at 110.10 s, including 93.50 s of transfer.
 
-At `7eb35ba`, packers could use owner CPU threads while remote receivers
+At `7eb35b`, packers could use owner CPU threads while remote receivers
 waited for data. The wired pair took 146.55 and 150.38 s. The three-GPU
 fills took 172.43 and 198.19 s. In the slower fill, the penultimate
 group held the only remaining destination HDD as scratch. The owner
@@ -1495,8 +1495,8 @@ members. Forced scratch received 48 encoded contributions and finished
 16.29 s before automatic. Each target published once. At admission the
 automatic owner had no comparable scratch read, merge or encoded-delivery
 measurement for those targets. The three runs followed the table order.
-A repeated, order-reversed automatic and forced comparison at the same
-cap would establish the variability of this gap. On the corrected
+The RTX-only comparison below repeats the two modes in reverse order.
+The mixed-worker runs have one observation per mode. On the corrected
 RTX-only control, 19,022 forecast evaluations used 4.146 s of wall time.
 The last admission had a partial forecast. Historical replay of the four
 earlier 48-member traces also lacked sufficient pre-grant evidence for
@@ -1530,6 +1530,83 @@ passed a 100-challenge full-proof check.
 On the same local fixture in a pseudo-terminal, the final build with the
 dashboard (2.040 s/member), phase tracing (2.067) and both (2.039) fell
 within the two plain runs (2.164 and 2.037), with matching hashes.
+
+#### Automatic RAM and forced scratch with one RTX 4090 and 16 HDDs
+
+These controls used the owner and broker at `f2d5863`. The previous
+owner in the live-join comparison was `2b10c10`, and the candidate and
+corrected rows there used intermediate builds. Each control started a fresh
+owner, cache and private broker for the same 48 members on David's 16
+HDDs at 32 GiB. The same RTX 4090 was the sole registered worker. The
+owner reported its first and last durable publication directly. Its
+verbose diagnostics used a 112 × 32 pseudo-terminal, with JSON on a
+separate stream. David's running farmer reported 17,886 k=32 plots,
+1.7296 PiB of effective plot size and 0.77955 PiB of loaded files.
+
+| Run in order | First durable (s) | Last durable (s) | s/member | Forecast evaluations / wall seconds | Eligible farm lookups / maximum (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Automatic, plain | 31.49 | 243.26 | 5.068 | 87,172 / 15.77 | 26 / 5.214 |
+| Forced scratch, plain | 21.95 | 176.42 | 3.675 | 16,109 / 3.922 | 18 / 4.629 |
+| Automatic, dashboard | 29.95 | 234.53 | 4.886 | 83,600 / 15.09 | 25 / 4.927 |
+| Automatic, phase tracing | 29.19 | 230.88 | 4.810 | 82,744 / 15.31 | 24 / 6.700 |
+| Automatic, both | 29.28 | 226.33 | 4.715 | 80,576 / 14.67 | 24 / 6.698 |
+| Forced scratch, plain | 21.14 | 171.07 | 3.564 | 16,038 / 3.864 | 18 / 5.654 |
+| Automatic, plain | 28.44 | 231.49 | 4.823 | 82,475 / 15.06 | 26 / 5.173 |
+
+Automatic used RAM for all groups. Each traced admission lacked a complete
+finish estimate for either construction mode. Each automatic fill received
+48 packed members, and each forced fill received 48 encoded contributions.
+Forced scratch finished 66.84 s earlier in the first pair and 60.42 s
+earlier in the reverse pair. The dashboard-only time fell between the two
+plain times. Tracing alone and with the dashboard finished sooner than both
+plain controls. The RTX worker could use all 24 logical CPUs, and its
+host's average CPU utilization ranged from 5.73% to 15.2% across the seven
+fills. Each display configuration had one observation.
+
+All seven fills matched the 16 full-proof-checked reference hashes and
+passed a fresh 16-challenge proof check on one group. The external sampler
+matched all 158 recorded full-node signage arrivals to a lookup start
+within one second and counted 161 eligible completions. One lookup
+completed after its fill's last durable publication. The farm recorded
+zero lookups over 8 s and zero timeout lines. An 80 s farming-only window
+before the controls had eight eligible lookups with a maximum of 3.917 s.
+
+Two further automatic runs at `a90f048` published the same 48 members in
+225.60 and 231.73 s (4.700 and 4.828 s/member). Forecasting took 2.001
+and 2.039 s across 86,632 and 89,452 evaluations. Both returned 48 packed
+members and peaked at three active destination engines and one in-flight
+GPU generation request, as in the earlier plain controls.
+At the same revision, forcing incremental RAM construction and encoded
+output returned 15 whole groups from the RTX and three packed members for
+the remaining group. The owner recorded zero local fallbacks, retries or
+failed tasks. The first group became durable at 19.72 s and the last at
+324.76 s (6.766 s/member). Up to nine requests were in flight to the
+single GPU slot.
+
+At `3c5ff1f`, the automatic RAM fills had two generation requests in
+flight to the RTX and peaked at five and four active destination engines.
+Their first groups were durable at 29.03 and 29.54 s. All 48 packed members
+were durable at 180.16 and 185.35 s (3.753 and 3.861 s/member). Forecasting
+took 1.440 and 1.487 s. Mean time per member fell 20.1% from `a90f048`.
+The automatic runs still averaged 5.18% longer than the forced-scratch
+controls. Both new runs matched all 16 reference hashes and passed
+a fresh 16-challenge full-proof check. The farm logged 39 eligible
+completions, with a maximum of 6.174 s. All 38 recorded signage arrivals
+matched and their lookups completed before the last publication.
+
+A separate ordinary fill selected the live Gigahorse 2.7.4.giga37 reader
+with `--harvester local`. For its 30 configured lookup workers, the
+per-job model required 1,040 MiB for 16 HDDs, 520 MiB for eight and
+260 MiB for four. With the diagnostic from `41dd81e`, a fresh 16-HDD
+fill reported the reader requirement and budget in JSON and exited 2
+with all target directories empty. The four-HDD fill fit the existing
+512 MiB budget and published 12 members in 70.96 s. All four hashes
+matched and all four groups passed fresh full-proof checks. The final Farm
+screen showed 17,886 loaded plots and three completions in 30 s, all with
+eligible plots. Median response was 2,733.2 ms and p95 and maximum
+were 3,942.3 ms. The external sampler recorded seven eligible completions
+over the full run, matched all six recorded signage arrivals and counted
+zero lookups over 8 s.
 
 #### Shared compute over a dedicated Ethernet link
 
