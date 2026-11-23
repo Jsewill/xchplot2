@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery, trace-worker, trace-refusal]
+        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery, trace-worker, trace-refusal, trace-growth]
 
 permissions:
   contents: read
@@ -328,7 +328,7 @@ jobs:
           exit $LASTEXITCODE
   diagnostics:
     name: Native compute and construction fixtures
-    if: inputs.phase == 'diagnose' || inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
+    if: inputs.phase == 'diagnose' || inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal' || inputs.phase == 'trace-growth'
     runs-on: windows-2022
     timeout-minutes: 35
     defaults:
@@ -470,8 +470,66 @@ jobs:
                    require(client.stats().failed_tasks == 3, "temporary refusals lost their failure accounting");
           '''
           subprocess.run(['git','apply','--whitespace=nowarn','-'], input=patch.lstrip().encode(), check=True)
+      - name: Trace both address families during a live worker join
+        if: inputs.phase == 'trace-growth'
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_one(text, before, after):
+              assert text.count(before)==1, before
+              return text.replace(before,after)
+          path=Path("src/host/ComputeWorker.cpp")
+          s=path.read_text()
+          i=s.index("    void refresh_brokers()")
+          j=s.index("    void rotate_brokers(",i)
+          code=s[i:j]
+          code=replace_one(code,"            if (stopping.load()) return;\n            try","            if (stopping.load()) return;\n            pool::Endpoint attempted;\n            try")
+          code=replace_one(code,"                if (revision == value.capacity_revision","                attempted = value.endpoint;\n                if (revision == value.capacity_revision")
+          code=replace_one(code,"            catch (...)\n            {\n                std::lock_guard lock(brokers_mutex); broker->healthy = false;",'''            catch (std::exception const& error)
+                      {
+                          std::lock_guard lock(brokers_mutex); broker->healthy = false;
+                          std::fprintf(stderr, "growth route %s:%u advertised=%s:%u revision=%llu known=%zu error=%s\\n",
+                              broker->endpoint.host.c_str(), unsigned(broker->endpoint.port), attempted.host.c_str(), unsigned(attempted.port),
+                              (unsigned long long)broker->revision, brokers.size(), error.what());''')
+          path.write_text("#include <cstdio>\n"+s[:i]+code+s[j:])
+          path=Path("tools/parity/compute_worker_client_test.cpp")
+          s=path.read_text()
+          before="    session.offer_local(offer(args));\n    auto baseline = cold.get();"
+          after=r'''    session.offer_local(offer(args));
+              auto track = [&](char const* name, std::shared_ptr<WorkerService> worker)
+              {
+                  return std::jthread([&, name, worker](std::stop_token stop)
+                  {
+                      unsigned beat = 0;
+                      while (!stop.stop_requested())
+                      {
+                          if (!(beat++ % 4)) try
+                          {
+                              auto worker_status = worker->status(); auto state = control.status();
+                              std::fprintf(stderr, "growth %s known=%llu healthy=%llu deferred=%llu limit=%llu owners_workers=%llu queued=%llu granted=%llu running=%llu\n",
+                                  name,(unsigned long long)worker_status.known_brokers,(unsigned long long)worker_status.healthy_brokers,
+                                  (unsigned long long)worker_status.deferred_brokers,(unsigned long long)worker_status.broker_limit,
+                                  (unsigned long long)state.workers,(unsigned long long)state.queued,(unsigned long long)state.granted,(unsigned long long)state.running);
+                          }
+                          catch (std::exception const& err) { std::fprintf(stderr, "growth sampling failed %s\n",err.what()); }
+                          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                      }
+                  });
+              };
+              auto first_monitor = track("original",session.local_worker());
+              std::cerr << "growth wait initial generation" << std::endl;
+              auto baseline = cold.get();'''
+          s=replace_one(s,before,after)
+          s=replace_one(s,"        helper.offer_local(offer(helper_args));\n        remote = generate(false, 2);",'''        helper.offer_local(offer(helper_args));
+                  auto helper_monitor = track("helper",helper.local_worker());
+                  std::cerr << "growth submit helper members" << std::endl;
+                  remote = generate(false, 2);
+                  std::cerr << "growth helper delivered" << std::endl;''')
+          s=replace_one(s,"    release.set_value(); auto local = original.get();","    std::cerr << \"growth release original\" << std::endl;\n    release.set_value(); auto local = original.get();")
+          path.write_text("#include <cstdio>\n"+s)
       - name: Identify the native worker phase which reaches its deadline
-        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
+        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal' || inputs.phase == 'trace-growth'
         shell: python
         env:
           QA_TRACE: ${{ inputs.phase }}
@@ -486,6 +544,8 @@ jobs:
           assert len(cases) > 10 and text.count(line) == 1
           if os.environ['QA_TRACE'] == 'trace-refusal':
               cases = ['temporary_worker_refusal']
+          elif os.environ['QA_TRACE'] == 'trace-growth':
+              cases = ['automatic_pool_growth']
           body = ['    auto trace = [](const char* name, auto phase) {',
                   '        auto const start = std::chrono::steady_clock::now();',
                   '        std::cerr << "start " << name << std::endl;',
@@ -495,7 +555,7 @@ jobs:
           body += ['    trace("' + name + '", ' + name + ');' for name in cases]
           path.write_text(text.replace(line, '\n'.join(body)), encoding='utf-8')
       - name: Repeat the traced native worker lifecycle
-        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
+        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal' || inputs.phase == 'trace-growth'
         env:
           QA_TRACE: ${{ inputs.phase }}
         run: |
@@ -504,7 +564,7 @@ jobs:
           cmake --build build/qa-host --parallel 4 --target pos2_pr118_grow_worker_client_test
           $PSNativeCommandUseErrorActionPreference = $false
           $failed = 0
-          $repeats = if ($env:QA_TRACE -eq 'trace-refusal') { 20 } else { 5 }
+          $repeats = if ($env:QA_TRACE -eq 'trace-refusal') { 20 } elseif ($env:QA_TRACE -eq 'trace-growth') { 8 } else { 5 }
           foreach ($attempt in 1..$repeats) {
             Write-Output "Native worker trial $attempt"
             & ./build/qa-host/tools/parity/pos2_pr118_grow_worker_client_test.exe
