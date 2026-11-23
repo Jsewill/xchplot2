@@ -47,6 +47,13 @@ int main(int argc, char** argv)
         if (backend != argv[1])
             throw std::runtime_error("Expected " + std::string(argv[1]) + ", found " + backend);
 #ifdef XCHPLOT2_GPU_CI_SYCL
+        if (backend == "hip") {
+            // A standalone worker must read free VRAM before it owns a plotting queue.
+            size_t available = 0, total = 0;
+            if (!pos2gpu::device_memory_probe(devices.front().id, available, total) ||
+                !available || available > total)
+                throw std::runtime_error("HIP worker cannot read live GPU memory before queue creation");
+        }
         size_t const free_bytes = pos2gpu::query_device_memory().free_bytes;
 #else
         size_t free_bytes = 0, total_bytes = 0;
