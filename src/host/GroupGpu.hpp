@@ -161,6 +161,7 @@ public:
     // Queue/runtime state can outlive a failed auto-backend attempt. CPU
     // fallback must continue to reserve this allowance after GPU initialization.
     static uint64_t runtime_host_allowance_bytes() noexcept;
+    static std::string device_loss(std::exception_ptr);
     std::string const& tier() const;
     bool profile_enabled() const;
     BorrowedFragments generate_borrowed(std::array<uint8_t, 32> const& plot_id);

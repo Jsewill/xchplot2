@@ -74,6 +74,14 @@ int main(int argc, char** argv)
 {
     try
     {
+#ifndef XCHPLOT2_GROUP_COMMANDS
+        // The reference worker is also a standalone executable.
+        if (argc == 8 && std::string_view(argv[1]) == "compute" && std::string_view(argv[2]) == "worker" &&
+            std::string_view(argv[3]) == "--config" && std::string_view(argv[5]) == "--gpu-recovery-worker")
+            return group_grow::run_worker_gpu_child(argv[6], argv[7]);
+#endif
+        if (argc == 4 && std::string_view(argv[1]) == "--gpu-recovery-worker")
+            return group_grow::run_worker_gpu_child(argv[2], argv[3]);
         group_grow::WorkerConfig config;
         std::filesystem::path directory;
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -200,10 +208,18 @@ int main(int argc, char** argv)
             << capacity.cpu_threads << " CPU threads, " << capacity.host_bytes / (uint64_t(1) << 20)
             << " MiB host RAM, " << capacity.gpu_bytes / (uint64_t(1) << 20) << " MiB GPU RAM.\n" << std::flush;
         uint64_t healthy = UINT64_MAX;
+        std::string gpu_recovery;
         auto admission = group_grow::pool::WorkerAdmission::Accepting;
         while (!stopped)
         {
             auto const status = worker.status();
+            if (!output.quiet && gpu_recovery != status.gpu_recovery)
+            {
+                gpu_recovery = status.gpu_recovery;
+                if (gpu_recovery.empty()) std::cout << "GPU generation is available again.\n";
+                else std::cout << "GPU recovering: " << gpu_recovery << '\n';
+                std::cout << std::flush;
+            }
             if (!output.quiet && (healthy != status.healthy_brokers || admission != status.admission))
             {
                 healthy = status.healthy_brokers; admission = status.admission;

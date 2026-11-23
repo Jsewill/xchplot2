@@ -38,7 +38,7 @@ constexpr char broker_restarted[] = "broker restarted; open a new owner session"
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute, RegisterGpuRecovery, StatusGpuRecovery, GenerationRoutesGpuRecovery };
 class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
 constexpr uint8_t independent_flag = 0x80;
@@ -192,7 +192,7 @@ struct BrokerClient::Connections
     ControlMetrics metrics;
     Endpoint endpoint;
     uint64_t route_revision = 1;
-    std::atomic<bool> generation_routes{true};
+    std::atomic<bool> generation_routes{true}, gpu_recovery{true};
     std::atomic<bool> generation_backlog{true};
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
     {
@@ -351,7 +351,10 @@ uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& ta
     };
     bool routes = roster && connections_->generation_routes.load();
     std::vector<uint8_t> bytes;
-    if (routes) try { bytes = query(Operation::GenerationRoutes); }
+    bool recovery = routes && connections_->gpu_recovery.load();
+    if (recovery) try { bytes = query(Operation::GenerationRoutesGpuRecovery); }
+    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); recovery = false; }
+    if (routes && !recovery) try { bytes = query(Operation::GenerationRoutes); }
     catch (UnknownOperation const&)
     {
         // Older compatible brokers still supply the aggregate capacity. Only
@@ -407,6 +410,12 @@ uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& ta
                 snapshot->complete == (admission.eligible == count) &&
                 waiting >= admission.registered - admission.eligible && waiting <= admission.registered,
                 "invalid generation admission");
+            if (recovery)
+            {
+                auto count = reader.u8(); require(count <= max_status_page_size && count <= admission.registered,
+                    "invalid GPU recovery count");
+                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), reader.string(240)});
+            }
             availability->admission = admission;
             *roster = std::move(snapshot);
         }
@@ -422,8 +431,24 @@ void BrokerClient::cancel(OwnerSession const& owner, std::string const& task, ui
 }
 void BrokerClient::renew(Lease const& lease)
 { auto writer = request(Operation::Renew); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
+std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recovering_gpu(WorkerOffer const& offer,
+    bool retain_route, std::string* peer_identity, std::string* peer_node_id)
+{
+    if (offer.gpu_recovery.empty() || !connections_->gpu_recovery.load()) return {};
+    auto writer = request(Operation::RegisterGpuRecovery); write_offer(writer, offer);
+    writer.u8(retain_route); writer.string(offer.gpu_recovery);
+    try
+    {
+        auto bytes = call(writer, peer_identity, peer_node_id);
+        Reader in(bytes); auto epoch = in.string(64); auto endpoint = read_endpoint(in); in.finish();
+        require(!epoch.empty() && endpoint.port, "invalid GPU recovery registration");
+        return std::pair{std::move(epoch), std::move(endpoint)};
+    }
+    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); return {}; }
+}
 std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string* peer_identity, std::string* peer_node_id)
 {
+    if (auto received = register_recovering_gpu(offer, false, peer_identity, peer_node_id)) return received->first;
     auto writer = request(Operation::Register); write_offer(writer, offer);
     auto bytes = call(writer, peer_identity, peer_node_id);
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
@@ -431,6 +456,8 @@ std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string*
 }
 std::string BrokerClient::register_worker_route(WorkerOffer& offer, std::string* peer_identity, std::string* peer_node_id)
 {
+    if (auto received = register_recovering_gpu(offer, true, peer_identity, peer_node_id))
+    { offer.endpoint = std::move(received->second); return received->first; }
     auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer);
     try
     {
@@ -503,8 +530,18 @@ void BrokerClient::worker_admission(std::string const& instance, WorkerAdmission
 }
 BrokerStatusPage BrokerClient::status(StatusRequest const& query)
 {
-    auto writer = request(Operation::Status); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
-    BrokerStatusPage result; auto bytes = call(writer, &result.identity); Reader in(bytes); result.section = StatusSection(in.u8());
+    BrokerStatusPage result;
+    auto page = [&](Operation op)
+    {
+        auto writer = request(op); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
+        return call(writer, &result.identity);
+    };
+    bool recovery = query.section == StatusSection::Workers && connections_->gpu_recovery.load();
+    std::vector<uint8_t> bytes;
+    if (recovery) try { bytes = page(Operation::StatusGpuRecovery); }
+    catch (UnknownOperation const&) { connections_->gpu_recovery.store(false); recovery = false; }
+    if (!recovery) bytes = page(Operation::Status);
+    Reader in(bytes); result.section = StatusSection(in.u8());
     require(result.section == query.section, "broker status section mismatch");
     result.host = in.string(255);
     result.next_cursor = in.u64(); result.workers = in.u64(); result.owners = in.u64(); result.jobs = in.u64();
@@ -520,6 +557,7 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
             value.hardware = read_worker_hardware(in);
+            if (recovery) value.gpu_recovery = in.string(240);
             result.worker_records.push_back(std::move(value));
         }
         else if (result.section == StatusSection::Owners)
@@ -1203,6 +1241,7 @@ struct BrokerServer::Impl
         else check_profiles(offer, offer.generation_profiles, threads);
         check_capacity(lease.worker_identity, update->capacity, &releasing);
         offer.capacity = update->capacity; offer.capacity_revision = update->revision;
+        if (offer.capacity.gpu_bytes) offer.gpu_recovery.clear();
         offer.generation_threads = threads;
         if (update->generation_profiles) offer.generation_profiles = *update->generation_profiles;
         worker->second.seen = Clock::now();
@@ -1245,7 +1284,7 @@ struct BrokerServer::Impl
         }
         return busy != WaitReason::None ? busy : reason;
     }
-    void status(Reader& reader, Writer& response)
+    void status(Reader& reader, Writer& response, bool recovery)
     {
         auto const section = StatusSection(reader.u8()); auto const cursor = reader.u64(); auto const limit = reader.u32(); reader.finish();
         require(section >= StatusSection::Workers && section <= StatusSection::Jobs && limit && limit <= max_status_page_size,
@@ -1287,6 +1326,7 @@ struct BrokerServer::Impl
                 response.u8(uint8_t(worker.offer.admission));
                 response.u64(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - worker.seen).count()));
                 write_worker_hardware(response, worker.offer.hardware);
+                if (recovery) response.string(worker.offer.gpu_recovery);
             }
             ++index; if (index >= cursor && index - cursor >= count) break;
         }
@@ -1325,7 +1365,8 @@ struct BrokerServer::Impl
         auto const operation = Operation(reader.u8()); Writer response(65536); expire();
         switch (operation)
         {
-        case Operation::Status: status(reader, response); break;
+        case Operation::Status:
+        case Operation::StatusGpuRecovery: status(reader, response, operation == Operation::StatusGpuRecovery); break;
         case Operation::WorkerAdmission:
         {
             auto const instance = reader.string(64); auto const admission = WorkerAdmission(reader.u8()); reader.finish();
@@ -1435,8 +1476,17 @@ struct BrokerServer::Impl
         }
         case Operation::Register:
         case Operation::RegisterWorkerRoute:
+        case Operation::RegisterGpuRecovery:
         {
             auto offer = read_offer(reader);
+            bool retain_route = operation == Operation::RegisterWorkerRoute;
+            if (operation == Operation::RegisterGpuRecovery)
+            {
+                auto const flag = reader.u8(); offer.gpu_recovery = reader.string(240);
+                require(flag <= 1 && !offer.capacity.gpu_bytes && !offer.gpu_recovery.empty() &&
+                    (offer.capabilities & capability(Kind::GenerateGpu)), "invalid withdrawn GPU registration");
+                retain_route = flag;
+            }
             if (offer.independent_k_mask)
             {
                 uint32_t supported = 0;
@@ -1483,7 +1533,7 @@ struct BrokerServer::Impl
             else
             {
                 auto& saved = it->second.offer;
-                if (operation == Operation::RegisterWorkerRoute) offer.endpoint = saved.endpoint;
+                if (retain_route) offer.endpoint = saved.endpoint;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
                     saved.capabilities == offer.capabilities && saved.independent_k_mask == offer.independent_k_mask &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
@@ -1505,11 +1555,12 @@ struct BrokerServer::Impl
                     require(saved.capacity == offer.capacity && saved.generation_profiles == offer.generation_profiles &&
                         saved.generation_threads == offer.generation_threads &&
                         saved.endpoint == offer.endpoint, "capacity revision changed its value");
+                if (saved.capacity_revision == offer.capacity_revision) saved.gpu_recovery = std::move(offer.gpu_recovery);
                 saved.admission = offer.admission; saved.producer_build = offer.producer_build;
                 saved.hardware = std::move(offer.hardware); it->second.seen = Clock::now();
             }
             response.string(epoch);
-            if (operation == Operation::RegisterWorkerRoute) write_endpoint(response, workers.at(identity).offer.endpoint);
+            if (operation != Operation::Register) write_endpoint(response, workers.at(identity).offer.endpoint);
             schedule(); break;
         }
         case Operation::Unregister:
@@ -1660,6 +1711,7 @@ struct BrokerServer::Impl
         case Operation::GenerationHint:
         case Operation::GenerationAvailability:
         case Operation::GenerationRoutes:
+        case Operation::GenerationRoutesGpuRecovery:
         {
             auto session = read_session(reader); auto task = read_task(reader);
             bool const detailed = operation != Operation::GenerationHint;
@@ -1673,7 +1725,8 @@ struct BrokerServer::Impl
             uint32_t independent = independent_request ? 0 : max_generation_batch_members;
             std::array<uint32_t, max_generation_batch_members + 1> independent_slots{};
             GenerationRoster roster;
-            bool const report_routes = operation == Operation::GenerationRoutes;
+            bool const recovery = operation == Operation::GenerationRoutesGpuRecovery;
+            bool const report_routes = operation == Operation::GenerationRoutes || recovery;
             GenerationAdmission admission; admission.registered = uint32_t(workers.size());
             bool codec_available = false, concurrent_codec = false;
             auto const free = report_routes ? available(owner_key(identity, session.owner_id), &admission.other_owner_tasks) :
@@ -1681,6 +1734,9 @@ struct BrokerServer::Impl
             for (auto const& [identity, worker] : workers)
             {
                 auto const& capacity = worker.offer.capacity;
+                if (recovery && !worker.offer.gpu_recovery.empty() && roster.recovering_gpus.size() < max_status_page_size)
+                    roster.recovering_gpus.push_back({worker.offer.hardware.host.empty() ? identity : worker.offer.hardware.host,
+                        worker.offer.gpu_recovery});
                 job.requested.independent_members = false;
                 job.requested.generation_output = requested_output;
                 bool const codec_room = detailed && worker.offer.admission == WorkerAdmission::Accepting && worker.offer.codec_compatibility == codec &&
@@ -1773,6 +1829,11 @@ struct BrokerServer::Impl
                 response.u32(admission.registered); response.u32(admission.eligible);
                 response.u32(admission.available_slots); response.u32(admission.other_owner_tasks);
                 for (auto number : admission.waiting) response.u32(number);
+                if (recovery)
+                {
+                    response.u8(uint8_t(roster.recovering_gpus.size()));
+                    for (auto const& gpu : roster.recovering_gpus) { response.string(gpu.host); response.string(gpu.cause); }
+                }
             }
             break;
         }

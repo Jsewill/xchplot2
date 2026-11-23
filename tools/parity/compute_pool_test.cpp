@@ -409,12 +409,12 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto legacy = std::async(std::launch::async, [&]
     {
         auto channel = listener.accept(3000);
-        for (auto operation : {19, 18, 18, 2, 2, 2})
+        for (auto operation : {23, 19, 18, 18, 2, 2, 2})
         {
             auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
             require(frame.type == Message::Control && input.u32() == 8 && input.u8() == operation,
                 "client repeated an unsupported broker operation");
-            if (operation == 19)
+            if (operation == 23 || operation == 19)
             { reply.u8(1); reply.string("unknown broker operation"); channel.send(Message::Error, reply.data()); }
             else if (operation == 18)
             {
