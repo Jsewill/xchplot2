@@ -9484,7 +9484,7 @@ std::unique_ptr<FarmingRun> farming_run(Arguments const& args, Keys const* keys,
         for (auto const& [filesystem, charge] : charged)
             require(charge <= args.capacity, "saved farming outputs and job exceed --capacity-bytes");
     require(run->metadata < args.max_ram, "farming job and output metadata exceed --max-ram");
-    if (run->state.capacity_fill && (!args.plan_only || job.saved))
+    if (run->state.capacity_fill && (job.saved || (!args.plan_only && run->feasible())))
     {
         group_grow::FarmingUpdateMailbox mailbox(run->state, job.legacy_metadata, false, args.max_ram,
             run->bound_directories, control_bindings);

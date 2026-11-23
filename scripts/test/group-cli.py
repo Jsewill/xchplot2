@@ -1541,6 +1541,14 @@ def check(binary, root, reference=None):
     review_b.mkdir()
     review_options = [review_a, review_b, *options[2:]]
     review_before = snapshot(review_a), snapshot(review_b)
+    constrained = [*review_options, "--harvester", "local", "--chia-root", chia_root,
+                   "--chia-executable", root / "missing-chia", "--farming-memory-bytes", "1K", "--json"]
+    forecast = json.loads(run("plan", *constrained, code=2).stdout)
+    refused = run("fill", *constrained, *keys, "--compute", "off", code=2)
+    assert not forecast["feasible"] and forecast["required_reader_memory_bytes"] > forecast["memory_bytes"]
+    assert forecast["infeasibility_reason"] in refused.stderr and "inspect plan" in refused.stderr
+    assert json.loads(refused.stdout)["infeasibility_reason"] == forecast["infeasibility_reason"]
+    assert (snapshot(review_a), snapshot(review_b)) == review_before
     reviewed = json.loads(run("plan", *review_options, "--harvester", profile_file, "--save-plan", review, "--json").stdout)
     assert reviewed["farming_profile"] == reviewed_profile
     assert review.is_file() and SEED not in review.read_text(encoding="utf-8")
