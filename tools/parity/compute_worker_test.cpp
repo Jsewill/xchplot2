@@ -297,8 +297,21 @@ void multiple_brokers(char const* ca, char const* cert, char const* key)
     if (!started) { release.set_value(); held.get(); throw std::runtime_error("first broker made no progress"); }
     auto queued = std::async(std::launch::async, [&] { return collect(b); });
     bool const bounded = queued.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    WorkerGenerationCapacity busy;
+    auto const until = Clock::now() + std::chrono::seconds(3);
+    do
+    {
+        busy = a.generation_capacity(18, 2);
+        if (busy.availability.admission && !busy.availability.admission->available_slots) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (Clock::now() < until);
     release.set_value();
-    require(held.get() == expected && queued.get() == expected, "independent brokers changed worker output");
+    auto const first_result = held.get();
+    auto const idle = a.generation_capacity(18, 2);
+    require(busy.slots == 1 && busy.availability.admission && !busy.availability.admission->available_slots &&
+        !busy.availability.admission->other_owner_tasks && idle.availability.admission && idle.availability.admission->available_slots == 1,
+        "completed packed receipt retained the owner's occupied slot");
+    require(first_result == expected && queued.get() == expected, "independent brokers changed worker output");
     require(bounded, "independent brokers exceeded the worker's one shared task slot");
 
     client.local_service = nullptr; WorkerClient remote(client);

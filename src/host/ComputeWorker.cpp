@@ -3950,6 +3950,14 @@ struct WorkerClient::Impl
             {
                 std::lock_guard lock(impl.planning_mutex);
                 impl.planning.released(lease.worker_identity, planning_selection);
+                auto& hint = impl.generation_capacity;
+                auto const& admission = hint.value.availability.admission;
+                // The cached sole slot can still be occupied by this finished
+                // grant. Ask the broker again before ordering the next batch.
+                if (completed && operation == Operation::Packed && hint.k == lease.task.k && hint.strength == lease.task.strength &&
+                    hint.value.slots == 1 && admission && !admission->available_slots && !admission->other_owner_tasks &&
+                    hint.value.roster && hint.value.roster->complete && !impl.unlisted_route(lease))
+                    hint.expires = {};
             }
             impl.input_bytes.fetch_add(input_bytes); impl.output_bytes.fetch_add(output_bytes);
             if (completed)
