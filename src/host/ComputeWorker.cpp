@@ -1071,8 +1071,8 @@ struct WorkerService::Impl
                   revision = broker->revision; }
                 auto client = broker->client.with_deadline(Clock::now() + std::chrono::milliseconds(config.broker_refresh_ms));
                 auto value = offer();
-                if (value.endpoint.host == "0.0.0.0" || value.endpoint.host == "::")
-                    value.endpoint.host = pool::local_address(address);
+                bool const routed = value.endpoint.host == "0.0.0.0" || value.endpoint.host == "::";
+                if (routed) value.endpoint.host = pool::local_address(address);
                 if (revision == value.capacity_revision && value.endpoint == advertised_endpoint &&
                     client.heartbeat(instance, value.capacity_revision, value.admission))
                 {
@@ -1085,7 +1085,7 @@ struct WorkerService::Impl
                     auto route = value.endpoint; value = offer(); value.endpoint = std::move(route);
                 }
                 std::string peer, node;
-                auto epoch = client.register_worker(value, &peer, &node);
+                auto epoch = !revision && routed ? client.register_worker_route(value, &peer, &node) : client.register_worker(value, &peer, &node);
                 std::lock_guard lock(brokers_mutex);
                 auto same = std::find_if(brokers.begin(), brokers.end(), [&](auto const& registered)
                 { return registered != broker && !registered->epoch.empty() && registered->epoch == epoch && registered->identity == peer; });
