@@ -139,6 +139,7 @@ void bounded_coalescing()
     ParallelEncoder local(k, 1, uint64_t(8) << 20, scheduler);
     std::promise<void> submitted;
     std::future<void> calibration;
+    std::chrono::nanoseconds local_elapsed{};
     {
         CodecScheduler::Lease pressure(scheduler.get());
         calibration = std::async(std::launch::async, [&]
@@ -146,9 +147,8 @@ void bounded_coalescing()
             auto const begin = std::chrono::steady_clock::now();
             submitted.set_value();
             auto blocks = local.encode(tasks, sizes);
-            remote.observe_local(k, tasks, sizes, blocks, uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - begin).count()));
+            local_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin);
+            remote.observe_local(k, tasks, sizes, blocks, uint64_t(local_elapsed.count()));
         });
         submitted.get_future().wait();
         require(calibration.wait_for(std::chrono::seconds(1)) != std::future_status::ready,
@@ -162,10 +162,15 @@ void bounded_coalescing()
     // on the same measured worker with the normal admitted-window deadline.
     for (uint64_t limit : {uint64_t(1) << 20, partial, uint64_t(16) << 10})
     {
-        client_options.owner_id = "coalescing-" + std::to_string(limit);
-        client_options.max_task_bytes = limit;
-        client_options.max_window_chunks = limit == offered.max_task_bytes ? 96 : pool::default_max_codec_chunks;
-        client = std::make_shared<WorkerClient>(client_options);
+        auto options = client_options;
+        options.owner_id = "coalescing-" + std::to_string(limit);
+        options.max_task_bytes = limit;
+        options.max_window_chunks = limit == offered.max_task_bytes ? 96 : pool::default_max_codec_chunks;
+        // Make a single-chunk tail cost more than one local chunk even on a
+        // fast loopback. Both requests together still cost less than the window.
+        if (limit == partial) options.selected = [setup = local_elapsed / int64_t(tasks.size()) * 2]
+            (WorkerTaskObservation const&) { std::this_thread::sleep_for(setup); };
+        client = std::make_shared<WorkerClient>(options);
         uint64_t const per_request = std::min<uint64_t>(client->max_window_chunks(),
             (limit - pool::codec_window_header_bytes) / chunk_bytes);
         uint64_t const requests = (tasks.size() + per_request - 1) / per_request;
