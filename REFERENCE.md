@@ -856,6 +856,15 @@ at that handoff. Saved scratch grants and the farming limits still apply.
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
 and clean-cache release. `--window-bytes SIZE` sets the I/O window size.
 
+For a compact group built in RAM, automatic GPU overlap can compact one member
+on the CPU while the pooled GPU generates the next. When a second GPU output
+buffer would exceed the device budget, the plotter can use a pinned host
+buffer for local batches of two or more members. At k=28 this needs 2,016 MiB
+of additional host memory over tiled transfers. The plotter checks the batch
+budget and live headroom before allocating it. Tight memory, an unavailable
+pinned allocation or protected farming resources keep the tiled path when
+the device output buffer is unavailable.
+
 `--checkpoint-bytes auto` is the default. Ordinary construction measures
 the time per durable byte and the time spent flushing each interval. During
 the first group it can try a target up to 4 GiB when that target predicts
