@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery, trace-worker]
+        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery, trace-worker, trace-refusal]
 
 permissions:
   contents: read
@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'ce8fd8fb86e117ee17978f21f07efb4ea2415770' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '9a65f019dd08d6b104467a865dcb5dfbb358165d' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -328,7 +328,7 @@ jobs:
           exit $LASTEXITCODE
   diagnostics:
     name: Native compute and construction fixtures
-    if: inputs.phase == 'diagnose' || inputs.phase == 'trace-worker'
+    if: inputs.phase == 'diagnose' || inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
     runs-on: windows-2022
     timeout-minutes: 35
     defaults:
@@ -339,7 +339,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ce8fd8fb86e117ee17978f21f07efb4ea2415770
+          ref: 9a65f019dd08d6b104467a865dcb5dfbb358165d
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -428,10 +428,55 @@ jobs:
           foreach ($file in $crypto, $ssl, "$tls/include/openssl/ssl.h") { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "TLS cache lacks $file" } }
           cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$tls" -DOPENSSL_USE_STATIC_LIBS=ON "-DLIB_EAY_RELEASE:FILEPATH=$crypto" "-DSSL_EAY_RELEASE:FILEPATH=$ssl" "-DLIB_EAY:FILEPATH=$crypto" "-DSSL_EAY:FILEPATH=$ssl"
           cmake --build build/qa-host --parallel 4 --target compute_membership_test pos2_pr118_grow_worker_test
-      - name: Identify the native worker phase which reaches its deadline
-        if: inputs.phase == 'trace-worker'
+      - name: Observe temporary refusal and the broker's retry state
+        if: inputs.phase == 'trace-refusal'
         shell: python
         run: |
+          import subprocess
+          patch = r'''
+          --- a/tools/parity/compute_worker_client_test.cpp
+          +++ b/tools/parity/compute_worker_client_test.cpp
+          @@ -1211,13 +1211,29 @@
+                           output = true;
+                       };
+                       refuse = true; bool rejected = false;
+          -            try { request(); } catch (pool::TransientTransport const&) { rejected = true; }
+          +            auto describe = [&] { return std::string(local ? "local " : "remote ") + (kind == 0 ? "packed" : kind == 1 ? "contributions" : "encode"); };
+          +            auto const begin = Clock::now();
+          +            try { request(); } catch (pool::TransientTransport const& err) {
+          +                std::cerr << "refusal " << describe() << " selected=" << !refuse << " error=" << err.what() << '\n';
+          +                rejected = true;
+          +            }
+                       require(rejected && !output && !service.status().accepted_tasks,
+                           "paused worker did not refuse the granted task before execution");
+                       service.control(WorkerControl::Resume); ++task.attempt; delayed_pause = true;
+                       try { request(); }
+                       catch (std::exception const& error)
+          -            { throw std::runtime_error("retry after temporary worker refusal failed: " + std::string(error.what())); }
+          +            {
+          +                auto current = service.status(); auto api = worker_control.status({pool::StatusSection::Jobs});
+          +                auto registry = worker_control.status({pool::StatusSection::Workers});
+          +                std::cerr << "retry " << describe() << " selected=" << !delayed_pause << " duration ms="
+          +                    << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - begin).count()
+          +                    << " local admission=" << unsigned(current.admission)
+          +                    << " broker admission=" << (registry.worker_records.empty() ? 0 : unsigned(registry.worker_records.front().admission))
+          +                    << " jobs=" << api.jobs << '\n';
+          +                for (auto const& job : api.job_records) std::cerr << "job " << job.id << " attempt=" << job.attempt << " state="
+          +                    << unsigned(job.state) << " reason=" << pool::wait_reason_name(job.waiting) << '\n';
+          +                throw std::runtime_error("retry after temporary worker refusal failed: " + std::string(error.what()));
+          +            }
+                       require(output, "temporary refusal excluded the only worker from the task's retry");
+                   }
+                   require(client.stats().failed_tasks == 3, "temporary refusals lost their failure accounting");
+          '''
+          subprocess.run(['git','apply','--whitespace=nowarn','-'], input=patch.lstrip().encode(), check=True)
+      - name: Identify the native worker phase which reaches its deadline
+        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
+        shell: python
+        env:
+          QA_TRACE: ${{ inputs.phase }}
+        run: |
+          import os
           from pathlib import Path
           import re
           path = Path('tools/parity/compute_worker_client_test.cpp')
@@ -439,6 +484,8 @@ jobs:
           line, = [s for s in text.splitlines() if 'retry_pressure(); planning_feedback();' in s]
           cases = re.findall(r'(\w+)\(\);', line)
           assert len(cases) > 10 and text.count(line) == 1
+          if os.environ['QA_TRACE'] == 'trace-refusal':
+              cases = ['temporary_worker_refusal']
           body = ['    auto trace = [](const char* name, auto phase) {',
                   '        auto const start = std::chrono::steady_clock::now();',
                   '        std::cerr << "start " << name << std::endl;',
@@ -448,14 +495,17 @@ jobs:
           body += ['    trace("' + name + '", ' + name + ');' for name in cases]
           path.write_text(text.replace(line, '\n'.join(body)), encoding='utf-8')
       - name: Repeat the traced native worker lifecycle
-        if: inputs.phase == 'trace-worker'
+        if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal'
+        env:
+          QA_TRACE: ${{ inputs.phase }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cmake --build build/qa-host --parallel 4 --target pos2_pr118_grow_worker_client_test
           $PSNativeCommandUseErrorActionPreference = $false
           $failed = 0
-          foreach ($attempt in 1..5) {
+          $repeats = if ($env:QA_TRACE -eq 'trace-refusal') { 20 } else { 5 }
+          foreach ($attempt in 1..$repeats) {
             Write-Output "Native worker trial $attempt"
             & ./build/qa-host/tools/parity/pos2_pr118_grow_worker_client_test.exe
             if ($LASTEXITCODE -ne 0) { ++$failed }
@@ -503,7 +553,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $zip[0].FullName).Hash -ne $hash) { throw 'Archive checksum mismatch' }
           Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath package
           $info = @(Get-ChildItem -LiteralPath package -Filter BUILDINFO.txt -Recurse)
-          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*ce8fd8fb86e117ee17978f21f07efb4ea2415770\s*$' -Quiet)) { throw 'Archive source mismatch' }
+          if ($info.Count -ne 1 -or !(Select-String -LiteralPath $info[0].FullName -Pattern '^Source:\s*9a65f019dd08d6b104467a865dcb5dfbb358165d\s*$' -Quiet)) { throw 'Archive source mismatch' }
       - name: Resume each native data boundary and verify published bytes and full proofs
         shell: pwsh
         run: |
