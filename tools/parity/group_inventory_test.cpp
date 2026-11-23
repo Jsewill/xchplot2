@@ -191,6 +191,8 @@ void inventory(fs::path const& directory)
     rejects([&] { (void)inventory_detail::catalog_deadline({}, 100001); }, "catalog allowance ignored the entry bound");
     auto malicious = observed; malicious.plots[0].relative_path = "../outside";
     rejects([&] { (void)farm_inventory_text(malicious); }, "parent path escaped inventory root");
+    malicious.plots[0].relative_path = "/outside";
+    rejects([&] { (void)farm_inventory_text(malicious); }, "root-relative path escaped inventory root");
     malicious = observed; malicious.plots[1].alias_of = 0;
     rejects([&] { (void)farm_inventory_text(malicious); }, "forged alias hid another native file");
     std::array<fs::path, 2> overlap{directory, directory / "nested"}; auto overlapped = scan_farm_inventory(overlap);
@@ -343,12 +345,13 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
     auto published = [&](std::string_view path, std::string_view id)
     {
         if (id != prototype.group_id) return false;
+        auto const filename = file_io::native_path(std::string(path));
         for (unsigned i = 0; i < files; ++i)
-            if (path == file_io::path_text(expectation(i).path)) return true;
+            if (filename == expectation(i).path) return true;
         return false;
     };
     auto future = [&](std::string_view path, std::string_view id)
-    { return path != file_io::path_text(expectation(files - 1).path) && published(path, id); };
+    { return file_io::native_path(std::string(path)) != expectation(files - 1).path && published(path, id); };
     rejects([&] { TargetReadinessSnapshot unpublished(options, projection, prototype.k, prototype.strength, service, &complete_scope, future); },
         "target registry accepted an unpublished future replacement name");
     auto before = count();
@@ -1140,8 +1143,16 @@ void retired_workload_batches(fs::path const& directory)
         "reader version changed during a grouped absence observation");
     fs::remove(first.root / "retirement-version-change"); fs::remove(first.root / "version");
     { std::ofstream changed(first.root / "retirement-config-change"); changed << '1'; }
+#ifdef _WIN32
+    auto const config = first.root / "config/config.yaml";
+    auto const original = stream_state::stamp(config);
+    observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(observed.no_loaded_records[0] && observed.no_loaded_records[1] && stream_state::stamp(config) == original,
+        "native config pin allowed the registry process to change the reviewed configuration");
+#else
     rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
         "reader configuration changed during a grouped absence observation");
+#endif
     fs::remove(first.root / "retirement-config-change");
     {
         auto bounded = first; bounded.limits.memory_bytes = 64 * 1024 * 1024;
@@ -1274,7 +1285,8 @@ void farming_log(fs::path const& directory)
     auto remote = options; remote.host = "unreviewed-remote-host"; FarmingLogSampler remote_sampler(remote);
     require(!remote_sampler.sample(begin, wall), "local CLI log became a remote farming observation");
     auto retired = settings; auto const dirs = retired.find("plot_directories: []");
-    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - /remaining-plots");
+    std::ostringstream remaining; profile_detail::quote(remaining, file_io::path_text(directory / "remaining-plots"));
+    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - " + remaining.str());
     { std::ofstream out(config); out << retired; }
     write(record("1.25000", wall)); require(sampler.sample(begin + seconds(11), wall) == 1250000000,
         "ordinary plot-directory retirement permanently disabled unchanged farming telemetry");

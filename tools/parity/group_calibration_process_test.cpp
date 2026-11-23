@@ -2,6 +2,8 @@
 #include "host/GroupFarmResources.hpp"
 #include <iostream>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <shellapi.h>
 #else
 #include <sys/mman.h>
@@ -269,6 +271,10 @@ int direct(std::string const& mode)
 }
 int fake_worker(std::vector<std::string> args)
 {
+#ifdef _WIN32
+    // The parent checks the exact bytes its bounded pipe collected.
+    check(::_setmode(::_fileno(stdout), _O_BINARY) != -1, "cannot set fixture worker output to binary mode");
+#endif
     bool const proof_worker = args.size() >= 18 && args[12] == "--replot-proof-worker";
     bool const structure_worker = args.size() >= 18 && args[12] == "--replot-structure-worker";
     if (proof_worker || structure_worker) args.erase(args.begin() + 12);
