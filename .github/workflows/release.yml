@@ -357,6 +357,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
           $repo = (Get-Location).Path.Replace('\','/')
           $normal = [IO.File]::ReadAllText((Resolve-Path 'CMakeLists.txt'))
           $start = $normal.IndexOf('set(POS2_KEYGEN_CRATE_DIR ',[StringComparison]::Ordinal)
@@ -378,6 +380,7 @@ jobs:
               include("@REPO@/cmake/GroupTests.cmake")
               pos2_group_tests("@REPO@/build/qualification-upstream" "${patched}")
               include("@REPO@/build/diagnostic-keygen.cmake")
+              target_link_libraries(pos2_keygen INTERFACE synchronization)
               foreach(target pos2_pr118_grow_worker_host pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test pos2_pr118_grow_pool_owner_test pos2_pr118_grow_inventory_test)
                 target_link_libraries(${target} PRIVATE pos2_keygen)
               endforeach()
