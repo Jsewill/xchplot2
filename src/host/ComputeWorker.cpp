@@ -151,6 +151,7 @@ class TaskCancelled : public std::runtime_error
 public:
     using std::runtime_error::runtime_error;
 };
+struct PackedRouteChanged : WorkerTaskDeclined {};
 std::exception_ptr task_failure(std::exception_ptr original, std::exception_ptr renewal)
 {
     if (renewal) try { std::rethrow_exception(original); }
@@ -2389,12 +2390,12 @@ public:
         }
         return selection;
     }
-    void receiving_packed(pool::Lease const& lease, uint64_t selection, Clock::time_point now)
+    void receiving_packed(pool::Lease const& lease, uint64_t selection, Clock::time_point work_sent)
     {
         if (!selection || lease.task.work_units != 1) return;
         auto at = current(text<64>(lease.worker_identity));
         if (at == peers_.begin() + peer_count_ || at->last != selection || at->in_flight != 1) return;
-        at->packed_since = now; at->packed_k = lease.task.k; at->packed_strength = lease.task.strength;
+        at->packed_since = work_sent; at->packed_k = lease.task.k; at->packed_strength = lease.task.strength;
         at->packed_kind = lease.task.kind;
     }
     void released(std::string const& worker, uint64_t selection)
@@ -2593,15 +2594,8 @@ public:
             { return item.peer.worker == worker && delivered(item); });
         });
     }
-    bool needs_first_member(WorkerTaskObservation const& task, Clock::time_point now = Clock::now(),
-                            WorkerPackedRoute const* batch_route = nullptr)
+    bool needs_first_member(WorkerTaskObservation const& task, Clock::time_point now = Clock::now())
     {
-        if (batch_route && !batch_route->route.identity.empty())
-        {
-            auto at = current(text<64>(task.worker_identity));
-            if (task.kind != batch_route->kind || task.worker_identity != batch_route->route.identity || task.worker_instance != batch_route->route.instance ||
-                at == peers_.begin() + peer_count_ || !same_route(at->peer, batch_route->route)) return true;
-        }
         if (task.work_units <= 1 || !roster_ || roster_k_ != task.k || roster_strength_ != task.strength) return false;
         retire(now);
         auto const worker = text<64>(task.worker_identity), instance = text<64>(task.worker_instance);
@@ -2741,6 +2735,43 @@ public:
         }
         return first;
     }
+    bool packed_before_singletons(uint8_t k, uint8_t strength, pool::Kind kind, unsigned width,
+                                  WorkerPackedRoute& batch_route, Clock::time_point now = Clock::now())
+    {
+        if (width < 2 || width > pool::max_generation_batch_members || !roster_ || !roster_->complete ||
+            roster_k_ != k || roster_strength_ != strength || roster_->routes.size() < 2) return false;
+        retire(now);
+        long double finish = std::numeric_limits<long double>::max();
+        History const* batch = nullptr;
+        for (auto const& item : std::span(histories_).first(count_))
+        {
+            if (!item.matches(k, strength, kind, GenerationOutput::Packed) || item.slots != 1 || !item.rates[width].samples ||
+                (item.rates[1].samples && item.rates[width].service >= item.rates[1].service)) continue;
+            auto const active = current(item.peer.worker);
+            auto const wait = active->remaining_ns(now);
+            if (active->in_flight && !wait) continue;
+            auto const end = wait + width * item.rates[width].service;
+            if (end < finish) { finish = end; batch = &item; }
+        }
+        if (!batch) return false;
+        unsigned offered = 0, measured = 1;
+        for (auto const& route : roster_->routes)
+        {
+            offered += bool(route.cpu_slots && kind != pool::Kind::GenerateGpu);
+            offered += bool(route.gpu_slots && kind != pool::Kind::GenerateCpu);
+        }
+        // Even if every other eligible backend were idle now, each would
+        // deliver its first member after this measured whole batch.
+        for (auto const& item : std::span(histories_).first(count_))
+            if (&item != batch && item.matches(k, strength, kind, GenerationOutput::Packed))
+            {
+                if (!item.rates[1].samples || item.rates[1].service <= finish) return false;
+                ++measured;
+            }
+        if (measured != offered) return false;
+        batch_route = {*offered_route(batch->peer.worker), batch->kind};
+        return true;
+    }
     unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, unsigned ready, unsigned destinations,
                             unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now(),
                             unsigned independent_width = 0, WorkerPackedRoute* batch_route = nullptr)
@@ -2806,8 +2837,8 @@ public:
                         std::chrono::duration<long double, std::nano>(now - at->packed_since).count() <= finish) break;
                     ++occupied;
                 }
-                // Every other slot is receiving its first member. Its transfer
-                // alone has already taken longer than this route's whole batch.
+                // Every other slot is delivering its first member. Its observed
+                // service has already taken longer than this route's whole batch.
                 // Recheck the actual assignment before any plot ID is sent.
                 if (slots + occupied == offered) { *batch_route = {*target, measured.kind}; return width; }
             }
@@ -3592,6 +3623,7 @@ struct WorkerClient::Impl
                 cancel.check();
             }
             if (config.selected) config.selected(connection->observation());
+            if (options.packed_route && !options.packed_route->matches(*lease)) throw PackedRouteChanged();
             if (options.selected && !options.selected(connection->observation())) throw WorkerTaskDeclined();
         }
         catch (...) { connection->declined = true; throw; }
@@ -3690,6 +3722,8 @@ struct WorkerClient::Impl
         request.u8(uint8_t(operation)); request.u8(k); request.u8(strength); request.u16(uint16_t(ids.size()));
         for (auto const& id : ids) request.bytes(id); connection->input_bytes = request.data().size();
         compute.reset(); connection->channel.send(pool::Message::Work, request.data());
+        auto const packed_sent = packed_sink && ids.size() == 1 && connection->planning_selection ?
+            Clock::now() : Clock::time_point{};
         uint64_t total = 0, expected_boundaries = 0, expected_words = 0, received_words = 0;
         std::vector<std::span<uint8_t const>> chunks;
         if (contribution_sink) chunks.resize(contribution_window ?
@@ -3788,10 +3822,11 @@ struct WorkerClient::Impl
                 require(validation.checked_count == total && !(validation.flags & ~PackedMemberValidation::known_flags) &&
                     !(validation.flags & (PackedMemberValidation::out_of_range | PackedMemberValidation::unsorted)), "invalid compute validation summary");
                 expected_words = (multiply(total, k + PlotGroupFile::PROOFS_PER_CHUNK_BITS) + 63) / 64;
-                if (ids.size() == 1 && connection->planning_selection)
+                // The validated prelude confirms that the sent request actually ran.
+                if (packed_sent != Clock::time_point{})
                 {
                     std::lock_guard lock(planning_mutex);
-                    planning.receiving_packed(connection->lease, connection->planning_selection, received);
+                    planning.receiving_packed(connection->lease, connection->planning_selection, packed_sent);
                 }
                 boundaries.reserve(size_t(expected_boundaries)); prelude = true;
             }
@@ -4011,11 +4046,15 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
     WorkerTaskOptions options; options.other_work_until = other_work_until;
     bool split = false;
     if (ids.size() > 1 && !impl_->config.local_only)
+    {
+        if (batch_route && !batch_route->route.identity.empty()) options.packed_route = batch_route;
         options.selected = [&](auto const& assigned)
         {
-            std::lock_guard lock(impl_->planning_mutex); split = impl_->planning.needs_first_member(assigned, Clock::now(), batch_route); return !split;
+            std::lock_guard lock(impl_->planning_mutex); split = impl_->planning.needs_first_member(assigned); return !split;
         };
+    }
     try { return impl_->generate(k, strength, ids, sink, {}, cancel, std::move(identity), {}, {}, false, false, options); }
+    catch (PackedRouteChanged const&) {}
     catch (WorkerTaskDeclined const&) { if (!split) throw; }
     // No plot ID or output was sent. Retain ordered packed delivery and the
     // original deadline across new identities for the disjoint member sets.
@@ -4268,10 +4307,12 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     unsigned const width = std::min(ready, unsigned(hint.batch));
     if (!hint.slots || width < 2) return 1;
     if (hint.slots == 1) return width;
+    std::lock_guard lock(impl_->planning_mutex);
+    if (destinations <= hint.slots && batch_route &&
+        impl_->planning.packed_before_singletons(k, strength, impl_->config.generation_kind, width, *batch_route)) return width;
     // Only form a packed batch when the other slots can serve independent
     // destinations. An unknown next route keeps the ordinary singletons.
     if (destinations < std::min(hint.slots, impl_->config.max_active_generation)) return 1;
-    std::lock_guard lock(impl_->planning_mutex);
     return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, GenerationOutput::Packed,
         ready, destinations, hint.slots, width, 1, Clock::now(), 0, batch_route);
 }

@@ -78,6 +78,11 @@ struct WorkerPackedRoute
 {
     pool::GenerationRoute route;
     pool::Kind kind = pool::Kind::GenerateAny;
+    bool matches(pool::Lease const& lease) const
+    {
+        return kind == lease.task.kind && route.identity == lease.worker_identity &&
+            route.instance == lease.worker_instance && route.endpoint == lease.endpoint;
+    }
 };
 struct WorkerGenerationEstimate
 {
@@ -147,6 +152,7 @@ struct WorkerTaskOptions
     std::function<bool(unsigned)> queued_generation;
     // Expected completion of other known work on independent destinations.
     std::chrono::steady_clock::time_point other_work_until{};
+    WorkerPackedRoute const* packed_route = nullptr;
 };
 class WorkerAlreadyRunning : public std::runtime_error
 {

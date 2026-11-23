@@ -614,10 +614,13 @@ void planning_feedback()
     require(width_after(4000) == 1, "a short first transfer was assumed to outlast a measured whole batch");
     require(width_after(6000) == 3 && planned.route.identity == fast_packed.worker_identity,
         "a long first singleton transfer kept a measured worker on singletons");
-    auto assigned = fast_packed; assigned.work_units = 3;
-    require(!receiving.needs_first_member(assigned, now, &planned), "the measured worker lost its sized packed batch");
-    assigned = slow_packed; assigned.work_units = 3;
-    require(receiving.needs_first_member(assigned, now, &planned), "a different worker received the wide batch after sizing");
+    pool::Lease granted; granted.task.kind = fast_packed.kind; granted.worker_identity = fast_packed.worker_identity;
+    granted.worker_instance = fast_packed.worker_instance; granted.endpoint = route;
+    require(planned.matches(granted), "the measured worker lost its sized packed batch");
+    granted.endpoint = relocated;
+    require(!planned.matches(granted), "a changed data endpoint kept a batch sized for the previous endpoint");
+    granted.endpoint = route; granted.worker_identity = slow_packed.worker_identity;
+    require(!planned.matches(granted), "a different worker received the wide batch after sizing");
     auto in_progress = receiving.selected(fast_packed, route, now + std::chrono::nanoseconds(5900));
     require(width_after(6000) == 3 && width_after(7000) == 1, "the measured worker's release horizon was ignored");
     receiving.released(fast_packed.worker_identity, in_progress);
@@ -626,11 +629,38 @@ void planning_feedback()
     require(width_after(6000, 3) == 1, "an unmeasured worker with a second free slot was excluded from packed sizing");
     receiving.capacity(18, 2, roster, receiving.selections(), now); receiving.released(slow_packed.worker_identity, selected);
     require(width_after(6000) == 1, "a completed first singleton still occupied its worker");
+    selected = receiving.selected(slow_packed, route, now + std::chrono::nanoseconds(10000));
+    auto const sent = now + std::chrono::nanoseconds(15000);
+    require(width_after(20000) == 1, "an unconfirmed request reserved the measured worker's batch");
+    receiving.receiving_packed(first, selected, sent);
+    require(width_after(20000) == 3, "the validated prelude discarded service already spent on the singleton");
+    receiving.released(slow_packed.worker_identity, selected);
     auto moved = std::make_shared<pool::GenerationRoster>(*roster); moved->routes.back().endpoint = relocated;
     auto replaced = receiving.selected(slow_packed, relocated, now); receiving.receiving_packed(first, selected, now);
     receiving.capacity(18, 2, moved, receiving.selections(), now);
     require(width_after(6000) == 1, "a stale member prelude from the old route occupied its replacement");
     receiving.released(slow_packed.worker_identity, replaced);
+
+    auto& final_group = new_planner();
+    final_group.capacity(18, 2, roster, 0, now);
+    auto triple = fast_packed; triple.work_units = 3; triple.generation = {1200, 600, 600, 0};
+    auto alternate = slow_packed; alternate.generation = {4000, 4000, 4000, 0}; alternate.connect_ns = 0;
+    train(final_group, triple, route); train(final_group, alternate, route);
+    auto earlier = [&](Clock::time_point at, pool::Kind kind = pool::Kind::GenerateAny)
+    { return final_group.packed_before_singletons(18, 2, kind, 3, planned, at); };
+    auto running = final_group.selected(triple, route, now);
+    require(earlier(now) && planned.route.identity == triple.worker_identity,
+        "a final measured batch was split although it beats a singleton on every alternative");
+    require(!earlier(now + std::chrono::nanoseconds(2000)), "an overdue worker kept the final batch");
+    final_group.released(triple.worker_identity, running);
+    auto dual = std::make_shared<pool::GenerationRoster>(*roster); dual->routes.back().cpu_slots = 1;
+    final_group.capacity(18, 2, dual, final_group.selections(), now);
+    require(!earlier(now) && earlier(now, pool::Kind::GenerateGpu),
+        "an unmeasured eligible backend was excluded from a final packed group");
+    final_group.capacity(18, 2, roster, final_group.selections(), now);
+    alternate.generation = {250, 250, 250, 0};
+    for (unsigned i = 0; i < 16; ++i) observe(final_group, alternate, route);
+    require(!earlier(now), "a faster singleton was excluded from a final packed group");
 }
 
 struct RunningBroker
