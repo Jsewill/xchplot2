@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery]
+        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose, verified-cli, archive-recovery, trace-worker]
 
 permissions:
   contents: read
@@ -328,7 +328,7 @@ jobs:
           exit $LASTEXITCODE
   diagnostics:
     name: Native compute and construction fixtures
-    if: inputs.phase == 'diagnose'
+    if: inputs.phase == 'diagnose' || inputs.phase == 'trace-worker'
     runs-on: windows-2022
     timeout-minutes: 35
     defaults:
@@ -428,10 +428,44 @@ jobs:
           foreach ($file in $crypto, $ssl, "$tls/include/openssl/ssl.h") { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "TLS cache lacks $file" } }
           cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$tls" -DOPENSSL_USE_STATIC_LIBS=ON "-DLIB_EAY_RELEASE:FILEPATH=$crypto" "-DSSL_EAY_RELEASE:FILEPATH=$ssl" "-DLIB_EAY:FILEPATH=$crypto" "-DSSL_EAY:FILEPATH=$ssl"
           cmake --build build/qa-host --parallel 4 --target compute_membership_test pos2_pr118_grow_worker_test
+      - name: Identify the native worker phase which reaches its deadline
+        if: inputs.phase == 'trace-worker'
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          path = Path('tools/parity/compute_worker_client_test.cpp')
+          text = path.read_text(encoding='utf-8')
+          line, = [s for s in text.splitlines() if 'retry_pressure(); planning_feedback();' in s]
+          cases = re.findall(r'(\w+)\(\);', line)
+          assert len(cases) > 10 and text.count(line) == 1
+          body = ['    auto trace = [](const char* name, auto phase) {',
+                  '        auto const start = std::chrono::steady_clock::now();',
+                  '        std::cerr << "start " << name << std::endl;',
+                  '        try { phase(); } catch (std::exception const& ex) { std::cerr << "case failed " << name << ": " << ex.what() << std::endl; throw; }',
+                  '        std::cerr << "passed " << name << " ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count() << std::endl;',
+                  '    };']
+          body += ['    trace("' + name + '", ' + name + ');' for name in cases]
+          path.write_text(text.replace(line, '\n'.join(body)), encoding='utf-8')
+      - name: Repeat the traced native worker lifecycle
+        if: inputs.phase == 'trace-worker'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake --build build/qa-host --parallel 4 --target pos2_pr118_grow_worker_client_test
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = 0
+          foreach ($attempt in 1..5) {
+            Write-Output "Native worker trial $attempt"
+            & ./build/qa-host/tools/parity/pos2_pr118_grow_worker_client_test.exe
+            if ($LASTEXITCODE -ne 0) { ++$failed }
+          }
+          if ($failed) { throw "$failed native worker trials failed" }
       - name: Run standalone authenticated network checks
+        if: inputs.phase == 'diagnose'
         run: ctest --test-dir build/qa-host --output-on-failure --no-tests=error --timeout 180 -R '^compute_(membership|worker)_network_test$'
       - name: Run the release regressions with native diagnostics
-        if: '!cancelled()'
+        if: inputs.phase == 'diagnose' && !cancelled()
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
