@@ -2,6 +2,7 @@
 // our admission gate; declarations are reservations, not hardware qualification.
 #pragma once
 #include "host/GroupHarvesterProfile.hpp"
+#include <array>
 #include <memory>
 #include <set>
 #ifdef _WIN32

@@ -54,19 +54,17 @@ std::vector<uint8_t> contents(fs::path const& path)
 struct PrefetchEncoder final : RemoteEncoder
 {
     std::shared_ptr<PoolRemoteEncoder> remote;
-    std::shared_ptr<CodecScheduler> scheduler;
-    std::function<void()> generation;
+    std::function<std::future<void>()> prefetch;
     std::future<void> pending;
     bool queued = false;
-    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider,
-                    std::shared_ptr<CodecScheduler> cpu, std::function<void()> work)
-        : remote(std::move(provider)), scheduler(std::move(cpu)), generation(std::move(work)) {}
+    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider, std::function<std::future<void>()> start)
+        : remote(std::move(provider)), prefetch(std::move(start)) {}
     ~PrefetchEncoder() { if (pending.valid()) pending.wait(); }
     std::optional<RemoteEncodedWindow> encode(uint8_t k, std::span<ChunkInput const> chunks, bool summaries) override
     {
         auto result = remote->encode(k, chunks, summaries);
         if (!result && !queued && !chunks.empty() && !chunks.front().contributions.empty())
-        { pending = scheduler->submit(generation); queued = true; }
+        { pending = prefetch(); queued = true; }
         return result;
     }
     void observe_local(uint8_t k, std::span<ChunkInput const> chunks,
@@ -113,12 +111,27 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     WorkerService pressure(pressure_config);
     auto backend = std::make_unique<Backend>(); backend->cpu_scheduler = scheduler;
     backend->initialize(args, requested, 0, false); backend->configure_network(args);
-    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, scheduler, [&]
+    auto generate_successor = [&]
     {
         auto const id = requested.params.get_plot_params_for_index(uint16_t(args.max_members)).get_plot_id().data();
         WorkerCancellation cancel; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         pressure.generate_local(18, 2, id, [](auto const&, uint64_t) {}, cancel, pool::Kind::GenerateCpu);
         ++completed_prefetch;
+    };
+    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, [&]
+    {
+        // Generation can leave a cached observation of its occupied slot.
+        // Wait for the owner to see the idle worker before timing local queue pressure.
+        auto const client = backend->acquire_pool_client();
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        for (;;)
+        {
+            auto const capacity = client->generation_capacity(18, 2);
+            if (capacity.slots && capacity.availability.codec_available) break;
+            require(std::chrono::steady_clock::now() < until, "publication worker did not become available after generation");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return scheduler->submit(generate_successor);
     });
     backend->test_remote = encoder;
     std::vector<std::vector<uint64_t>> raw;

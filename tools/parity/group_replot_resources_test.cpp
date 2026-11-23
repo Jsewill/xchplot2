@@ -626,10 +626,10 @@ int main() try
             stage.construction[0].work_us == adaptive.native.construction[0].work_us,
             "CPU selection weakened a conditional modeled service bound");
         auto bounded = adaptive; bounded.native.construction[1].transient_units = 19 * mib;
-        auto small = maximum; small.ram_bytes = 16 * mib; small.controller_ram_bytes = 3 * mib;
-        auto const retained_controller = replot_stage(bounded, small, {}, 0, true, false, false);
+        auto limited_ram = maximum; limited_ram.ram_bytes = 16 * mib; limited_ram.controller_ram_bytes = 3 * mib;
+        auto const retained_controller = replot_stage(bounded, limited_ram, {}, 0, true, false, false);
         require(retained_controller.construction[1].resident_units + retained_controller.construction[1].transient_units ==
-            small.ram_bytes + small.controller_ram_bytes,
+            limited_ram.ram_bytes + limited_ram.controller_ram_bytes,
             "an allocation ceiling larger than the phase shape released actual controller memory");
         bounded = opaque; bounded.native.construction[0].reserved_units = std::min<uint64_t>(cpus, 2);
         auto const retained_cpu = replot_stage(bounded, smaller, {}, 0, true, false, false);
