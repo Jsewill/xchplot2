@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'c655be9731a4710dbdf10ec1b02ce48fa38c2f60' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '953e93477437915d6c3ff78dd04dc890fc5cc38a' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -230,6 +230,11 @@ jobs:
           git diff --exit-code HEAD --
           $source = (git rev-parse HEAD).Trim()
           if (!(Select-String -LiteralPath build/release-windows/BUILDINFO.txt -Pattern "^Source: $source$" -Quiet)) { throw 'Package source differs from the checkout' }
+      - name: Exercise authenticated transport after a host fixture failure
+        if: inputs.phase == 'candidate-gates' && failure()
+        run: |
+          if (!(Test-Path 'build/release-windows/tools/parity/pos2_pr118_grow_worker_test.exe')) { throw 'Native host targets did not build' }
+          ctest --test-dir build/release-windows --output-on-failure --no-tests=error --timeout 900 -R '^compute_(membership|worker)_network_test$'
       - uses: actions/upload-artifact@v7
         if: inputs.phase != 'candidate-gates'
         with:
@@ -241,7 +246,7 @@ jobs:
           if-no-files-found: error
   topology:
     name: Hosted Windows processor groups
-    if: inputs.phase == 'diagnose'
+    if: inputs.phase == 'diagnose' || inputs.phase == 'candidate-gates'
     runs-on: windows-2022
     steps:
       - name: Read the inherited Windows group and affinity masks
@@ -268,6 +273,13 @@ jobs:
           process, system = c.c_size_t(), c.c_size_t()
           ok = k.GetProcessAffinityMask(p, c.byref(process), c.byref(system))
           print('Affinity success', ok, 'process', hex(process.value), 'system', hex(system.value))
+          for offset in (0, 2, 4, 6):
+              backing = c.create_string_buffer(16)
+              groups = c.cast(c.byref(backing, offset), c.POINTER(w.WORD))
+              count = w.WORD(1)
+              c.set_last_error(0)
+              ok = k.GetProcessGroupAffinity(p, c.byref(count), groups)
+              print('Group output mod8', c.addressof(groups.contents) % 8, 'success', ok, 'error', c.get_last_error(), 'memberships', count.value)
   diagnostics:
     name: Native compute and construction fixtures
     if: inputs.phase == 'diagnose'
@@ -281,7 +293,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: c655be9731a4710dbdf10ec1b02ce48fa38c2f60
+          ref: 953e93477437915d6c3ff78dd04dc890fc5cc38a
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
