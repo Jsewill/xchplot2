@@ -2376,7 +2376,7 @@ public:
             at->peer = peer; at->first = selection; at->in_flight = 0;
         }
         at->last = selection; at->seen = now; at->sequence = sequence_; ++at->in_flight;
-        at->delivery_ns = 0;
+        at->delivery_ns = 0; at->packed_since = {};
         if (at->in_flight == 1 && value.work_units <= pool::max_generation_batch_members)
         {
             auto const prior = find(value, peer);
@@ -2388,6 +2388,14 @@ public:
             }
         }
         return selection;
+    }
+    void receiving_packed(pool::Lease const& lease, uint64_t selection, Clock::time_point now)
+    {
+        if (!selection || lease.task.work_units != 1) return;
+        auto at = current(text<64>(lease.worker_identity));
+        if (at == peers_.begin() + peer_count_ || at->last != selection || at->in_flight != 1) return;
+        at->packed_since = now; at->packed_k = lease.task.k; at->packed_strength = lease.task.strength;
+        at->packed_kind = lease.task.kind;
     }
     void released(std::string const& worker, uint64_t selection)
     {
@@ -2585,8 +2593,15 @@ public:
             { return item.peer.worker == worker && delivered(item); });
         });
     }
-    bool needs_first_member(WorkerTaskObservation const& task, Clock::time_point now = Clock::now())
+    bool needs_first_member(WorkerTaskObservation const& task, Clock::time_point now = Clock::now(),
+                            WorkerPackedRoute const* batch_route = nullptr)
     {
+        if (batch_route && !batch_route->route.identity.empty())
+        {
+            auto at = current(text<64>(task.worker_identity));
+            if (task.kind != batch_route->kind || task.worker_identity != batch_route->route.identity || task.worker_instance != batch_route->route.instance ||
+                at == peers_.begin() + peer_count_ || !same_route(at->peer, batch_route->route)) return true;
+        }
         if (task.work_units <= 1 || !roster_ || roster_k_ != task.k || roster_strength_ != task.strength) return false;
         retire(now);
         auto const worker = text<64>(task.worker_identity), instance = text<64>(task.worker_instance);
@@ -2728,7 +2743,7 @@ public:
     }
     unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, unsigned ready, unsigned destinations,
                             unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now(),
-                            unsigned independent_width = 0)
+                            unsigned independent_width = 0, WorkerPackedRoute* batch_route = nullptr)
     {
         retire(now);
         bool const packed = output == GenerationOutput::Packed;
@@ -2767,6 +2782,34 @@ public:
                 if (!wait) known = false;
                 else if (auto const finish = wait + rate.service; finish < next_finish)
                 { next_finish = finish; next_rate = rate.service; }
+            }
+        }
+        if (packed && batch_route && count == 1 && slots < offered && roster_ && roster_->complete &&
+            roster_k_ == k && roster_strength_ == strength)
+        {
+            auto const& measured = *peers.front();
+            auto const* target = offered_route(measured.peer.worker);
+            auto const width = std::min(ready, limit);
+            auto const finish = (available ? available : next_rate) * width +
+                (available || !next_rate ? 0 : next_finish - next_rate);
+            if (target && same_route(measured.peer, *target) && finish > 0 && roster_->routes.size() == 1 + (offered - slots))
+            {
+                unsigned occupied = 0;
+                for (auto const& route : roster_->routes)
+                {
+                    if (route.identity == target->identity) continue;
+                    auto at = current(text<64>(route.identity));
+                    if (at == peers_.begin() + peer_count_ || !same_route(at->peer, route) || at->in_flight != 1 ||
+                        std::max(route.cpu_slots, route.gpu_slots) != 1 || at->packed_since == Clock::time_point{} ||
+                        at->packed_k != k || at->packed_strength != strength ||
+                        (kind != pool::Kind::GenerateAny && at->packed_kind != kind) ||
+                        std::chrono::duration<long double, std::nano>(now - at->packed_since).count() <= finish) break;
+                    ++occupied;
+                }
+                // Every other slot is receiving its first member. Its transfer
+                // alone has already taken longer than this route's whole batch.
+                // Recheck the actual assignment before any plot ID is sent.
+                if (slots + occupied == offered) { *batch_route = {*target, measured.kind}; return width; }
             }
         }
         // Another packed destination can supply a singleton to the idle route.
@@ -3004,6 +3047,9 @@ private:
         unsigned in_flight = 0;
         Clock::time_point seen{};
         long double delivery_ns = 0;
+        Clock::time_point packed_since{};
+        uint8_t packed_k = 0, packed_strength = 0;
+        pool::Kind packed_kind = pool::Kind::GenerateCpu;
         long double remaining_ns(Clock::time_point now) const
         {
             if (in_flight != 1 || !delivery_ns) return 0;
@@ -3742,6 +3788,11 @@ struct WorkerClient::Impl
                 require(validation.checked_count == total && !(validation.flags & ~PackedMemberValidation::known_flags) &&
                     !(validation.flags & (PackedMemberValidation::out_of_range | PackedMemberValidation::unsorted)), "invalid compute validation summary");
                 expected_words = (multiply(total, k + PlotGroupFile::PROOFS_PER_CHUNK_BITS) + 63) / 64;
+                if (ids.size() == 1 && connection->planning_selection)
+                {
+                    std::lock_guard lock(planning_mutex);
+                    planning.receiving_packed(connection->lease, connection->planning_selection, received);
+                }
                 boundaries.reserve(size_t(expected_boundaries)); prelude = true;
             }
             else if (type == DataKind::Boundaries)
@@ -3953,7 +4004,8 @@ bool WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32>
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity, Clock::time_point other_work_until)
 { return generate_packed(k, strength, {&id, 1}, sink, cancel, std::move(identity), other_work_until); }
 bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
-    WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity, Clock::time_point other_work_until)
+    WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity, Clock::time_point other_work_until,
+    WorkerPackedRoute const* batch_route)
 {
     cancel = impl_->cancellation(cancel);
     WorkerTaskOptions options; options.other_work_until = other_work_until;
@@ -3961,14 +4013,14 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
     if (ids.size() > 1 && !impl_->config.local_only)
         options.selected = [&](auto const& assigned)
         {
-            std::lock_guard lock(impl_->planning_mutex); split = impl_->planning.needs_first_member(assigned); return !split;
+            std::lock_guard lock(impl_->planning_mutex); split = impl_->planning.needs_first_member(assigned, Clock::now(), batch_route); return !split;
         };
     try { return impl_->generate(k, strength, ids, sink, {}, cancel, std::move(identity), {}, {}, false, false, options); }
     catch (WorkerTaskDeclined const&) { if (!split) throw; }
     // No plot ID or output was sent. Retain ordered packed delivery and the
     // original deadline across new identities for the disjoint member sets.
     auto first = generate(k, strength, ids.front(), sink, cancel, {}, other_work_until);
-    auto rest = generate_packed(k, strength, ids.subspan(1), sink, cancel, {}, other_work_until);
+    auto rest = generate_packed(k, strength, ids.subspan(1), sink, cancel, {}, other_work_until, batch_route);
     return first && rest;
 }
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
@@ -4207,8 +4259,10 @@ WorkerGenerationCapacity WorkerClient::Impl::capacity(uint8_t k, uint8_t strengt
         try { config.generation_capacity_changed(k, strength, result); } catch (...) {}
     return result;
 }
-unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const
+unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
+                                              WorkerPackedRoute* batch_route) const
 {
+    if (batch_route) *batch_route = {};
     if (ready < 2) return ready;
     auto const hint = generation_capacity(k, strength);
     unsigned const width = std::min(ready, unsigned(hint.batch));
@@ -4219,7 +4273,7 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     if (destinations < std::min(hint.slots, impl_->config.max_active_generation)) return 1;
     std::lock_guard lock(impl_->planning_mutex);
     return impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, GenerationOutput::Packed,
-        ready, destinations, hint.slots, width, 1);
+        ready, destinations, hint.slots, width, 1, Clock::now(), 0, batch_route);
 }
 bool WorkerClient::codec_probe_available(uint8_t k, uint64_t timeout_ns) const
 {

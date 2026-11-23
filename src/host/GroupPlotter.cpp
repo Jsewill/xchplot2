@@ -2076,7 +2076,8 @@ struct Producer
             while (wanted - values.size() > 1)
             {
                 size_t const start = values.size();
-                size_t n = client->packed_generation_width(k, strength, unsigned(wanted - start), destinations);
+                group_grow::WorkerPackedRoute batch_route;
+                size_t n = client->packed_generation_width(k, strength, unsigned(wanted - start), destinations, &batch_route);
                 if (n < 2) break;
                 uint64_t const held = sum(sum(sum(fixed, backend.retained()), other_retained), resident(values));
                 while (n > 1 && sum(held, pool_receive_bytes(uint16_t(first + start), n)) > budget) --n;
@@ -2103,7 +2104,7 @@ struct Producer
                         require(!received.empty(), "packed batch has no member prelude");
                         received.back()->append(tile);
                         progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
-                    }, cancel, {}, other_work_until);
+                    }, cancel, {}, other_work_until, &batch_route);
                     complete = true;
                 }
                 catch (group_grow::pool::UnsupportedResources const&) {}
