@@ -18,7 +18,6 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <conio.h>
 #include <io.h>
 #include <windows.h>
 #else
@@ -457,7 +456,10 @@ class DashboardTerminal
     static constexpr std::array views{"Overview", "Resources", "Workers", "Decisions", "Farm"};
 #ifdef _WIN32
     HANDLE output_ = INVALID_HANDLE_VALUE;
-    DWORD old_mode_ = 0;
+    HANDLE console_input_ = INVALID_HANDLE_VALUE;
+    DWORD old_mode_ = 0, old_input_mode_ = 0;
+    int repeated_key_ = 0;
+    WORD repeats_left_ = 0;
 #else
     termios old_input_{};
     unsigned escape_ = 0;
@@ -474,6 +476,7 @@ class DashboardTerminal
     {
         leave();
 #ifdef _WIN32
+        if (input_) ::SetConsoleMode(console_input_, old_input_mode_);
         if (enabled_) ::SetConsoleMode(output_, old_mode_);
 #else
         if (input_) ::tcsetattr(STDIN_FILENO, TCSANOW, &old_input_);
@@ -539,8 +542,9 @@ class DashboardTerminal
         output_ = ::GetStdHandle(STD_ERROR_HANDLE);
         enabled_ = ::GetConsoleMode(output_, &old_mode_) &&
                    ::SetConsoleMode(output_, old_mode_ | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        DWORD input_mode;
-        input_ = enabled_ && ::GetConsoleMode(::GetStdHandle(STD_INPUT_HANDLE), &input_mode);
+        console_input_ = ::GetStdHandle(STD_INPUT_HANDLE);
+        input_ = enabled_ && ::GetConsoleMode(console_input_, &old_input_mode_) &&
+                 ::SetConsoleMode(console_input_, old_input_mode_ & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT));
 #else
         if (!::isatty(STDERR_FILENO)) return;
         struct stat dst{}, in{}, out{};
@@ -591,13 +595,29 @@ class DashboardTerminal
         {
             int c;
 #ifdef _WIN32
-            if (!::_kbhit()) break;
-            c = ::_getch();
-            if (c == 0 || c == 224)
+            if (!repeats_left_)
             {
-                c = ::_getch();
-                c = c == 72 ? 'k' : c == 80 ? 'j' : c == 75 ? 'h' : c == 77 ? 'l' : 0;
+                // A pending release or resize is not a pending character.
+                // Consume only queued records, including non-key events.
+                DWORD pending = 0, read = 0;
+                INPUT_RECORD record{};
+                if (!::GetNumberOfConsoleInputEvents(console_input_, &pending) || !pending ||
+                    !::ReadConsoleInputA(console_input_, &record, 1, &read) || !read) break;
+                if (record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown) continue;
+                auto const& key = record.Event.KeyEvent;
+                switch (key.wVirtualKeyCode)
+                {
+                    case VK_UP: repeated_key_ = 'k'; break;
+                    case VK_DOWN: repeated_key_ = 'j'; break;
+                    case VK_LEFT: repeated_key_ = 'h'; break;
+                    case VK_RIGHT: repeated_key_ = 'l'; break;
+                    default: repeated_key_ = uint8_t(key.uChar.AsciiChar); break;
+                }
+                if (!repeated_key_) continue;
+                repeats_left_ = std::max<WORD>(1, key.wRepeatCount);
             }
+            --repeats_left_;
+            c = repeated_key_;
 #else
             pollfd fd{STDIN_FILENO, POLLIN, 0};
             unsigned char byte;
