@@ -75,6 +75,11 @@ jobs:
           add_subdirectory("@UPSTREAM@/lib/fse" fse)
           include("@REPO@/cmake/GroupPlotter.cmake")
           pos2_grow_prepare("@UPSTREAM@" grow_include)
+          add_library(qualification_controller OBJECT "@REPO@/src/host/GroupPlotter.cpp")
+          target_compile_definitions(qualification_controller PRIVATE XCHPLOT2_GROUP_COMMANDS=1 GROW_GPU_BACKEND=1 GROW_POOL_NETWORK=1)
+          target_compile_options(qualification_controller PRIVATE -O0 -maes -msse4.1 -mssse3 -msse2)
+          target_include_directories(qualification_controller BEFORE PRIVATE "${grow_include}" "@UPSTREAM@/src" "@UPSTREAM@/src/plot" "@REPO@/src" "@REPO@/keygen-rs/include")
+          target_link_libraries(qualification_controller PRIVATE fse Threads::Threads)
           include("@REPO@/cmake/GroupTests.cmake")
           pos2_group_tests("@UPSTREAM@" "${grow_include}")
           foreach(target pos2_pr118_grow_replot_resources_test pos2_pr118_grow_farming_test pos2_pr118_grow_gpu_output_test)
@@ -86,6 +91,8 @@ jobs:
           $tests = @('pos2_pr118_grow_replot_resources_test','pos2_pr118_grow_farming_test','pos2_pr118_grow_gpu_output_test')
           cmake --build $build --parallel 2 --target $tests
           foreach ($test in $tests) { & "$build/tools/parity/$test.exe" }
+      - name: Compile the production group controller with the Windows SDK
+        run: cmake --build build/qualification-planner --parallel 2 --target qualification_controller
 
   hardware:
     name: Windows AMD test archive
