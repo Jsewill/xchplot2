@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli, candidate-gates]
+        options: [host, pushed-cli, candidate-cli, candidate-gates, diagnose]
 
 permissions:
   contents: read
@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || inputs.phase == 'candidate-gates' && '33ad40ea7158bccee206ff90d63d379cb6842334' || '97e830427c118376501fff38b62ab55e0ad43bb9' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '33ad40ea7158bccee206ff90d63d379cb6842334' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -239,3 +239,143 @@ jobs:
             build/release-windows/dist/*.sha256
           retention-days: 5
           if-no-files-found: error
+  topology:
+    name: Hosted Windows processor groups
+    if: inputs.phase == 'diagnose'
+    runs-on: windows-2022
+    steps:
+      - name: Read the inherited Windows group and affinity masks
+        shell: python
+        run: |
+          import ctypes as c
+          from ctypes import wintypes as w
+          k = c.WinDLL('kernel32', use_last_error=True)
+          k.GetCurrentProcess.restype = w.HANDLE
+          p = k.GetCurrentProcess()
+          k.GetActiveProcessorGroupCount.restype = w.WORD
+          actual = k.GetActiveProcessorGroupCount()
+          print('Active processor groups', actual)
+          k.GetProcessGroupAffinity.argtypes = [w.HANDLE, c.POINTER(w.WORD), c.POINTER(w.WORD)]
+          for size in (0, 1, actual, max(64, actual)):
+              groups = (w.WORD * size)() if size else None
+              count = w.WORD(size)
+              c.set_last_error(0)
+              ok = k.GetProcessGroupAffinity(p, c.byref(count), groups)
+              error = c.get_last_error()
+              print('Provided', size, 'success', ok, 'error', error, 'returned', count.value,
+                    'groups', list(groups[:count.value]) if ok and groups is not None else [])
+          k.GetProcessAffinityMask.argtypes = [w.HANDLE, c.POINTER(c.c_size_t), c.POINTER(c.c_size_t)]
+          process, system = c.c_size_t(), c.c_size_t()
+          ok = k.GetProcessAffinityMask(p, c.byref(process), c.byref(system))
+          print('Affinity success', ok, 'process', hex(process.value), 'system', hex(system.value))
+  diagnostics:
+    name: Native compute and construction fixtures
+    if: inputs.phase == 'diagnose'
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          ref: 33ad40ea7158bccee206ff90d63d379cb6842334
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: Chia-Network/pos2-chip
+          ref: 077c692b51a32cde748e6a8f1ccefe5354c81fa8
+          path: build/qualification-upstream
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: mjansson/mdns
+          ref: a569c4759bd47e0f2a7bfc4d4c19620445782806
+          path: build/qualification-mdns
+          persist-credentials: false
+      - name: Configure Visual Studio
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $arm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64'
+          $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+          $visualStudio = & $vswhere -latest -products '*' -requires $component -property installationPath
+          if (-not $visualStudio) { throw 'Visual Studio C++ build tools are required' }
+          $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvarsall.bat'
+          $target = if ($arm64) { 'arm64' } else { 'x64' }
+          # LLVM 20 needs the VS 2022 STL supplied by this side-by-side toolset.
+          $toolset = if ($arm64) { '-vcvars_ver=14.44' } else { '' }
+          cmd /c "call `"$vcvars`" $target $toolset >nul && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;" + $env:PATH
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsRedistDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
+          }
+          clang-cl --version
+      - uses: actions/cache/restore@v6
+        id: tls
+        with:
+          path: build/qa-tls/install
+          key: qa-windows-x64-static-tls-v1-${{ hashFiles('ci/release/build-openssl-windows.ps1') }}
+      - name: Build the pinned TLS dependency
+        if: steps.tls.outputs.cache-hit != 'true'
+        run: ./ci/release/build-openssl-windows.ps1 -BuildDir (Join-Path $PWD 'build/qa-tls')
+      - uses: actions/cache/save@v6
+        if: steps.tls.outputs.cache-hit != 'true'
+        with:
+          path: build/qa-tls/install
+          key: ${{ steps.tls.outputs.cache-primary-key }}
+      - name: Configure the repository's native host and group fixtures
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $repo = (Get-Location).Path.Replace('\','/')
+          @'
+          if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_PROJECT_NAME STREQUAL "CMAKE_TRY_COMPILE")
+            function(register_qualification_groups)
+              set(upstream "@REPO@/build/qualification-upstream")
+              set(XCHPLOT2_MDNS_DIR "@REPO@/build/qualification-mdns")
+              find_package(Git REQUIRED)
+              find_package(Threads REQUIRED)
+              add_subdirectory("@REPO@/build/qualification-upstream/lib/fse" "fse" EXCLUDE_FROM_ALL)
+              include("@REPO@/cmake/GroupPlotter.cmake")
+              pos2_grow_prepare("@REPO@/build/qualification-upstream" patched)
+              include("@REPO@/cmake/ComputePool.cmake")
+              pos2_pool_targets("@REPO@/build/qualification-upstream" "${patched}")
+              include("@REPO@/cmake/GroupTests.cmake")
+              pos2_group_tests("@REPO@/build/qualification-upstream" "${patched}")
+              foreach(target compute_membership_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test
+                  pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test)
+                target_sources(${target} PRIVATE "@REPO@/tools/xchplot2/windows.manifest")
+                target_link_libraries(${target} PRIVATE advapi32 bcrypt psapi)
+                set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
+                add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
+              endforeach()
+              add_test(NAME compute_membership_network_test COMMAND $<TARGET_FILE:compute_membership_test> --network)
+              add_test(NAME compute_worker_network_test COMMAND $<TARGET_FILE:pos2_pr118_grow_worker_test> --network)
+            endfunction()
+            cmake_language(DEFER CALL register_qualification_groups)
+          endif()
+          '@.Replace('@REPO@',$repo) | Set-Content 'build/diagnostic-groups.cmake'
+          cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$repo/build/qa-tls/install" -DOPENSSL_USE_STATIC_LIBS=ON
+          $targets = @('cli_host_test','group_calibration_process_test','compute_membership_test','pos2_pr118_grow_inventory_test','pos2_pr118_grow_retirement_test','pos2_pr118_grow_worker_test','pos2_pr118_grow_worker_client_test','pos2_pr118_grow_pool_codec_test','pos2_pr118_grow_pool_owner_test')
+          cmake --build build/qa-host --parallel 4 --target $targets
+      - name: Run standalone authenticated network checks
+        run: ctest --test-dir build/qa-host --output-on-failure --no-tests=error --timeout 180 -R '^compute_(membership|worker)_network_test$'
+      - name: Run the release regressions with native diagnostics
+        if: '!cancelled()'
+        run: |
+          if (!(Test-Path 'build/qa-host/tools/parity/pos2_pr118_grow_pool_owner_test.exe')) { throw 'The test build was incomplete' }
+          ctest --test-dir build/qa-host --output-on-failure --no-tests=error --timeout 900 -R '^(cli_host_test|group_calibration_process_test|pos2_pr118_grow_(worker_client|pool_codec|pool_owner|inventory|retirement)_test)$'
+      - name: Preserve native CTest results
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-ctest-record
+          path: build/qa-host/Testing/Temporary/LastTest.log
+          retention-days: 3
+          if-no-files-found: ignore
