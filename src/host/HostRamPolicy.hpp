@@ -47,6 +47,7 @@ struct HostRamSpillInputs {
     // safe to route.
     bool tier_tiny    = false;   // Tiny or Pinned
     bool tier_streams = false;   // anything but Plain
+    bool force_t1_meta = false;  // XCHPLOT2_SPILL_T1META on Tiny/Pinned
 
     // Minimal or Tiny — the tiers whose T2 sort gathers in tiles. Needed
     // only for the disk-traffic estimate: the tiled gather re-reads and

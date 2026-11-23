@@ -2044,26 +2044,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 spill_auto = true;
             }
 
-            // Guard (fail-fast, before any allocation or plotting): refuse
-            // to "spill" onto a RAM-backed temp dir. On most systemd/Arch
-            // boxes /tmp is tmpfs — i.e. RAM — so writing the spill tables
-            // there consumes the very RAM this budget is meant to cap and
-            // invites the OOM killer, defeating the feature. The spill
-            // TempFiles resolve their dir from XCHPLOT2_TEMP_DIR / TMPDIR /
-            // /tmp (--temp-dir feeds XCHPLOT2_TEMP_DIR), so probe that same
-            // resolved dir. XCHPLOT2_ALLOW_RAM_TEMP_DIR (1/true/yes/on)
-            // downgrades the refusal to a warning for the rare disk-backed
-            // /tmp.
-            //
-            // An EXPLICIT budget throws here: the user asked for a spill and
-            // needs to know it would have been a lie. AUTO must not — the user
-            // asked for a plot, not a spill, so a tmpfs temp dir simply means
-            // this rescue is unavailable. Record why and let the host-RAM
-            // guard below deliver the verdict with that clause attached, which
-            // tells them both facts at once instead of trading one confusing
-            // error for another.
-            if (do_spill) {
-                std::string const spill_dir = TempFile::resolve_dir("");
+            // An explicit disk spill reports its own error. An automatic one returns
+            // the reason to the host-RAM guard when it cannot rescue the plot.
+            auto check_spill_dir = [&](std::string const& spill_dir, uint64_t need) {
                 if (TempFile::dir_is_ram_backed(spill_dir)) {
                     char const* ov =
                         std::getenv("XCHPLOT2_ALLOW_RAM_TEMP_DIR");
@@ -2078,9 +2061,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "XCHPLOT2_ALLOW_RAM_TEMP_DIR is set.\n",
                             log_prefix.c_str(), spill_dir.c_str());
                     } else if (spill_auto) {
-                        do_spill              = false;
                         auto_blocked_ram_dir  = true;
                         auto_ram_dir          = spill_dir;
+                        return false;
                     } else {
                         throw std::runtime_error(
                             "--max-host-ram is set but the spill temp dir '" +
@@ -2090,24 +2073,14 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "XCHPLOT2_TEMP_DIR) at real disk.");
                     }
                 }
-            }
 
-            // Second half of the same guard: the dir must actually be
-            // usable. dir_is_ram_backed() above returns false when it cannot
-            // probe at all — a mistyped path, an unmounted drive — so a bad
-            // --temp-dir passes that check and then dies deep in the pipeline
-            // with a raw mkstemp errno, minutes into a batch. Since the tmpfs
-            // message tells users to reach for --temp-dir, mistyping it is
-            // the expected next failure and belongs here, before any work.
-            if (do_spill) {
-                std::string const spill_dir = TempFile::resolve_dir("");
-                std::string const problem   = TempFile::dir_problem(spill_dir);
+                std::string const problem = TempFile::dir_problem(spill_dir);
                 if (!problem.empty()) {
                     if (spill_auto) {
-                        do_spill             = false;
                         auto_blocked_bad_dir = true;
                         auto_dir_problem     = problem;
                         auto_ram_dir         = spill_dir;
+                        return false;
                     } else {
                         throw std::runtime_error(
                             "--max-host-ram is set but no spill file can be "
@@ -2117,8 +2090,43 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "existing, writable directory on real disk.");
                     }
                 }
-            }
 
+                // Check the whole routed set before allocating any of the tables.
+                uint64_t const avail = TempFile::free_space(spill_dir);
+                // 0 == statvfs could not answer; treat as unknown and let
+                // the per-table fallocate be the backstop, rather than
+                // refusing a spill that would have worked.
+                if (avail != 0 && avail < need) {
+                    std::string const detail =
+                        " needs ~" + std::to_string(to_gib(need)).substr(0, 5) +
+                        " GiB in the temp dir '" + spill_dir + "' but only ~" +
+                        std::to_string(to_gib(avail)).substr(0, 5) +
+                        " GiB is free";
+                    if (spill_auto) {
+                        auto_blocked_bad_dir = true;
+                        auto_ram_dir         = spill_dir;
+                        auto_dir_problem     =
+                            "not enough free space (needs ~" +
+                            std::to_string(to_gib(need)).substr(0, 5) +
+                            " GiB, has ~" +
+                            std::to_string(to_gib(avail)).substr(0, 5) + " GiB)";
+                        return false;
+                    } else {
+                        throw std::runtime_error(
+                            log_prefix + " the host-RAM spill for tier " +
+                            tier_name(tier) + " at k=" +
+                            std::to_string(pool_k) + detail +
+                            ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at a "
+                            "filesystem with more room, free space there, or "
+                            "raise --max-host-ram so fewer tables spill.");
+                    }
+                }
+                return true;
+            };
+
+            bool const tier_tiny = tier == Tier::Tiny || tier == Tier::Pinned;
+            char const* force_t1_meta = std::getenv("XCHPLOT2_SPILL_T1META");
+            stream_scratch.spill.h_t1_meta = tier_tiny && force_t1_meta && force_t1_meta[0] == '1';
             if (do_spill) {
 
                 // cap entries, from the public estimators: each is
@@ -2152,7 +2160,6 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 // A2 lifted the Tiny restriction on h_t2_meta / h_t2_xbits:
                 // the T2-sort partition used to read both USM-host, and now
                 // pulls each through its own SpillTileReader.
-                bool const tier_tiny    = (tier == Tier::Tiny || tier == Tier::Pinned);
                 bool const tier_streams = (tier != Tier::Plain);
 
                 // The arithmetic itself lives in HostRamPolicy.cpp, as a pure
@@ -2178,6 +2185,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 pin.cap_entries    = cap_entries;
                 pin.budget         = B;
                 pin.tier_tiny      = tier_tiny;
+                pin.force_t1_meta  = stream_scratch.spill.h_t1_meta;
                 pin.tier_streams   = tier_streams;
                 // Minimal joins Tiny in gathering T2 sort in tiles, which
                 // costs h_t2_xbits two extra passes over the temp dir that
@@ -2219,52 +2227,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     }
                 }
 
-                // Is there room for it? Same fail-fast argument as the temp-dir
-                // usability probe above, one step further on: that one proves a
-                // file can be CREATED, this one that the tables will FIT. Every
-                // spill file is now reserved with fallocate at setup, so a
-                // short temp dir already fails early rather than mid-T2 — but
-                // it fails one table at a time, deep in the pipeline, naming
-                // only that table's size. Checking the whole set here reports
-                // the real requirement in one line, before any GPU work.
-                //
-                // Concurrency is not modelled: not every routed table is alive
-                // at once (h_t1_meta is gone before h_t3 exists), so the sum is
-                // an over-estimate. Deliberately — the tables that ARE
-                // concurrent vary by tier, and a spill that fits only because
-                // of lifetime overlap is one bad batch away from ENOSPC.
-                if (do_spill) {
-                    uint64_t const need = sp.spilled_bytes;
-                    std::string const spill_dir = TempFile::resolve_dir("");
-                    uint64_t const avail = TempFile::free_space(spill_dir);
-                    // 0 == statvfs could not answer; treat as unknown and let
-                    // the per-table fallocate be the backstop, rather than
-                    // refusing a spill that would have worked.
-                    if (avail != 0 && avail < need) {
-                        std::string const detail =
-                            " needs ~" + std::to_string(to_gib(need)).substr(0, 5) +
-                            " GiB in the temp dir '" + spill_dir + "' but only ~" +
-                            std::to_string(to_gib(avail)).substr(0, 5) +
-                            " GiB is free";
-                        if (spill_auto) {
-                            do_spill             = false;
-                            auto_blocked_bad_dir = true;
-                            auto_ram_dir         = spill_dir;
-                            auto_dir_problem     =
-                                "not enough free space (needs ~" +
-                                std::to_string(to_gib(need)).substr(0, 5) +
-                                " GiB, has ~" +
-                                std::to_string(to_gib(avail)).substr(0, 5) + " GiB)";
-                        } else {
-                            throw std::runtime_error(
-                                log_prefix + " the host-RAM spill for tier " +
-                                tier_name(tier) + " at k=" +
-                                std::to_string(pool_k) + detail +
-                                ". Point --temp-dir (or XCHPLOT2_TEMP_DIR) at a "
-                                "filesystem with more room, free space there, or "
-                                "raise --max-host-ram so fewer tables spill.");
-                        }
-                    }
+                std::string spill_dir;
+                if (do_spill && plan.any()) {
+                    spill_dir = TempFile::resolve_dir("");
+                    do_spill = check_spill_dir(spill_dir, sp.spilled_bytes);
                 }
 
                 if (do_spill) {
@@ -2290,12 +2256,12 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             to_gib(est + reclaimable), to_gib(reclaimable));
                     }
                     std::fprintf(stderr,
-                        "%s host-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
+                        "%s %shost-RAM budget %s (tier %s, k=%d): D2H drain %d->%d "
                         "slot%s (-%.2f GiB), spilling%s -> modelled unswappable "
                         "host peak ~%.2f GiB%s (routable floor ~%.2f GiB); "
                         "~%.1f GiB/plot of temp-dir traffic, ~%.1f GiB of it "
                         "writes\n",
-                        log_prefix.c_str(), budget_label, tier_name(tier), pool_k,
+                        log_prefix.c_str(), spill_auto ? "automatic " : "", budget_label, tier_name(tier), pool_k,
                         GpuBufferPool::kNumPinnedBuffers, num_pinned_slots,
                         num_pinned_slots == 1 ? "" : "s", to_gib(drain_freed),
                         spilled.c_str(),
@@ -2306,7 +2272,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                     // AUTO was not asked for, so it must announce itself. A
                     // user who never passed a flag still needs to know why
                     // this run touches the disk and got slower.
-                    if (spill_auto) {
+                    if (spill_auto && plan.any()) {
                         std::fprintf(stderr,
                             "%s tier %s needs ~%.2f GiB of host RAM but only "
                             "~%.2f GiB is available: automatically spilling the "
@@ -2319,7 +2285,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             "instead.\n",
                             log_prefix.c_str(), tier_name(tier),
                             to_gib(host_required), to_gib(budget),
-                            TempFile::resolve_dir("").c_str(),
+                            spill_dir.c_str(),
                             to_gib(sp.traffic_written + sp.traffic_read),
                             to_gib(sp.traffic_written));
                     }
@@ -2398,7 +2364,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // baseline; the streaming-partition algorithm change
             // ships in Phase 1.3c-ii and is then gated by an
             // additional pinned_mode flag on the scratch struct.
-            stream_scratch.tiny_mode   = (tier == Tier::Tiny || tier == Tier::Pinned);
+            stream_scratch.tiny_mode   = tier_tiny;
             stream_scratch.pinned_mode = (tier == Tier::Pinned);
             // Tiny / Pinned share minimal's tile counts (gather_tile_count > 1
             // is the trigger for the host-pinned T2 sort path that
@@ -2480,11 +2446,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             //   - h_meta backs h_t1_meta; spillable in tiny only (T2 meta
             //     uses the separate h_t2_meta below, so nulling is safe).
             //   - h_t3 is spillable in compact / minimal / tiny.
-            bool const spill_t1meta = stream_scratch.tiny_mode &&
-                (stream_scratch.spill.h_t1_meta ||
-                 [] { char const* v = std::getenv("XCHPLOT2_SPILL_T1META");
-                      return v && v[0] == '1'; }());
-            stream_scratch.spill.h_t1_meta = spill_t1meta;  // reconcile with legacy env
+            bool const spill_t1meta = stream_scratch.spill.h_t1_meta;
             bool const spill_t3 = stream_scratch.spill.h_t3;
             // h_t2_xbits routes in every streaming tier since A2 taught the
             // T2-sort partition to pull its source streams off disk; h_t2_meta

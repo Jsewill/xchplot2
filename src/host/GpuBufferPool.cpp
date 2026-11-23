@@ -416,6 +416,10 @@ bool cuda_query_device_memory(int device_ordinal,
                               std::size_t& total_bytes);
 #endif
 
+#ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
+size_t windows_hip_worker_budget(HMODULE runtime, int ordinal, size_t hip_free, size_t hip_total);
+#endif
+
 // AMD free-VRAM probe. Resolved at runtime rather than linked, deliberately:
 // asking CMake for HIP would add a build-time dependency and a libamdhip64 link
 // to every build, including the NVIDIA ones that will never call this. On a
@@ -667,6 +671,28 @@ bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes,
 
 } // namespace
 
+#ifdef _WIN32
+HMODULE retained_hip_runtime()
+{
+    // A cold probe can release AdaptiveCpp's last device just after enumeration.
+    // Own the runtime used for the cached entry points before that happens.
+    struct Module {
+        std::mutex mutex;
+        HMODULE handle = nullptr;
+        ~Module() { if (handle) ::FreeLibrary(handle); }
+    };
+    static Module module;
+    std::lock_guard lock(module.mutex);
+    if (!module.handle) {
+        for (auto name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
+            HMODULE handle;
+            if (::GetModuleHandleExW(0, name, &handle)) { module.handle = handle; break; }
+        }
+    }
+    return module.handle;
+}
+#endif
+
 bool hip_query_device_memory(int device_ordinal,
                              size_t& free_bytes,
                              size_t& total_bytes)
@@ -675,13 +701,10 @@ bool hip_query_device_memory(int device_ordinal,
     using SetDeviceFn  = int (*)(int);
     using GetDeviceFn  = int (*)(int*);
 
-    static void* const handle = [] () -> void* {
 #ifdef _WIN32
-        // Query the runtime AdaptiveCpp loaded, including versioned HIP SDK DLLs.
-        for (wchar_t const* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
-            if (auto handle = ::GetModuleHandleW(name)) return handle;
-        }
+    void* const handle = retained_hip_runtime();
 #else
+    static void* const handle = [] () -> void* {
         // Already in-process? A ROCm build has it loaded before we get here.
         if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
             if (dlsym(self, "hipMemGetInfo")) return self;
@@ -691,9 +714,9 @@ bool hip_query_device_memory(int device_ordinal,
                                    "libamdhip64.so.5"}) {
             if (void* h = dlopen(soname, RTLD_LAZY | RTLD_LOCAL)) return h;
         }
-#endif
         return nullptr;
     }();
+#endif
     if (!handle) return false;
 
     static auto const mem_get_info =
@@ -864,11 +887,19 @@ ProbeTarget probe_target_for(int device_ordinal)
             if (rt == ProbeRuntime::LevelZero)
                 t.host_unified_memory = devs[idx].get_info<sycl::info::device::host_unified_memory>();
             if (rt != ProbeRuntime::None) {
-                // Rank among devices sharing this backend — that IS the
-                // runtime's own ordinal, whereas idx counts every vendor.
                 int rank = 0;
-                for (std::size_t i = 0; i < idx; ++i)
-                    if (devs[i].get_backend() == backend) ++rank;
+                if (rt == ProbeRuntime::LevelZero) {
+                    for (std::size_t i = 0; i < idx; ++i)
+                        if (devs[i].get_backend() == backend) ++rank;
+                } else {
+                    // CUDA and HIP interop expose the native ordinal even when
+                    // AdaptiveCpp visibility filters omit other devices.
+                    rank = devs[idx].AdaptiveCpp_device_id().get_id();
+                    if (rank < 0) return {};
+#ifdef _WIN32
+                    if (rt == ProbeRuntime::Hip && !retained_hip_runtime()) return {};
+#endif
+                }
                 t.runtime = rt;
                 t.ordinal = rank;
             }
@@ -878,9 +909,9 @@ ProbeTarget probe_target_for(int device_ordinal)
         // None leaves the probe unavailable, so admission fails closed.
     }
 
+    if (t.runtime == ProbeRuntime::None) return t;
     std::lock_guard<std::mutex> lk(m);
-    cache[device_ordinal] = t;
-    return t;
+    return cache.emplace(device_ordinal, t).first->second;
 }
 
 } // namespace
@@ -977,6 +1008,23 @@ bool device_memory_probe(int device_ordinal,
     // No runtime owns this device (Level Zero / OpenCL), or the owning one
     // declined. Budget admission must fail rather than assume the total is free.
     return false;
+}
+
+size_t worker_gpu_available_bytes(int device_ordinal)
+{
+    size_t free = 0, total = 0;
+    if (!device_memory_probe(device_ordinal, free, total)) return 0;
+#ifdef _WIN32
+    auto const target = probe_target_for(device_ordinal);
+    if (target.runtime == ProbeRuntime::Hip) {
+#ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
+        return windows_hip_worker_budget(retained_hip_runtime(), target.ordinal, std::min(free, total), total);
+#else
+        return 0;
+#endif
+    }
+#endif
+    return std::min(free, total);
 }
 
 size_t vram_safety_margin()

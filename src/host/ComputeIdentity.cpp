@@ -11,6 +11,7 @@
 #endif
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <array>
 #include <algorithm>
@@ -635,6 +636,19 @@ PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory, bo
     return publish(directory, name, node, ca_text, identity, {}, policy);
 }
 void validate_compute_defaults(ComputeDefaults const& defaults) { validate_defaults(defaults); }
+bool load_bundled_tls_identity(TlsOptions const& options, SSL_CTX* context)
+{
+    if (options.membership_directory.empty() || options.cert_file != options.key_file) return false;
+    auto const path = path_from_text(options.cert_file);
+    if (path != path_from_text(options.membership_directory) / "credentials.pem") return false;
+    // A renewal publishes the node's certificate and key in one file. Use the
+    // same private, delete-sharing snapshot for both halves of the TLS identity.
+    auto const text = read_private(path);
+    auto cert = read_certificate(text); auto key = read_key(text);
+    require(SSL_CTX_use_cert_and_key(context, cert.get(), key.get(), nullptr, 1) == 1,
+        "cannot load matching network TLS certificate and key");
+    return true;
+}
 void configure_pool(PoolIdentity const& pool, ComputeDefaults const& defaults)
 {
     auto encoded = profile(pool.name, pool.node_id, defaults);

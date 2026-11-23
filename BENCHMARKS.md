@@ -1,7 +1,8 @@
 # Benchmarks
 
-The September GPU measurements use the pre-1.0 cipher and raw format. For
-current `.gplot` measurements, see [grouped plots on HDDs](#grouped-plots-on-hdds).
+The September GPU measurements use the pre-1.0 cipher and raw format.
+Current `.gplot` measurements cover [native Windows grouped plotting](#native-windows-grouped-plotting)
+and [grouped plots on HDDs](#grouped-plots-on-hdds).
 Use [`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
 
 Single-GPU results measured September 9, 2026, at **k=28, strength=2**.
@@ -82,10 +83,86 @@ measured plots, with automatic tier selection.
 |---:|---:|---:|---:|
 | 11.73 ± 0.69 | 10.67–12.98 | 11,228 | 0.276 |
 
-The report did not specify the driver version, CPU model, storage, or Windows
-version. Full-proof and CPU byte-parity results were not provided. Treat this
-as a completed benchmark report; hardware qualification still needs those
-correctness checks.
+The September report recorded benchmark completion. The November measurements
+below include CPU byte comparisons and full-proof verification.
+
+## Native Windows grouped plotting
+
+On November 22–23, 2026, a Radeon RX 6700 XT (12 GiB) and a Ryzen 9 5950X
+with 32 GiB of RAM built k=28, strength=2 plot groups.
+The native Windows 11 build used the HIP backend and AMD driver
+32.0.21045.5002. Construction used RAM, with final output on an NTFS NVMe
+SSD and destination scratch disabled.
+
+| Generator | CPU worker budget | Construction | Seconds per durable member |
+|---|---:|---|---:|
+| RX 6700 XT | Automatic | Automatic | 15.40 |
+| RX 6700 XT | 4 | Automatic | 13.86 |
+| RX 6700 XT | 4 | Incremental | 13.89 |
+| Ryzen 9 5950X | 4 | Incremental | 78.22 |
+
+Each row above is a two-member run of `xchplot2 batch` with compact member
+storage, before the Windows write and GPU handoff changes.
+Times include generation, assembly and durable publication of the complete group.
+The first Radeon run with a fresh runtime cache took 15.83 seconds per member
+with four workers and incremental construction. The table uses the warmed GPU
+cache. Every group matched all 1,991,815,377 bytes of the independent CPU
+reference and passed a separate full-proof check.
+
+Repeating automatic construction with phase timing enabled took 14.27, 13.84,
+14.21 and 14.42 seconds per member at two, four, eight and sixteen workers,
+respectively. The default worker budget took 15.45. GPU generation stayed near
+11.1 seconds per member. The append for the pair took 4.53 seconds with four
+workers and 7.79 seconds with the default budget.
+
+With four workers and automatic construction, profiling measured about
+11.1 seconds of GPU generation and host compaction per member, then
+4.74 seconds to append the pair. Raw member storage shortened generation
+but increased the pair's append time to 7.02 seconds and finished at
+14.24 seconds per member. Forcing generation overlap on this 12 GiB card
+retained the tiled output path and took 13.88 seconds per member.
+
+### Coalesced writes and overlapping compaction
+
+The updated Windows writer combines codec output from multiple workers in
+the space already reserved for the output window. On this 12 GiB Radeon,
+automatic generation overlap also lets the CPU compact one member while
+the GPU generates the next. Each run published one group using automatic
+construction with phase timing disabled. The warm runs reused each binary's
+working directory and reversed the order of the binaries between pairs.
+
+| GPU kernel cache | Members per group | CPU workers | Before, seconds per published member | After, seconds per published member |
+|---|---:|---|---:|---:|
+| Fresh | 2 | Automatic | 16.55, 17.15 | 15.00 |
+| Fresh | 4 | Automatic | 15.58, 15.63 | 13.77 |
+| Warm | 2 | Automatic | 15.00, 15.62 | 13.63, 13.65 |
+| Warm | 4 | Automatic | 15.03, 15.10 | 13.17, 13.25 |
+| Warm | 2 | 4 | 14.05, 14.74 | 13.69, 14.52 |
+
+In each warm four-member run with automatic workers, Windows recorded
+51,160 writes from the plotting process before the change and 3,396 after.
+With two members and four fixed workers, the timing ranges overlapped.
+
+In the profiled four-member runs the append took 12.38 seconds before and
+7.83 seconds after. With four workers on the updated build, switching
+generation overlap from off to automatic reduced
+publication time from 14.61 to 13.64 seconds per member. Allocating the
+pinned host buffer took 0.31 seconds and releasing it took 0.13 seconds for
+the whole group.
+
+All two-member and four-member outputs matched the independent CPU files
+and passed full-proof verification. The four-member file was 3,971,617,699
+bytes. The bundled Windows AdaptiveCpp runtime keeps compiled kernels in a
+`.acpp` directory under the working directory. Reusing that directory across
+plotting commands lets later runs reuse those kernels.
+
+As a temporary compute worker for a Linux storage host, the same Radeon
+processed one k=28 member in 15.22 and 15.36 seconds in two trials. Both
+sent 1,157,902,871 bytes through an SSH forward and produced the same
+verified file. Sending took 9.21 seconds in the first trial and 97.78
+seconds in the second. Windows reported a negotiated Ethernet speed of
+100 Mb/s after the second trial. Payload throughput during that send was
+94.74 Mb/s.
 
 ## Grouped plots on HDDs
 
@@ -1294,6 +1371,53 @@ The Wi-Fi transfer carried 1.058 GB of contribution data, averaging
 107.56 Mb/s over the worker's send interval. Even at the reported
 143.3 Mb/s radio rate, those bytes alone would take 59.04 s. During its
 busiest 12-second sample the wireless interface transmitted 116.05 Mb/s.
+
+Two independent storage owners on David submitted a four-member k=28 group
+and then a single member while the RTX 4090 was busy. Outputs went to tmpfs
+to isolate scheduling and transfer time. With both routes measured, the
+previous broker sent the singleton to the idle Arc. It took 97.14 s from
+submission to publication. The updated broker waited for the RTX to deliver
+the first owner's group. The singleton took 27.38 s in the first trial and
+26.93 s after deployment on David. Each output matched its CPU reference
+and passed full-proof verification.
+
+With an empty timing history, the deployed broker sampled the Arc and took
+96.73 s to finish all five members (19.35 s/member). After calibration, it
+finished all five in 27.45 s (5.49 s/member). The four-member group reached
+publication in 19.14 s and 19.02 s, respectively.
+
+A separate test on that broker filled 16 physical HDDs with one three-member
+k=28 group per drive. Each run used 32 GiB of owner RAM, incremental
+construction, zero scratch drives and the same 48 members. Times include
+durable publication of the last group. The harvester had 17,886 plots loaded.
+
+| Storage owner | Accepting GPUs | Time for 48 members | Seconds per durable member |
+| --- | --- | ---: | ---: |
+| Previous | RTX 4090 | 170.23 s | 3.55 |
+| Previous | RTX 4090 and Arc B580 | 181.13, 180.61 s | 3.77, 3.76 |
+| Batch during the Arc's first transfer | RTX 4090 | 169.77 s | 3.54 |
+| Batch during the Arc's first transfer | RTX 4090 and Arc B580 | 175.26, 175.66 s | 3.65, 3.66 |
+| Count confirmed worker time and compare the last batches | RTX 4090 and Arc B580 | 170.05, 170.34 s | 3.54, 3.55 |
+| Same final owner | RTX 4090 | 171.33 s | 3.57 |
+
+In each two-GPU fill in the table, the Arc delivered one member over Wi-Fi
+and the RTX delivered 47 over 10 Gb Ethernet. The final owner kept the RTX
+on three-member requests through the end of both fills. The Arc finished
+its member at 110.45 and 111.20 s. Both runs had zero retries, matched all
+16 reference hashes and passed a fresh full-proof sample. The owner's
+10 Gb interface received 334 MB/s on average, with five-second peaks of
+561 and 572 MB/s. The 16 HDDs together wrote 281 MB/s on average and
+peaked at 616 and 631 MB/s over five seconds.
+
+The two-GPU fills finished 0.99 to 1.28 seconds ahead of the RTX-only fill
+on the final executable. Earlier RTX-only controls ranged from 169.77 to
+170.23 seconds. Across the paired two-GPU runs, the owner changes cut the
+mean time per durable member by 0.22 seconds (5.9%).
+
+Two intermediate fills experienced an Intel compute-engine reset and its
+aftermath. Both recovered, published the same reference files and took
+219.36 and 189.20 s with two retries apiece. The Arc benchmark worker was
+restarted while idle before the final two-GPU measurements.
 
 David also filled the same 16 HDDs through a persistent broker with the Arc
 and the two wired GPUs enrolled. With a 4 GiB owner budget, the original

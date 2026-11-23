@@ -856,6 +856,15 @@ at that handoff. Saved scratch grants and the farming limits still apply.
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
 and clean-cache release. `--window-bytes SIZE` sets the I/O window size.
 
+For a compact group built in RAM, automatic GPU overlap can compact one member
+on the CPU while the pooled GPU generates the next. When a second GPU output
+buffer would exceed the device budget, the plotter can use a pinned host
+buffer for local batches of two or more members. At k=28 this needs 2,016 MiB
+of additional host memory over tiled transfers. The plotter checks the batch
+budget and live headroom before allocating it. Tight memory, an unavailable
+pinned allocation or protected farming resources keep the tiled path when
+the device output buffer is unavailable.
+
 `--checkpoint-bytes auto` is the default. Ordinary construction measures
 the time per durable byte and the time spent flushing each interval. During
 the first group it can try a target up to 4 GiB when that target predicts
@@ -1951,7 +1960,10 @@ before the owner reports its first delivery. During that interval the
 broker can use the time already spent on that route for the same owner,
 workload and batch size. The broker can wait when busy workers
 together can finish the owner's ready queue before an idle worker would
-deliver the waiting job. If a wide batch should wait, the broker checks whether the
+deliver the waiting job. A running lease from another owner can contribute to
+this estimate. The broker uses that owner's delivery history to predict the
+release and the waiting owner's route history to estimate the next delivery.
+If a wide batch should wait, the broker checks whether the
 idle worker can help by taking a later, shorter job. The wide batch keeps
 its queue position. Each job must still start within its admission deadline.
 During a multi-destination scratch fill the owner can also forecast generation
@@ -1968,7 +1980,7 @@ finish the ready queue sooner. An overdue GPU batch can have up to one
 measured singleton delivery beyond its expected finish. For independently
 streamed members, the broker uses that allowance when the waiting job
 would commit another whole batch to the slower worker.
-A larger backlog, a competing owner, an unmeasured route, or a job running
+A larger backlog, another queued owner, an unmeasured route, or a job running
 past its observed range lets an idle compatible worker take work immediately.
 
 The scheduler prioritizes the next batch that can start an idle output drive.
@@ -2031,8 +2043,10 @@ Transfer the invitation privately to that machine, then run there:
 xchplot2 compute setup worker-b.invite
 ```
 
-You can run this step while an enrolled owner is plotting. For a temporary
-helper, run `xchplot2 compute worker --join worker-b.invite` in its terminal.
+You can issue and accept invitations while an enrolled owner is plotting.
+Existing connections can keep using their credentials during the update.
+For a temporary helper, run `xchplot2 compute worker --join worker-b.invite`
+in its terminal.
 It uses the invited identity and saved resource limits and offers compute
 until you stop the process. Repeating the command for the same enrollment
 preserves the credentials already in use.
@@ -2089,7 +2103,10 @@ A standalone worker adapts to its available CPU affinity and host RAM, with one
 task slot and automatic CPU/GPU selection. Saved or explicit limits remain
 caps. Automatic GPU allocation uses available VRAM at startup with the backend's
 required safety allowance; it does not infer spare GPU compute time from free
-memory. A GPU worker can encode the last member of a batch directly from its
+memory. On Windows, a HIP worker also checks its OS-assigned memory budget and
+the dedicated memory in use on its selected GPU. Set `--gpu-bytes` to a known
+safe limit when Windows cannot identify the physical GPU or report these
+counters. A GPU worker can encode the last member of a batch directly from its
 pinned output buffer. Its host RAM reservation includes separate raw copies
 only for earlier members and accounts for retained GPU buffers across tasks.
 The worker releases its host output buffer if keeping it would prevent
@@ -2191,6 +2208,11 @@ tasks should finish first. Restart after changing saved defaults or replacing
 the executable. After restarting a drained worker, run `compute resume` to
 accept new tasks; restarting alone does not clear its saved drain setting.
 
+An Intel GPU worker can remain registered after a compute-engine reset.
+If Level Zero reports `DEVICE_LOST` and subsequent jobs on that worker
+fail, restart the worker when idle to create a fresh GPU context. Confirm
+the next completed job reports a member from that worker.
+
 Linux uses a systemd user service; logout behavior follows the system's user
 manager policy. Windows uses Task Scheduler at user login, without elevation,
 and requires that user to remain logged in. The native Windows service path
@@ -2227,8 +2249,10 @@ xchplot2 compute configure --broker auto
 ```
 
 `compute worker --broker HOST:PORT` can repeat direct addresses and also
-browse discovered brokers. `--discovery off` disables discovery; a standalone
-worker then needs a direct broker. Broker and worker `--listen` / `--advertise`
+browse discovered brokers. When IPv4 and IPv6 both reach the same broker,
+the worker counts it once and keeps its working plot-data address. A newly
+discovered broker can use the remaining capacity. With `--discovery off`,
+a standalone worker needs a direct broker. Broker and worker `--listen` / `--advertise`
 options override saved listener settings. Save predictable ports with
 `compute configure --broker-port 18444 --worker-port 18445`, then restart
 the affected services. The worker port also applies to a plotting job's local
@@ -2317,6 +2341,10 @@ waits. The defaults are one hour per task and 30 seconds per socket operation.
 If a task expires during admission, a short control deadline lets the worker
 receive the broker's acknowledgement and release the slot. The original
 deadline still bounds execution.
+When a worker pauses or its queue fills before it starts a task, it can
+confirm the refusal directly with the broker. The broker can assign a retry
+to that worker once it has capacity, even if the owner's upload was interrupted.
+
 `--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
@@ -2340,6 +2368,14 @@ send several ready members in one lease. With multiple eligible slots, it
 shares them among ready destinations with the same k and strength.
 A single destination can spread its ready members across GPUs. With one slot,
 the owner can also combine requests from different destinations.
+Once a new worker starts returning its first packed member, the owner can
+count the time since it sent the request. If that already exceeds a measured
+worker's expected time to finish a batch, the measured worker can resume
+batching. As the last destinations finish, the owner can also keep a batch
+together when every eligible route has been measured and that worker can
+finish the batch before any other could deliver one member. It checks the
+granted worker and endpoint before sending the member IDs. New arrivals can
+still receive single-member probes.
 The broker reports a common batch width and the number of slots that can
 stream each independent batch size within the workers' CPU and memory budgets.
 The GPU generates and sorts the next member while the worker encodes the
@@ -2717,6 +2753,12 @@ Minimal, and Tiny. Pinned is a separate manual tier, not a smaller automatic fal
 The owning driver supplies free VRAM after context creation. A missing
 reading or insufficient `peak + buffer` causes refusal before allocation.
 
+On Windows with the HIP backend, direct single-GPU plotting and its memory
+watchdog use the driver's reading for the plotting process. When sharing the
+Radeon with another application, `POS2GPU_MAX_VRAM_MB` can bound a direct
+plot's memory use. A compute worker with an automatic GPU limit also reads
+Windows' adapter-wide usage and process budget when it starts.
+
 Integrated Intel GPUs share host memory. Admission uses the driver's free
 host-memory reading, bounded by physical host RAM and the runtime's allocation
 cap. CPU allocations and cache activity affect those counters, so they cannot
@@ -2763,14 +2805,12 @@ For boundary tests and the limits of software caps, see
 Lower VRAM tiers keep more intermediate data in host RAM. A tier can fit
 the GPU and still exceed the host's available memory.
 
-xchplot2 models each tier's host peak and checks it before allocating
-anything. When the tier does not fit, it **tries to spill eligible cold tables to a
-usable temporary directory** by default. If the remaining working set still does not fit, it refuses.
-Automatic spill is used only when admission would otherwise fail.
+xchplot2 checks each tier's estimated host peak before allocation. If the tier
+would exceed available host RAM, the plotter automatically tries to reduce its
+working set. If the remaining working set still does not fit, it refuses the plot.
 
 ```bash
-# Nothing to do — this is the default. A host that is short on RAM
-# spills, announces it, and plots.
+# Use the default automatic host RAM budget when RAM is tight.
 xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-address>
 
 # Put the spill somewhere specific (a fast NVMe, not the array).
@@ -2785,29 +2825,26 @@ xchplot2 plot ... --max-host-ram min
 xchplot2 plot ... --no-auto-spill
 ```
 
-`--auto-spill` re-enables automatic spilling after an earlier
-`--no-auto-spill` flag or configuration setting. The environment override
-`XCHPLOT2_NO_AUTO_SPILL=1` still disables it; unset that variable to re-enable it.
+`--no-auto-spill` disables this automatic fallback. An explicit `--max-host-ram`
+budget still applies and can route tables to disk. Use `--auto-spill` to re-enable
+the fallback after an earlier flag or configuration setting. If you set
+`XCHPLOT2_NO_AUTO_SPILL=1`, unset it to re-enable the fallback.
 
-What gets spilled, in order, largest first — and only as far as the
-budget requires:
+The plotter makes these adjustments in order until the budget fits.
 
-1. the cold cap-sized tables, streamed through two shared 32 MiB staging
-   windows (64 MiB in total, however many tables spill) so the disk I/O
-   overlaps compute. Which tables depends on the tier: `tiny` and `pinned` route
-   `h_t1_meta`, `h_t3`, `h_t2_meta`, `h_t2_xbits`; `compact` and
-   `minimal` route `h_t3`, `h_frags`, `h_t2_xbits`;
-2. the D2H drain slots, 3 → 1, **last**. Spilling a table costs disk
-   I/O per plot; a drain slot costs producer/consumer overlap across
-   plots, which is the more expensive of the two in a batch.
+1. Spill the cold cap-sized tables largest first. Two shared 32 MiB staging
+   windows let disk I/O overlap compute. The `tiny` and `pinned` tiers can route
+   `h_t1_meta`, `h_t3`, `h_t2_meta` and `h_t2_xbits`. The `compact` and
+   `minimal` tiers can route `h_t3`, `h_frags` and `h_t2_xbits`.
+2. Reduce the D2H drain slot count from three toward one. Fewer slots use less
+   pinned host RAM and reduce producer/consumer overlap across plots.
 
 Notes:
 
-- **The temp dir must be real disk.** `/tmp` is tmpfs on most systemd
-  distributions, i.e. RAM — spilling there consumes the memory the
-  budget exists to bound. xchplot2 refuses a RAM-backed temp dir up
-  front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow RAM-backed spill), and checks the dir exists and is writable before
-  starting rather than failing mid-batch.
+- **Only spilled tables need a temp directory.** Before spilling, xchplot2
+  checks that the directory is writable and disk-backed. Spilling to a
+  RAM-backed directory such as a `/tmp` mounted on tmpfs consumes host memory.
+  Set `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow it.
 - **Budget ~7.1 GiB of free space** for tiny at k=28, ~5.1 GiB for
   compact or minimal — the latter two route `h_frags` as well, a full
   2.03 GiB table even though it makes no engine I/O. This is checked
@@ -2988,9 +3025,9 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny\|pinned` | Force a streaming tier even when the pool fits. A non-auto `--tier` takes precedence. See [memory requirements](#memory-requirements). |
-| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's unswappable (pinned + anonymous) host peak, spilling the cold cap-sized tables to `--temp-dir` largest-first — and then the D2H drain slots, 3 → 1 — until the model fits. `min` takes everything this tier can. Equivalent CLI flag: `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
-| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then `/tmp`. **Must be real disk** — a RAM-backed dir is refused up front, since spilling to tmpfs consumes the memory the budget exists to bound. Equivalent CLI flag: `--temp-dir`. |
-| `XCHPLOT2_NO_AUTO_SPILL=1`    | Refuse to plot when the tier does not fit host RAM, instead of spilling automatically. The automatic spill only ever fires where the run would otherwise be rejected, so this trades a slower plot for a clear error. Equivalent CLI flag: `--no-auto-spill`. |
+| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's pinned and anonymous host memory. The plotter spills eligible tables largest first, then reduces the D2H drain slot count until the model fits. `min` spills every eligible table and uses one drain slot unless its count was set explicitly. Equivalent to `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
+| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then the system temp directory. The plotter checks this directory when it routes tables to disk. Equivalent CLI flag: `--temp-dir`. |
+| `XCHPLOT2_NO_AUTO_SPILL=1`    | Disable the automatic host-RAM fallback. An explicit host RAM budget can still route tables to disk. Equivalent to `--no-auto-spill`. |
 | `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` | Allow a RAM-backed spill directory with a warning. The spilled bytes consume RAM outside the stated host budget. No override is needed for a disk-backed directory. |
 | `XCHPLOT2_HOST_RESERVE_MB=N`  | Host RAM left for the rest of the box when admitting a streaming tier. Default 512. |
 | `XCHPLOT2_DRAIN_SLOTS=N`      | Pin the D2H drain slot count (1-3) and skip the budget's automatic reduction. Fewer slots means less pinned host memory and less producer/consumer overlap. |
@@ -2998,7 +3035,7 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_HOST_FREE_MB=N`     | Testing only — make the host report at most N MB free, so the host-RAM guard and the automatic spill can be exercised on a box that is not actually short. Clamps only: it can never talk the plotter past a real shortage. |
 | `POS2GPU_MAX_VRAM_MB=N` | Cap the free-VRAM query and enforce the selected budget. This tests admission and the watchdog on the current GPU; it does not emulate another physical card. |
 | `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected modeled VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
-| `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
+| `POS2GPU_ASSERT_VRAM=1` | Fail when the sampled decrease in free VRAM exceeds the declared budget, including its margin. The Windows HIP reading covers the plotting process. On a backend with device-wide readings, repeat on an idle GPU before attributing a failure to the model. Enabled by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
 | `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr. The [group construction engine](#construction-and-recovery) also reports output transfers, host CPU time and controller waits. Diagnostic synchronization can change overlap; these are not kernel-busy measurements. |

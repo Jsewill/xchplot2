@@ -21,7 +21,7 @@ inline constexpr uint64_t default_codec_task_bytes = uint64_t(64) << 20;
 // A serialized codec window begins with its count. Each chunk then carries
 // ordinal, old membership/blob length and contribution/new-member counts.
 inline constexpr uint32_t codec_window_header_bytes = 4, codec_chunk_header_bytes = 18;
-enum class FailureCode : uint8_t { UnsupportedResources = 1 };
+enum class FailureCode : uint8_t { UnsupportedResources = 1, RefusedBeforeBegin };
 class UnsupportedResources : public std::runtime_error
 {
 public:
@@ -326,6 +326,9 @@ public:
     // The authenticated broker epoch selects the correct authority when one
     // executor accepts work from several independent brokers.
     std::string register_worker(WorkerOffer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
+    // On a newly observed broker route, retain the endpoint that this worker
+    // instance already advertises to that authority. Returns it in the offer.
+    std::string register_worker_route(WorkerOffer&, std::string* peer_identity, std::string* peer_node_id);
     void unregister_worker(std::string const& instance);
     // Graceful rotation never releases granted or accepted work. False keeps
     // this authority and its transport reservation until the leases finish.

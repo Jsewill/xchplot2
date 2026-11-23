@@ -158,6 +158,7 @@ struct GpuProducer::Impl
     uint64_t twophase_budget_bytes = 0;
     bool profile = false;
     bool locked_output = false;
+    bool prepared_borrowed_output = false;
     bool copy_event_profiling = false;
     uint64_t profile_member = 0;
     sycl::queue* queue = nullptr;
@@ -554,8 +555,11 @@ void GpuProducer::release_host_output()
 {
     impl_->check_generation();
     impl_->finish_output();
+    OutputWallTimings wall(impl_->profile && impl_->prepared_borrowed_output, "host-output-release", 0);
     impl_->release_full_output();
     impl_->release(impl_->transfer);
+    impl_->prepared_borrowed_output = false;
+    wall.complete = true;
 }
 uint64_t GpuProducer::runtime_host_allowance_bytes() noexcept { return runtime_host_bytes; }
 uint64_t GpuProducer::device_resident_bytes() const
@@ -624,6 +628,30 @@ GpuProducer::BorrowedFragments GpuProducer::generate_borrowed(std::array<uint8_t
 void GpuProducer::generate_borrowed_into(std::array<uint8_t, 32> const& plot_id,
     std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy)
 {
+    (void)generate_borrowed_into_async(plot_id, std::move(consume), before_copy);
+}
+bool GpuProducer::try_prepare_borrowed_output()
+{
+    impl_->check_generation();
+    if (!impl_->pool || !impl_->options.member_overlap || impl_->device_output) return false;
+    if (impl_->pool->h_pinned_t3[0]) { impl_->prepared_borrowed_output = true; return true; }
+    impl_->finish_output();
+    impl_->release(impl_->transfer);
+    // Only the optional pinned allocation may fall back. Errors from pending
+    // consumers or from actual generation stay visible to the controller.
+    OutputWallTimings wall(impl_->profile, "host-output-allocation", 0);
+    try
+    {
+        impl_->prepared_borrowed_output = impl_->pool->ensure_pinned(0) != nullptr;
+        wall.complete = impl_->prepared_borrowed_output;
+        return wall.complete;
+    }
+    catch (std::runtime_error const&) { return false; }
+    catch (std::bad_alloc const&) { return false; }
+}
+std::shared_future<uint64_t> GpuProducer::generate_borrowed_into_async(std::array<uint8_t, 32> const& plot_id,
+    std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy)
+{
     impl_->check_generation();
     if (!impl_->pool || !consume) throw std::logic_error("borrowed output handoff requires a pooled GPU and a consumer");
     OutputWallTimings wall(impl_->profile, "generation-borrowed", impl_->next_profile_member());
@@ -634,9 +662,17 @@ void GpuProducer::generate_borrowed_into(std::array<uint8_t, 32> const& plot_id,
     auto const fragments = result.fragments();
     if (!result.t3_fragments_storage.empty() || fragments.size() > impl_->capacity)
         throw std::logic_error("GPU producer returned invalid borrowed output");
-    impl_->handoff.launch([fragments, consume = std::move(consume)]
-    { consume(fragments); return uint64_t(fragments.size()); });
+    bool const profile_output = impl_->prepared_borrowed_output && impl_->profile;
+    if (profile_output) wall.bytes = fragments.size_bytes();
+    auto pending = impl_->handoff.launch([fragments, consume = std::move(consume), profile = profile_output, member = wall.member]
+    {
+        OutputWallTimings consumer(profile, "output-borrowed", member);
+        { AddWallTime timing(consumer.consume_ns, profile); consume(fragments); }
+        consumer.complete = true;
+        return uint64_t(fragments.size());
+    });
     wall.complete = true;
+    return pending;
 }
 uint64_t GpuProducer::generate_into(std::array<uint8_t, 32> const& plot_id,
     std::function<void(std::span<uint64_t const>, uint64_t)> const& consume)

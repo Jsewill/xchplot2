@@ -38,7 +38,7 @@ constexpr char broker_restarted[] = "broker restarted; open a new owner session"
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute };
 class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
 constexpr uint8_t independent_flag = 0x80;
@@ -429,6 +429,33 @@ std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string*
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
     require(!epoch.empty(), "broker registration omitted its epoch"); return epoch;
 }
+std::string BrokerClient::register_worker_route(WorkerOffer& offer, std::string* peer_identity, std::string* peer_node_id)
+{
+    auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer);
+    try
+    {
+        auto bytes = call(writer, peer_identity, peer_node_id);
+        Reader reader(bytes); auto epoch = reader.string(64); auto endpoint = read_endpoint(reader); reader.finish();
+        require(!epoch.empty() && !endpoint.host.empty() && endpoint.port, "broker route registration omitted its endpoint or epoch");
+        offer.endpoint = std::move(endpoint); return epoch;
+    }
+    catch (UnknownOperation const&) {}
+    // Older brokers can expose the same worker's current endpoint through
+    // authenticated status. The caller's registration deadline bounds every page.
+    auto const identity = certificate_identity(tls_.cert_file);
+    StatusRequest query;
+    for (;;)
+    {
+        auto page = status(query);
+        auto found = std::find_if(page.worker_records.begin(), page.worker_records.end(),
+            [&](auto const& worker) { return worker.identity == identity && worker.instance == offer.instance; });
+        if (found != page.worker_records.end()) { offer.endpoint = found->endpoint; break; }
+        if (!page.next_cursor) break;
+        require(page.next_cursor > query.cursor && page.next_cursor <= 4096, "invalid broker worker status cursor");
+        query.cursor = page.next_cursor;
+    }
+    return register_worker(offer, peer_identity, peer_node_id);
+}
 void BrokerClient::unregister_worker(std::string const& instance)
 { auto writer = request(Operation::Unregister); writer.string(instance); auto bytes = call(writer); Reader(bytes).finish(); }
 bool BrokerClient::retire_worker(std::string const& instance)
@@ -664,6 +691,16 @@ struct BrokerServer::Impl
     }
     bool reserved(Job const& job) const
     { return job.lease && (job.state == State::Granted || job.state == State::Running || job.state == State::Cancelled); }
+    void release_unstarted(Job& job)
+    {
+        // A cold batch that never began learned nothing about its worker.
+        auto const& lease = *job.lease;
+        auto worker = workers.find(lease.worker_identity);
+        if (job.requested.work_units > 1 && worker != workers.end() && worker->second.offer.instance == lease.worker_instance)
+            for (auto& sample : worker->second.histories)
+                if (!sample.count && sample.assigned == job.assignment) sample.assigned = 0;
+        job.state = State::Finished;
+    }
     void expire()
     {
         auto const now = Clock::now();
@@ -944,9 +981,12 @@ struct BrokerServer::Impl
         for (auto const* running : active)
         {
             auto const& lease = *running->lease;
-            if (running->owner != waiting.owner || (lease.worker_identity == idle && lease.task.kind == idle_kind)) continue;
+            if (lease.worker_identity == idle && lease.task.kind == idle_kind) continue;
             auto const at = workers.find(lease.worker_identity);
-            if (at == workers.end() || at->second.offer.instance != lease.worker_instance || at->second.offer.endpoint != lease.endpoint) continue;
+            if (at == workers.end() || at->second.offer.instance != lease.worker_instance ||
+                at->second.offer.endpoint != lease.endpoint || running->granted_at < at->second.route_since) continue;
+            // The current owner's delivery predicts when the lease releases.
+            // Each queued owner still needs its own estimate on this route.
             auto const ready = remaining_on_lease(at->second, waiting, *running, now);
             if (ready <= 0 || ready >= idle_ns || ready >= Nanoseconds(running->expires - now).count()) continue;
             auto capacity = free.at(at->first); auto const& held = lease.task.resources;
@@ -1386,18 +1426,7 @@ struct BrokerServer::Impl
             {
                 require(it->second.requested.attempt == attempt, "stale cancellation attempt");
                 auto& job = it->second;
-                if (job.state == State::Granted)
-                {
-                    // Repartitioning a cold batch before Begin has learned
-                    // nothing. Let the replacement singleton try this route
-                    // immediately without discarding any later assignment.
-                    auto const& lease = *job.lease;
-                    auto worker = workers.find(lease.worker_identity);
-                    if (job.requested.work_units > 1 && worker != workers.end() && worker->second.offer.instance == lease.worker_instance)
-                        for (auto& sample : worker->second.histories)
-                            if (!sample.count && sample.assigned == job.assignment) sample.assigned = 0;
-                    job.state = State::Finished;
-                }
+                if (job.state == State::Granted) release_unstarted(job);
                 else if (job.state == State::Running) job.state = State::Cancelled;
                 else if (job.state == State::Queued) job.state = State::Finished;
                 job.unreported_finish = {}; job.touched = Clock::now();
@@ -1405,6 +1434,7 @@ struct BrokerServer::Impl
             schedule(); break;
         }
         case Operation::Register:
+        case Operation::RegisterWorkerRoute:
         {
             auto offer = read_offer(reader);
             if (offer.independent_k_mask)
@@ -1453,6 +1483,7 @@ struct BrokerServer::Impl
             else
             {
                 auto& saved = it->second.offer;
+                if (operation == Operation::RegisterWorkerRoute) offer.endpoint = saved.endpoint;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
                     saved.capabilities == offer.capabilities && saved.independent_k_mask == offer.independent_k_mask &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
@@ -1477,7 +1508,9 @@ struct BrokerServer::Impl
                 saved.admission = offer.admission; saved.producer_build = offer.producer_build;
                 saved.hardware = std::move(offer.hardware); it->second.seen = Clock::now();
             }
-            response.string(epoch); schedule(); break;
+            response.string(epoch);
+            if (operation == Operation::RegisterWorkerRoute) write_endpoint(response, workers.at(identity).offer.endpoint);
+            schedule(); break;
         }
         case Operation::Unregister:
         {
@@ -1570,8 +1603,17 @@ struct BrokerServer::Impl
         {
             auto lease = read_lease(reader); auto reason = FailureCode(reader.u8()); auto update = read_update(reader);
             reader.finish();
-            require(identity == lease.worker_identity && reason == FailureCode::UnsupportedResources, "invalid worker admission rejection");
+            require(identity == lease.worker_identity && (reason == FailureCode::UnsupportedResources ||
+                (reason == FailureCode::RefusedBeforeBegin && !update)), "invalid worker admission rejection");
             auto& job = lease_job(lease);
+            if (reason == FailureCode::RefusedBeforeBegin)
+            {
+                if (job.state != State::Granted || !active_owner(job)) throw StaleLease("worker refusal needs a current unstarted grant");
+                release_unstarted(job);
+                // The worker attested that it never began this exact lease.
+                // An owner whose upload connection closed cannot abandon it later.
+                job.lease.reset(); job.touched = Clock::now(); schedule(); break;
+            }
             if (job.state != State::Running) throw StaleLease("rejected compute lease is not running");
             update_capacity(lease, update, job);
             job.state = State::Finished; job.touched = Clock::now();

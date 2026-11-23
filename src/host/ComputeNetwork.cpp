@@ -291,6 +291,36 @@ void set_socket(SSL* ssl, SocketHandle fd)
     SSL_set_bio(ssl, bio, bio);
 }
 using Context = std::shared_ptr<SSL_CTX>;
+std::unique_ptr<X509, decltype(&X509_free)> certificate_from_file(std::string const& path)
+{
+#ifdef _WIN32
+    // OpenSSL's filename BIO uses the CRT, which omits FILE_SHARE_DELETE.
+    // Supply a buffered reader so a fingerprint lookup can keep reading the
+    // old certificate while an enrollment publishes its replacement.
+    struct File { HANDLE value; ~File() { if (value != INVALID_HANDLE_VALUE) ::CloseHandle(value); } };
+    auto const name = std::filesystem::path(reinterpret_cast<char8_t const*>(path.c_str()));
+    File handle{::CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    require(handle.value != INVALID_HANDLE_VALUE, "cannot read network certificate");
+    static std::unique_ptr<BIO_METHOD, decltype(&BIO_meth_free)> method([]
+    {
+        auto result = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "pool certificate file");
+        if (result && BIO_meth_set_read(result, [](BIO* bio, char* data, int size)
+            { DWORD count = 0; return ::ReadFile(BIO_get_data(bio), data, DWORD(size), &count, nullptr) ? int(count) : -1; }) == 1 &&
+            BIO_meth_set_ctrl(result, [](BIO*, int command, long, void*) -> long { return command == BIO_CTRL_FLUSH; }) == 1)
+            return result;
+        BIO_meth_free(result); return static_cast<BIO_METHOD*>(nullptr);
+    }(), BIO_meth_free);
+    std::unique_ptr<BIO, decltype(&BIO_free_all)> file(BIO_new(BIO_f_buffer()), BIO_free_all);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input(method ? BIO_new(method.get()) : nullptr, BIO_free);
+    require(file && input, "cannot read network certificate");
+    BIO_set_data(input.get(), handle.value); BIO_set_init(input.get(), 1); BIO_push(file.get(), input.release());
+#else
+    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
+    require(bool(file), "cannot read network certificate");
+#endif
+    return {PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free};
+}
 Context context(TlsOptions const& options, bool server)
 {
     require(!options.ca_file.empty() && !options.cert_file.empty() && !options.key_file.empty(),
@@ -324,8 +354,9 @@ Context context(TlsOptions const& options, bool server)
     }
     require(SSL_CTX_load_verify_locations(result.get(), options.ca_file.c_str(), nullptr) == 1,
             "cannot load network TLS CA");
-    require(SSL_CTX_use_certificate_chain_file(result.get(), options.cert_file.c_str()) == 1 &&
-        SSL_CTX_use_PrivateKey_file(result.get(), options.key_file.c_str(), SSL_FILETYPE_PEM) == 1 &&
+    require((load_bundled_tls_identity(options, result.get()) ||
+        (SSL_CTX_use_certificate_chain_file(result.get(), options.cert_file.c_str()) == 1 &&
+         SSL_CTX_use_PrivateKey_file(result.get(), options.key_file.c_str(), SSL_FILETYPE_PEM) == 1)) &&
         SSL_CTX_check_private_key(result.get()) == 1, "cannot load matching network TLS certificate and key");
     return result;
 }
@@ -925,19 +956,13 @@ std::string random_token()
 }
 std::string certificate_identity(std::string const& path)
 {
-    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
-    require(bool(file), "cannot read network certificate");
-    std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
-    return fingerprint(certificate.get());
+    return fingerprint(certificate_from_file(path).get());
 }
 void validate_tls_credentials(TlsOptions const& options)
 { (void)context(options, false); }
 std::string certificate_node_id(std::string const& path)
 {
-    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
-    require(bool(file), "cannot read network certificate");
-    std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
-    return node_identity(certificate.get());
+    return node_identity(certificate_from_file(path).get());
 }
 bool numeric_host(std::string const& value)
 {

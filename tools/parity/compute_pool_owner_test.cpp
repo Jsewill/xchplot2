@@ -54,19 +54,17 @@ std::vector<uint8_t> contents(fs::path const& path)
 struct PrefetchEncoder final : RemoteEncoder
 {
     std::shared_ptr<PoolRemoteEncoder> remote;
-    std::shared_ptr<CodecScheduler> scheduler;
-    std::function<void()> generation;
+    std::function<std::future<void>()> prefetch;
     std::future<void> pending;
     bool queued = false;
-    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider,
-                    std::shared_ptr<CodecScheduler> cpu, std::function<void()> work)
-        : remote(std::move(provider)), scheduler(std::move(cpu)), generation(std::move(work)) {}
+    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider, std::function<std::future<void>()> start)
+        : remote(std::move(provider)), prefetch(std::move(start)) {}
     ~PrefetchEncoder() { if (pending.valid()) pending.wait(); }
     std::optional<RemoteEncodedWindow> encode(uint8_t k, std::span<ChunkInput const> chunks, bool summaries) override
     {
         auto result = remote->encode(k, chunks, summaries);
         if (!result && !queued && !chunks.empty() && !chunks.front().contributions.empty())
-        { pending = scheduler->submit(generation); queued = true; }
+        { pending = prefetch(); queued = true; }
         return result;
     }
     void observe_local(uint8_t k, std::span<ChunkInput const> chunks,
@@ -113,12 +111,27 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     WorkerService pressure(pressure_config);
     auto backend = std::make_unique<Backend>(); backend->cpu_scheduler = scheduler;
     backend->initialize(args, requested, 0, false); backend->configure_network(args);
-    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, scheduler, [&]
+    auto generate_successor = [&]
     {
         auto const id = requested.params.get_plot_params_for_index(uint16_t(args.max_members)).get_plot_id().data();
         WorkerCancellation cancel; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         pressure.generate_local(18, 2, id, [](auto const&, uint64_t) {}, cancel, pool::Kind::GenerateCpu);
         ++completed_prefetch;
+    };
+    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, [&]
+    {
+        // Generation can leave a cached observation of its occupied slot.
+        // Wait for the owner to see the idle worker before timing local queue pressure.
+        auto const client = backend->acquire_pool_client();
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        for (;;)
+        {
+            auto const capacity = client->generation_capacity(18, 2);
+            if (capacity.slots && capacity.availability.codec_available) break;
+            require(std::chrono::steady_clock::now() < until, "publication worker did not become available after generation");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return scheduler->submit(generate_successor);
     });
     backend->test_remote = encoder;
     std::vector<std::vector<uint64_t>> raw;
@@ -376,17 +389,25 @@ void owner_broker_restart()
     auto const raw_reference = directory.path / "restart-raw-reference.gplot";
     { Engine engine(raw_reference.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(Members(expected).subspan(0, 1)).accepted, "restart raw reference did not fit"); }
+    auto restart_after_retries = [&](auto& task, uint64_t before)
+    {
+        // A refused connection can take a full socket timeout. Bring the
+        // broker back after two observed retries with the task still pending.
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        while (backend.pool_retries.load() < before + 2 && std::chrono::steady_clock::now() < until &&
+            task.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout) {}
+        bool const pending = backend.pool_retries.load() >= before + 2 &&
+            task.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+        broker = std::make_unique<RunningBroker>(options);
+        return pending;
+    };
     uint64_t const raw_retries = backend.pool_retries.load();
     broker.reset();
     auto raw = std::async(std::launch::async, [&] { return backend.generate_pool(requested, 0, args); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_raw = raw.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_raw, "raw owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(raw, raw_retries), "raw owner did not stay pending across two broker retries");
     require(raw.wait_for(std::chrono::seconds(8)) == std::future_status::ready,
         "raw owner did not recover within its original task deadline");
     std::vector<Member> member; member.push_back(raw.get());
-    require(backend.pool_retries.load() > raw_retries + 1, "raw owner did not survive the old retry limit");
     auto const raw_path = directory.path / "restart-raw.gplot";
     { Engine engine(raw_path.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(member).accepted, "restarted raw owner append did not fit"); }
@@ -406,13 +427,10 @@ void owner_broker_restart()
         producer.defer_pool_history = true;
         return producer.fill_contributions(*input, 0, 0, producer.contribution_bytes(cfg, 2), "restart member ");
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_contribution = contribution.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_contribution, "contribution owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(contribution, contribution_retries),
+        "contribution owner did not stay pending across two broker retries");
     require(contribution.wait_for(std::chrono::seconds(8)) == std::future_status::ready && contribution.get() == 2,
         "contribution owner did not recover its complete membership");
-    require(backend.pool_retries.load() > contribution_retries + 1, "contribution owner did not survive the old retry limit");
     require(engine.append(*input).accepted, "restarted contribution append did not fit"); input.reset(); engine.finish();
     auto const contribution_reference = directory.path / "restart-contributions-reference.gplot";
     { Engine reference(contribution_reference.string(), cfg, false, initial); reference.confirm_identity();

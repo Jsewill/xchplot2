@@ -1802,16 +1802,19 @@ def check(binary, root, reference=None):
     expected = None
     scratch = root / "engine scratch"
     scratch.mkdir()
-    for mode, point in (("incremental", "initialized"), ("staged", "stage-run-committed"),
+    for mode, point in (("incremental", "initialized"), ("incremental", "direct-target-partial"), ("staged", "stage-run-committed"),
                         ("merged", "merge-index-flushed"), ("external", "external-header-flushed")):
-        engine = ["plot", "-k", 18, *keys, "-S", SEED, "-o", root / (mode + " recovered"),
+        directory = root / (point + " recovered")
+        engine = ["plot", "-k", 18, *keys, "-S", SEED, "-o", directory,
                   "--group-members", 3, "--batch-members", 2, "--construction", mode,
                   *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+        if point == "direct-target-partial":
+            # The fresh two-member payload fits in one coalesced Windows output buffer.
+            engine[engine.index("--window-bytes") + 1] = "16M"
         run(*engine, point=point, code=86)
-        directory = root / (mode + " recovered")
         assert not list(directory.glob("*.gplot")), "unfinished group has a public filename"
         partial, = directory.glob("*.gplot.partial")
-        if mode == "incremental":
+        if point == "initialized":
             # A competing final name must neither replace nor hide either file.
             final = partial.with_suffix("")
             final.write_bytes(b"occupied publication")

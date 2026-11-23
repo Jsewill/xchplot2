@@ -918,6 +918,19 @@ target_include_directories(pos2_gpu PUBLIC
 )
 target_link_libraries(pos2_gpu PUBLIC pos2_chip_headers)
 target_compile_features(pos2_gpu PUBLIC cxx_std_20)
+if(WIN32)
+    find_path(XCHPLOT2_WINDOWS_HIP_INCLUDE hip/hip_runtime_api.h HINTS ENV HIP_PATH PATH_SUFFIXES include)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("#include <dxcore_interface.h>
+        int main() { return int(DXCoreAdapterState::AdapterMemoryUsageBytes); }" XCHPLOT2_DXCORE_MEMORY)
+    if(XCHPLOT2_WINDOWS_HIP_INCLUDE AND XCHPLOT2_DXCORE_MEMORY)
+        target_sources(pos2_gpu PRIVATE src/host/WindowsHipBudget.cpp)
+        # The versioned HIP properties type is used in this host-only source, away from CUDA headers.
+        set_source_files_properties(src/host/WindowsHipBudget.cpp PROPERTIES
+            INCLUDE_DIRECTORIES "${XCHPLOT2_WINDOWS_HIP_INCLUDE}" COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__=1")
+        target_compile_definitions(pos2_gpu PRIVATE XCHPLOT2_WINDOWS_HIP_BUDGET=1)
+    endif()
+endif()
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()

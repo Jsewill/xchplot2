@@ -2076,7 +2076,8 @@ struct Producer
             while (wanted - values.size() > 1)
             {
                 size_t const start = values.size();
-                size_t n = client->packed_generation_width(k, strength, unsigned(wanted - start), destinations);
+                group_grow::WorkerPackedRoute batch_route;
+                size_t n = client->packed_generation_width(k, strength, unsigned(wanted - start), destinations, &batch_route);
                 if (n < 2) break;
                 uint64_t const held = sum(sum(sum(fixed, backend.retained()), other_retained), resident(values));
                 while (n > 1 && sum(held, pool_receive_bytes(uint16_t(first + start), n)) > budget) --n;
@@ -2103,7 +2104,7 @@ struct Producer
                         require(!received.empty(), "packed batch has no member prelude");
                         received.back()->append(tile);
                         progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
-                    }, cancel, {}, other_work_until);
+                    }, cancel, {}, other_work_until, &batch_route);
                     complete = true;
                 }
                 catch (group_grow::pool::UnsupportedResources const&) {}
@@ -2260,7 +2261,7 @@ struct Producer
     };
     static_assert(2 * sizeof(PendingMember) < mib); // Existing controller reserve.
     std::unique_ptr<PendingMember> generate_pending(uint16_t index, uint64_t retained,
-                                                   group_grow::MemberBatchHash* hash)
+                                                   group_grow::MemberBatchHash* hash, bool borrowed_output)
     {
         require(fits(index, retained), "member producer exceeds --max-ram or available host memory");
         uint64_t const count = fragment_bound(identity.params) / sizeof(uint64_t);
@@ -2275,7 +2276,10 @@ struct Producer
         pending->cpu_scheduler = backend.cpu_scheduler;
         auto const plot_id = identity.params.get_plot_params_for_index(index).get_plot_id().data();
         auto* const state = pending.get();
-        if (backend.gpu->compact_transfer_available())
+        if (borrowed_output)
+            pending->ready = backend.gpu->generate_borrowed_into_async(plot_id,
+                [state](std::span<uint64_t const> fragments) { state->consume(fragments, fragments.size()); }, [] {});
+        else if (backend.gpu->compact_transfer_available())
             pending->ready = backend.gpu->generate_packed_into_async(plot_id,
                 [state](group_grow::PackedFragmentTile const& tile, uint64_t total) { state->consume_packed(tile, total); });
         else
@@ -2291,7 +2295,7 @@ struct Producer
     // count its maximum storage before admitting the next device generation.
     size_t fill(std::vector<group_grow::Member>& values, uint16_t first, size_t wanted,
                 uint64_t other_retained, group_grow::MemberBatchHash* hash, MemberLease* lease,
-                std::string const& progress, std::function<bool()> const& stop = {})
+                std::string const& progress, std::function<bool()> const& stop = {}, bool resident_input = false)
     {
         fill_stop = FillStop::full;
         size_t const before = values.size();
@@ -2309,7 +2313,37 @@ struct Producer
         auto const begin = std::chrono::steady_clock::now();
         bool borrowable = lease && can_borrow(sum(other_retained, resident(values)));
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+        struct BorrowedOutput
+        {
+            group_grow::GpuProducer* gpu = nullptr;
+            void release() { if (gpu) { gpu->release_host_output(); gpu = nullptr; } }
+            ~BorrowedOutput()
+            {
+                if (!gpu) return;
+                // During unwinding, retire any failed future before releasing
+                // its pinned memory, preserving the original exception.
+                try { gpu->wait_for_output(); } catch (...) {}
+                try { release(); } catch (...) {}
+            }
+        } borrowed;
         std::unique_ptr<PendingMember> pending;
+        bool considered_borrowed = false;
+        auto admit_borrowed = [&](size_t remaining, uint64_t retained, uint64_t pending_allocation)
+        {
+            uint64_t const compact = group_grow::Member::compact_bytes(uint8_t(identity.params.get_k()),
+                fragment_bound(identity.params) / sizeof(uint64_t));
+            uint64_t const host = backend.gpu->host_borrowed_generation_peak_bytes();
+            uint64_t const destinations = product(remaining, compact);
+            uint64_t const proposed = sum(sum(fixed, retained), sum(host, destinations));
+            auto const held = backend.retained();
+            auto const available = available_host_bytes();
+            uint64_t const growth = sum(sum(host > held ? host - held : 0, destinations), pending_allocation);
+            if (proposed > budget || !available || growth > *available) return false;
+            if (!borrowed.gpu && !backend.gpu->try_prepare_borrowed_output()) return false;
+            borrowed.gpu = backend.gpu.get();
+            peak = std::max(peak, proposed); generation_peak = std::max(generation_peak, sum(host, compact));
+            return true;
+        };
         auto finish_pending = [&]
         {
             if (pending)
@@ -2342,11 +2376,12 @@ struct Producer
 #endif
             bool admitted = fits(index, retained, borrow, pending_allocation);
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-            if (!admitted && pending)
+            if (!admitted && (pending || borrowed.gpu))
             {
-                // Retry with the completed member's actual allocation before
-                // reducing the batch for a conservative pending-member bound.
+                // Retry at the ordinary tiled peak after draining the prior
+                // callback and dropping the optional full-size pinned slot.
                 finish_pending();
+                borrowed.release();
                 continue;
             }
 #endif
@@ -2367,11 +2402,25 @@ struct Producer
             }
             if (args.command.empty() || args.verbose) std::cerr << progress << index << '\n';
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-            if (backend.gpu && backend.gpu->member_overlap_available())
+            if (!considered_borrowed)
+            {
+                considered_borrowed = true;
+                if (resident_input && !args.protected_resources && backend.generation_overlap &&
+                    args.member_storage == "compact" && backend.gpu && backend.gpu->tier() == "pool" &&
+                    !backend.gpu->member_overlap_available() && wanted - count >= 2)
+                    (void)admit_borrowed(wanted - count, retained, pending_allocation);
+            }
+            else if (borrowed.gpu && !admit_borrowed(wanted - count, retained, pending_allocation))
+            {
+                finish_pending();
+                borrowed.release();
+                continue;
+            }
+            if (backend.gpu && (backend.gpu->member_overlap_available() || borrowed.gpu))
             {
                 bool const overlaps = pending &&
                     pending->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-                auto next = generate_pending(index, retained, hash);
+                auto next = generate_pending(index, retained, hash, borrowed.gpu != nullptr);
                 finish_pending();
                 pending = std::move(next);
                 if (overlaps) ++overlap_members;
@@ -2383,6 +2432,7 @@ struct Producer
         }
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         finish_pending();
+        borrowed.release();
 #endif
         size_t const added = values.size() - before;
         if (added)
@@ -5433,7 +5483,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             incoming.reserve(wanted);
             require(incoming.capacity() <= batch_cap, "member container exceeds admitted capacity");
             metrics.generated_members += producer.fill(incoming, uint16_t(metrics.members), size_t(wanted), prefetched.resident_bytes(),
-                hash.get(), &borrowed, fixture ? "loading fixture member " : "generating " + backend->mode + " member ");
+                hash.get(), &borrowed, fixture ? "loading fixture member " : "generating " + backend->mode + " member ", {}, !engine.external);
         }
         producer.admit_engine(incoming, prefetched.resident_bytes());
         std::optional<group_grow::AppendResult> appended;
@@ -17544,7 +17594,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                             return other->ready.valid() && other->ready.wait_for(std::chrono::seconds(0)) ==
                                 std::future_status::ready;
                         });
-                });
+                }, !d.engine->external);
             task.fill_stop = wanted ? producer.fill_stop : Producer::FillStop::requested;
             require(!wanted || !task.members.empty(), "destination producer returned an empty batch");
             require(!d.needs_resume || task.members.size() == wanted, "saved destination batch exceeds --max-ram");

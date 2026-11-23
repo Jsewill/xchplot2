@@ -74,6 +74,16 @@ struct WorkerGenerationCapacity
     uint64_t control_ns = 0;
     std::shared_ptr<pool::GenerationRoster const> roster;
 };
+struct WorkerPackedRoute
+{
+    pool::GenerationRoute route;
+    pool::Kind kind = pool::Kind::GenerateAny;
+    bool matches(pool::Lease const& lease) const
+    {
+        return kind == lease.task.kind && route.identity == lease.worker_identity &&
+            route.instance == lease.worker_instance && route.endpoint == lease.endpoint;
+    }
+};
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
@@ -142,6 +152,7 @@ struct WorkerTaskOptions
     std::function<bool(unsigned)> queued_generation;
     // Expected completion of other known work on independent destinations.
     std::chrono::steady_clock::time_point other_work_until{};
+    WorkerPackedRoute const* packed_route = nullptr;
 };
 class WorkerAlreadyRunning : public std::runtime_error
 {
@@ -353,7 +364,7 @@ public:
                   std::chrono::steady_clock::time_point other_work_until = {});
     bool generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
-        std::chrono::steady_clock::time_point other_work_until = {});
+        std::chrono::steady_clock::time_point other_work_until = {}, WorkerPackedRoute const* batch_route = nullptr);
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
@@ -380,7 +391,8 @@ public:
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
-    unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations) const;
+    unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
+                                     WorkerPackedRoute* batch_route = nullptr) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     // A zero joint width selects the independent pipeline for this ready work.

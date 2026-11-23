@@ -2,6 +2,8 @@
 #include "host/GroupFarmResources.hpp"
 #include <iostream>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <shellapi.h>
 #else
 #include <sys/mman.h>
@@ -269,6 +271,10 @@ int direct(std::string const& mode)
 }
 int fake_worker(std::vector<std::string> args)
 {
+#ifdef _WIN32
+    // The parent checks the exact bytes its bounded pipe collected.
+    check(::_setmode(::_fileno(stdout), _O_BINARY) != -1, "cannot set fixture worker output to binary mode");
+#endif
     bool const proof_worker = args.size() >= 18 && args[12] == "--replot-proof-worker";
     bool const structure_worker = args.size() >= 18 && args[12] == "--replot-structure-worker";
     if (proof_worker || structure_worker) args.erase(args.begin() + 12);
@@ -386,8 +392,22 @@ void monitor_fixture(process::Limits const& limits)
     paused = false;
     try
     {
-        process::run_worker("hang", 1, limits, process::Worker::migration_proof, 1, 1,
-            [](SupervisedProcess const&) -> bool { throw ProcessObservationUnavailable(); });
+        process::run_worker("hang", 1, limits, process::Worker::migration_proof, 1, 1, [&](SupervisedProcess const& held) -> bool
+        {
+#ifdef _WIN32
+            // The supervisor can still wait for this exact child, but neither
+            // source of resident-memory counters may credit a wait-only handle.
+            process::NativeHandle wait_only;
+            check(::DuplicateHandle(::GetCurrentProcess(), held.handle, ::GetCurrentProcess(), &wait_only.value, SYNCHRONIZE, FALSE, 0),
+                "cannot restrict fixture proof handle");
+            auto restricted = held; restricted.handle = wait_only.value;
+            check(!resource_detail::private_working_set(restricted.handle), "unqueryable proof handle received resident-memory credit");
+            (void)sampler.sample(profile, Clock::now(), cpu.capacity, &restricted, true);
+            return true;
+#else
+            (void)held; throw ProcessObservationUnavailable();
+#endif
+        });
     }
     catch (process::WorkerPaused const&) { paused = true; }
     check(paused, "missing counters admitted a still-running proof worker");

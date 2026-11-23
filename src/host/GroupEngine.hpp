@@ -440,6 +440,16 @@ private:
     void read_at(uint64_t offset, std::span<uint8_t> bytes) const;
     std::span<uint8_t const> source_window(uint64_t offset, uint64_t bytes, bool reverse);
     void write_at(uint64_t offset, std::span<uint8_t const> bytes) const;
+    static void copy_blocks(std::span<uint8_t> destination, std::span<EncodedBlock const> blocks)
+    {
+        for (auto const& block : blocks)
+        {
+            require(block.bytes.size() <= destination.size(), "encoded output block size mismatch");
+            std::copy(block.bytes.begin(), block.bytes.end(), destination.begin());
+            destination = destination.subspan(block.bytes.size());
+        }
+        require(destination.empty(), "encoded output block size mismatch");
+    }
     void write_blocks(uint64_t offset, std::span<EncodedBlock const> blocks,
                       uint64_t begin, uint64_t length) const;
     void sync() const;
@@ -1789,6 +1799,9 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
     PackingCheckpointHistory checkpoint_history;
     auto interval = std::chrono::steady_clock::now();
     uint64_t buffered = 0;
+#ifdef _WIN32
+    std::unique_ptr<uint8_t[]> output;
+#endif
     while (next.remaining)
     {
         config_.check_running();
@@ -1813,6 +1826,18 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
             offset += size;
         }
         uint64_t const length = offset - next.new_frontier, partial = length / 2;
+#ifdef _WIN32
+        // Windows writes and waits on each span. Gather a fresh codec window
+        // into the admitted output buffer before the two midpoint writes.
+        if (window->blocks.size() > 1 && length <= config_.window_bytes)
+        {
+            if (!output) output.reset(new uint8_t[size_t(config_.window_bytes)]);
+            std::span<uint8_t> bytes{output.get(), size_t(length)};
+            copy_blocks(bytes, window->blocks);
+            window->blocks.resize(1);
+            window->blocks.front() = {0, size_t(count), bytes};
+        }
+#endif
         write_blocks(next.new_frontier, window->blocks, 0, partial);
         grow_failpoint("direct-target-partial");
         write_blocks(next.new_frontier + partial, window->blocks, partial, length - partial);
@@ -2019,14 +2044,7 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
             flush_output();
         if (!output) output.reset(new uint8_t[size_t(config_.window_bytes)]);
         auto* destination = output.get() + size_t(config_.window_bytes - output_bytes - length);
-        uint64_t copied = 0;
-        for (auto const& block : blocks)
-        {
-            require(block.bytes.size() <= length - copied, "encoded output block size mismatch");
-            std::memcpy(destination + size_t(copied), block.bytes.data(), block.bytes.size());
-            copied += block.bytes.size();
-        }
-        require(copied == length, "encoded output block size mismatch");
+        copy_blocks({destination, size_t(length)}, blocks);
         output_begin = offset; output_bytes += length;
     };
     PackingCheckpointHistory checkpoint_history;

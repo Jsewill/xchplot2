@@ -21,7 +21,7 @@ inline void bounded_text(std::string const& text, size_t bound = 4096)
 inline fs::path relative(std::string const& value)
 {
     bounded_text(value); auto result = file_io::native_path(value);
-    require(!result.empty() && !result.is_absolute() && !result.has_root_name(), "inventory path must be relative");
+    require(!result.empty() && !result.has_root_path(), "inventory path must be relative");
     for (auto const& component : result)
     {
         require(component != "." && component != ".." && !component.empty(), "invalid inventory path component");
@@ -29,6 +29,9 @@ inline fs::path relative(std::string const& value)
         require(component.native().find(L':') == std::wstring::npos, "alternate data streams cannot identify an inventory source");
 #endif
     }
+    // Handle-resolved Windows paths use the extended namespace, which does
+    // not translate the slash separators stored in inventory and claim names.
+    result.make_preferred();
     return result;
 }
 struct Handle
