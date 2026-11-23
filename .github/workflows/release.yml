@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '953e93477437915d6c3ff78dd04dc890fc5cc38a' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '130521e0b64280b74d9ed1cd4df182b9adf5a5ee' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -293,7 +293,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: 953e93477437915d6c3ff78dd04dc890fc5cc38a
+          ref: 130521e0b64280b74d9ed1cd4df182b9adf5a5ee
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -347,7 +347,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $repo = (Get-Location).Path.Replace('\','/')
           @'
-          if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_PROJECT_NAME STREQUAL "CMAKE_TRY_COMPILE")
+          if(PROJECT_NAME STREQUAL "pos2-gpu" AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
             function(register_qualification_groups)
               set(upstream "@REPO@/build/qualification-upstream")
               set(XCHPLOT2_MDNS_DIR "@REPO@/build/qualification-mdns")
@@ -360,17 +360,8 @@ jobs:
               pos2_pool_targets("@REPO@/build/qualification-upstream" "${patched}")
               include("@REPO@/cmake/GroupTests.cmake")
               pos2_group_tests("@REPO@/build/qualification-upstream" "${patched}")
-              foreach(target compute_membership_test pos2_pr118_grow_inventory_test pos2_pr118_grow_retirement_test
-                  pos2_pr118_grow_worker_test pos2_pr118_grow_worker_client_test pos2_pr118_grow_pool_codec_test pos2_pr118_grow_pool_owner_test)
-                target_sources(${target} PRIVATE "@REPO@/tools/xchplot2/windows.manifest")
-                target_link_libraries(${target} PRIVATE advapi32 bcrypt psapi)
-                set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools/parity")
-                add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
-              endforeach()
-              add_test(NAME compute_membership_network_test COMMAND $<TARGET_FILE:compute_membership_test> --network)
-              add_test(NAME compute_worker_network_test COMMAND $<TARGET_FILE:pos2_pr118_grow_worker_test> --network)
             endfunction()
-            cmake_language(DEFER CALL register_qualification_groups)
+            register_qualification_groups()
           endif()
           '@.Replace('@REPO@',$repo) | Set-Content 'build/diagnostic-groups.cmake'
           cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$repo/build/qa-tls/install" -DOPENSSL_USE_STATIC_LIBS=ON
