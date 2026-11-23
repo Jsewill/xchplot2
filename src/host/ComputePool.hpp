@@ -32,6 +32,11 @@ class StaleOwnerSession : public std::runtime_error
 public:
     using std::runtime_error::runtime_error;
 };
+class BrokerRestarted : public StaleOwnerSession
+{
+public:
+    using StaleOwnerSession::StaleOwnerSession;
+};
 class StaleDelivery : public std::runtime_error
 {
 public:
@@ -236,6 +241,33 @@ struct BrokerStatusPage
     std::vector<BrokerOwnerStatus> owner_records;
     std::vector<BrokerJobStatus> job_records;
 };
+// Eligible singleton generation routes for this owner request. CPU and GPU
+// figures on the same worker draw from the same partition. Like a capacity
+// hint, this snapshot does not reserve any worker or change its admission.
+struct GenerationRoute
+{
+    std::string identity, instance;
+    Endpoint endpoint;
+    std::string host, gpu_identity;
+    uint32_t cpu_slots = 0, gpu_slots = 0;
+    bool operator==(GenerationRoute const&) const = default;
+};
+struct GenerationRoster
+{
+    // At most one ordinary status page. Aggregate slot counts still cover
+    // the whole registry when additional rows do not fit this observation.
+    std::vector<GenerationRoute> routes;
+    bool complete = true;
+    bool operator==(GenerationRoster const&) const = default;
+};
+struct GenerationAdmission
+{
+    uint32_t registered = 0, eligible = 0, available_slots = 0, other_owner_tasks = 0;
+    // Registered workers unable to start this singleton at observation time.
+    // The broker can still defer an available slot for another owner or grant.
+    std::array<uint32_t, size_t(WaitReason::SlotReserved) + 1> waiting{};
+    bool operator==(GenerationAdmission const&) const = default;
+};
 // Bounded persistent TLS channels, shared by copies and per-task deadlines.
 // A channel has one request in flight. A failed request is never replayed.
 // Control frames use a fixed 65536-byte bound independent of bulk-data frames.
@@ -277,6 +309,7 @@ public:
         bool codec_available = true, concurrent_codec = true;
         // Total eligible slots for an independent request of each width.
         std::array<uint32_t, max_generation_batch_members + 1> independent_slots{};
+        std::optional<GenerationAdmission> admission;
         unsigned independent_width(unsigned limit) const
         {
             if (limit > max_generation_batch_members) limit = max_generation_batch_members;
@@ -285,7 +318,8 @@ public:
         }
     };
     uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr,
-        GenerationAvailability* availability = nullptr, std::string const& codec = {});
+        GenerationAvailability* availability = nullptr, std::string const& codec = {},
+        std::shared_ptr<GenerationRoster const>* roster = nullptr);
     void cancel(OwnerSession const&, std::string const& task_id, uint64_t attempt);
     // Only the worker renews Running work; unused grants have a fixed TTL.
     void renew(Lease const&);

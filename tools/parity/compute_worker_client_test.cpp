@@ -259,6 +259,36 @@ void planning_feedback()
     auto const partial = mixed_link.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(partial.receivers == 2 && std::abs(partial.member_ns - 10500.L / 17) < 1e-6L,
         "the forecast did not time-share workers at the shared link limit");
+    {
+        Planning adapters(1000);
+        auto first = link_heavy, second = link_heavy; second.worker_identity = "second-adapter-worker";
+        first.ingress_interface = second.ingress_interface = 7; train(adapters, first, route); train(adapters, second, route);
+        auto estimate = [&] { return adapters.estimate(18, 2, first.kind, Output::Contributions, 2, 1, now); };
+        require(std::abs(estimate().member_ns - 900) < 1e-6L, "two workers on one adapter consumed two link budgets");
+        second.ingress_interface = 9; train(adapters, second, route);
+        require(std::abs(estimate().member_ns - 500) < 1e-6L && estimate().receivers == 2,
+            "workers on distinct physical adapters could not receive in parallel");
+        // The fast adapter saturates part way through a second receiver.
+        // Give the remaining receiver time to the other physical link.
+        second.generation = {1500, 500, 500, 0}; second.ingress_interface = 11; train(adapters, second, route);
+        long double const expected = 1 / (1.L / 900 + (2 - 1000.L / 900) / 2000);
+        require(std::abs(estimate().member_ns - expected) < 1e-6L,
+            "separate links consumed more than the shared owner receiver budget");
+        second.ingress_interface = 0; second.generation = first.generation; train(adapters, second, route);
+        require(std::abs(estimate().member_ns - 900) < 1e-6L, "an unresolved path was assumed independent of a physical adapter");
+        first.ingress_interface = 3; second.ingress_interface = 3;
+        first.generation.frame_read_ns = second.generation.frame_read_ns = 100;
+        first.generation.receiver_ns = second.generation.receiver_ns = 200;
+        train(adapters, first, route); train(adapters, second, route);
+        require(std::abs(estimate().member_ns - 550) < 1e-6L, "receiver stalls were charged again as link occupancy");
+    }
+    {
+        Planning widths(1000); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
+        packed.generation = {70, 30, 30, 0}; train(widths, packed, route);
+        packed.work_units = 2; packed.generation = {100, 20, 20, 0}; train(widths, packed, route);
+        auto price = [&](unsigned width) { return widths.estimate(18, 2, packed.kind, Output::Packed, 1, width, now).member_ns; };
+        require(price(1) == 150 && price(2) == 85, "packed widths lost their own delivery and connection setup costs");
+    }
     Planning dual_backend(1000);
     link_heavy.worker_slots = 1;
     auto efficient_cpu = link_heavy; efficient_cpu.generation = {1080, 120, 120, 0};
@@ -613,6 +643,103 @@ template <typename Operation> void bounded_failure(Operation&& operation)
         "client waited for the longer socket timeout after its task deadline");
 }
 
+void confirmed_generation_prior()
+{
+    using Planning = worker_detail::GenerationPlanning;
+    pool::Endpoint endpoint{"192.0.2.1", 4000};
+    WorkerTaskObservation task; task.worker_identity = "worker"; task.worker_instance = "active";
+    task.k = 18; task.strength = 2; task.work_units = 1; task.kind = pool::Kind::GenerateGpu;
+    task.worker_slots = 1; task.execution_ns = 100; task.transfer_ns = 20; task.connect_ns = 5;
+    task.ingress_interface = 7; task.generation = {100, 20, 20, 10, 20};
+    auto routes = std::make_shared<pool::GenerationRoster>();
+    routes->routes.push_back({"worker","active",endpoint,"host","device",0,1});
+    unsigned lookups = 0;
+    Planning planner(10000, [&](auto const& observed, auto const& route, uint64_t compute, uint64_t wire) {
+        ++lookups;
+        require(route.instance == observed.worker_instance && compute == 100 && wire > 0, "incorrect dated calibration input");
+        return WorkerGenerationPrior{90,120,15,25,std::chrono::seconds(1),2,12345};
+    });
+    auto forecast = [&](unsigned width = 1) { return planner.estimate(18, 2, task.kind, task.generation_output, 1, width); };
+    auto receive = [&] {
+        auto const ticket = planner.selected(task, endpoint);
+        planner.observed(task, endpoint, ticket); planner.released(task.worker_identity, ticket);
+    };
+    planner.capacity(18, 2, routes, planner.selections());
+    require(!forecast().member_ns && !lookups, "a saved prior licensed an unobserved route");
+    receive();
+    auto const confirmed = forecast();
+    require(confirmed.dated_prior && confirmed.prior_min_samples == 2 && confirmed.prior_oldest_utc == 12345 &&
+        std::abs(confirmed.member_ns - 150) < 0.001 && !forecast(2).member_ns && lookups == 1,
+        "a confirmed 120 ns worker ceiling plus 25 ns wire and 5 ns setup did not price the exact width");
+    require(!planner.estimate(18, 2, task.kind, task.generation_output, 1, 1, Clock::now() + std::chrono::seconds(2)).member_ns,
+        "a long-running owner kept a confirmed prior after its dated source expired");
+    auto changed = std::make_shared<pool::GenerationRoster>(*routes); changed->routes.front().gpu_slots = 2;
+    planner.capacity(18, 2, changed, planner.selections());
+    require(!forecast().member_ns, "a changed offer kept the previous dated forecast");
+    task.generation.frame_read_ns = task.generation.send_ns = 40; receive();
+    require(!forecast().member_ns, "a current link slower than the dated range accepted the prior");
+    receive();
+    require(forecast().member_ns > 0 && !forecast().dated_prior, "live samples failed to replace older evidence");
+    task.ingress_interface = 0; receive();
+    require(!forecast().member_ns && lookups == 3, "an unknown physical ingress reused the dated route");
+    task.ingress_interface = 7; task.generation.frame_read_ns = task.generation.send_ns = 20; receive();
+    require(forecast().dated_prior, "restoring the measured ingress failed to reconfirm the prior");
+    auto const failed = planner.selected(task, endpoint); planner.failed(task, endpoint, failed);
+    planner.released(task.worker_identity, failed);
+    require(!forecast().member_ns, "a failed delivery left the dated route available for the following assignment");
+}
+void live_generation_routes()
+{
+    using Planning = worker_detail::GenerationPlanning;
+    auto const now = Clock::now();
+    pool::Endpoint old{"127.0.0.1", 49111}, added{"127.0.0.1", 49112};
+    WorkerTaskObservation value; value.worker_identity = "first"; value.worker_instance = "instance-a";
+    value.kind = pool::Kind::GenerateGpu; value.k = 18; value.strength = 2;
+    value.generation_output = pool::GenerationOutput::Contributions; value.work_units = value.worker_slots = 1;
+    value.execution_ns = value.transfer_ns = 100; value.generation = {100, 100, 100, 100};
+    pool::GenerationRoute first{value.worker_identity, value.worker_instance, old, {}, {}, 0, 1};
+    pool::GenerationRoute second{"second", "instance-b", added, {}, {}, 0, 1};
+    Planning planning(10000);
+    auto offers = [&](std::vector<pool::GenerationRoute> routes, bool complete = true)
+    {
+        auto roster = std::make_shared<pool::GenerationRoster>(); roster->routes = std::move(routes); roster->complete = complete;
+        planning.capacity(18, 2, roster, planning.selections(), now);
+    };
+    auto observe = [&](WorkerTaskObservation const& task, pool::Endpoint const& route)
+    {
+        auto const selection = planning.selected(task, route, now);
+        planning.observed(task, route, selection, now); planning.released(task.worker_identity, selection);
+    };
+    auto probe = [&] { return planning.probe_contribution_route(18, 2, now); };
+    auto measured = [&] { return planning.estimate(18, 2, value.kind, value.generation_output, 3, 1, now, 6).measured_slots; };
+    offers({first}); observe(value, old);
+    require(!probe() && measured() == 1, "one delivery did not price the existing GPU");
+    offers({first, second});
+    require(probe() && measured() == 1, "adding a GPU borrowed the established worker's delivery history");
+    auto newcomer = value; newcomer.worker_identity = second.identity; newcomer.worker_instance = second.instance;
+    auto wide = newcomer; wide.work_units = 3; wide.independent_members = true;
+    auto selection = planning.selected(wide, added, now);
+    require(planning.repartition_contributions(wide, now) == 1, "a late GPU was given an entire unmeasured pipeline");
+    planning.released(wide.worker_identity, selection);
+    selection = planning.selected(newcomer, added, now);
+    require(!probe(), "a pending first delivery kept throttling established GPU pipelines");
+    planning.observed(newcomer, added, selection, now); planning.released(newcomer.worker_identity, selection);
+    require(!probe() && measured() == 2, "a useful first delivery did not price the new route");
+    for (size_t i = 0; i <= Planning::maximum; ++i) observe(value, old);
+    require(!probe() && measured() == 2, "other assignments repeatedly retried a slow but currently offered worker");
+    offers({second}, false);
+    require(measured() == 2, "a truncated listing evicted an unlisted measured worker");
+    offers({second});
+    require(measured() == 1, "withdrawn generation capacity stayed in the forecast");
+    offers({first, second});
+    require(!probe() && measured() == 2, "resuming the same route forced an unnecessary cold trial");
+    auto late = planning.selected(value, old, now);
+    ++first.endpoint.port; offers({first, second});
+    require(probe() && measured() == 1, "an equal-slot endpoint replacement kept the old delivery cost");
+    planning.observed(value, old, late, now); planning.released(value.worker_identity, late);
+    require(measured() == 1, "an old route's late receipt reactivated its cost");
+}
+
 void network_deadlines()
 {
     pool_test::Directory directory;
@@ -623,6 +750,22 @@ void network_deadlines()
     auto other_key = pool_test::issue(directory.path, "admission-wrong-key", &ca);
     auto mismatched_key = tls; mismatched_key.key_file = pool_test::utf8_path(other_key.key_file);
     rejects([&] { pool::validate_tls_credentials(mismatched_key); });
+    {
+        pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+        auto broker = std::make_unique<RunningBroker>(options);
+        WorkerClientConfig config; config.broker = options.listen = broker->server.endpoint(); config.tls = tls;
+        config.owner_id = "idle-discovery"; WorkerClient client(config);
+        require(bool(client.generation_capacity(18, 2).roster), "cold discovery did not open its owner session");
+        broker.reset(); broker = std::make_unique<RunningBroker>(options);
+        auto const until = Clock::now() + std::chrono::seconds(5);
+        while (!client.generation_capacity(20, 2).roster && Clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(bool(client.generation_capacity(20, 2).roster), "idle discovery never recovered after a broker restart");
+        pool::BrokerClient control(config.broker, tls);
+        auto replacement = control.open_owner(config.owner_id);
+        require(!client.generation_capacity(22, 2).roster, "advisory discovery displaced a new owner in the same broker epoch");
+        control.close_owner(replacement);
+    }
     {
         StalledPeer peer(tls);
         WorkerClientConfig config; config.broker = peer.listener.endpoint(); config.tls = tls;
@@ -853,7 +996,7 @@ void assigned_local_and_fencing()
     WorkerClient client(config);
     auto const generation_slots = client.generation_capacity(18, 2).slots;
     require(generation_slots && generation_slots < offer.capacity.slots, "fixture requires CPU-limited generation capacity");
-    std::array<uint8_t, 32> id{};
+    std::array<uint8_t, 32> id{0x91};
     std::vector<std::array<uint8_t, 32>> oversized(pool::max_generation_batch_members + 1);
     rejects([&] { client.contributions(18, 2, oversized, [](auto, auto, auto) {}); });
     std::unique_ptr<CompactMemberReceiver> receiver;
@@ -889,6 +1032,7 @@ void assigned_local_and_fencing()
     });
     auto const timing = remote.stats();
     require(!remote_observation.local_direct && remote_observation.execution_ns &&
+        remote_observation.member_id_count == 1 && remote_observation.member_ids[0] == id &&
         sink_ns && remote_observation.transfer_ns >= sink_ns && timing.timed_generation_tasks == 1 &&
         timing.generation.worker_ns && timing.generation.send_ns && timing.generation.frame_wait_ns &&
         timing.generation.receiver_ns >= sink_ns && remote_observation.worker_slots == generation_slots &&
@@ -1180,6 +1324,7 @@ void expired_cleanup()
         task.resources = {1, 1, task.work_units * 20 + ChunkCodec::estimate_work(18, 0, 0), 0};
         auto lease = controller.acquire(session, task); require(bool(lease), "short codec task was not granted");
         auto channel = pool::Channel::connect(lease->endpoint, tls, lease->worker_identity);
+        require(!channel.ingress_interface(), "an authenticated same-host connection consumed a physical ingress budget");
         pool::Writer request(tls.max_frame_bytes); pool::write_lease(request, *lease);
         request.u32(25); request.u8(uint8_t(Operation::Encode)); request.u8(18); request.u8(2);
         request.u64(task.work_units); request.u64(task.max_output_bytes);
@@ -1406,6 +1551,92 @@ void session_memory_ownership()
     foreign.offer_local(pos2gpu::make_group_compute_offer(foreign_args));
     require(!foreign.local_worker() && !foreign.owned_worker_bytes(),
         "an already-running worker identity granted its foreign pages to another session");
+}
+
+void automatic_pool_growth()
+{
+    pool_test::Directory directory;
+    auto owner_id = pool::create_pool(directory.path / "owner", "storage");
+    auto options = [&](pool::PoolIdentity const& identity)
+    {
+        auto defaults = identity.defaults; defaults.interfaces = {"lo"}; defaults.max_brokers = 2;
+        defaults.cpus = 1; defaults.host_bytes = uint64_t(512) << 20; defaults.backend = "cpu";
+        pool::configure_pool(identity, defaults);
+        pos2gpu::GroupOptions args; args.pool_directory = pool_test::utf8_path(identity.directory);
+        args.max_ram = uint64_t(2) << 30; args.workers = 2; args.backend = "cpu"; args.backend_set = true;
+        args.pool_frame_bytes = args.window = 65536; args.pool_timeout_ms = 20000;
+        pos2gpu::prepare_group_compute(args); return args;
+    };
+    auto args = options(owner_id);
+    pos2gpu::ComputeSession session(args);
+    WorkerClientConfig config; config.broker = pool::parse_endpoint(args.pool_broker);
+    config.broker.server_name = owner_id.server_name; config.tls = owner_id.tls;
+    config.owner_id = args.pool_session_owner; config.ephemeral_owner = true;
+    config.generation_kind = pool::Kind::GenerateCpu; config.task_timeout_ms = 20000;
+    config.local_service_provider = [&] { return session.local_worker(); };
+    std::mutex mutex; std::vector<WorkerTaskObservation> deliveries; std::vector<size_t> rosters;
+    config.observe = [&](auto const& value) { std::lock_guard lock(mutex); deliveries.push_back(value); };
+    config.generation_capacity_changed = [&](uint8_t, uint8_t, WorkerGenerationCapacity const& value)
+    { if (value.roster && value.roster->complete) { std::lock_guard lock(mutex); rosters.push_back(value.roster->routes.size()); } };
+    WorkerClient client(config);
+    auto empty = client.generation_capacity(18, 2);
+    require(empty.roster && empty.roster->complete && empty.roster->routes.empty() && !empty.slots,
+        "cold automatic owner did not expose its empty broker before the first worker arrived");
+    std::promise<void> receiving, release; auto resume = release.get_future().share();
+    auto generate = [&](bool hold, unsigned members = 1)
+    {
+        std::vector<uint64_t> data; std::array<std::array<uint8_t, 32>, 2> ids{};
+        client.generate_packed(18, 2, std::span(ids).first(members), [&](PackedFragmentTile const& tile, uint64_t)
+        {
+            if (hold)
+            {
+                hold = false; receiving.set_value();
+                require(resume.wait_for(std::chrono::seconds(20)) == std::future_status::ready, "late worker did not relieve the original executor");
+            }
+            data.insert(data.end(), tile.boundaries.begin(), tile.boundaries.end());
+            data.insert(data.end(), tile.words.begin(), tile.words.end());
+        });
+        return data;
+    };
+    auto cold = std::async(std::launch::async, [&] { return generate(false); });
+    pool::BrokerClient control(config.broker, config.tls);
+    auto const queued_by = Clock::now() + std::chrono::seconds(5);
+    while (!control.status().queued && Clock::now() < queued_by) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    require(control.status().queued == 1, "empty broker failed to retain the pending owner's request");
+    session.offer_local(pos2gpu::make_group_compute_offer(args));
+    auto baseline = cold.get();
+    auto original = std::async(std::launch::async, [&] { return generate(true); });
+    require(receiving.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready, "original executor never began its delivery");
+    auto initial = client.generation_capacity(18, 2);
+    require(initial.roster && initial.roster->complete && initial.roster->routes.size() == 1 &&
+        initial.roster->routes.front().cpu_slots == 1 && !initial.roster->routes.front().gpu_slots,
+        "automatic owner did not observe its original CPU executor");
+    // Enroll and start the peer after an actual lease has delivered its
+    // first output. Both normal plotting sessions advertise on loopback.
+    auto invitation = directory.path / "addition.invite"; pool::invite_pool(owner_id, invitation, "addition");
+    auto helper_id = pool::join_pool(invitation, directory.path / "addition");
+    std::vector<uint64_t> remote;
+    {
+        auto helper_args = options(helper_id); pos2gpu::ComputeSession helper(helper_args);
+        helper.offer_local(pos2gpu::make_group_compute_offer(helper_args));
+        remote = generate(false, 2);
+    }
+    release.set_value(); auto local = original.get();
+    require(!local.empty() && local == baseline && remote.size() == local.size() * 2 &&
+        std::equal(local.begin(), local.end(), remote.begin()) && std::equal(local.begin(), local.end(), remote.begin() + local.size()),
+        "newly enrolled executor changed the live owner's ordered member data");
+    auto const until = Clock::now() + std::chrono::seconds(5);
+    auto current = client.generation_capacity(18, 2);
+    while ((!current.roster || *current.roster != *initial.roster) && Clock::now() < until)
+    { std::this_thread::sleep_for(std::chrono::milliseconds(50)); current = client.generation_capacity(18, 2); }
+    require(current.roster && *current.roster == *initial.roster && generate(false) == local,
+        "the same plotting owner did not continue on its original worker after departure");
+    std::lock_guard lock(mutex);
+    auto const helper = pool::certificate_identity(helper_id.tls.cert_file);
+    require(deliveries.size() == 5 && deliveries[1].worker_identity == helper && deliveries[2].worker_identity == helper &&
+        deliveries[1].work_units == 1 && !deliveries[1].local_direct && deliveries.back().local_direct &&
+        std::find(rosters.begin(), rosters.end(), 2) != rosters.end() && rosters.back() == 1,
+        "active job did not report and delegate to the late authenticated node before its departure");
 }
 
 void codec_window_limits()
@@ -1721,7 +1952,7 @@ void status_inspection()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); network_deadlines(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); confirmed_generation_prior(); live_generation_routes(); network_deadlines(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); automatic_pool_growth(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

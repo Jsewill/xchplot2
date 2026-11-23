@@ -125,7 +125,7 @@ int main(int argc, char** argv) try
         if (!discovery_set) discover = identity->defaults.discovery;
     }
     else if (discovery_set && discover)
-        throw std::runtime_error("LAN discovery needs saved pool membership; use compute init or compute join");
+        throw std::runtime_error("LAN discovery needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
     if (options.listen.host.empty() || !options.listen.port)
         throw std::runtime_error("broker needs saved pool membership, or --listen and explicit TLS credentials");
     stopping.store(false);

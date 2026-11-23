@@ -38,6 +38,7 @@ void help(bool all)
 #ifdef XCHPLOT2_GROUP_COMMANDS
         "Usage: xchplot2 compute worker [OPTIONS]\n"
         "  Uses saved pool membership and discovers plotting hosts on the LAN.\n"
+        "  --join INVITATION       enroll and run this foreground worker for active plotting jobs\n"
         "  --broker HOST:PORT      direct broker; repeat for additional brokers\n"
         "  --directory DIR         saved compute setup directory\n"
         "  --interface NAME        sharing/discovery interface; repeat for more\n"
@@ -75,6 +76,9 @@ int main(int argc, char** argv)
     {
         group_grow::WorkerConfig config;
         std::filesystem::path directory;
+#ifdef XCHPLOT2_GROUP_COMMANDS
+        std::filesystem::path invitation;
+#endif
         std::vector<std::string> interfaces;
         bool discover = true, discovery_set = false, backend_set = false, brokers_set = false;
         pos2gpu::ComputeOutputOptions output;
@@ -88,6 +92,13 @@ int main(int argc, char** argv)
             auto const value = argv[++i];
             if (option == "--broker") config.brokers.push_back(group_grow::pool::parse_endpoint(value));
             else if (option == "--directory") directory = std::filesystem::path(reinterpret_cast<char8_t const*>(value));
+#ifdef XCHPLOT2_GROUP_COMMANDS
+            else if (option == "--join")
+            {
+                if (!invitation.empty() || !*value) throw std::runtime_error("--join requires one invitation file");
+                invitation = std::filesystem::path(reinterpret_cast<char8_t const*>(value));
+            }
+#endif
             else if (option == "--interface") interfaces.emplace_back(value);
             else if (option == "--discovery")
             {
@@ -121,7 +132,15 @@ int main(int argc, char** argv)
         output.validate();
         std::optional<group_grow::pool::PoolIdentity> identity;
 #ifdef XCHPLOT2_GROUP_COMMANDS
-        if (config.tls.ca_file.empty() && config.tls.cert_file.empty() && config.tls.key_file.empty())
+        if (!invitation.empty())
+        {
+            if (!config.tls.ca_file.empty() || !config.tls.cert_file.empty() || !config.tls.key_file.empty())
+                throw std::runtime_error("--join cannot be combined with explicit TLS credentials");
+            identity = group_grow::pool::join_pool(invitation, directory.empty() ? group_grow::pool::pool_directory() : directory, true);
+            if (!output.quiet) std::cerr << "Using saved enrollment for " << identity->name
+                << ". Delete the transferred invitation copies after joining.\n";
+        }
+        else if (config.tls.ca_file.empty() && config.tls.cert_file.empty() && config.tls.key_file.empty())
             identity = group_grow::pool::load_pool(directory.empty() ? group_grow::pool::pool_directory() : directory);
 #endif
         std::shared_ptr<group_grow::pool::ComputeDiscovery> discovery;
@@ -157,7 +176,7 @@ int main(int argc, char** argv)
             group_grow::default_worker_resources(config);
         }
         else if (discovery_set && discover)
-            throw std::runtime_error("LAN discovery needs saved pool membership; use compute init or compute join");
+            throw std::runtime_error("LAN discovery needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
         if ((!identity && (config.brokers.empty() || !config.listen.port)) || config.tls.ca_file.empty() ||
             config.tls.cert_file.empty() || config.tls.key_file.empty())
             throw std::runtime_error("worker needs saved pool membership, or explicit broker/listen endpoints and CA/cert/key");

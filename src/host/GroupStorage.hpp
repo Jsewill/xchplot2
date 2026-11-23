@@ -1,7 +1,9 @@
 // Storage limits shared by single-file growth and destination scheduling.
 #pragma once
 #include "host/GroupEngine.hpp"
+#include "host/GroupFarmService.hpp"
 #include "host/Utf8.hpp"
+#include <atomic>
 #include <cstring>
 #include <condition_variable>
 #include <cwctype>
@@ -107,8 +109,16 @@ public:
         bool farming_known = false, pressured = false;
         uint64_t completed_bytes = 0, waits = 0;
     };
-    explicit DiskIoGovernor(Sampler sampler = sample_device, size_t pending_capacity = 4096)
-        : sampler_(std::move(sampler)) { pending_.reserve(pending_capacity); }
+    enum class Mode { protected_farm, observed_farm };
+    explicit DiskIoGovernor(Sampler sampler = sample_device, size_t pending_capacity = 4096, Mode mode = Mode::protected_farm)
+        : sampler_(std::move(sampler)), mode_(mode) { pending_.reserve(pending_capacity); }
+    static uint64_t initial_memory_bytes(size_t pending_capacity = 4096)
+    { return sizeof(DiskIoGovernor) + 2 * pending_capacity * sizeof(Pending); }
+    bool limits_io(Clock::time_point now = Clock::now()) const
+    {
+        if (mode_ == Mode::protected_farm) return true;
+        return now.time_since_epoch().count() < observed_limit_until_.load(std::memory_order_relaxed);
+    }
 
     void register_device(StorageDevice const& device, std::optional<uint64_t> filesystem = {})
     {
@@ -302,11 +312,27 @@ public:
     Status status(Clock::time_point now = Clock::now()) const
     {
         std::lock_guard lock(mutex_);
-        return {drives_.size(), active_, limit_, farming_known(now), now < pressure_until_, completed_bytes_, waits_};
+        return {drives_.size(), active_, limit_, farming_known(now), now < pressure_until_ && limits_io(now), completed_bytes_, waits_};
     }
+    // Show the controller's existing bulk-service estimate without polling or
+    // changing the feedback that governs construction.
+    std::optional<std::pair<long double, long double>> observed_bulk_bandwidth(std::string const& leaf,
+        Clock::time_point now = Clock::now()) const
+    {
+        std::lock_guard lock(mutex_);
+        auto const it = drives_.find(leaf);
+        if (it == drives_.end() || !it->second.bulk_ns) return {};
+        auto const& drive = it->second;
+        auto const rate = drive.bulk_bytes / drive.bulk_ns;
+        return std::pair{rate, now < drive.share_until ? rate * (1 - drive.foreign_fraction) : rate};
+    }
+    void record_farming_service(FarmingServiceRecord const& record, uint64_t deadline_ns)
+    { std::lock_guard lock(mutex_); farming_service_.add(record, deadline_ns); }
+    FarmingServiceWindow farming_service(Clock::time_point now = Clock::now()) const
+    { std::lock_guard lock(mutex_); return farming_service_.window(now); }
     uint64_t memory_bytes() const
     {
-        std::lock_guard lock(mutex_); uint64_t bytes = sizeof(*this) + 2 * pending_.capacity() * sizeof(Pending);
+        std::lock_guard lock(mutex_); uint64_t bytes = initial_memory_bytes(pending_.capacity());
         for (auto const& [name, drive] : drives_) { (void)drive; bytes += sizeof(Drive) + sizeof(std::string) + 4 * sizeof(void*) + name.capacity() + 1; }
         for (auto const& [id, device] : filesystems_)
         {
@@ -366,14 +392,17 @@ private:
     std::map<uint64_t, StorageDevice> filesystems_;
     StorageDevice unknown_device_;
     Sampler sampler_;
+    Mode mode_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     struct Pending { uint64_t ticket; StorageDevice const* device; };
     std::vector<Pending> pending_;
     Clock::time_point sampled_{}, window_{}, pressure_until_{}, trial_after_{}, farming_at_{};
+    std::atomic<Clock::duration::rep> observed_limit_until_{0};
     size_t active_ = 0, limit_ = 1;
     uint64_t completed_bytes_ = 0, window_bytes_ = 0, waits_ = 0, selection_ = 0, ticket_ = 0;
     uint64_t farming_response_ = 0, farming_deadline_ = 0;
+    FarmingServiceHistory farming_service_;
     long double baseline_rate_ = 0;
     bool waiting_ = false, trial_ = false;
     void register_drive(std::string const& name)
@@ -437,6 +466,9 @@ private:
     {
         // Multiplicative decrease and a hold avoid repeated grow/shrink cycles.
         limit_ = std::max<size_t>(1, limit_ / 2); pressure_until_ = now + std::chrono::seconds(2);
+        if (mode_ == Mode::observed_farm && farming_known(now))
+            observed_limit_until_.store(std::min(pressure_until_, farming_at_ + std::chrono::seconds(30)).time_since_epoch().count(),
+                std::memory_order_relaxed);
         trial_after_ = now + std::chrono::seconds(5); trial_ = false; baseline_rate_ = 0;
     }
     void poll_locked(Clock::time_point now)

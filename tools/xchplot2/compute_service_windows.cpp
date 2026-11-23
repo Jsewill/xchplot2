@@ -145,7 +145,7 @@ int pos2gpu::run_compute_service(int argc, char** argv) try
     require(command == "install" || command == "start" || command == "stop" || command == "restart" ||
         command == "status" || command == "remove" || command == "print", "unknown compute service command: " + command + "; use compute service --help");
     require(role == "worker" || role == "broker", "--role requires worker or broker");
-    auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
+    auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute setup on a plotting host or compute setup INVITATION on a helper");
     auto const name = wide("xchplot2-compute-" + role + '-' + identity->node_id);
     auto const marker = wide("xchplot2 compute service " + role + ' ' + identity->node_id);
     pos2gpu::PrivateFileSecurity security;

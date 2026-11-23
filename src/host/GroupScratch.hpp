@@ -79,6 +79,7 @@ public:
             for (auto const& root : roots_) bandwidth_->register_device(root.value.device);
         }
     }
+    std::shared_ptr<DiskIoGovernor> bandwidth_feedback() const { return bandwidth_; }
     void bind_runtime(ExternalConfig& external) const
     { external.io_governor = io_governor_; external.bandwidth = bandwidth_; }
     bool offers_scratch(std::string const& filesystem) const
@@ -93,6 +94,21 @@ public:
         std::vector<StorageDevice> devices;
         if (auto const* entry = find(owner))
             for (auto root : entry->roots) devices.push_back(roots_[root].value.device);
+        return devices;
+    }
+    // A candidate may be priced against the existing owners before it has
+    // a reservation of its own. Resolve the same discovery snapshots.
+    std::vector<StorageDevice> scratch_devices(ExternalConfig const& config) const
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<StorageDevice> devices; devices.reserve(config.scratch.size());
+        for (auto const& grant : config.scratch)
+        {
+            auto at = std::find_if(roots_.begin(), roots_.end(),
+                [&](auto const& root) { return root.value.directory == grant.directory; });
+            require(at != roots_.end(), "unknown candidate scratch directory");
+            devices.push_back(at->value.device);
+        }
         return devices;
     }
 
@@ -232,7 +248,8 @@ public:
                                         uint64_t segment_bytes, unsigned fan_in, bool automatic = false,
                                         unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0,
                                         size_t parallel_roots = 1, size_t open_slots = SIZE_MAX,
-                                        std::function<uint64_t(ExternalConfig&)> const& configure_stripes = {})
+                                        std::function<uint64_t(ExternalConfig&)> const& configure_stripes = {},
+                                        bool preview = false, bool spare_spindle = false)
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -270,7 +287,7 @@ public:
         size_t next_ssd = 0;
         for (auto& index : order) if (roots_[index].value.device.nonrotating && !roots_[index].value.device.drives.empty())
             index = ssds[next_ssd++];
-        if (io_governor_)
+        if (io_governor_ && io_governor_->limits_io())
         {
             // Keep SSD positions and their established backlog ranking. HDD
             // capacity still comes from this ledger; live feedback orders only
@@ -283,10 +300,24 @@ public:
             size_t next = 0;
             for (auto& index : order) if (!roots_[index].value.device.nonrotating) index = rotating[next++];
         }
+        if (spare_spindle)
+        {
+            // An optional receiver can wait a long time for its first byte.
+            // Keep queued rotational writers available even on an unstriped grant.
+            std::erase_if(order, [&](size_t root)
+            {
+                auto const& disk = roots_[root].value.device;
+                bool const own = roots_[root].filesystem == roots_[entry->output->root].filesystem ||
+                    (!disk.drives.empty() && !destination.drives.empty() && overlap(destination, disk));
+                return !disk.nonrotating && (shared_rotating(root, owner) ||
+                    (!own && std::any_of(owners_.begin(), owners_.end(), [&](auto const& other)
+                    { return other.id != owner && other.output && overlap(disk, roots_[other.output->root].value.device); })));
+            });
+        }
         if (parallel_roots > 1)
         {
             uint64_t const extent = std::min(segment_bytes, read_buffer_bytes ? std::max(uint64_t(1), read_buffer_bytes / 8) : segment_bytes);
-            size_t const width = std::min<uint64_t>(parallel_roots, std::max<uint64_t>(1, desired / extent));
+            size_t const width = spare_spindle ? 1 : std::min<uint64_t>(parallel_roots, std::max<uint64_t>(1, desired / extent));
             for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots))
             {
                 auto const& root = roots_[i]; root.value.check();
@@ -301,6 +332,7 @@ public:
         {
             if (!remaining) break;
             auto const& root = roots_[i];
+            if (spare_spindle && !root.value.device.nonrotating && !selected.empty()) continue;
             if (!root.grantable || std::find(seen.begin(), seen.end(), root.filesystem) != seen.end()) continue;
             if (automatic ? unsigned(!root.value.device.nonrotating) != speed : speed != 0) continue;
             if (automatic && destination.nonrotating && !root.value.device.drives.empty() &&
@@ -327,6 +359,7 @@ public:
         uint64_t const readers = nonrotating ? packing_inputs : known ?
             std::min<uint64_t>(packing_inputs, read_buffer_bytes / (16ull * 1024 * 1024)) : 0;
         external.packing_inputs = unsigned(std::max<uint64_t>(fan_in, readers));
+        if (preview) return external;
         for (size_t i = 0; i < selected.size(); ++i)
         {
             auto& filesystem = fs_for(selected[i]); uint64_t const quota = external.scratch[i].capacity_bytes;

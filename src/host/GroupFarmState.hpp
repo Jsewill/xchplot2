@@ -284,13 +284,18 @@ inline std::string farming_profile_metadata_text(FarmingProfileMetadata const& p
     out << '\n';
     if (version >= 6)
     {
-        out << profile.reader_calibration.has_value();
+        // The scope tag also versions this record inside queued updates.
+        // Preserve exact legacy bytes (0 absent, 1 original scope). Older
+        // readers reject tag 2 before consuming the new membership fields.
+        unsigned const tag = profile.reader_calibration ? (profile.reader_calibration->sampled_min_members ? 2 : 1) : 0;
+        out << tag;
         if (profile.reader_calibration)
         {
             auto const& scope = *profile.reader_calibration;
             out << ' ' << unsigned(scope.k) << ' ' << unsigned(scope.strength) << ' ' << unsigned(scope.reader)
                 << ' ' << std::quoted(scope.method) << ' ' << scope.margin
                 << ' ' << std::quoted(scope.host_name) << ' ' << std::quoted(scope.captured_at);
+            if (tag == 2) out << ' ' << scope.sampled_min_members << ' ' << scope.sampled_max_members;
         }
         out << '\n';
     }
@@ -317,13 +322,19 @@ inline FarmingProfileMetadata farming_profile_metadata_read(std::istream& in, un
     }
     if (version >= 6)
     {
-        bool calibrated = false; in >> calibrated;
-        require(bool(in), "invalid saved reader calibration presence");
+        unsigned calibrated = 0; in >> calibrated;
+        require(in && calibrated <= 2, "invalid saved reader calibration version");
         if (calibrated)
         {
             ReaderCalibrationScope scope; unsigned k = 0, strength = 0, reader = 0;
             in >> k >> strength >> reader >> std::quoted(scope.method) >> scope.margin
                 >> std::quoted(scope.host_name) >> std::quoted(scope.captured_at);
+            if (calibrated == 2)
+            {
+                unsigned low = 0, high = 0; in >> low >> high;
+                require(in && low && low <= high && high <= UINT16_MAX, "invalid saved calibration membership range");
+                scope.sampled_min_members = uint16_t(low); scope.sampled_max_members = uint16_t(high);
+            }
             require(in && k <= UINT8_MAX && strength <= UINT8_MAX && reader <= 1,
                 "invalid saved reader calibration scope");
             scope.k = uint8_t(k); scope.strength = uint8_t(strength); scope.reader = FarmingReader(reader);

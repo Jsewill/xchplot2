@@ -611,7 +611,7 @@ void invite_pool(PoolIdentity const& pool, fs::path const& invitation, std::stri
     output.bytes(policy.encoded); auto local = saved_identity(pool.directory); save_credentials(pool.directory, local, policy);
     export_private(invitation, output.data());
 }
-PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory)
+PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory, bool reuse_matching)
 {
     auto encoded = read_private(invitation);
     Reader input({reinterpret_cast<uint8_t const*>(encoded.data()), encoded.size()});
@@ -625,6 +625,13 @@ PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory)
     auto member = std::find_if(policy.members.begin(), policy.members.end(), [&](auto const& value) { return value.node_id == node; });
     require(!policy.generation || (member != policy.members.end() && !member->revoked && member->certificate == fingerprint(identity.cert.get())),
         "invitation is not an active member of its signed policy");
+    if (reuse_matching)
+        if (auto saved = load_pool(directory))
+        {
+            require(saved->pool_id == fingerprint(ca.get()) && saved->node_id == node,
+                "invitation differs from this machine's saved compute enrollment");
+            return std::move(*saved);
+        }
     return publish(directory, name, node, ca_text, identity, {}, policy);
 }
 void validate_compute_defaults(ComputeDefaults const& defaults) { validate_defaults(defaults); }

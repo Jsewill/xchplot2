@@ -490,6 +490,22 @@ void rotating_bandwidth(fs::path const& directory)
     }
     auto first = root(directory / "e", "output-1", {"output-1"});
     auto second = root(directory / "f", "output-2", {"output-2"});
+    ScratchPool probe(disks, 0);
+    require(probe.try_reserve_output(0, first, unit), "probe output reservation failed");
+    for (size_t i = 1; i < disks.size(); ++i)
+        require(probe.try_reserve_output(i, disks[i - 1], unit), "queued writer reservation failed");
+    probe.seal_recovery();
+    auto const room = probe.available_for_output(0, first);
+    auto const candidate = probe.grant(0, 16 * unit, 16 * unit, unit, 2, true, 4, unit, 1, 1, {}, true, true);
+    require(candidate && candidate->scratch.size() == 1 && candidate->scratch.front().directory == disks.back().directory &&
+        probe.scratch_devices(0).empty() && probe.available_for_output(0, first) == room &&
+        probe.scratch_devices(*candidate).front().drives == disks.back().device.drives,
+        "pricing an optional route claimed capacity or included an already queued writer in its stripe");
+    auto const commit = probe.grant(0, 16 * unit, 16 * unit, unit, 2, true, 4, unit, 4, 1, {}, false, true);
+    require(commit && commit->scratch.front().directory == candidate->scratch.front().directory &&
+        probe.try_io(1).has_value(), "the optional receiver stranded a ready writer after its checked grant");
+    require(!probe.grant(1, 120 * unit, 120 * unit, unit, 2, true, 4, unit, 4, 1, {}, true, true),
+        "a narrow optional grant occupied extra spindles to meet its capacity request");
     auto observe = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
     ScratchPool pool(disks, 0); pool.set_io_governor(observe);
     for (size_t i = 0; i < disks.size(); ++i) observe->observe_transfer(disks[i].device, (4 - i) * unit, unit);
@@ -640,6 +656,9 @@ void rotating_bandwidth(fs::path const& directory)
     counters[0].read_sectors += 100000; counters[0].busy_ms += 500;
     auto const concurrent = shared.concurrent_bandwidth(pair, begin + seconds(3));
     auto const available = shared.bandwidth(pair[0], begin + seconds(3));
+    auto const observed = shared.observed_bulk_bandwidth(pair[0].drives.front(), begin + seconds(3));
+    require(observed && observed->first >= observed->second && std::abs(observed->second - available) < 1e-15L &&
+        !shared.observed_bulk_bandwidth("unobserved"), "read-only disk telemetry disagreed with scheduler bandwidth");
     require(concurrent > 0 && available < shared.bandwidth(pair[0], begin + seconds(5)),
         "a partial foreign load failed to reserve its bandwidth or erased a joint measurement");
 

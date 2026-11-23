@@ -1445,6 +1445,92 @@ on the first group. David's harvester reported 17,886 plots across all
 75 eligible challenge samples during those fills. Its longest recorded
 lookup took 5.63 s.
 
+#### Adding a worker to a running fill
+
+On November 22, 2026, David published the same 48 k=28 members on 16
+Btrfs HDDs, three per group, with eight owner threads and an 8 GiB
+output limit per HDD. The RTX 4090 used 10 GbE and the Arc B580 used
+Wi-Fi. Each fill started a new owner. The observer checked for each
+published file after the owner's
+completion message, sleeping 50 ms between scans. On the previous
+build, successful process exit followed the last observation within
+0.602 s. All completed fills matched the 16 full-proof-verified group
+hashes and passed a fresh 16-challenge proof check on one output.
+
+| Owner and broker | RAM, construction | Worker admission | RTX / Arc members | First group | Last group | s/member |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Previous | 4 GiB, scratch | Both, warm broker | 47 / 1 | 28.29 s | 218.64 s | 4.55 |
+| Previous, repeat | 4 GiB, scratch | Both, warm broker | 48 / 0 | 25.23 s | 166.11 s | 3.46 |
+| Previous | 4 GiB, scratch | Both, fresh broker | 47 / 1 | 30.25 s | 199.00 s | 4.15 |
+| Candidate | 4 GiB, scratch | Both, fresh broker | 47 / 1 | 24.97 s | 180.58 s | 3.76 |
+| Candidate | 4 GiB, scratch | Both, warm broker | 47 / 1 | 38.92 s | 171.59 s | 3.57 |
+| Candidate | 4 GiB, scratch | RTX only | 48 / 0 | 22.27 s | 176.26 s | 3.67 |
+| Candidate | 4 GiB, scratch | Arc joined during fill | 46 / 2 | 20.70 s | 281.83 s | 5.87 |
+| Candidate | 32 GiB, automatic RAM | Both | 47 / 1 | 42.35 s | 205.46 s | 4.28 |
+| Candidate | 32 GiB, forced RAM | Both | 47 / 1 | 38.34 s | 208.93 s | 4.35 |
+| Candidate | 32 GiB, forced scratch | Both | 47 / 1 | 40.47 s | 189.17 s | 3.94 |
+| Corrected broker | 4 GiB, scratch | RTX only | 48 / 0 | 22.41 s | 168.38 s | 3.51 |
+
+The 52.53 s difference between the previous warm runs set the practical
+comparison threshold for the 4 GiB two-worker case before the candidate
+ran. The fresh-broker difference of 18.42 s fell inside it. Builds and
+CPU tests ran on the RTX workstation. Its worker could use logical CPUs
+0–23, including CPU 20 used by a pinned test. CPU use during individual
+GPU deliveries was unmeasured.
+
+In the live join, the broker listed the new Arc instance 5.567 s after
+owner launch. Its first member took 115.8 s from request to validated
+receipt. The broker assigned it another singleton at 158.26 s, just
+before an RTX pair finished at 158.46 s. That Arc request took 128.9 s
+including its broker wait. The last two group publications were 103.6 s
+apart. The corrected broker uses the observed time for a larger joint
+batch on the same route to estimate when the busy RTX can take the
+singleton. A regression fixture reproduces this assignment. The corrected
+live-join run assigned one member to the Arc and published six groups
+before the trial was interrupted. Its final throughput and farming
+outcome remain unverified.
+
+At 32 GiB the automatic and forced RAM fills received 48 packed
+members. Forced scratch received 48 encoded contributions and finished
+16.29 s before automatic. Each target published once. At admission the
+automatic owner had no comparable scratch read, merge or encoded-delivery
+measurement for those targets. The three runs followed the table order.
+A repeated, order-reversed automatic and forced comparison at the same
+cap would establish the variability of this gap. On the corrected
+RTX-only control, 19,022 forecast evaluations used 4.146 s of wall time.
+The last admission had a partial forecast. Historical replay of the four
+earlier 48-member traces also lacked sufficient pre-grant evidence for
+a complete through-publication forecast.
+
+During the fresh-broker candidate fill, the highest five-second rates
+were 4.627 Gb/s received on David's 10 GbE interface, 689.9 MB/s read and
+913.8 MB/s written across the 16 benchmark volumes. Both SAS paths of
+every tested disk and all 88 mounted farming JBODs used one SAS9300-8e
+with a SAS3008 controller. It negotiated PCIe 3.0 ×4 and eight 12 Gb/s
+SAS phys. The 10 GbE X540 negotiated PCIe 2.0 ×4 and shared an upstream
+PCIe 4.0 ×4 bridge with the HBA. The disk counters cover the benchmark
+volumes, and the NIC counters include other traffic. Controller payload
+and link utilization were unavailable.
+
+An external sampler read the live farm logs during ordinary plotting.
+The farming-only control recorded 14 eligible completions, with a
+maximum of 3.36384 s. Across the completed plotting runs the harvester
+reported 17,886 plots and 233 eligible completions. Each of the 229
+recorded full-node signage arrivals fell within one second of the inferred
+start of its matched lookup. Three lookups finished after their fill's
+last publication. One took 8.82234 s during the adverse join, exceeding the
+8 s operating target. The farm log recorded zero timeouts, V1 proofs or
+V2 qualities in these windows.
+
+A separate local NVMe comparison pinned one CPU and published three
+three-member k=22 groups per invocation. Run averages were 1.990, 2.049
+and 2.017 s/member on the previous owner and 2.032, 2.031 and 2.056
+s/member on the candidate. All group hashes matched and each reference
+passed a 100-challenge full-proof check.
+On the same local fixture in a pseudo-terminal, the final build with the
+dashboard (2.040 s/member), phase tracing (2.067) and both (2.039) fell
+within the two plain runs (2.164 and 2.037), with matching hashes.
+
 #### Shared compute over a dedicated Ethernet link
 
 A GPU workstation and a storage host had separate 1 and 10 GbE links. With

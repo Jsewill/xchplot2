@@ -72,12 +72,16 @@ struct WorkerGenerationCapacity
     uint32_t batch = 0, slots = 0;
     pool::BrokerClient::GenerationAvailability availability;
     uint64_t control_ns = 0;
+    std::shared_ptr<pool::GenerationRoster const> roster;
 };
 struct WorkerGenerationEstimate
 {
     long double member_ns = 0;
     // The selected receiver count and all slots represented by the measurements.
     unsigned receivers = 0, measured_slots = 0;
+    bool dated_prior = false;
+    unsigned prior_min_samples = 0;
+    uint64_t prior_oldest_utc = 0;
 };
 struct WorkerStats
 {
@@ -105,7 +109,24 @@ struct WorkerTaskObservation
     unsigned worker_slots = 0;
     WorkerGenerationTiming generation;
     bool independent_members = false;
+    uint32_t ingress_interface = 0; // Owner-local physical adapter, zero if unresolved.
+    uint64_t connect_ns = 0;
+    // Successful generation receipts identify the exact public plot IDs,
+    // including singleton requests coalesced across different destinations.
+    std::array<std::array<uint8_t, 32>, pool::max_generation_batch_members> member_ids{};
+    unsigned member_id_count = 0;
+    pool::Resources generation_resources{};
+    std::optional<int> local_device; // Display selector for a private in-process executor.
 };
+struct WorkerGenerationPrior
+{
+    uint64_t compute_low = 0, compute_high = 0, wire_low = 0, wire_high = 0;
+    std::chrono::seconds remaining{};
+    unsigned samples = 0;
+    uint64_t oldest_utc = 0;
+};
+using WorkerGenerationCalibration = std::function<WorkerGenerationPrior(WorkerTaskObservation const&,
+    pool::GenerationRoute const&, uint64_t compute_ns_per_member, uint64_t wire_ns_per_member)>;
 class WorkerTaskDeclined : public std::runtime_error
 {
 public:
@@ -197,6 +218,12 @@ struct WorkerTaskAdmission
     std::string owner_identity, owner_id, broker_identity;
     bool local_fallback = false;
 };
+struct WorkerLocalOffer
+{
+    pool::Resources capacity, demand{0, 0, 0, 0};
+    uint64_t standing_host_bytes = 0, member_host_bytes = 0;
+    unsigned max_batch_members = 0;
+};
 class WorkerAdmissionRejected : public std::runtime_error
 {
 public:
@@ -223,6 +250,7 @@ public:
     pool::Endpoint endpoint() const;
     bool owns(pool::Lease const&) const;
     WorkerStatus status() const;
+    WorkerLocalOffer local_generation_offer(uint8_t k, uint8_t strength, unsigned members) const;
     WorkerStatus control(WorkerControl);
     static WorkerStatus remote_status(pool::Endpoint const&, pool::TlsOptions const&);
     // Mutations require the running worker's authenticated machine identity.
@@ -234,11 +262,11 @@ public:
         pool::Kind = pool::Kind::GenerateAny, std::function<void(WorkerTaskAdmission const&)> const& = {});
     void generate_packed_local(uint8_t, uint8_t, std::span<std::array<uint8_t, 32> const>,
         WorkerPackedSink const&, WorkerCancellation, pool::Kind,
-        std::function<void(WorkerTaskAdmission const&)> const&);
+        std::function<void(WorkerTaskAdmission const&)> const&, pool::Resources const* = nullptr);
     void contributions_local(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const>, WorkerContributionSink const&,
         WorkerCancellation = {}, pool::Kind = pool::Kind::GenerateAny,
-        std::function<void(WorkerTaskAdmission const&)> const& = {});
+        std::function<void(WorkerTaskAdmission const&)> const& = {}, pool::Resources const* = nullptr);
 private:
     friend class WorkerClient;
     unsigned generate_assigned(pool::Lease const&, std::span<std::array<uint8_t, 32> const>,
@@ -259,6 +287,16 @@ uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, ui
 // supported CPU generation task. Explicit limits remain constructor errors.
 void fit_worker_broker_budget(WorkerConfig&);
 
+// A private owner keeps its shared host/CPU grant until the last local sink
+// returns, including when admission, generation or a consumer throws.
+struct WorkerLocalGrant
+{
+    WorkerService* service = nullptr;
+    pool::Resources resources;
+    bool delivered = false;
+    std::optional<int> local_device;
+    virtual ~WorkerLocalGrant() = default;
+};
 struct WorkerClientConfig
 {
     pool::Endpoint broker;
@@ -278,7 +316,14 @@ struct WorkerClientConfig
     // The embedding owner keeps the service alive through every client call.
     WorkerService* local_service = nullptr;
     std::function<std::shared_ptr<WorkerService>()> local_service_provider;
+    std::function<std::unique_ptr<WorkerLocalGrant>(uint8_t, uint8_t, unsigned, pool::GenerationOutput,
+        WorkerCancellation const&)> acquire_private_generation;
+    std::function<WorkerGenerationCapacity(uint8_t, uint8_t)> private_generation_capacity;
     std::function<void(WorkerTaskObservation const&)> observe;
+    // The plotting client's normal cached broker query publishes changed
+    // eligible routes. No network request is needed by a display observer.
+    std::function<void(uint8_t, uint8_t, WorkerGenerationCapacity const&)> generation_capacity_changed;
+    WorkerGenerationCalibration generation_calibration;
     // Called after selection, before worker contact. A caller may reject an
     // optional task by throwing; the unbegun grant is then cancelled.
     std::function<void(WorkerTaskObservation const&)> selected;
@@ -303,14 +348,16 @@ public:
     WorkerClient& operator=(WorkerClient const&) = delete;
     // True only if this client checked all packed fields and their narrow deltas on receipt.
     bool generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& plot_id,
-                  WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
+                  WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
+                  std::chrono::steady_clock::time_point other_work_until = {});
     bool generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> plot_ids,
-        WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {});
+        WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
+        std::chrono::steady_clock::time_point other_work_until = {});
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
         WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {}, bool independent = false,
-        bool coalesce_singletons = true);
+        bool coalesce_singletons = true, std::chrono::steady_clock::time_point other_work_until = {});
     // Zero means all members were delivered. A positive width releases the
     // unstarted lease for independent delivery of that prefix and its remainder.
     unsigned try_contributions(uint8_t k, uint8_t strength,

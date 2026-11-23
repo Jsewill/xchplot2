@@ -329,6 +329,96 @@ def private_record(directory, name):
     return directory / ".xchplot2" / name
 
 
+def check_dashboard(binary, root):
+    directory = root / "dashboard farm"
+    directory.mkdir()
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", "1"]
+    def command(name, *args):
+        return [str(binary), name, "--config", os.devnull, str(directory), *map(str, args)]
+
+    limits = ["-f", FARMER, "--pool-ph", POOL, "--seed", SEED, "-k", "18",
+              "--group-members", "2", "--max-groups", "1", "--max-total-members", "2",
+              "--capacity-bytes", "32M", "--leave-free", "0"]
+    result = subprocess.run(command("fill", *limits, *runtime, "--tui", "--json"),
+                            capture_output=True, check=True, timeout=90)
+    metrics = json.loads(result.stdout.splitlines()[-1])
+    assert b"\x1b" not in result.stdout + result.stderr
+    assert metrics["new_durable_members"] == 2 and metrics["inherited_members"] == 0, metrics
+    assert 0 < metrics["first_new_publication_seconds"] <= metrics["last_new_publication_seconds"]
+    assert metrics["seconds_per_new_durable_member"] > 0
+    result = subprocess.run(command("fill", "-r", *runtime, "--json"),
+                            capture_output=True, check=True, timeout=90)
+    metrics = json.loads(result.stdout.splitlines()[-1])
+    assert metrics["new_durable_members"] == 0 and metrics["inherited_members"] == 2, metrics
+    assert all(metrics[name] is None for name in ("first_new_publication_seconds", "last_new_publication_seconds",
+                                                   "seconds_per_new_durable_member"))
+
+    private = root / "dashboard private publication"
+    private.mkdir()
+    fill = [str(binary), "fill", "--config", os.devnull, str(private)]
+    interrupted = subprocess.run([*fill, *limits, *runtime, "--construction", "staged", "--quiet"],
+                                 capture_output=True, timeout=90, env=dict(os.environ, XCHPLOT2_GROW_FAILPOINT="publication-ready"))
+    assert interrupted.returncode == 86 and len(list(private.glob("*.gplot.partial"))) == 1, interrupted.stderr
+    result = subprocess.run([*fill, "--resume", *runtime, "--construction", "staged", "--json"],
+                            capture_output=True, check=True, timeout=90)
+    recovered = json.loads(result.stdout.splitlines()[-1])
+    assert recovered["new_durable_members"] == 2 and recovered["inherited_members"] == 0, recovered
+
+    if sys.platform != "linux":
+        return
+    import fcntl
+    import pty
+    import select
+    import termios
+    before = snapshot(directory)
+    primary, terminal = pty.openpty()
+    initial = termios.tcgetattr(terminal)
+    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
+    def foreground():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(command("status", "--tui"), stdin=terminal, stderr=terminal,
+                               stdout=subprocess.PIPE, env={**os.environ, "TERM": "xterm"},
+                               preexec_fn=foreground)
+    try:
+        def until(marker):
+            received = bytearray()
+            deadline = time.monotonic() + 15
+            while marker not in received:
+                left = deadline - time.monotonic()
+                assert left > 0 and select.select([primary], [], [], left)[0], (marker, bytes(received))
+                received.extend(os.read(primary, 8192))
+            return received
+
+        assert b"\x1b[?1049h" in until(b"2 saved members")
+        os.write(primary, b"?")
+        until(b"Dashboard help")
+        os.write(primary, b"a")
+        until(b"xchplot2 compute setup helper.invite")
+        os.write(primary, b"3")
+        until(b"[Workers]")
+        fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        os.write(primary, b"\t")
+        until(b"Decisions   Tab to change view")
+        os.write(primary, b"/absent-worker\n")
+        until(b"No matching rows")
+        os.write(primary, b"/\n")
+        os.write(primary, b"q")
+        until(b"\x1b[?1049l")
+        stdout, _ = process.communicate(timeout=15)
+        assert process.returncode == 0 and not stdout, (process.returncode, stdout)
+        assert termios.tcgetattr(terminal) == initial
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=15)
+        os.close(primary)
+        os.close(terminal)
+    assert snapshot(directory) == before, "dashboard changed a saved farm"
+    print("PASS durable member accounting, redirected output, terminal navigation, resize and read-only detach", flush=True)
+
+
 def replot_artifacts(directory, job_id):
     return private_record(directory, f"replot-{job_id}")
 
@@ -1563,7 +1653,8 @@ def check(binary, root, reference=None):
         assert 0 < latency["p50_ns"] <= latency["p95_ns"] == latency["p99_ns"] == latency["max_ns"]
     calibrated_profile = calibrated["farming_profile"]
     scope = calibrated_profile["reader_calibration"]
-    assert calibrated_profile["schema_version"] == 2 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
+    assert calibrated_profile["schema_version"] == 3 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
+    assert scope["sampled_members"] == calibrated["sampled_members"]
     assert scope["reader"] == calibrated_profile["reader"] and scope["method"] == "pos2-group-reference-reader-gsz-1"
     for phase in (measured["phases"]["retained_lookup"], distinct):
         if phase["cpu_measured"]:
@@ -1672,6 +1763,13 @@ def check(binary, root, reference=None):
     ordinary_one = Path(ordinary_result.stdout.strip())
     assert not ordinary_result.stderr
     assert digest(grouped_one) == digest(ordinary_one)
+    ordinary_job, = single.glob("xchplot2-job-*.tsv")
+    unused_pool = root / "unused compute state"
+    run("batch", ordinary_job, "--resume", "--devices", "cpu", "--compute", "off",
+        "--compute-directory", unused_pool, "--quiet")
+    assert not unused_pool.exists() and digest(ordinary_one) == digest(grouped_one)
+    invalid = run("batch", ordinary_job, "--compute", "invalid", code=2)
+    assert "--compute requires auto or off" in invalid.stderr
     if reference:
         group, k, strength, count, meta, memo = header(paths[0])
         fragments = root / "reference fragments"
@@ -1819,6 +1917,7 @@ def check(binary, root, reference=None):
         shutil.copymode(grouped_one, copy)
     report = json.loads(run("grow", combined, "--max-members", 3, *construction, "--json").stdout)
     assert report["batches"] == 1 and report["generated_members"] == report["max_batch_members"] == 2, report
+    assert report["new_durable_members"] == 2 and report["inherited_members"] == 1, report
     for target in (2, 3):
         run("grow", successive, "--max-members", target, *construction)
     group_id, k, strength, _, meta, memo = header(grouped_one)
@@ -4434,6 +4533,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix="xchplot2 group é-", dir=args.scratch.resolve()) as work:
             os.environ["XDG_CONFIG_HOME"] = str(Path(work) / "empty-compute-settings")
             os.environ["XDG_STATE_HOME"] = str(Path(work) / "migration-state")
+            os.environ["XDG_CACHE_HOME"] = str(Path(work) / "performance-cache")
+            check_dashboard(args.binary.resolve(), Path(work))
             check(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)
             if sys.platform == "linux":
                 check_replot(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)

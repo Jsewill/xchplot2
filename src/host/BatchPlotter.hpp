@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+namespace group_grow { struct DashboardFrame; }
+
 namespace pos2gpu {
 
 struct BatchEntry {
@@ -203,6 +205,8 @@ inline constexpr int kCpuWorkersMax  = -2;  // as many as fit in RAM, capped at 
 
 struct BatchOptions {
     bool verbose           = false;
+    bool tui               = false;
+    std::function<bool(group_grow::DashboardFrame)> display_progress;
     bool skip_existing     = false;
     bool continue_on_error = false;
     // Called after publication or a successful resume check, including before

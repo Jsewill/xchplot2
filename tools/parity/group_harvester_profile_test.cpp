@@ -207,6 +207,19 @@ void calibration_scope_tests()
     auto mismatch = scoped; mismatch.config.k = 28;
     rejects([&] { std::ostringstream text; write_farming_profile_json(text, mismatch); },
         "calibrated profile was re-exported with mismatched target parameters");
+    auto ranged = profile("{\"reader_calibration\":true,\"sampled_members\":{\"min\":3,\"max\":7},\"farming_profile\":" + out.str() + '}');
+    check(ranged.reader_calibration->coverage(1, 3) == "extrapolated" &&
+        ranged.reader_calibration->coverage(4, 7) == "within-sampled-range" &&
+        ranged.reader_calibration->coverage(7, 8) == "extrapolated" &&
+        copied.reader_calibration->coverage(4, 4) == "unknown-sampled-range",
+        "legacy report membership was discarded or standalone legacy range was invented");
+    std::ostringstream extended; write_farming_profile_json(extended, ranged);
+    check(extended.str().find("\"schema_version\":3") != std::string::npos &&
+        profile(extended.str()).reader_calibration == ranged.reader_calibration, "scoped membership did not survive profile export");
+    rejects([&] { profile("{\"reader_calibration\":true,\"sampled_members\":{\"min\":4,\"max\":7},\"farming_profile\":" + extended.str() + '}'); },
+        "conflicting report/profile membership range was accepted");
+    ranged.reader_calibration->sampled_min_members = 8;
+    rejects([&] { std::ostringstream invalid; write_farming_profile_json(invalid, ranged); }, "inverted calibration membership range was exported");
 }
 void config_tests()
 {

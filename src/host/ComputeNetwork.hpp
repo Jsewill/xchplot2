@@ -136,6 +136,9 @@ public:
     // not consume application bytes or wait for a request/response.
     bool peer_closed();
     std::string const& peer_identity() const;
+    // Physical adapter associated with this socket's local address, when
+    // unique. Virtual, ambiguous and unavailable paths return zero.
+    uint32_t ingress_interface() const noexcept;
     bool generation_timing() const;
     std::string const& peer_node_id() const;
     explicit operator bool() const noexcept { return bool(impl_); }

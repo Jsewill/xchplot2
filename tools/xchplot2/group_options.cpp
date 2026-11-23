@@ -402,7 +402,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             std::string_view const key = argv[i]; if (key == "--") break;
             if (!key.starts_with('-')) continue;
             require((replot_status && (key == "--status" || key == "--no-status" || key == "--from-plan" || key == "-F" ||
-                    key == "--watch" || key == "--no-watch" || key == "--inspect" || key == "--no-inspect" ||
+                    key == "--watch" || key == "--no-watch" || key == "--tui" || key == "--no-tui" || key == "--inspect" || key == "--no-inspect" ||
                     key == "--live" || key == "--no-live" || key == "--timeout-ms")) ||
                 (replot_status && status_live && (key == "--compute" || key == "--compute-directory" || key == "--compute-broker" ||
                     key == "--harvester" || key == "--farm-adapter" || key == "--chia-root" || key == "--chia-executable")) ||
@@ -473,6 +473,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--no-inventory") { result.inventory = false; continue; }
         if (key == "--status") { result.replot_status = true; continue; }
         if (key == "--no-status") { result.replot_status = command == "status"; continue; }
+        if (key == "--tui" || key == "--no-tui") { result.tui = key == "--tui"; continue; }
         if (key == "--watch") { result.status_watch = true; continue; }
         if (key == "--no-watch") { result.status_watch = false; continue; }
         if (key == "--inspect") { result.status_inspect = true; continue; }
@@ -734,6 +735,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "cannot determine an available RAM budget; retry when memory is available or set --max-host-ram");
     }
     bool const farm_command = command == "fill" || command == "plan";
+    require(!result.tui || result.replot_status || command == "plan" || command == "fill" || command == "grow" || command == "plot",
+        "--tui is available for planning, plotting or status");
+    require(!result.tui || progress != 0, "choose --tui or --no-progress");
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(!result.status_live || result.replot_status, "--live requires status");
     require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
@@ -934,7 +938,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(command.empty() || !result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
     // Match plot/batch: an explicit progress choice wins; otherwise use stderr
     // TTY detection, with quiet suppressing the automatic progress display.
-    if (progress >= 0) result.progress = progress != 0;
+    if (result.tui || progress >= 0) result.progress = result.tui || progress != 0;
 #ifdef _WIN32
     else result.progress = !result.quiet && ::_isatty(::_fileno(stderr)) != 0;
 #else

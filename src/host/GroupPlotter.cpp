@@ -2,6 +2,8 @@
 #include "host/GroupEngine.hpp"
 #include "host/GroupStaging.hpp"
 #include "host/GroupStorage.hpp"
+#include "host/GroupDashboard.hpp"
+#include "host/GroupHardwareTelemetry.hpp"
 #include "host/GroupMerge.hpp"
 #include "host/GroupExternal.hpp"
 #include "host/GroupScratch.hpp"
@@ -15,6 +17,8 @@
 #include "host/GroupFarmUpdate.hpp"
 #include "host/GroupFarmControl.hpp"
 #include "host/GroupFarmOwner.hpp"
+#include "host/GroupConstructionCache.hpp"
+#include "host/GroupDashboardFeed.hpp"
 #include "host/GroupFarmProgress.hpp"
 #include "host/GroupFarmMigration.hpp"
 #include "host/GroupFarmInventory.hpp"
@@ -72,6 +76,19 @@ std::array<uint8_t, 32> pos2gpu::compute_owner_seed(std::array<uint8_t, 32> cons
     return scoped;
 }
 
+namespace group_grow
+{
+struct ProgressRegistry
+{
+    std::mutex mutex;
+    std::vector<std::weak_ptr<WorkProgress>> work;
+    std::weak_ptr<DiskIoGovernor> bandwidth;
+    std::atomic<uint64_t> members{0}, published{0}, generated{0}, received_bytes{0}, target{0};
+    std::atomic<uint64_t> unpublished_capacity{UINT64_MAX};
+    std::atomic<uint32_t> waits{0};
+};
+}
+
 #ifdef GROW_TEST_CONSTRUCTION
 namespace grow_controller_test
 #else
@@ -124,11 +141,21 @@ void check_cancel(Arguments const& args)
 {
     if (args.cancelled && args.cancelled()) throw Interrupted{};
 }
+void show_plan_dashboard(Arguments const& args, group_grow::DashboardFrame frame)
+{
+    args.dashboard->observe(std::move(frame));
+    while (args.dashboard->active())
+    {
+        check_cancel(args);
+        args.dashboard->navigate();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
 bool detailed_output(Arguments const& args)
 { return args.command.empty() || args.verbose; }
 bool progress_in_place(Arguments const& args)
 {
-    if (!args.progress || args.verbose || args.command.empty()) return false;
+    if (!args.progress || args.verbose || args.json || args.command.empty() || group_grow::DashboardTerminal::plain_terminal()) return false;
 #ifdef _WIN32
     return ::_isatty(::_fileno(stderr)) != 0;
 #else
@@ -136,10 +163,13 @@ bool progress_in_place(Arguments const& args)
 #endif
 }
 void clear_progress(Arguments const& args)
-{ if (progress_in_place(args)) std::cerr << "\r\033[K" << std::flush; }
+{
+    if (args.dashboard && args.dashboard->active()) args.dashboard->suspend();
+    else if (progress_in_place(args)) std::cerr << "\r\033[K" << std::flush;
+}
 void print_progress(Arguments const& args, uint64_t members, uint64_t published = 0)
 {
-    if (!args.progress || args.command.empty()) return;
+    if (!args.progress || args.command.empty() || (args.dashboard && args.dashboard->active())) return;
     bool const in_place = progress_in_place(args);
     std::osyncstream out(std::cerr);
     if (in_place) out << "\r\033[K";
@@ -148,12 +178,7 @@ void print_progress(Arguments const& args, uint64_t members, uint64_t published 
     out << std::flush;
 }
 
-struct ProgressRegistry
-{
-    std::mutex mutex;
-    std::vector<std::weak_ptr<group_grow::WorkProgress>> work;
-    std::atomic<uint64_t> members{0}, published{0}, generated{0}, received_bytes{0};
-};
+using group_grow::ProgressRegistry;
 void progress_generated(std::weak_ptr<ProgressRegistry> const& registry, uint64_t members = 1)
 { if (auto state = registry.lock()) state->generated.fetch_add(members); }
 void progress_received(std::weak_ptr<ProgressRegistry> const& registry, uint64_t bytes)
@@ -167,13 +192,16 @@ std::shared_ptr<group_grow::WorkProgress> progress_activity(std::weak_ptr<Progre
     std::erase_if(owner->work, [](auto const& entry) { return entry.expired(); });
     owner->work.push_back(result); return result;
 }
+std::string progress_waits(uint32_t mask);
 class ProgressReporter
 {
 public:
     std::shared_ptr<ProgressRegistry> state;
-    explicit ProgressReporter(Arguments const& args) : args_(args)
+    explicit ProgressReporter(Arguments const& args, std::string const& job = {}) : args_(args)
     {
-        if (!args.progress || args.command.empty()) return;
+        if (args.parent_progress) { state = args.parent_progress; return; }
+        if (!job.empty()) feed_.emplace(job);
+        if ((!args.progress && !feed_) || args.command.empty()) return;
         state = std::make_shared<ProgressRegistry>();
         thread_ = std::thread([this]
         {
@@ -182,9 +210,24 @@ public:
                 "merging", "packing", "placing final data", "finalizing", "publishing"};
             std::array<size_t, size_t(Phase::count)> previous{};
             auto last = std::chrono::steady_clock::time_point{};
+            std::optional<group_grow::HardwareTelemetry> hardware;
+            group_grow::DashboardFrame frame;
+            auto next_sample = std::chrono::steady_clock::now();
             std::unique_lock lock(mutex_);
-            while (!wake_.wait_for(lock, std::chrono::seconds(1), [&] { return stopped_; }))
+            while (!stopped_)
             {
+                bool const drawn = args_.dashboard && args_.dashboard->active();
+                bool const keys = drawn && args_.dashboard->keys();
+                if (std::chrono::steady_clock::now() < next_sample)
+                {
+                    if (keys) args_.dashboard->draw(frame);
+                    wake_.wait_until(lock, drawn ? std::min(next_sample,std::chrono::steady_clock::now()+std::chrono::milliseconds(100)) : next_sample,
+                        [&] { return stopped_; });
+                    continue;
+                }
+                next_sample = std::chrono::steady_clock::now()+std::chrono::seconds(1);
+                bool const observing = feed_ && feed_->wants_frame();
+                if (!drawn && !observing && !args_.progress) continue;
                 std::array<size_t, size_t(Phase::count)> counts{};
                 std::array<uint64_t, size_t(Phase::count)> read{}, written{}, elapsed{};
                 {
@@ -204,7 +247,78 @@ public:
                 bool const active = std::any_of(counts.begin(), counts.end(), [](auto n) { return n != 0; });
                 auto const now = std::chrono::steady_clock::now();
                 bool const in_place = progress_in_place(args_);
-                if (active && (in_place || counts != previous || now - last >= std::chrono::seconds(5)))
+                if ((drawn || observing) && args_.dashboard_job)
+                {
+                    frame = {};
+                    frame.title = args_.command+"   "+file_io::path_text(args_.target.filename());
+                    args_.dashboard_job->fill(frame, args_.automatic_compute || !args_.pool_broker.empty(), state->target.load());
+                    using Frame = group_grow::DashboardFrame;
+                    auto const capacity = state->unpublished_capacity.load();
+                    if (capacity != UINT64_MAX)
+                        frame.add(Frame::overview, "Open capacity target   "+std::to_string(capacity/mib)+" MiB of unpublished allowance",
+                            "Remaining destination allowance includes space held by active groups. Final member count depends on encoded sizes.");
+                    frame.add(Frame::overview, std::to_string(state->generated.load())+" generated   "+
+                        std::to_string(state->members.load())+" assembled   "+std::to_string(state->received_bytes.load()/mib)+" MiB received");
+                    for (size_t i=1; i<counts.size(); ++i) if (counts[i])
+                        frame.add(Frame::overview, std::string(names[i])+"   "+std::to_string(counts[i])+" active   "+
+                            std::to_string(elapsed[i])+" s","Phase I/O   "+std::to_string(read[i]/mib)+" MiB read   "+std::to_string(written[i]/mib)+" MiB written");
+                    auto waits=state->waits.load();
+                    if (waits) frame.add(Frame::overview,"Controller waiting   "+progress_waits(waits),"Several groups can wait on different resources at once");
+                    try
+                    {
+                        if (!hardware)
+                        {
+                            hardware.emplace();
+                            auto add = [&](fs::path const& dir) { if (!dir.empty()) hardware->add(group_grow::storage_device(dir)); };
+                            add(args_.directory_farm ? args_.target : args_.target.parent_path());
+                            for (auto const& dir : args_.destinations) add(dir);
+                            for (auto const& dir : args_.temporary) add(dir);
+                        }
+                        std::shared_ptr<group_grow::DiskIoGovernor> bandwidth;
+                        { std::lock_guard registry_lock(state->mutex); bandwidth = state->bandwidth.lock(); }
+                        hardware->sample(frame,args_.max_ram,args_.workers ? unsigned(args_.workers) : group_grow::profile_detail::logical_cpus(),
+                            bandwidth ? bandwidth.get() : args_.disk_io.get());
+                    }
+                    catch (std::exception const&) { frame.add(Frame::resources,"Hardware sample unavailable"); }
+                    long double const deadline_seconds = args_.farming_deadline_ms ? *args_.farming_deadline_ms / 1000.L :
+                        args_.farming_profile ? args_.farming_profile->config.deadline_seconds : 0;
+                    std::optional<group_grow::FarmingServiceWindow> service;
+                    if (args_.disk_io)
+                    {
+                        auto io=args_.disk_io->status();
+                        frame.add(Frame::farm, args_.disk_io->limits_io() ?
+                            "Disk I/O permits   "+std::to_string(io.active)+" active / "+std::to_string(io.limit) :
+                            "Monitoring farm response   ordinary disk concurrency",
+                            io.farming_known ? (io.pressured ? "The controller observed farm pressure" : "A recent lookup reached the controller") : "Controller lookup feedback unavailable or stale");
+                        service = args_.disk_io->farming_service();
+                    }
+                    if (service && service->completions)
+                    {
+                        auto const& s = *service;
+                        frame.add(Frame::farm, std::to_string(s.completions)+" lookup completions in 30 s   last "+std::to_string(s.age_ms/1000)+" s ago",
+                            "Harvester log records. Arrivals, outstanding lookups and independent proof validation are unknown.");
+                        if (s.counts_known)
+                            frame.add(Frame::farm, std::to_string(s.eligible_completions)+" eligible   "+std::to_string(s.zero_eligible_completions)+" zero eligible   "+std::to_string(s.loaded_plots)+" loaded plots",
+                                "Loaded plots reported by the last harvester completion");
+                        auto milliseconds = [](uint64_t ns) { return group_grow::dashboard_number(double(ns)/1e6,1); };
+                        frame.add(Frame::farm, "Response   median "+milliseconds(s.p50_ns)+"   p95 "+milliseconds(s.p95_ns)+"   max "+milliseconds(s.max_ns)+" ms");
+                        frame.add(Frame::farm, s.deadline_known ? std::to_string(s.missed_deadline)+" observed lookups over deadline" : "Lookup deadline unavailable");
+                        if (s.started_before_window) frame.add(Frame::farm, std::to_string(s.started_before_window)+" lookups began before the observation window");
+                    }
+                    else frame.add(Frame::farm, service && service->log_observed ? "No recorded lookup completions in the last 30 s" : "Live harvester feedback unavailable for this job");
+                    if (service && service->incomplete) frame.add(Frame::farm, "Recent log coverage is incomplete");
+                    if (deadline_seconds > 0) frame.add(Frame::farm, "Configured lookup deadline   "+group_grow::dashboard_number(double(deadline_seconds))+" s");
+                    if (args_.farming_profile && args_.farming_profile->reader_calibration)
+                    {
+                        auto const& scope = *args_.farming_profile->reader_calibration;
+                        auto const members = uint16_t(std::min<uint64_t>(args_.group_members, UINT16_MAX));
+                        frame.add(Frame::farm, scope.sampled_min_members ? "Reader calibration   "+std::to_string(scope.sampled_min_members)+" to "+std::to_string(scope.sampled_max_members)+" members" : "Reader calibration   sampled range unknown",
+                            std::string(scope.coverage(members,members))+"   "+scope.host_name+"   "+scope.captured_at);
+                    }
+                    if (observing) feed_->publish(frame);
+                    if (drawn) args_.dashboard->draw(frame);
+                }
+                if (!drawn && args_.progress && active && (in_place || counts != previous || now - last >= std::chrono::seconds(5)))
                 {
                     std::osyncstream out(std::cerr);
                     if (in_place) out << "\r\033[K";
@@ -228,7 +342,17 @@ public:
         });
     }
     void assembled(uint64_t count) { if (state) state->members.store(count); }
-    void published() { if (state) state->published.fetch_add(1); }
+    void observe_bandwidth(group_grow::ScratchPool const& scratch)
+    {
+        if (!state) return;
+        std::lock_guard lock(state->mutex);
+        state->bandwidth = scratch.bandwidth_feedback();
+    }
+    void published(uint64_t members, uint64_t inherited, std::optional<group_grow::DashboardJob::LaneFile> file = {})
+    {
+        if (state) state->published.fetch_add(1);
+        if (args_.dashboard_job) args_.dashboard_job->published(members, inherited, file);
+    }
     void finish()
     {
         if (!thread_.joinable()) return;
@@ -238,6 +362,7 @@ public:
     ~ProgressReporter() { finish(); }
 private:
     Arguments const& args_;
+    std::optional<group_grow::DashboardFeed> feed_;
     std::mutex mutex_;
     std::condition_variable wake_;
     bool stopped_ = false;
@@ -247,9 +372,14 @@ private:
 void report_output(Arguments const& args, fs::path const& path, uint16_t members, uint64_t bytes, bool existing = false)
 {
     if (args.on_output || (!args.command.empty() && !args.json && members)) clear_progress(args);
-    if (args.on_output) args.on_output(path, members, bytes, existing);
-    else if (!args.command.empty() && !args.json && members)
-        std::cout << file_io::path_text(path) << '\n' << std::flush;
+    auto print = [&]
+    {
+        if (args.on_output) args.on_output(path, members, bytes, existing);
+        else if (!args.command.empty() && !args.json && members)
+            std::cout << file_io::path_text(path) << '\n' << std::flush;
+    };
+    if (args.dashboard) args.dashboard->output(print);
+    else print();
 }
 
 void add_destination_temporary(std::vector<fs::path>& roots, std::string_view policy,
@@ -577,13 +707,232 @@ struct MemberLease
 };
 bool controller_profile();
 
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+class PrivateLocalSchedule
+{
+    using Clock = std::chrono::steady_clock;
+    using Resources = group_grow::pool::Resources;
+public:
+    struct Shape
+    {
+        uint8_t k, strength;
+        unsigned members;
+        group_grow::pool::GenerationOutput output;
+        bool operator==(Shape const&) const = default;
+    };
+    struct Device
+    {
+        std::shared_ptr<group_grow::WorkerService> service;
+        int selector = 0;
+        group_grow::WorkerLocalOffer offer;
+        Resources held{0, 0, 0, 0};
+        uint64_t standing_at_start = 0, assignments = 0;
+        Clock::time_point started{}, failed_until{};
+        long double expected_ns = 0;
+        struct Delivery { Shape shape{}; unsigned threads = 0; uint64_t ns = 0; };
+        std::array<Delivery, 8> recent{};
+        size_t next = 0;
+
+        long double service_ns(Shape shape, unsigned threads) const
+        {
+            group_grow::GenerationHistory exact, prior;
+            for (auto const& sample : recent)
+                if (sample.ns && sample.shape == shape)
+                {
+                    prior.add(1, sample.ns);
+                    if (sample.threads == threads) exact.add(1, sample.ns);
+                }
+            return exact.count ? exact.member_ns() : prior.member_ns();
+        }
+    };
+    std::vector<Device> devices;
+    unsigned cpus;
+    uint64_t host_bytes;
+    PrivateLocalSchedule(unsigned cpu_budget, uint64_t ram_budget) : cpus(cpu_budget), host_bytes(ram_budget) {}
+
+    struct Choice
+    {
+        size_t device = SIZE_MAX;
+        Resources grant{0, 0, 0, 0};
+        long double wait_ns = 0, service_ns = 0;
+        bool possible = false;
+    };
+    Choice choose(Shape shape, Clock::time_point now, uint64_t headroom) const
+    {
+        // Each private device has one generation slot. Model releases of the
+        // exact CPU and RAM already committed, including retained GPU output.
+        struct Release { long double ns; unsigned cpus; uint64_t bytes; };
+        std::vector<Release> releases;
+        unsigned used_cpus = 0;
+        uint64_t standing = 0, occupied = 0;
+        auto ready = [&](Device const& lane)
+        {
+            if (!lane.held.slots) return 0.L;
+            auto const elapsed = std::chrono::duration<long double, std::nano>(now - lane.started).count();
+            // A late or unmeasured task supplies no reliable future slot.
+            return lane.expected_ns > elapsed ? lane.expected_ns - elapsed : std::numeric_limits<long double>::infinity();
+        };
+        for (auto const& lane : devices)
+        {
+            auto const retained = lane.offer.standing_host_bytes;
+            standing = sum(standing, retained);
+            auto const reserved = lane.held.slots ? std::max(retained, sum(lane.standing_at_start, lane.held.host_bytes)) : retained;
+            occupied = sum(occupied, reserved);
+            used_cpus += lane.held.cpu_threads;
+            if (lane.held.slots && std::isfinite(ready(lane)))
+                releases.push_back({ready(lane), lane.held.cpu_threads, reserved - retained});
+        }
+        auto const limit = std::min(host_bytes, headroom);
+        std::sort(releases.begin(), releases.end(), [](auto const& a, auto const& b) { return a.ns < b.ns; });
+        // Prefixes retain total occupancy so a fall in current host headroom
+        // is accounted for before a projected release can fund another task.
+        releases.insert(releases.begin(), {0, used_cpus, occupied});
+        for (size_t i = 1; i < releases.size(); ++i)
+        {
+            releases[i].cpus = releases[i - 1].cpus - releases[i].cpus;
+            releases[i].bytes = releases[i - 1].bytes - releases[i].bytes;
+        }
+        Choice best;
+        std::tuple<bool, bool, long double, long double, bool, uint64_t> best_score;
+        for (size_t i = 0; i < devices.size(); ++i)
+        {
+            auto const& lane = devices[i];
+            auto demand = lane.offer.demand;
+            if (!demand.slots || !demand.cpu_threads || standing > host_bytes || demand.host_bytes > host_bytes - standing) continue;
+            best.possible = true;
+            if (demand.host_bytes > lane.offer.capacity.host_bytes || demand.host_bytes > limit) continue;
+            auto const device_ready = ready(lane);
+            auto const at = std::lower_bound(releases.begin(), releases.end(), device_ready, [&](Release const& event, long double ns)
+                { return event.ns < ns || event.cpus >= cpus || event.bytes > limit - demand.host_bytes; });
+            if (at == releases.end()) continue;
+            auto const available = cpus - at->cpus;
+            demand.cpu_threads = std::min(demand.cpu_threads, available);
+            // Only divide CPUs with peers able to run alongside this grant.
+            // One large device can use the whole host when RAM excludes its
+            // peers. A GPU needs fewer framing threads than CPU generation.
+            if (available > 1 && demand.cpu_threads > 1)
+            {
+                auto const room = limit - at->bytes - demand.host_bytes;
+                auto const peer = std::find_if(devices.begin(), devices.end(), [&](auto const& candidate)
+                {
+                    auto const& other = candidate.offer.demand;
+                    return &candidate != &lane && other.slots && other.cpu_threads && ready(candidate) <= at->ns &&
+                        other.host_bytes <= std::min(room, candidate.offer.capacity.host_bytes);
+                });
+                if (peer != devices.end())
+                {
+                    auto const share = demand.gpu_bytes ? std::min(available - 1, 2u) :
+                        peer->offer.demand.gpu_bytes ? available - 1 : available / 2 + available % 2;
+                    demand.cpu_threads = std::min(demand.cpu_threads, share);
+                }
+            }
+            auto const service = lane.service_ns(shape, demand.cpu_threads);
+            // Give an idle, explicitly selected, unmeasured device one trial.
+            // Once measured, an idle slow device can lose to a faster release.
+            if (!service && at->ns) continue;
+            auto const score = std::tuple{now < lane.failed_until, service != 0, at->ns + service,
+                at->ns, !demand.gpu_bytes, lane.assignments};
+            if (best.device == SIZE_MAX || score < best_score)
+            { best_score = score; best = {i, demand, at->ns, service, true}; }
+        }
+        return best;
+    }
+
+    group_grow::WorkerGenerationCapacity capacity(uint8_t k, uint8_t strength)
+    {
+        std::lock_guard lock(mutex_);
+        auto const now = Clock::now();
+        if (k == hint_k_ && strength == hint_strength_ && now < hint_until_) return hint_;
+        uint64_t standing = 0;
+        for (auto& lane : devices)
+        {
+            lane.offer = lane.service->local_generation_offer(k, strength, 1);
+            standing = sum(standing, lane.offer.standing_host_bytes);
+        }
+        auto const limit = std::min(host_bytes, available_host_bytes().value_or(host_bytes));
+        auto room = limit - std::min(limit, standing);
+        std::vector<uint64_t> singletons;
+        group_grow::WorkerGenerationCapacity hint;
+        for (auto const& lane : devices)
+        {
+            auto const& offer = lane.offer;
+            auto const budget = std::min(room, offer.capacity.host_bytes);
+            if (!offer.demand.slots || offer.demand.host_bytes > budget) continue;
+            singletons.push_back(offer.demand.host_bytes);
+            auto const width = 1 + (budget - offer.demand.host_bytes) / offer.member_host_bytes;
+            hint.batch = std::max(hint.batch, uint32_t(std::min<uint64_t>(width, offer.max_batch_members)));
+        }
+        std::sort(singletons.begin(), singletons.end());
+        for (auto bytes : singletons)
+        {
+            if (bytes > room || hint.slots == cpus) break;
+            room -= bytes; ++hint.slots;
+        }
+        hint_k_ = k; hint_strength_ = strength; hint_until_ = now + std::chrono::seconds(1);
+        return hint_ = hint;
+    }
+
+    std::unique_ptr<group_grow::WorkerLocalGrant> acquire(Shape shape, group_grow::WorkerCancellation const& cancel)
+    {
+        std::unique_lock lock(mutex_);
+        for (;;)
+        {
+            cancel.check();
+            for (auto& lane : devices) lane.offer = lane.service->local_generation_offer(shape.k, shape.strength, shape.members);
+            auto const now = Clock::now();
+            auto const choice = choose(shape, now, available_host_bytes().value_or(host_bytes));
+            if (choice.device != SIZE_MAX && !choice.wait_ns)
+            {
+                auto& lane = devices[choice.device];
+                auto lease = std::make_unique<Grant>(*this, lane, shape);
+                lease->service = lane.service.get(); lease->resources = choice.grant; lease->local_device = lane.selector;
+                lane.held = choice.grant; lane.standing_at_start = lane.offer.standing_host_bytes;
+                lane.started = now; lane.expected_ns = choice.service_ns; ++lane.assignments;
+                return lease;
+            }
+            if (!choice.possible && std::none_of(devices.begin(), devices.end(), [](auto const& lane) { return lane.held.slots; }))
+                throw group_grow::pool::UnsupportedResources("the selected devices lack RAM for this member and their retained buffers. Increase --max-host-ram or change --devices");
+            released_.wait_until(lock, std::min(cancel.deadline, now + std::chrono::milliseconds(50)));
+        }
+    }
+private:
+    struct Grant final : group_grow::WorkerLocalGrant
+    {
+        PrivateLocalSchedule& owner;
+        Device& lane;
+        Shape shape;
+        Grant(PrivateLocalSchedule& scheduler, Device& device, Shape work) : owner(scheduler), lane(device), shape(work) {}
+        ~Grant()
+        {
+            {
+                std::lock_guard lock(owner.mutex_);
+                if (delivered)
+                {
+                    lane.recent[lane.next] = {shape, resources.cpu_threads, group_grow::elapsed_ns(lane.started)};
+                    lane.next = (lane.next + 1) % lane.recent.size();
+                    lane.failed_until = {};
+                }
+                else lane.failed_until = Clock::now() + std::chrono::seconds(1);
+                lane.held = {0, 0, 0, 0};
+            }
+            owner.released_.notify_all();
+        }
+    };
+    std::mutex mutex_;
+    std::condition_variable released_;
+    uint8_t hint_k_ = 0, hint_strength_ = 0;
+    Clock::time_point hint_until_{};
+    group_grow::WorkerGenerationCapacity hint_;
+};
+#endif
+
 struct Backend
 {
     std::weak_ptr<ProgressRegistry> progress;
     std::shared_ptr<group_grow::CodecScheduler> cpu_scheduler;
+    std::optional<group_grow::ConstructionCache> publication_cache;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     std::unique_ptr<group_grow::WorkerService> pool_service;
-    std::vector<std::shared_ptr<group_grow::WorkerService>> local_services;
     std::shared_ptr<group_grow::WorkerClient> pool_client;
     group_grow::WorkerClientConfig pool_client_config;
     std::shared_ptr<group_grow::PoolRemoteEncoder> pool_remote;
@@ -605,14 +954,111 @@ struct Backend
     static void observe_pool_task(group_grow::WorkerTaskObservation const& task)
     {
         if (!controller_profile()) return;
-        std::osyncstream(std::cerr) << "[grow-pool-task] worker=" << task.worker_identity
+        std::osyncstream line(std::cerr);
+        line << "[grow-pool-task] worker=" << task.worker_identity
             << " instance=" << task.worker_instance << " work_units=" << task.work_units
             << " elapsed_ns=" << task.elapsed_ns << " execution_ns=" << task.execution_ns
             << " transfer_ns=" << task.transfer_ns << " output_bytes=" << task.output_bytes << " worker_ns=" << task.generation.worker_ns
             << " send_ns=" << task.generation.send_ns << " frame_wait_ns=" << task.generation.frame_wait_ns
             << " receiver_ns=" << task.generation.receiver_ns << " local_direct=" << unsigned(task.local_direct)
             << " contributions=" << unsigned(task.generation_output != group_grow::pool::GenerationOutput::Packed)
-            << " independent_members=" << unsigned(task.independent_members) << '\n';
+            << " independent_members=" << unsigned(task.independent_members);
+        if (task.local_device) line << " local_device=" << pos2gpu::device_label(*task.local_device);
+        if (task.member_id_count)
+        {
+            line << " member_ids=";
+            for (unsigned i = 0; i < task.member_id_count; ++i)
+                line << (i ? "," : "") << group_tools::hex(task.member_ids[i]);
+        }
+        line << '\n';
+    }
+    static void observe_pool(group_grow::WorkerClientConfig& client, Arguments const& args)
+    {
+        if (!client.local_only && !client.tls.cert_file.empty() && !args.protected_resources)
+        {
+            using Cache = group_grow::ConstructionCache;
+            struct CacheState { std::mutex mutex; std::optional<Cache> cache; };
+            try
+            {
+                std::string boot;
+#if defined(__linux__)
+                boot = group_grow::farming_owner_detail::kernel_identity();
+#elif defined(_WIN32)
+                boot = group_grow::farming_owner_detail::process_start(4);
+#endif
+                if (!boot.empty())
+                {
+                    std::ostringstream owner; owner.imbue(std::locale::classic());
+                    owner << std::quoted(boot) << ' ' << std::quoted(group_grow::profile_detail::host_name()) << ' '
+                        << group_grow::pool::certificate_identity(client.tls.cert_file) << ' ' << client.compatibility << ' '
+                        << args.max_ram << ' ' << args.workers << ' ' << args.pool_inflight << ' ' << args.pool_frame_bytes << ' '
+                        << args.window << ' ' << args.construction << ' ' << args.io_overlap << ' ' << args.generation_overlap;
+                    client.generation_calibration = [state=std::make_shared<CacheState>(), scope=owner.str()]
+                        (auto const& task, auto const& route, uint64_t compute, uint64_t wire)
+                    {
+                        std::lock_guard lock(state->mutex);
+                        if (!state->cache) state->cache.emplace(Cache::location(Cache::Kind::Generation), Cache::Kind::Generation);
+                        if (!state->cache->available()) return group_grow::WorkerGenerationPrior{};
+                        std::ostringstream key; key.imbue(std::locale::classic());
+                        auto const& d = task.generation_resources;
+                        key << scope << ' ' << route.identity << ' ' << route.instance << ' ' << std::quoted(route.host)
+                            << ' ' << std::quoted(route.gpu_identity) << ' ' << std::quoted(route.endpoint.host) << ' ' << route.endpoint.port
+                            << ' ' << std::quoted(route.endpoint.server_name) << ' ' << task.ingress_interface << ' ' << unsigned(task.kind)
+                            << ' ' << unsigned(task.k) << ' ' << unsigned(task.strength) << ' ' << unsigned(task.generation_output)
+                            << ' ' << task.independent_members << ' ' << task.work_units << ' ' << d.cpu_threads << ' '
+                            << d.host_bytes << ' ' << d.gpu_bytes << ' ' << route.cpu_slots << ' ' << route.gpu_slots;
+                        auto const digest = stream_state::digest(key.str());
+                        auto const worker = state->cache->evidence(digest, false), link = state->cache->evidence(digest, true);
+                        state->cache->completed(digest, false, compute); state->cache->completed(digest, true, wire);
+                        return group_grow::WorkerGenerationPrior{worker.low_ns, worker.high_ns, link.low_ns, link.high_ns,
+                            std::min(Cache::remaining(worker), Cache::remaining(link)), std::min(worker.samples, link.samples),
+                            std::min(worker.oldest_utc, link.oldest_utc)};
+                    };
+                }
+            }
+            catch (...) {} // The in-session estimator works without a calibration store.
+        }
+        auto announce = [display=args.dashboard, progress=args.progress, command=args.command](std::string const& text)
+        {
+            if (progress && !command.empty() && (!display || !display->active()) && !text.empty())
+                std::osyncstream(std::cerr) << '[' << command << "] " << group_grow::DashboardTerminal::label(text) << '\n';
+        };
+        client.observe = [job=args.dashboard_job, announce](group_grow::WorkerTaskObservation const& task)
+        {
+            observe_pool_task(task);
+            if (job && task.kind != group_grow::pool::Kind::Pack)
+                if (auto name = job->delivery(task.worker_identity, task.worker_instance, task.work_units, task.output_bytes,
+                    task.elapsed_ns, task.generation.worker_ns, task.generation.send_ns, task.generation.receiver_ns, task.ingress_interface,
+                    task.local_device ? pos2gpu::device_label(*task.local_device) :
+                        task.local_direct && task.worker_identity.empty() ? "executor" : ""))
+                    announce("First validated delivery from "+*name+" ("+std::to_string(task.work_units)+
+                        (task.work_units == 1 ? " member)" : " members)"));
+        };
+        if (args.dashboard_job) client.generation_capacity_changed =
+            [job=args.dashboard_job, announce](uint8_t k, uint8_t strength, group_grow::WorkerGenerationCapacity const& available)
+        {
+            std::vector<group_grow::DashboardJob::Route> routes;
+            if (available.roster) for (auto const& r : available.roster->routes)
+                routes.push_back({r.identity,r.instance,r.host,r.gpu_identity,r.endpoint.host,std::max(r.cpu_slots,r.gpu_slots)});
+            std::optional<unsigned> registered;
+            std::vector<group_grow::DashboardFrame::Row> admission;
+            if (auto const& status = available.availability.admission)
+            {
+                registered = status->registered;
+                admission.push_back({std::to_string(*registered)+" registered   "+std::to_string(status->eligible)+
+                    " eligible   "+std::to_string(status->available_slots)+" slots free now",
+                    std::to_string(status->other_owner_tasks)+" grants held by other owners"});
+                for (size_t i = 1; i < status->waiting.size(); ++i) if (status->waiting[i])
+                {
+                    std::string reason = group_grow::pool::wait_reason_name(group_grow::pool::WaitReason(i));
+                    std::replace(reason.begin(), reason.end(), '_', ' ');
+                    admission.push_back({std::to_string(status->waiting[i])+" waiting   "+reason,
+                        "Registered workers currently unable to accept one matching member"});
+                }
+            }
+            announce(job->roster(k,strength,available.slots,available.control_ns != 0,bool(available.roster),
+                available.roster && available.roster->complete,routes,registered,std::move(admission)));
+        };
     }
     static void wait_pool_retry(group_grow::WorkerCancellation const& cancel, std::chrono::milliseconds& delay)
     {
@@ -658,37 +1104,42 @@ struct Backend
             "multiple local producers require an ordinary construction job; migration uses its reviewed producer resources");
         require(cpu_scheduler && args.pool_offer_ram && args.pool_offer_cpus,
             "selected local producers have no shared CPU and RAM allowance");
-        uint64_t const host_bytes = args.pool_offer_ram / args.local_devices.size();
-        unsigned const threads = unsigned(std::max<uint64_t>(1, args.pool_offer_cpus / args.local_devices.size()));
+        auto schedule = std::make_shared<PrivateLocalSchedule>(unsigned(args.pool_offer_cpus), args.pool_offer_ram);
+        schedule->devices.reserve(args.local_devices.size());
+        uint64_t standing = 0;
         for (auto const& device : args.local_devices)
         {
             group_grow::WorkerConfig config;
-            config.capacity = {threads, 1, host_bytes, 0};
             config.backend = pos2gpu::is_cpu_device(device.device) ? "cpu" : "gpu";
             config.device = device.device; config.tier = device.tier;
             config.cpu_affinity = device.cpu_affinity;
-            config.generation_threads = threads; config.max_batch_members = 1;
+            config.generation_threads = unsigned(device.cpu_affinity.empty() ? args.pool_offer_cpus :
+                std::min<uint64_t>(device.cpu_affinity.size(), args.pool_offer_cpus));
+            config.capacity = {config.generation_threads, 1, args.pool_offer_ram, 0};
             config.cpu_scheduler = cpu_scheduler;
             config.max_brokers = 1; config.tls.max_frame_bytes = uint32_t(args.pool_frame_bytes);
             config.max_task_bytes = sum(args.window, args.pool_frame_bytes);
             config.task_timeout_ms = unsigned(args.pool_timeout_ms);
             group_grow::default_worker_resources(config);
-            require(group_grow::worker_service_baseline_bytes(config) < host_bytes,
-                "selected local producers exceed the RAM allowance; increase --max-host-ram or select fewer devices");
+            standing = sum(standing, group_grow::worker_service_baseline_bytes(config));
+            require(standing < args.pool_offer_ram,
+                "selected local producers exceed the RAM allowance. Increase --max-host-ram or select fewer devices");
             // These services are never started: no listener, enrollment,
             // discovery or network worker identity is needed for local work.
-            local_services.push_back(std::make_shared<group_grow::WorkerService>(std::move(config)));
+            auto& lane = schedule->devices.emplace_back(); lane.selector = device.device;
+            lane.service = std::make_shared<group_grow::WorkerService>(std::move(config));
         }
         group_grow::WorkerClientConfig client;
         client.local_only = true; client.cpu_scheduler = cpu_scheduler;
         client.generation_kind = group_grow::pool::Kind::GenerateAny;
         client.task_timeout_ms = unsigned(args.pool_timeout_ms);
         client.max_task_bytes = sum(args.window, args.pool_frame_bytes);
-        client.max_active_generation = unsigned(std::min<uint64_t>(args.pool_inflight, local_services.size()));
-        auto next = std::make_shared<std::atomic<size_t>>(0);
-        client.local_service_provider = [services = local_services, next]
-        { return services[next->fetch_add(1) % services.size()]; };
-        client.observe = observe_pool_task;
+        client.max_active_generation = unsigned(std::min<uint64_t>(args.pool_inflight, schedule->devices.size()));
+        client.acquire_private_generation = [schedule](uint8_t k, uint8_t strength, unsigned members,
+            group_grow::pool::GenerationOutput output, group_grow::WorkerCancellation const& cancel)
+        { return schedule->acquire({k, strength, members, output}, cancel); };
+        client.private_generation_capacity = [schedule](uint8_t k, uint8_t strength) { return schedule->capacity(k, strength); };
+        observe_pool(client, args);
         { std::lock_guard lock(pool_mutex); pool_client_config = std::move(client); }
         (void)acquire_pool_client();
         pool_retained = sum(group_grow::WorkerClient::memory_bytes(), product(args.local_devices.size(), 4096));
@@ -697,7 +1148,7 @@ struct Backend
         {
             std::cerr << "Local producers:";
             for (auto const& device : args.local_devices) std::cerr << ' ' << pos2gpu::device_label(device.device);
-            std::cerr << "; " << host_bytes << " buffer bytes per producer, " << args.pool_offer_cpus << " shared CPU threads\n";
+            std::cerr << ", " << args.pool_offer_ram << " shared buffer bytes, " << args.pool_offer_cpus << " shared CPU threads\n";
         }
     }
 
@@ -751,7 +1202,7 @@ struct Backend
 #endif
         client.admit_task = args.compute_admit_task;
         client.max_active_generation = unsigned(args.pool_inflight);
-        client.observe = observe_pool_task;
+        observe_pool(client, args);
         client.max_task_bytes = sum(args.window, args.pool_frame_bytes);
         { std::lock_guard lock(pool_mutex); pool_client_config = std::move(client); }
         try { (void)acquire_pool_client(); }
@@ -788,7 +1239,7 @@ struct Backend
 #endif
         client.admit_task = args.compute_admit_task;
         client.max_active_generation = unsigned(args.pool_inflight);
-        client.observe = observe_pool_task;
+        observe_pool(client, args);
         client.max_task_bytes = sum(args.window, args.pool_frame_bytes);
         { std::lock_guard lock(pool_mutex); pool_client_config = client; }
         pool_remote = std::make_shared<group_grow::PoolRemoteEncoder>(args.pool_codec_ram,
@@ -810,13 +1261,14 @@ struct Backend
     }
     unsigned fresh_group_slots(Identity const& identity, size_t count)
     {
-        if (!count || count > group_grow::pool::max_generation_batch_members) return 0;
+        if (pool_client_config.local_only || !count || count > group_grow::pool::max_generation_batch_members) return 0;
         auto const hint = acquire_pool_client()->generation_capacity(identity.params.get_k(), identity.params.get_strength());
         return count <= hint.batch ? hint.slots : 0;
     }
 
     std::optional<group_grow::AppendResult> stream_fresh_group(group_grow::Engine& engine,
-        Identity const& identity, uint16_t count, Arguments const& args, uint64_t& generation_elapsed, std::atomic<bool> const* stop = nullptr)
+        Identity const& identity, uint16_t count, Arguments const& args, uint64_t& generation_elapsed,
+        std::atomic<bool> const* stop = nullptr, std::chrono::steady_clock::time_point other_work_until = {})
     {
         auto const started = std::chrono::steady_clock::now();
         auto client = acquire_pool_client();
@@ -844,7 +1296,7 @@ struct Backend
                     };
                     auto chunk = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t n)
                     { window(ordinal, {&bytes, 1}, n); };
-                    client->contributions(k, strength, ids, chunk, cancel, {}, window, manifest);
+                    client->contributions(k, strength, ids, chunk, cancel, {}, window, manifest, false, true, other_work_until);
                 });
             if (result)
             {
@@ -861,7 +1313,8 @@ struct Backend
     }
 
     group_grow::Member generate_pool(Identity const& identity, uint16_t index, Arguments const& args,
-                                    std::atomic<bool> const* stop = nullptr)
+                                    std::atomic<bool> const* stop = nullptr,
+                                    std::chrono::steady_clock::time_point other_work_until = {})
     {
         auto const k = uint8_t(identity.params.get_k());
         uint64_t const bound = fragment_bound(identity.params) / sizeof(uint64_t);
@@ -907,7 +1360,7 @@ struct Backend
             try
             {
                 deltas_checked = acquire_pool_client()->generate(k, uint8_t(identity.params.get_strength()), plot_id,
-                    receive, cancel, task);
+                    receive, cancel, task, other_work_until);
                 break;
             }
             catch (Interrupted const&) { throw; }
@@ -1287,7 +1740,7 @@ struct Producer
     }
     size_t fill_pool_input(group_grow::ExternalEngine::PreparedInput& input, uint16_t first,
         uint64_t other_retained, uint64_t admitted, std::atomic<bool> const* stopped = nullptr,
-        ScratchIo const& acquire_io = {})
+        ScratchIo const& acquire_io = {}, std::chrono::steady_clock::time_point other_work_until = {})
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         auto const begin = std::chrono::steady_clock::now();
@@ -1327,7 +1780,7 @@ struct Producer
                     progress_received(backend.progress, sum(tile.words.size_bytes(), tile.boundaries.size_bytes()));
                     remaining -= tile.words.size();
                     if (!remaining) { input.finish_member(); ++member; }
-                }, cancel);
+                }, cancel, {}, other_work_until);
                 require(!remaining && member == end, "incomplete packed scratch batch");
             }
         }
@@ -1526,7 +1979,8 @@ struct Producer
                                             individual, other_work_until))
                                         return first;
                                 }
-                                else client->contributions(k, strength, ids, receive, cancel, task, receive_window, {}, individual, coalesce_singletons);
+                                else client->contributions(k, strength, ids, receive, cancel, task, receive_window, {},
+                                    individual, coalesce_singletons, other_work_until);
                                 break;
                             }
                             catch (group_grow::WorkerTaskDeclined const&) { throw; }
@@ -1593,7 +2047,8 @@ struct Producer
     size_t fill_pool(std::vector<group_grow::Member>& values, uint16_t first, size_t wanted,
                      uint64_t other_retained, std::string const& progress,
                      std::function<bool()> const& stop, std::atomic<bool> const* stopped = nullptr,
-                     group_grow::MemberBatchHash* hash = nullptr, unsigned destinations = 1)
+                     group_grow::MemberBatchHash* hash = nullptr, unsigned destinations = 1,
+                     std::chrono::steady_clock::time_point other_work_until = {})
     {
         auto live = progress_activity(backend.progress, group_grow::ProgressPhase::generate);
         size_t const before = values.size();
@@ -1648,7 +2103,7 @@ struct Producer
                         require(!received.empty(), "packed batch has no member prelude");
                         received.back()->append(tile);
                         progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
-                    }, cancel);
+                    }, cancel, {}, other_work_until);
                     complete = true;
                 }
                 catch (group_grow::pool::UnsupportedResources const&) {}
@@ -1713,7 +2168,7 @@ struct Producer
                 generation_peak = std::max(generation_peak, next_peak(index));
                 if (args.command.empty() || args.verbose) std::osyncstream(std::cerr) << progress << index << '\n';
                 pending.push_back({scheduled, std::async(std::launch::async, [&, index]
-                    { return backend.generate_pool(identity, index, args, &cancelled); }), allocation});
+                    { return backend.generate_pool(identity, index, args, &cancelled, other_work_until); }), allocation});
                 in_flight = sum(in_flight, allocation); ++scheduled; made_progress = true;
             }
             if (scheduled == wanted) accepting = false;
@@ -2296,6 +2751,13 @@ private:
     uint32_t reasons_;
     std::chrono::steady_clock::time_point begin_{};
 };
+std::string progress_waits(uint32_t mask)
+{
+    std::string result;
+    for (size_t i=0; i<controller_wait_names.size(); ++i) if (mask & (1u<<i))
+    { if (!result.empty()) result += ", "; result += controller_wait_names[i]; }
+    std::replace(result.begin(), result.end(), '_', ' '); return result;
+}
 struct ControllerWaits
 {
     std::array<uint64_t, size_t(ControllerWait::count)> nanoseconds{};
@@ -2327,9 +2789,12 @@ struct Metrics : group_grow::Stats
     uint64_t packing_engine_bytes = 0, packing_released_bytes = 0;
     uint64_t destination_count = 0, writer_count = 0, queued_peak_bytes = 0, drive_overlap_batches = 0, queue_wait_ns = 0;
     uint64_t execution_active = 0, execution_batch = 0, peak_active_destinations = 0;
+    uint64_t execution_forecasts = 0, execution_forecast_ns = 0, execution_budget_stops = 0;
     uint64_t pool_receiving_destinations = 0;
     long double pool_generation_member_ns = 0;
     group_grow::ExecutionEstimate execution_estimate;
+    group_grow::ConstructionModeChoice construction_choice;
+    long double ram_finish_ns = 0, scratch_finish_ns = 0;
     bool recovered = false, scratch_released = true;
     long double farming_response_bound_seconds = 0, farming_dynamic_work_seconds_per_sp = 0;
     uint64_t farming_certified_max_eligible_groups = 0;
@@ -2584,25 +3049,250 @@ std::shared_ptr<group_grow::SharedConstructionHistory> construction_history(
     group_grow::ConstructionHistories* histories, Arguments const& args,
     fs::path const& path, group_grow::Identity const& identity, unsigned workers, bool create = true,
     group_grow::ExternalConfig const* scratch = nullptr,
-    std::shared_ptr<group_grow::SharedConstructionHistory> const& demand = {}, bool execution = false)
+    std::shared_ptr<group_grow::SharedConstructionHistory> const& demand = {}, bool execution = false,
+    group_grow::StorageDevice const* output = nullptr, std::span<group_grow::StorageDevice const> scratch_devices = {})
 {
-    if (!histories) return {};
-    auto const device = group_grow::storage_device(path.parent_path());
-    group_grow::ConstructionContext context{device.drives, identity.header.k, identity.header.strength, identity.header.meta_group,
+    if (!histories || (!create && histories->empty())) return {};
+    auto drives = output ? output->drives : group_grow::storage_device(path.parent_path()).drives;
+    group_grow::ConstructionContext context{std::move(drives), identity.header.k, identity.header.strength, identity.header.meta_group,
         identity.memo.size(), args.max_ram, args.window, args.checkpoint_bytes,
         std::min(args.max_ram / 16, 256 * mib), workers, args.member_storage == "compact",
         args.io_overlap, args.cache_release};
-    if (scratch) for (auto const& grant : scratch->scratch)
+    if (scratch) for (size_t i = 0; i < scratch->scratch.size(); ++i)
     {
-        auto const source = group_grow::storage_device(file_io::native_path(grant.directory));
-        if (source.drives.empty()) return {};
-        context.scratch_drives.insert(context.scratch_drives.end(), source.drives.begin(), source.drives.end());
+        auto const& source = scratch_devices.empty() ?
+            group_grow::storage_device(file_io::native_path(scratch->scratch[i].directory)).drives : scratch_devices[i].drives;
+        if (source.empty()) return {};
+        context.scratch_drives.insert(context.scratch_drives.end(), source.begin(), source.end());
     }
     std::sort(context.scratch_drives.begin(), context.scratch_drives.end());
     context.scratch_drives.erase(std::unique(context.scratch_drives.begin(), context.scratch_drives.end()), context.scratch_drives.end());
     if (auto reused = histories->reuse_external(demand, context)) return reused;
     if (execution) return histories->execution(context);
     return histories->find(std::move(context), create);
+}
+
+using PublicationShape = group_grow::SharedConstructionHistory::Publication::Shape;
+struct CachedPublication
+{
+    std::string key;
+    group_grow::ConstructionPrior ram, scratch;
+    std::string grant;
+    std::array<unsigned, 2> workers{}, batches{};
+    static std::string grant_shape(group_grow::ExternalConfig const& config)
+    {
+        std::ostringstream text;
+        for (auto const& volume : config.scratch) text << std::quoted(volume.directory) << ' ' << volume.capacity_bytes << '\n';
+        return stream_state::digest(text.str());
+    }
+    bool matches(unsigned actual_workers, unsigned actual_batch, group_grow::ExternalConfig const* external) const noexcept
+    {
+        try
+        {
+            bool const use_scratch = external != nullptr;
+            return !key.empty() && actual_workers == workers[use_scratch] && actual_batch == batches[use_scratch] &&
+                (!external || grant_shape(*external) == grant);
+        }
+        catch (...) { return false; }
+    }
+};
+std::string publication_cache_key(std::string const& topology, Arguments const& args, group_grow::Identity const& identity,
+    uint16_t members, unsigned ram_workers, uint16_t ram_batch, unsigned scratch_workers, uint16_t scratch_batch,
+    group_grow::ExternalConfig const& scratch)
+{
+    std::ostringstream scope; scope.imbue(std::locale::classic());
+    scope << topology << '\n' << GROW_IDENTITY << ' ' << std::quoted(group_grow::profile_detail::host_name()) << ' '
+        << group_grow::profile_detail::logical_cpus() << ' ' << unsigned(identity.header.k) << ' '
+        << unsigned(identity.header.strength) << ' ' << unsigned(identity.header.meta_group) << ' ' << identity.memo.size()
+        << ' ' << members << ' ' << args.max_ram << ' ' << ram_workers << ' ' << ram_batch << ' ' << scratch_workers << ' ' << scratch_batch
+        << ' ' << args.batch << ' ' << args.window << ' ' << args.window_set << ' ' << args.checkpoint_bytes << ' ' << args.checkpoint_set
+        << ' ' << args.generation_overlap << ' ' << args.generation_overlap_auto << ' ' << args.io_overlap << ' ' << args.cache_release
+        << ' ' << args.member_storage << ' ' << args.directory_farm << ' ' << args.capacity << ' ' << args.headroom
+        << ' ' << args.temporary_capacity << ' ' << scratch.segment_bytes
+        << ' ' << scratch.fan_in << ' ' << scratch.packing_inputs << ' ' << scratch.striped << '\n';
+    for (auto const& volume : scratch.scratch) scope << ' ' << volume.capacity_bytes;
+    scope << '\n';
+    if (args.farming_profile)
+    {
+        scope << std::setprecision(std::numeric_limits<long double>::max_digits10);
+        group_grow::farming_config_write(scope, args.farming_profile->config);
+        scope << group_grow::farming_profile_metadata_text(*args.farming_profile, 7);
+    }
+    return stream_state::digest(scope.str());
+}
+CachedPublication comparable_publications(Backend& backend, Arguments const& args, fs::path const& path,
+    group_grow::Identity const& identity, uint16_t members, unsigned ram_workers, uint16_t ram_batch,
+    unsigned scratch_workers, uint16_t scratch_batch, group_grow::ExternalConfig const& scratch)
+{
+    try
+    {
+        // Private local CPU deliveries have no external roster or transport.
+        // A selected live harvester, changing reservation, recovered prefix
+        // or unresolved storage leaves this comparison entirely run-local.
+        if (args.backend != "cpu" || has_compute(args) || args.automatic_compute || args.protected_resources ||
+            args.resume || args.replot || args.farming_detect_local || !args.fixtures.empty() || scratch.scratch.empty() || scratch.scratch.size() > 16 ||
+            (args.disk_io && args.disk_io->status().pressured)) return {};
+        std::ostringstream scope; scope.imbue(std::locale::classic());
+#ifdef __linux__
+        auto const boot = group_grow::farming_owner_detail::kernel_identity();
+        cpu_set_t cpus; CPU_ZERO(&cpus);
+        if (boot.empty() || ::sched_getaffinity(0, sizeof(cpus), &cpus)) return {};
+        auto const pid_ns = group_grow::farming_owner_detail::pid_namespace(uint64_t(::getpid()));
+        if (pid_ns.empty()) return {};
+        scope << boot << ' ' << pid_ns;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &cpus)) scope << ' ' << cpu;
+        // Affinity alone omits cgroup CPU bandwidth and I/O throttling. Use
+        // the visible v2 hierarchy when it can be resolved without guessing.
+        std::ifstream membership("/proc/self/cgroup");
+        auto cgroups = group_grow::profile_detail::read_text(membership, 4096);
+        if (!cgroups.starts_with("0::/") || cgroups.find('\n') != cgroups.size() - 1) return {};
+        fs::path const group(cgroups.substr(3, cgroups.size() - 4)), mount("/sys/fs/cgroup");
+        if (group.lexically_normal() != group || !fs::exists(mount / "cgroup.controllers")) return {};
+        auto dir = (mount / group.relative_path()).lexically_normal();
+        if (dir.filename().empty() && dir != mount) dir = dir.parent_path();
+        if (!fs::exists(dir / "cgroup.procs")) return {};
+        for (unsigned depth = 0;; ++depth)
+        {
+            if (depth > 24) return {};
+            for (auto field : {"cpu.max", "cpu.weight", "io.max"})
+            {
+                auto const setting = dir / field;
+                if (!fs::exists(setting)) { scope << " -"; continue; }
+                std::ifstream input(setting);
+                scope << ' ' << std::quoted(group_grow::profile_detail::read_text(input, 2048));
+            }
+            if (dir == mount) break;
+            dir = dir.parent_path();
+        }
+#elif defined(_WIN32)
+        auto const boot = group_grow::farming_owner_detail::process_start(4);
+        DWORD_PTR cpus = 0, machine = 0;
+        BOOL in_job = FALSE;
+        if (boot.empty() || !::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || in_job ||
+            !::GetProcessAffinityMask(::GetCurrentProcess(), &cpus, &machine)) return {};
+        scope << boot << ' ' << cpus;
+#else
+        return {};
+#endif
+        auto storage = [&](fs::path const& directory)
+        {
+            auto const device = group_grow::storage_device(directory);
+            if (device.filesystem.empty() || device.drives.empty() || device.drives.size() > 32) return false;
+            scope << '\n' << std::quoted(device.filesystem) << ' ' << device.rotating << ' ' << device.nonrotating;
+            for (auto const& drive : device.drives)
+            {
+                scope << ' ' << std::quoted(drive);
+#ifdef __linux__
+                if (!drive.starts_with("nvme:"))
+                {
+                    if (drive.find_first_not_of("0123456789:") != drive.npos) return false;
+                    std::ifstream sequence(fs::path("/sys/dev/block") / drive / "diskseq"); uint64_t id = 0;
+                    if (!(sequence >> id) || !id) return false;
+                    scope << ' ' << id;
+                }
+#elif defined(_WIN32)
+                // A physical disk number alone may be reused after hotplug.
+                if (!drive.starts_with("windows:nvme:")) return false;
+#endif
+            }
+            return true;
+        };
+        if (!storage(path.parent_path())) return {};
+        for (auto const& grant : scratch.scratch) if (!storage(file_io::native_path(grant.directory))) return {};
+        scope << '\n' << (backend.generated_members ? "warm" : "startup");
+        if (!backend.publication_cache) backend.publication_cache.emplace(group_grow::ConstructionCache::location());
+        if (!backend.publication_cache->available()) return {};
+        CachedPublication result;
+        result.key = publication_cache_key(scope.str(), args, identity, members, ram_workers, ram_batch, scratch_workers, scratch_batch, scratch);
+        result.grant = CachedPublication::grant_shape(scratch);
+        result.workers = {ram_workers, scratch_workers}; result.batches = {ram_batch, scratch_batch};
+        result.ram = backend.publication_cache->evidence(result.key, false);
+        result.scratch = backend.publication_cache->evidence(result.key, true);
+        return result;
+    }
+    catch (...) { return {}; }
+}
+PublicationShape construction_load(Arguments const& args, Backend& backend, Identity const& identity,
+    uint16_t members, size_t width)
+{
+    PublicationShape shape{members, width};
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (has_compute(args))
+    {
+        auto const capacity = backend.acquire_pool_client()->generation_capacity(
+            identity.params.get_k(), identity.params.get_strength());
+        shape.supply = {capacity.slots, capacity.roster};
+    }
+#endif
+    return shape;
+}
+
+void construction_decision(Arguments const& args, fs::path const& target, Identity const& identity, Metrics const& metrics,
+    uint64_t members, size_t width, size_t roots, uint64_t grant_bytes,
+    group_grow::ExternalConfig const* scratch = nullptr, group_grow::ExecutionEstimate const* estimate = nullptr)
+{
+    auto const mode = metrics.construction_choice.external ? "scratch" : "RAM";
+    auto const mode_finish = metrics.construction_choice.external ? metrics.scratch_finish_ns : metrics.ram_finish_ns;
+    auto const release = !estimate ? mode_finish : estimate->known ? estimate->target_release : 0;
+    if (controller_profile())
+    {
+        // Receipts carry public plot IDs, which can span several groups. The
+        // group ID and member range also identify members beyond this prefix.
+        std::osyncstream out(std::cerr);
+        out << "[grow-controller-timing] phase=grant target=" << std::quoted(file_io::path_text(target))
+            << " group_id=" << group_tools::hex(identity.params.get_plot_group_id().span())
+            << " members=" << members << " mode=" << mode << " scratch_roots=" << roots
+            << " workspace_bytes=" << grant_bytes << " target_release_ns=" << release
+            << " ram_finish_ns=" << metrics.ram_finish_ns << " scratch_finish_ns=" << metrics.scratch_finish_ns
+            << " dated_route_prior=" << bool(estimate && estimate->dated_route_prior);
+        if (estimate && estimate->dated_route_prior)
+            out << " route_prior_min_samples=" << estimate->route_prior_min_samples << " route_prior_oldest_utc=" << estimate->route_prior_oldest_utc;
+        out << " member_ids=";
+        for (uint16_t i = 0; i < std::min<uint64_t>(members, 16); ++i)
+        {
+            if (i) out << ',';
+            out << group_tools::hex(identity.params.get_plot_params_for_index(i).get_plot_id().span());
+        }
+        out << '\n';
+    }
+    if (!args.dashboard_job) return;
+    auto detail = std::string(group_grow::construction_reason(metrics.construction_choice.reason)) +
+        ", " + std::to_string(members) + " members, " + std::to_string(width) + " active destinations";
+    auto prior_age = [](uint64_t oldest)
+    {
+        auto const now = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        return std::to_string((now - std::min(now, oldest)) / 60) + " min ago";
+    };
+    if (metrics.construction_choice.prior_samples)
+        detail += ", " + std::to_string(metrics.construction_choice.prior_samples) + " cached samples, oldest " +
+            prior_age(metrics.construction_choice.prior_oldest_utc);
+    if (roots) detail += ", " + std::to_string(roots) + " scratch volumes";
+    if (metrics.ram_finish_ns || metrics.scratch_finish_ns)
+    {
+        auto seconds = [](long double ns)
+        { return ns > 0 ? group_grow::dashboard_number(double(ns / 1e9L)) + " s" : std::string("unknown"); };
+        detail += ", prediction from admission, RAM " + seconds(metrics.ram_finish_ns) +
+            ", scratch " + seconds(metrics.scratch_finish_ns);
+    }
+    if (estimate && estimate->lower_bound > 0)
+    {
+        detail += ", modeled work requires at least "+group_grow::dashboard_number(double(estimate->lower_bound/1e9L))+" s";
+        if (estimate->unmeasured) detail += ", "+std::to_string(estimate->unmeasured)+" lanes partly unmeasured";
+    }
+    if (estimate && estimate->dated_route_prior)
+        detail += ", dated worker delivery estimate from at least " + std::to_string(estimate->route_prior_min_samples) +
+            " cached deliveries per route, oldest " + prior_age(estimate->route_prior_oldest_utc);
+    std::string grant = std::string(mode)+" construction   "+std::to_string(grant_bytes/mib)+" MiB owner workspace";
+    if (scratch)
+    {
+        for (auto const& part : scratch->scratch)
+        {
+            if (grant.size() >= 1800) { grant += "   more scratch volumes"; break; }
+            grant += "   "+part.directory+" ("+std::to_string(part.capacity_bytes/mib)+" MiB reserved)";
+        }
+    }
+    args.dashboard_job->granted(file_io::path_text(target), std::move(grant), double(release/1e9L));
+    args.dashboard_job->decision(file_io::path_text(target) + " (" + mode + ")", std::move(detail));
 }
 
 using group_grow::ExternalBatchHistory;
@@ -2741,10 +3431,11 @@ struct Construction
     }
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     std::optional<group_grow::AppendResult> stream_fresh(Backend& backend, Identity const& requested,
-        uint16_t count, Arguments const& args, uint64_t& elapsed, std::atomic<bool> const* stop = nullptr)
+        uint16_t count, Arguments const& args, uint64_t& elapsed, std::atomic<bool> const* stop = nullptr,
+        std::chrono::steady_clock::time_point other_work_until = {})
     {
         seed_checkpoint(true);
-        auto result = backend.stream_fresh_group(*incremental, requested, count, args, elapsed, stop);
+        auto result = backend.stream_fresh_group(*incremental, requested, count, args, elapsed, stop, other_work_until);
         if (result) { remember_checkpoint(true); observe_shape(result->result); }
         return result;
     }
@@ -3004,15 +3695,16 @@ struct Construction
             group_grow::grow_failpoint("publication-hidden");
         }
     }
-    void publish()
+    bool publish()
     {
-        if (!identity().header.group_size || !publication::pending(path)) return;
+        if (!identity().header.group_size || !publication::pending(path)) return false;
         group_grow::ProgressScope live(config.progress, group_grow::ProgressPhase::publish);
         require(!identity().pending && identity().header.version == PlotGroupFile::FORMAT_VERSION &&
             (!external || external_released), "only a finished group with retired checkpoints can be published");
         group_grow::grow_failpoint("publication-ready");
         publication::publish(path);
         group_grow::grow_failpoint("publication-renamed");
+        return true;
     }
     static group_grow::Stats add_stats(group_grow::Stats a, group_grow::Stats const& b)
     {
@@ -3657,7 +4349,8 @@ std::unique_ptr<group_grow::ExternalEngine::ContributionInput> prepare_pool_cont
 std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPool& pool,
     uint64_t owner, fs::path const& directory, Identity const& identity, uint16_t maximum, uint16_t batch,
     group_grow::Config& config, bool automatic, bool* output_capacity_rejected = nullptr, bool preserve_output = false,
-    bool input = false, size_t open_slots = SIZE_MAX, bool pool_contributions = false, bool pool_packed = false)
+    bool input = false, size_t open_slots = SIZE_MAX, bool pool_contributions = false, bool pool_packed = false,
+    bool preview = false, bool spare_spindle = false)
 {
     uint64_t const batches = (uint64_t(maximum) + batch - 1) / batch;
     uint64_t const run = sum(canonical_bound(identity, batch),
@@ -3713,19 +4406,20 @@ std::optional<group_grow::ExternalConfig> temporary_grant(group_grow::ScratchPoo
             return group_grow::ExternalEngine::striped_reader_bytes(k, config, external);
         };
         auto grant = pool.grant(owner, desired, minimum, segment, 4, automatic, packing_inputs,
-            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots, configure_stripes);
+            product(config.window_bytes, 8), config.io_overlap ? 64 : 1, open_slots, configure_stripes, preview, spare_spindle);
         if (grant && group_grow::ExternalEngine::metadata_bytes(uint8_t(identity.params.get_k()), *grant) +
                 sizeof(group_grow::Header) + identity.memo.size() > config.capacity_bytes)
         {
             if (output_capacity_rejected) *output_capacity_rejected = true;
-            pool.release_scratch_after_cleanup(owner); grant.reset();
+            if (!preview) pool.release_scratch_after_cleanup(owner);
+            grant.reset();
         }
         return grant;
     };
     if (auto grant = attempt()) return grant;
     // A migration has already reserved a complete replacement. It must wait
     // for enough scratch, rather than trade part of that output for scratch.
-    if (preserve_output) return {};
+    if (preserve_output || preview) return {};
     // On a shared filesystem leave room for the retained runs and a merging
     // replacement as well as the final output. This is a fresh reservation;
     // saved quotas never shrink. Ordinary handoff restores available capacity.
@@ -3806,6 +4500,7 @@ struct DestinationPlan
     unsigned workers = 0;
     uint16_t batch = 0;
     ControllerWait empty_reason = ControllerWait::engine_memory;
+    long double cost = std::numeric_limits<long double>::infinity();
 };
 #if (defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK) || defined(GROW_TEST_CONSTRUCTION)
 unsigned pooled_scratch_receivers(unsigned offered, unsigned batch_slots, unsigned measured_slots, unsigned useful)
@@ -3837,14 +4532,14 @@ template<class Memory, class Cost>
 DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t generation,
     uint64_t member_bytes, size_t drive_groups, unsigned workers, uint16_t maximum,
     uint16_t minimum, Memory memory, Cost cost, size_t active_limit = 0, size_t packing_writers = 0,
-    bool prefer_full_batch = false, PackingGrant packing = {})
+    bool prefer_full_batch = false, PackingGrant packing = {}, long double margin = 0)
 {
     // A fresh whole group avoids both prefix rewrites and a scratch round
     // trip. Try all fitting worker grants before accepting a partial batch.
     if (prefer_full_batch && minimum < maximum)
     {
         auto whole = destination_plan(budget, fixed, generation, member_bytes, drive_groups, workers,
-            maximum, maximum, memory, cost, active_limit, packing_writers, false, packing);
+            maximum, maximum, memory, cost, active_limit, packing_writers, false, packing, margin);
         if (whole.active) return whole;
     }
     DestinationPlan best;
@@ -3876,8 +4571,8 @@ DestinationPlan destination_plan(uint64_t budget, uint64_t fixed, uint64_t gener
         }
         if (!batch) continue;
         long double const projected = cost(active, share, batch);
-        if (projected < best_cost)
-        { best = {active, share, batch}; best_cost = projected; }
+        if (projected < best_cost * (1 - margin))
+        { best = {active, share, batch}; best.cost = best_cost = projected; }
     }
     return best;
 }
@@ -4237,6 +4932,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             std::vector<group_grow::ScratchRoot>{group_grow::ScratchRoot::inspect(target.parent_path())}, args.headroom, args.temporary_capacity);
         else scratch_pool = std::make_unique<group_grow::ScratchPool>(roots, args.headroom, args.temporary_capacity);
         scratch_pool->set_io_governor(args.disk_io);
+        progress.observe_bandwidth(*scratch_pool);
         preserve_retired(*scratch_pool, target, args.max_ram - std::min(args.max_ram, external_bytes), args.group_members != 0);
         preserve_published_retired(*scratch_pool, admission_retirements, args.max_ram - std::min(args.max_ram, external_bytes));
         if (initial || recovery)
@@ -4279,6 +4975,11 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     uint64_t caller_fixed = sum(sum(sum(sum(fixture ? fixture->bytes : 0, external_bytes), mib),
         2 * sizeof(group_grow::Member)), batch_hash_bytes(args, 1));
     auto config = configuration(args, capacity, caller_fixed, cpu_scheduler, backend->remote_encoder());
+    group_grow::ConstructionModeChoice mode_choice;
+    long double ram_duration = 0, scratch_duration = 0;
+    PublicationShape publication_shape;
+    CachedPublication cache;
+    auto const mode_started = std::chrono::steady_clock::now();
     if (fresh_roots && scratch_pool && !args.resume && initial && (args.construction == "auto" || args.construction == "external"))
     {
         if (!backend) backend = std::make_unique<Backend>();
@@ -4293,14 +4994,37 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
             [&](uint16_t n) { return group_grow::Engine::memory_bytes(initial->header.k, config, n, 0, compact ? n : 0); });
         if (!batch && input_fits) { input_required = true; batch = 1; }
         require(batch, "member producer and engine workspace exceed --max-ram");
-        if (args.construction == "external" || input_required || batch < maximum)
+        bool const partial = input_required || batch < maximum;
+        mode_choice = {partial, partial ? group_grow::ConstructionModeReason::partial_batch :
+            group_grow::ConstructionModeReason::ordinary};
+        if (args.construction == "auto" && !input_required && !args.protected_resources)
+        {
+            auto preview = temporary_grant(*scratch_pool, 0, target.parent_path(), identity, maximum, batch, config,
+                true, nullptr, true, false, SIZE_MAX, has_compute(args), has_compute(args) && args.pool_output != "encoded", true);
+            publication_shape = construction_load(args, *backend, identity, maximum, 1);
+            if (preview)
+            {
+                auto ram = construction_history(histories, args, target, *initial, cpu_workers, false, nullptr, {}, true);
+                auto external = construction_history(histories, args, target, *initial, cpu_workers, false, &*preview, {}, true);
+                bool const repeat = successor && successor->maximum == maximum && !successor->recovery;
+                if (!fixture && !inherited_bytes) cache = comparable_publications(*backend, args, target, *initial, maximum,
+                    cpu_workers, batch, cpu_workers, batch, *preview);
+                mode_choice = group_grow::choose_construction_mode(partial, publication_shape, publication_shape,
+                    ram.get(), external.get(), repeat && !inherited_bytes && (!args.disk_io || !args.disk_io->status().pressured),
+                    0, 0, cache.ram, cache.scratch);
+                ram_duration = ram ? ram->publication.rate(publication_shape) * maximum : 0;
+                scratch_duration = external ? external->publication.rate(publication_shape) * maximum : 0;
+            }
+        }
+        if (args.construction == "external" || input_required || mode_choice.external)
         {
             uint64_t const prior_capacity = capacity;
             for (;;)
             {
                 uint64_t const before = scratch_pool->memory_bytes();
                 scratch = temporary_grant(*scratch_pool, 0, target.parent_path(), identity, maximum, batch, config,
-                    args.construction == "auto", nullptr, args.protected_resources, input_required, SIZE_MAX, has_compute(args), has_compute(args) && args.pool_output != "encoded");
+                    args.construction == "auto", nullptr, args.protected_resources || !partial, input_required,
+                    SIZE_MAX, has_compute(args), has_compute(args) && args.pool_output != "encoded");
                 capacity = config.capacity_bytes;
                 external_bytes = sum(external_bytes, scratch_pool->memory_bytes() - before);
                 caller_fixed = sum(caller_fixed, scratch_pool->memory_bytes() - before);
@@ -4335,7 +5059,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                     require(scratch_pool->try_reserve_output(0, target.parent_path(), prior_capacity),
                         "cannot restore an unused destination reservation");
                     capacity = prior_capacity; config = configuration(args, capacity, caller_fixed, cpu_scheduler, backend->remote_encoder());
-                    if (bounded) { input_required = true; batch = 1; continue; }
+                        if (bounded && (partial || args.construction == "external")) { input_required = true; batch = 1; continue; }
                 }
                 break;
             }
@@ -4355,12 +5079,14 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         else inherited_peak = construction;
     }
     bool scratch_live = scratch.has_value();
+    size_t const scratch_roots = scratch ? scratch->scratch.size() : 0;
     if (scratch) scratch->target_gate = target_gate;
     // Scratch selection is part of an external phase's physical context.
     // Resolve it before sharing completed CPU or storage observations.
     auto source = initial ? construction_history(histories, args, target, *initial,
         args.workers ? unsigned(args.workers) : std::max(1u, std::thread::hardware_concurrency()), true,
         scratch ? &*scratch : nullptr) : nullptr;
+    auto const mode_history = publication_shape.members && !inherited_bytes ? source : nullptr;
     uint64_t const history_growth = histories ? histories->memory_bytes() - history_bytes : 0;
     external_bytes = sum(external_bytes, history_growth); caller_fixed = sum(caller_fixed, history_growth);
     config = configuration(args, capacity, caller_fixed, cpu_scheduler, backend->remote_encoder());
@@ -4371,6 +5097,7 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         engine.external->tune_packing_checkpoints(group_grow::PackingCheckpointHistory::maximum_bytes);
     engine.attach_history(std::move(source));
     auto const saved = engine.identity();
+    uint64_t const inherited_publication = args.resume && !publication::pending(target) ? saved.header.group_size : 0;
     require(saved.bytes <= engine.config.capacity_bytes, "existing group exceeds destination capacity");
     require(!saved.pending || saved.pending_peak_bytes <= engine.config.capacity_bytes,
             "pending transaction exceeds destination capacity; restore its original capacity");
@@ -4451,11 +5178,19 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
                 "member producer exceeds --max-ram or available host memory");
     engine.confirm_identity(saved.pending || engine.is_staging() || engine.member_count() < maximum);
     Metrics metrics;
+    if (args.resume) mode_choice.reason = group_grow::ConstructionModeReason::recovery;
+    else if (args.construction != "auto" || input_required) mode_choice.reason = group_grow::ConstructionModeReason::required;
+    else if (mode_choice.external && !engine.external) mode_choice.reason = group_grow::ConstructionModeReason::fallback;
+    mode_choice.external = engine.external != nullptr; metrics.construction_choice = mode_choice;
+    metrics.ram_finish_ns = ram_duration; metrics.scratch_finish_ns = scratch_duration;
+    if (mode_history) mode_history->publication.begin(publication_shape);
+    construction_decision(args, target, identity, metrics, maximum, 1, scratch_roots, fixed);
     metrics.peak_modeled_bytes = inherited_peak;
     metrics.capacity_bytes = capacity;
     metrics.peak_file_bytes = sum(saved.bytes, auxiliary.retired);
     metrics.final_bytes = saved.bytes;
     metrics.members = engine.member_count();
+    if (progress.state && args.max_members < 65535) progress.state->target = maximum;
     progress.assembled(metrics.members);
     metrics.engine_reserved_bytes = fixed;
     metrics.recovered = engine.staged_recovery;
@@ -4519,7 +5254,8 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     std::array<group_grow::GenerationHistory, 2> scratch_cost;
     uint16_t scratch_batch = 0;
     group_grow::PoolPublicationHistory::Shape const pool_shape{
-        unsigned(identity.params.get_k()), unsigned(identity.params.get_strength()), maximum};
+        unsigned(identity.params.get_k()), unsigned(identity.params.get_strength()), maximum,
+        has_compute(args) ? construction_load(args, *backend, identity, maximum, 1).supply : group_grow::GenerationSupply{}};
     std::optional<group_grow::PoolPublicationHistory::Choice> publication_choice;
     std::chrono::steady_clock::time_point publication_start{};
     bool comparable_publication = false;
@@ -4933,20 +5669,49 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     {
         metrics.record_generation(backend->mode, producer.generation_peak);
     }
-    clear_progress(args); engine.release_external(); engine.publish();
+    clear_progress(args); engine.release_external();
+    bool const newly_published = engine.publish();
+    auto const durable_elapsed = group_grow::elapsed_ns(mode_started);
+    if (metrics.members && publication::enabled(target)) progress.published(metrics.members, newly_published ? inherited_publication : metrics.members);
+    if (args.dashboard_job) args.dashboard_job->released(file_io::path_text(target), newly_published);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     if (publication_choice && backend->single_publications.begin(pool_shape, *publication_choice, 0))
         backend->single_publications.publish(metrics.members, group_grow::elapsed_ns(publication_start), comparable_publication);
 #endif
-    if (metrics.members && publication::enabled(target)) progress.published();
     progress.finish();
     metrics.scratch_released = engine.scratch_cleanup_complete;
     metrics.scratch_peak_bytes = engine.peak_scratch_bytes;
     static_cast<group_grow::Stats&>(metrics) = engine.stats();
     if (scratch_pool && engine.scratch_cleanup_complete)
         scratch_pool->release_after_cleanup(0, sum(allocated_bytes(target), engine.remaining_metadata_bytes));
+    if (newly_published && (mode_history || !cache.key.empty()) && !metrics.recovered && metrics.members == maximum && engine.scratch_cleanup_complete &&
+        (engine.mode() == "external") == mode_choice.external &&
+        publication_shape == construction_load(args, *backend, identity, maximum, 1))
+    {
+        if (mode_history) mode_history->publication.times.add(metrics.members, durable_elapsed);
+        if (mode_choice.reason != group_grow::ConstructionModeReason::fallback && !metrics.automatic_fallbacks &&
+            cache.matches(engine.config.workers, batch_cap, scratch && mode_choice.external ? &*scratch : nullptr) &&
+            (!args.disk_io || !args.disk_io->status().pressured))
+            backend->publication_cache->completed(cache.key, mode_choice.external, durable_elapsed);
+    }
     check_cancel(args);
     return metrics;
+}
+
+void print_durable_summary(Arguments const& args)
+{
+    if (!args.dashboard_job || args.quiet || args.json) return;
+    auto const p = args.dashboard_job->progress();
+    if (!p.fresh && !p.inherited) return;
+    std::cerr << '[' << args.command << "] ";
+    if (p.fresh)
+    {
+        std::cerr << p.fresh << " new durable members in " << group_grow::dashboard_number(p.last_seconds)
+                  << " s (" << group_grow::dashboard_number(p.last_seconds / p.fresh) << " s/member through publication)";
+        if (p.inherited) std::cerr << ", " << p.inherited << " inherited members";
+    }
+    else std::cerr << p.inherited << " inherited members, no new publication";
+    std::cerr << '\n';
 }
 
 void print_metrics(Arguments const& args, Metrics const& metrics, Backend const& backend,
@@ -4961,6 +5726,7 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
         {
             std::cerr << '[' << args.command << "] " << metrics.members << " members, "
                       << metrics.final_bytes << " bytes; " << metrics.stop_reason << '\n';
+            print_durable_summary(args);
             if (args.verbose)
             {
                 std::cerr << "Backend: " << (args.local_compute && backend.mode == "pool" ? "local" : backend.mode);
@@ -5062,6 +5828,16 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
               << ",\"execution_active_destinations\":" << metrics.execution_active
               << ",\"execution_batch_members\":" << metrics.execution_batch
               << ",\"execution_estimate_known\":" << (metrics.execution_estimate.known ? "true" : "false")
+              << ",\"execution_dated_route_prior\":" << (metrics.execution_estimate.dated_route_prior ? "true" : "false")
+              << ",\"execution_route_prior_min_samples\":" << metrics.execution_estimate.route_prior_min_samples
+              << ",\"execution_route_prior_oldest_utc_seconds\":" << (metrics.execution_estimate.route_prior_oldest_utc ?
+                  std::to_string(metrics.execution_estimate.route_prior_oldest_utc) : "null")
+              << ",\"execution_forecasts\":" << metrics.execution_forecasts
+              << ",\"execution_forecast_seconds\":" << double(metrics.execution_forecast_ns)/1e9
+              << ",\"execution_budget_stops\":" << metrics.execution_budget_stops
+              << ",\"execution_unmeasured_lanes\":" << metrics.execution_estimate.unmeasured
+              << ",\"execution_lower_bound_seconds\":" << (metrics.execution_estimate.lower_bound > 0 ?
+                  std::to_string(double(metrics.execution_estimate.lower_bound/1e9L)) : "null")
               << ",\"stream_input_trial\":\"" << metrics.stream_input_trial << '"'
               << ",\"execution_estimated_seconds\":";
     if (metrics.execution_estimate.known) std::cout << double(metrics.execution_estimate.completion) / 1e9;
@@ -5076,6 +5852,22 @@ void print_metrics(Arguments const& args, Metrics const& metrics, Backend const&
               << ",\"generation_overlap_members\":" << metrics.generation_overlap_members
               << ",\"recovered\":" << (metrics.recovered ? "true" : "false")
               << ",\"stop_reason\":\"" << metrics.stop_reason << '"';
+    if (args.dashboard_job)
+    {
+        auto const p=args.dashboard_job->progress();
+        std::cout << ",\"construction_choice_reason\":";
+        if (metrics.construction_selected.empty()) std::cout << "null";
+        else pos2gpu::write_json_string(std::cout, group_grow::construction_reason(metrics.construction_choice.reason));
+        if (metrics.construction_choice.prior_samples)
+            std::cout << ",\"construction_prior_samples\":" << metrics.construction_choice.prior_samples
+                << ",\"construction_prior_oldest_utc_seconds\":" << metrics.construction_choice.prior_oldest_utc;
+        std::cout << ",\"predicted_ram_finish_seconds\":" << (metrics.ram_finish_ns>0 ? std::to_string(double(metrics.ram_finish_ns/1e9L)) : "null")
+            << ",\"predicted_scratch_finish_seconds\":" << (metrics.scratch_finish_ns>0 ? std::to_string(double(metrics.scratch_finish_ns/1e9L)) : "null");
+        std::cout << ",\"new_durable_members\":" << p.fresh << ",\"inherited_members\":" << p.inherited
+            << ",\"first_new_publication_seconds\":" << (p.fresh ? std::to_string(p.first_seconds) : "null")
+            << ",\"last_new_publication_seconds\":" << (p.fresh ? std::to_string(p.last_seconds) : "null")
+            << ",\"seconds_per_new_durable_member\":" << (p.fresh ? std::to_string(p.last_seconds/p.fresh) : "null");
+    }
     std::cout << ",\"devices_requested\":";
     pos2gpu::write_json_string(std::cout, args.devices);
     std::cout << ",\"controller_wait_seconds\":{";
@@ -5393,9 +6185,14 @@ int rollover(Arguments const& args, Keys const& keys)
     total.capacity_bytes = capacity;
     total.peak_file_bytes = charged;
     std::unique_ptr<Backend> backend;
-    group_grow::ConstructionHistories histories(1);
+    group_grow::ConstructionHistories histories(2);
     uint64_t ordinal = first_pending.value_or(outputs.empty() ? 0 : outputs.back().ordinal);
     if (!first_pending && !outputs.empty() && outputs.back().members == args.group_members) ++ordinal;
+    if (args.dashboard_job)
+        for (auto const& output : outputs)
+            if (!output.pending && output.members && (output.ordinal < ordinal ||
+                (total.members >= args.max_total_members && !first_pending)))
+                args.dashboard_job->published(output.members, output.members);
     auto target_gate = std::make_shared<std::recursive_mutex>();
     uint64_t last_members = outputs.empty() ? 0 : outputs.back().members;
     GroupPrefetch prefetched;
@@ -5508,6 +6305,8 @@ int rollover(Arguments const& args, Keys const& keys)
         total.max_batch_members = std::max(total.max_batch_members, part.max_batch_members);
         if (total.construction_selected.empty()) total.construction_selected = part.construction_selected;
         else if (total.construction_selected != part.construction_selected) total.construction_selected = "mixed";
+        total.construction_choice = part.construction_choice;
+        total.ram_finish_ns = part.ram_finish_ns; total.scratch_finish_ns = part.scratch_finish_ns;
         static_cast<group_grow::Stats&>(total) = Construction::add_stats(total, part);
         total.generation_overlap_batches = sum(total.generation_overlap_batches, part.generation_overlap_batches);
         total.generation_overlap_members = sum(total.generation_overlap_members, part.generation_overlap_members);
@@ -11216,6 +12015,24 @@ int print_replot_review(Arguments const& args, ReplotInputs inputs, bool saved)
         "reviewed source totals exceed the complete inventory");
     uint64_t const protected_bytes = inventory_bytes - selected_bytes;
     auto const protected_entries = inputs.inventory.plots.size() - review.sources.size();
+    if (args.dashboard && args.plan_only && args.dashboard->interactive() && !args.json)
+    {
+        using Frame = group_grow::DashboardFrame;
+        Frame frame;
+        frame.title = "migration plan   read-only preview";
+        frame.summary = std::to_string(review.sources.size())+" selected source files   "+
+            std::to_string(review.batches.size())+" replacement groups";
+        frame.add(Frame::overview, metadata ? "Saved metadata" :
+            assessment.feasible ? "Feasible under the reviewed farming limits" : "Blocked under the reviewed farming limits");
+        if (!next.empty()) frame.add(Frame::overview, "Next command", next);
+        for (auto const& dir : state.directories)
+            frame.add(Frame::resources, dir.directory, std::to_string(dir.capacity_bytes/mib)+" MiB budget");
+        for (auto const& reason : assessment.reasons) frame.add(Frame::decisions, reason);
+        frame.add(Frame::farm, std::to_string(protected_entries)+" protected inventory entries",
+            std::to_string(protected_bytes/mib)+" MiB outside the selected source set");
+        frame.add(Frame::workers, "Worker limits come from the reviewed resource policy");
+        show_plan_dashboard(args,std::move(frame));
+    }
     if (args.json)
     {
         std::cout << "{\"replot_review\":true,\"metadata_only\":" << (metadata ? "true" : "false")
@@ -11358,6 +12175,13 @@ void print_farming_profile(std::ostream& out, group_grow::FarmingProfile const& 
         << "Estimate covers this job only and depends on CPU/storage assumptions.\n";
     if (profile.source == "assumed")
         out << "Select the intended harvester with --harvester local or --harvester FILE.\n";
+    if (profile.reader_calibration)
+    {
+        auto const& scope = *profile.reader_calibration;
+        if (scope.sampled_min_members) out << "Reader samples covered " << scope.sampled_min_members << " to "
+            << scope.sampled_max_members << " members per group. Estimates outside that range are extrapolated.\n";
+        else out << "Sampled membership range is unknown for this reader profile.\n";
+    }
     if (verbose)
     {
         out << "Profile origin: " << profile.source;
@@ -11676,6 +12500,19 @@ void print_farming_membership(std::ostream& out, group_grow::FarmingState const&
     uint64_t members = 0; for (auto count : grant) members = sum(members, count);
     uint64_t admitted = 0; for (auto count : directory.extents) admitted = sum(admitted, count);
     bool const retained = !group_grow::farming_member(directory) && !directory.detached_acknowledged;
+    if (state.profile_metadata && state.profile_metadata->reader_calibration)
+    {
+        uint16_t low = UINT16_MAX, high = 0;
+        auto observe = [&](uint16_t size) { if (size) { low = std::min(low, size); high = std::max(high, size); } };
+        for (auto size : directory.extents) observe(size);
+        if (directory.layout.files)
+        { observe(directory.layout.file_members(0)); observe(directory.layout.file_members(directory.layout.files - 1)); }
+        auto const& scope = *state.profile_metadata->reader_calibration;
+        auto const coverage = scope.coverage(high ? low : 0, high);
+        if (json) out << ",\"reader_calibration_coverage\":" << json_string(std::string(coverage));
+        else if (coverage == "extrapolated") out << "  Reader estimate extrapolated for the planned range of "
+            << low << " to " << high << " members per group.\n";
+    }
     if (json)
     {
         out << ",\"membership\":" << json_string(directory.membership) << ",\"detached_at\":" << directory.detached_at
@@ -11982,6 +12819,28 @@ StatusComputeObservation inspect_status_compute(Arguments const& args, std::chro
 #endif
     return result;
 }
+group_grow::DashboardFrame status_dashboard(StatusDiagnosis const& diagnosis, StatusComputeObservation const& compute)
+{
+    using Frame = group_grow::DashboardFrame;
+    Frame frame; frame.title = "status   read-only"; frame.summary = diagnosis.status;
+    frame.add(Frame::overview,diagnosis.condition,diagnosis.evidence);
+    frame.add(Frame::overview,diagnosis.next,diagnosis.affected_work);
+    frame.add(Frame::decisions,diagnosis.status,diagnosis.affected_work);
+    frame.add(Frame::decisions,diagnosis.unknowns);
+    frame.add(Frame::workers,compute.diagnosis.condition.empty() ? compute.diagnosis.status : compute.diagnosis.condition,compute.diagnosis.next);
+#if defined(XCHPLOT2_GROUP_COMMANDS) && defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (compute.live)
+    {
+        auto const& live=*compute.live;
+        frame.add(Frame::workers,std::to_string(live.accepting_generation)+" accepting generation   "+
+            std::to_string(live.paused)+" paused   "+std::to_string(live.draining)+" draining");
+        for (auto const& worker : live.worker_resources)
+            frame.add(Frame::workers,worker.host+"   "+worker.gpu_identity+"   "+worker.admission,
+                worker.identity+"   "+std::to_string(worker.slots)+" slots offered");
+    }
+#endif
+    return frame;
+}
 void print_status_compute(std::ostream& out, StatusComputeObservation const& value, bool json)
 {
     if (json) { out << "{\"diagnosis\":"; print_status_diagnosis(out, value.diagnosis, true); }
@@ -12058,6 +12917,11 @@ int print_farming_status_once(Arguments args)
                 "coordinator, construction and live compute availability", next, !unstarted};
             auto compute_args = args; compute_args.max_ram = args.max_ram / 8;
             auto compute = inspect_status_compute(compute_args, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.status_timeout_ms));
+            if (args.dashboard)
+            {
+                args.dashboard->observe(status_dashboard(diagnosis,compute));
+                if (!args.json) return unstarted && compute.complete ? 0 : 2;
+            }
             if (args.json) std::cout << "{\"farming_status\":true,\"read_only\":true,\"inspection_complete\":"
                 << (unstarted && compute.complete ? "true" : "false") << ",\"status\":" << json_string(status)
                 << ",\"next_action\":" << json_string(next) << ",\"observed_at_unix_ms\":" << observed_at << ",\"diagnosis\":";
@@ -12408,6 +13272,46 @@ int print_farming_status_once(Arguments args)
     incomplete = incomplete || !compute.complete;
     if (args.status_live && !diagnosis.blocking && (compute.diagnosis.blocking || !compute.complete)) diagnosis = compute.diagnosis;
     else if (args.status_live) diagnosis.unknowns = compute.diagnosis.unknowns + "; ordinary farming services are not inspected by farm status";
+    if (args.dashboard)
+    {
+        using Frame=group_grow::DashboardFrame;
+        auto frame=status_dashboard(diagnosis,compute);
+        uint64_t members=0, files=0;
+        for (auto const& d : destinations)
+        {
+            members=sum(members,d.members); files=sum(files,d.files);
+            frame.add(Frame::resources,d.directory+"   "+d.state,
+                std::to_string(d.members)+" saved members   "+std::to_string(d.allowance/mib)+" MiB allowance remaining");
+            if (d.diagnosis.blocking) frame.add(Frame::decisions,d.directory+"   "+d.diagnosis.condition,d.diagnosis.next);
+        }
+        frame.summary=std::to_string(members)+" saved members   "+std::to_string(files)+" published files";
+        frame.add(Frame::overview,"Saved drive observations   revision "+std::to_string(state.revision));
+        frame.add(Frame::farm,"Configured lookup deadline  "+group_grow::dashboard_number(double(state.config.deadline_seconds))+" s");
+        frame.add(Frame::farm,"Live harvester lookup observations unavailable in saved progress");
+        std::set<uint64_t> checked_owners;
+        bool attached = false;
+        for (auto const& d : destinations)
+        {
+            if (checked_owners.size() == 16) break;
+            if (!d.owner.local_process_proven || !checked_owners.insert(d.owner.local_pid).second) continue;
+            uint64_t age=0;
+            if (auto owner_frame=group_grow::DashboardFeed::read(state.job_id,d.owner,&age))
+            {
+                if (!attached)
+                {
+                    owner_frame->title += "   attached   "+std::to_string(age/1000)+" s ago";
+                    owner_frame->add(Frame::overview,frame.summary,"Durable observations across the saved farm");
+                    owner_frame->add(Frame::decisions,diagnosis.condition,diagnosis.next);
+                    frame=std::move(*owner_frame);
+                    attached = true;
+                }
+                else frame.add(Frame::overview, "Owner "+std::to_string(d.owner.local_pid)+"   "+owner_frame->summary,
+                    owner_frame->title+"   sampled "+std::to_string(age/1000)+" s ago");
+            }
+        }
+        args.dashboard->observe(std::move(frame));
+        if (!args.json) return incomplete ? 2 : 0;
+    }
     if (args.json)
     {
         std::cout << "{\"farming_status\":true,\"read_only\":true,\"job_id\":" << json_string(state.job_id)
@@ -12531,13 +13435,21 @@ template <typename Observe> int print_watched_status(Arguments const& args, Obse
         catch (std::runtime_error const& error)
         {
             if (!args.status_watch || !observed) throw;
-            if (args.json) std::cout << "{\"read_only\":true,\"inspection_complete\":false,\"status\":\"unavailable\",\"reason\":"
+            if (args.dashboard)
+            {
+                group_grow::DashboardFrame frame; frame.title="status"; frame.summary="Waiting for next observation";
+                frame.add(group_grow::DashboardFrame::overview,error.what()); args.dashboard->observe(std::move(frame));
+            }
+            else if (args.json) std::cout << "{\"read_only\":true,\"inspection_complete\":false,\"status\":\"unavailable\",\"reason\":"
                 << json_string(error.what()) << ",\"next_action\":\"waiting for the next status observation\"}\n";
             else std::cerr << "Status temporarily unavailable: " << error.what() << ". Retrying.\n";
         }
         std::cout.flush();
         for (unsigned tick = 0; tick < 10; ++tick)
-        { check_cancel(args); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+        {
+            if (args.dashboard) { args.dashboard->navigate(); if (!args.dashboard->active()) return 0; }
+            check_cancel(args); std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 }
 int print_farming_status(Arguments args)
@@ -12593,6 +13505,27 @@ void print_farming_plan(FarmingRun const& run, Arguments const& args)
     auto const profile = farming_profile(args, c);
     auto const profile_input = !args.from_plan.empty() ? "saved preview" : run.previous_destinations ? "saved job" :
         !args.farming_profile_path.empty() ? "imported" : args.farming_detect_local ? "local observation" : "declared inputs";
+    if (args.dashboard && args.plan_only && args.dashboard->interactive() && !args.json)
+    {
+        using Frame = group_grow::DashboardFrame;
+        Frame frame; frame.title="plan   read-only preview";
+        uint64_t total_members=0, files=0;
+        for (auto const& d : run.state.directories)
+        {
+            auto members=group_grow::farming_layout_members(d); auto groups=group_grow::farming_layout_files(d);
+            total_members=sum(total_members,members); files=sum(files,groups);
+            frame.add(Frame::resources,d.directory+"   "+std::to_string(members)+" planned members",
+                std::to_string(groups)+" files   "+farming_size(d.capacity_bytes)+" capacity budget");
+        }
+        frame.summary=std::to_string(total_members)+" planned members   "+std::to_string(files)+" files";
+        frame.add(Frame::overview,run.feasible() ? "Feasible under the selected farming profile" : run.infeasibility_reason());
+        frame.add(Frame::overview,"Plot layout   k"+std::to_string(c.k)+" strength "+std::to_string(c.strength));
+        frame.add(Frame::workers,"Eligible workers are assessed during plotting");
+        frame.add(Frame::decisions,"Requested construction   "+args.construction);
+        frame.add(Frame::farm,"Modeled response  "+json_estimate(assessment.response_bound_seconds)+" s",
+            "Declared lookup deadline  "+group_grow::dashboard_number(double(c.deadline_seconds))+" s");
+        show_plan_dashboard(args,std::move(frame));
+    }
     if (!args.command.empty() && !args.json)
     {
         if (args.quiet && !args.plan_only) return;
@@ -13131,6 +14064,7 @@ int calibrate_harvester_reader(Arguments const& args)
     ::gmtime_r(&now, &utc);
 #endif
     char captured[32]{}; std::strftime(captured, sizeof(captured), "%Y-%m-%dT%H:%M:%SZ", &utc); scope.captured_at = captured;
+    scope.sampled_min_members = smallest; scope.sampled_max_members = largest;
     profile->reader_calibration = scope;
     for (auto& assumption : profile->assumptions)
         if (assumption == "Reader CPU costs and storage service costs are assumed envelopes, not calibration measurements.")
@@ -13285,10 +14219,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (total.stop_reason.empty()) total.stop_reason = farm->stop_reason(args);
         Backend backend;
         farm->assessment_metrics(total);
-        for (auto const& lane : farm->lanes)
+        for (size_t i = 0; i < farm->lanes.size(); ++i)
+        {
+            auto const& lane = farm->lanes[i];
             for (auto const& output : lane.outputs) if (!output.empty_capacity_probe)
-                report_output(args, group_output_path(farm->directory_path(size_t(&lane - farm->lanes.data())),
+            {
+                if (args.dashboard_job) args.dashboard_job->published(output.members, output.members,
+                    group_grow::DashboardJob::LaneFile{i, output.ordinal});
+                report_output(args, group_output_path(farm->directory_path(i),
                     output), uint16_t(output.members), output.bytes, true);
+            }
+        }
         print_metrics(args, total, backend, groups, last_members, accounted);
         return total.members || farm->job_control() != "active" ||
             std::all_of(farm->state.directories.begin(), farm->state.directories.end(),
@@ -13446,6 +14387,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         for (size_t i = 0; i < paths.size(); ++i)
             output_room[devices[i].filesystem] = scratch_pool->available_for_output(i, paths[i].parent_path()) - minimum_peaks[i];
     }
+    else if (args.disk_io) metadata = sum(metadata, args.disk_io->memory_bytes());
     enum class Work { append, recover, prepare_finish, finish, recover_finish, fallback_input };
     struct Task
     {
@@ -13463,6 +14405,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t contribution_bytes = 0;
         uint64_t original_member_bytes = 0;
         uint16_t prepared_members = 0, fresh_members = 0;
+        uint16_t scheduled_members = 0;
+        uint64_t receipt_due = 0;
         uint64_t prepared_read_accounted = 0, fresh_generation_ns = 0;
         MemberLease lease;
         std::optional<group_grow::ScratchPool::IoLease> io;
@@ -13479,6 +14423,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         std::atomic<bool> cancel_generation{false};
         group_grow::NotifiedFuture<Generated> generating;
         uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
+        std::chrono::steady_clock::time_point other_work_until{};
         // A producer can still own provisional scratch or its member vector.
         // Join before any of those fields, or the engine, are destroyed.
         ~Task()
@@ -13502,12 +14447,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         bool fresh_declined = false, packed_declined = false;
         bool pool_encoded = true, pool_comparable = true;
         group_grow::PoolPublicationHistory* pool_trial = nullptr;
+        std::shared_ptr<group_grow::SharedConstructionHistory> mode_history;
+        PublicationShape publication_shape;
+        std::string publication_cache_key;
+        uint64_t mode_started = 0;
         size_t writer = 0, owner = 0, scratch_owner = 0;
         std::unique_ptr<GroupSuccessor> successor;
         size_t successor_target = 0, prefunded_rows = 0;
         bool successor_staged = false, staging_successor = false;
         uint32_t successor_wait_reason = 0, prefetch_wait_reason = 0;
-        uint16_t batch_cap = 0, recover_count = 0, maximum = 0;
+        ControllerWait admission_wait = ControllerWait::count;
+        Destination const* admission_holder = nullptr;
+        uint16_t batch_cap = 0, recover_count = 0, maximum = 0, inherited_members = 0;
         bool stream_input_candidate = false, stream_input_required = false;
         uint16_t stream_input_batch = 0;
         uint64_t stream_input_bytes = 0;
@@ -13529,17 +14480,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     // Receiver futures and ordered writers may both wake the controller.
     // These objects outlive every task, including exception unwinding.
     group_grow::ControllerWake wake;
-    ProgressReporter progress_reporter(args);
+    ProgressReporter progress_reporter(args,farm ? farm->state.job_id : std::string{});
+    if (scratch_pool) progress_reporter.observe_bandwidth(*scratch_pool);
     std::unique_ptr<Backend> backend = std::make_unique<Backend>();
     backend->progress = progress_reporter.state;
     std::vector<std::unique_ptr<Destination>> destinations; destinations.reserve(paths.size());
-    group_grow::ConstructionHistories histories(paths.size());
+    group_grow::ConstructionHistories histories(2 * paths.size());
     group_grow::StreamingInputCohort stream_cohort(paths.size());
     std::array<group_grow::PoolPublicationHistory, 2> pool_publications; // incremental and external
     metadata = sum(metadata, sum(stream_cohort.memory_bytes(), sizeof(pool_publications)));
     auto const execution_begin = std::chrono::steady_clock::now();
     auto execution_now = [&] { return sum(1, group_grow::elapsed_ns(execution_begin)); };
-    size_t history_contexts = 0;
     uint64_t pool_memory = scratch_pool ? scratch_pool->memory_bytes() : 0;
     uint64_t fixed = sum(sum(metadata, histories.memory_bytes()), pool_memory);
     auto update_pool_memory = [&]
@@ -13737,6 +14688,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         require(d.metrics.members <= d.maximum && (!d.saved.pending || d.saved.target_members <= d.maximum),
                 "saved destination membership exceeds --max-members");
         d.recover_count = d.needs_resume ? uint16_t(d.saved.target_members - d.saved.old_members) : 0;
+        d.inherited_members = d.guard && !publication::pending(d.path) ? d.saved.header.group_size : 0;
         d.metrics.final_bytes = d.saved.bytes;
         d.metrics.peak_file_bytes = sum(std::max(d.saved.bytes, d.saved.pending_peak_bytes), retired);
         destinations.push_back(std::move(destination));
@@ -13869,14 +14821,20 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     auto farm_peak = [&]
     {
         if (!farm) return;
-        uint64_t peak = 0;
+        uint64_t peak = 0, remaining = 0;
         for (auto const& d : destinations)
         {
             peak = sum(peak, farm->lanes[d->owner].completed_charge);
+            if (farm->state.capacity_fill && progress_reporter.state)
+            {
+                auto const allowance = std::min(farm->state.directories[d->owner].capacity_bytes, d->farm_capacity);
+                remaining = sum(remaining, allowance - std::min(allowance, farm->lanes[d->owner].completed_charge));
+            }
             if (!d->farm_counted) peak = sum(peak, d->metrics.peak_file_bytes);
             if (d->successor) peak = sum(peak, d->successor->recovery ?
                 d->successor->guard.charge() : d->successor->metrics.peak_file_bytes);
         }
+        if (farm->state.capacity_fill && progress_reporter.state) progress_reporter.state->unpublished_capacity = remaining;
         total.peak_file_bytes = std::max(total.peak_file_bytes, sum(peak, farm->replacement_peak_bytes));
     };
     size_t active = 0;
@@ -13912,6 +14870,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (d.scratch)
         {
             auto disks = scratch_pool->scratch_devices(d.scratch_owner);
+            if (disks.empty()) disks = scratch_pool->scratch_devices(*d.scratch);
             require(disks.size() == d.scratch->scratch.size(), "execution scratch topology changed");
             lane.parallel_scratch = work.io_overlap && group_grow::ExternalEngine::scratch_overlap(window, *d.scratch);
             long double quota = 0;
@@ -13924,7 +14883,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 lane.parallel_scratch = lane.parallel_scratch && disks[i].rotating && rate > 0;
                 long double const bytes = d.scratch->scratch[i].capacity_bytes;
                 lane.scratch.push_back({resources.index(disks[i]), rate > 0 ? bytes / rate : bytes,
-                    rate > 0 ? work.scratch_bytes * (bytes / quota) / rate : 0});
+                    rate > 0 ? work.scratch_bytes * (bytes / quota) / rate : 0, disks[i].rotating});
             }
             if (!lane.parallel_scratch) for (size_t i = 0; i < lane.scratch.size(); ++i)
                 lane.scratch[i].weight = d.scratch->scratch[i].capacity_bytes;
@@ -13933,10 +14892,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     };
     auto physical_estimate = [&](std::vector<group_grow::ExecutionLane>& lanes, auto const& resources,
                                   size_t count, unsigned grant, bool overlap,
-                                  group_grow::DiskIoGovernor* bandwidth)
+                                  group_grow::DiskIoGovernor* bandwidth, size_t target = SIZE_MAX)
     {
-        if (resources.empty() || std::any_of(resources.begin(), resources.end(), [](auto const& device)
-            { return device.drives.empty(); })) return group_grow::ExecutionEstimate{};
+        if (resources.empty()) return group_grow::ExecutionEstimate{};
         auto const physical = group_grow::writer_groups(resources);
         auto const groups = *std::max_element(physical.begin(), physical.end()) + 1;
         std::vector<bool> seen(groups);
@@ -13952,7 +14910,15 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
         }
         return group_grow::pipeline_execution_estimate(lanes, count, workers, grant, groups, overlap,
-            bandwidth ? bandwidth->concurrent_bandwidth(scratch) : 0);
+            bandwidth ? bandwidth->concurrent_bandwidth(scratch) : 0, target);
+    };
+    auto execution_history = [&](Destination const& d, unsigned grant)
+    {
+        // Admission already resolved these physical devices. Repeated candidates
+        // on a multipath farm must not walk sysfs again for every unopened lane.
+        auto scratch = d.scratch ? scratch_pool->scratch_devices(*d.scratch) : std::vector<group_grow::StorageDevice>{};
+        return construction_history(&histories, args, d.path, initial_identity(d.requested), grant, false,
+            d.scratch ? &*d.scratch : nullptr, {}, true, &devices[d.owner], scratch);
     };
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
     using group_grow::pool::GenerationOutput;
@@ -13983,6 +14949,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     auto admit_destination = [&](Destination& d)
     {
         if (d.engine) return true;
+        auto admission_blocked = [&](ControllerWait reason, Destination const* holder = nullptr)
+        {
+            if (args.dashboard_job && (reason != d.admission_wait || holder != d.admission_holder))
+            {
+                d.admission_wait = reason; d.admission_holder = holder;
+                std::string resource = controller_wait_names[size_t(reason)];
+                std::replace(resource.begin(), resource.end(), '_', ' ');
+                args.dashboard_job->waiting(file_io::path_text(d.path), std::move(resource),
+                    holder ? file_io::path_text(holder->path) : std::string{});
+            }
+            return blocked(reason);
+        };
         require(!farm || !farm->scratch_grants_frozen || args.construction != "external" || d.scratch || d.guard,
             "fresh temporary scratch requires every outstanding farming writer grant to be accounted for; "
             "restore the saved members or use --construction auto for ordinary in-file construction");
@@ -13997,9 +14975,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         }
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         if (pool_prefetch.ready.valid() && pool_prefetch.batch.owner == d.owner)
-            return blocked(ControllerWait::generation_order);
+            return admission_blocked(ControllerWait::generation_order);
 #endif
-        if (!stream_cohort.may_admit(d.owner)) return blocked(ControllerWait::generation_order);
+        if (!stream_cohort.may_admit(d.owner)) return admission_blocked(ControllerWait::generation_order);
         if (farm)
         {
             auto& lane = farm->lanes[d.owner]; auto const previous = lane.reserved_members;
@@ -14010,7 +14988,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 lane.reserved_members = previous;
                 if (!error.memory_budget) throw;
-                farming_resource_error = error.what(); return blocked(ControllerWait::engine_memory);
+                farming_resource_error = error.what(); return admission_blocked(ControllerWait::engine_memory);
             }
             farming_resource_error.clear();
             metadata = sum(metadata - before, farm->metadata); fixed = sum(fixed - before, farm->metadata);
@@ -14035,18 +15013,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto defer = [&](ControllerWait reason)
         {
             release_unused_grant();
-            return blocked(reason);
+            return admission_blocked(reason);
         };
         bool const pooled_generation = has_compute(args);
         if (pooled_generation && args.pool_writers && devices[d.owner].rotating &&
             std::count_if(destinations.begin(), destinations.end(), [&](auto const& other)
                 { return other->engine && devices[other->owner].rotating; }) >= args.pool_writers)
-            return blocked(ControllerWait::writer_queue);
+            return admission_blocked(ControllerWait::writer_queue);
         // A remote receiver owns bounded RAM independently of its final
         // physical writer. The writer queue still serializes all publication.
         if (!pooled_generation)
             for (auto const& other : destinations)
-                if (other->engine && other->writer == d.writer) return blocked(ControllerWait::writer_queue);
+                if (other->engine && other->writer == d.writer) return admission_blocked(ControllerWait::writer_queue, other.get());
         uint64_t const held = retained();
         bool const owns_prefetch = !prefetched.members.empty() && prefetched.owner == d.owner;
         uint64_t const incoming_metadata = owns_prefetch ? prefetched.metadata_bytes : 0;
@@ -14102,7 +15080,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint16_t const minimum = std::max(uint16_t(1), d.recover_count);
         uint64_t const floor = memory(1, minimum);
         if (floor > args.max_ram - std::min(args.max_ram, sum(sum(fixed, held), backend->retained())))
-            return blocked(ControllerWait::engine_memory);
+            return admission_blocked(ControllerWait::engine_memory);
         Producer probe{d.requested, nullptr, *backend, args, args.max_ram, sum(generation_fixed(), floor), 0};
         uint64_t const after_recovery = d.needs_resume ? d.saved.target_members : d.metrics.members;
         bool const needs_generation = d.recover_count || (!d.needs_finish && after_recovery < d.maximum);
@@ -14138,9 +15116,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (!admit_producer(floor, d.scratch || (fresh_roots && !d.guard &&
                 (args.construction == "auto" || args.construction == "external"))))
         {
-            if (!input_allowed) return blocked(ControllerWait::producer_memory);
+            if (!input_allowed) return admission_blocked(ControllerWait::producer_memory);
             use_stream_input = input_required = true;
-            if (!admit_producer(memory(1, minimum))) return blocked(ControllerWait::producer_memory);
+            if (!admit_producer(memory(1, minimum))) return admission_blocked(ControllerWait::producer_memory);
         }
         // A remote receiver can progress even when its final output shares
         // a writer. Count independent physical writers for local generation.
@@ -14194,8 +15172,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         if (pipeline_hdd) size_pipeline(d.scratch || args.construction == "external");
         bool const pooled_hdd = pipeline_hdd && pooled_generation && args.io_overlap && args.generation_overlap &&
             args.member_storage == "compact" && !d.metrics.members && !d.needs_resume && !d.needs_finish;
+        auto const supply = pooled_hdd ? construction_load(args, *backend, d.requested, d.maximum, 1).supply :
+            group_grow::GenerationSupply{};
         group_grow::PoolPublicationHistory::Shape const pool_shape{unsigned(d.requested.params.get_k()),
-            unsigned(d.requested.params.get_strength()), d.maximum};
+            unsigned(d.requested.params.get_strength()), d.maximum, supply};
         // A one-pass fill cannot reuse a trial on this writer. Start it with
         // the bandwidth model and keep any observations from earlier groups.
         auto another_group = [&]
@@ -14238,59 +15218,134 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return false;
 #endif
         };
-        auto estimate = [&](size_t count, unsigned grant, uint16_t batch)
+        constexpr size_t forecast_lanes = 64;
+        using ForecastCoverage = std::array<std::array<bool, 6>, forecast_lanes>;
+        auto estimate = [&](size_t count, unsigned grant, uint16_t batch, ForecastCoverage* coverage = nullptr)
         {
-            if (std::any_of(destinations.begin(), destinations.end(), [](auto const& other)
-                { return other->engine && other->stream_input_bytes; })) return group_grow::ExecutionEstimate{};
+            auto const started = std::chrono::steady_clock::now();
             std::vector<group_grow::ExecutionLane> lanes;
             ExecutionResources resources;
             group_grow::DiskIoGovernor* bandwidth = nullptr;
-            lanes.reserve(destinations.size());
-            for (auto const& other : destinations) if (!other->complete)
+            lanes.reserve(std::min(destinations.size(), forecast_lanes));
+            size_t omitted = 0;
+            unsigned route_prior_samples = 0;
+            uint64_t route_prior_oldest = 0;
+            auto const now = execution_now();
+            auto append = [&](Destination const& other)
             {
+                if (lanes.size() == forecast_lanes) { ++omitted; return; }
+                bool const external = other.scratch || args.construction == "external";
+                unsigned const lane_batch = other.engine && other.batch_cap ? other.batch_cap : batch;
                 long double member_ns = backend->generation_history.member_ns();
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
                 if (pooled_generation)
                 {
-                    bool const external = other->scratch || args.construction == "external";
-                    bool const encoded = other->engine ? other->pool_encoded : initial_pool_output(external, startup_receivers);
-                    member_ns = generation_estimate(*other, external, encoded, unsigned(count), batch).member_ns;
+                    bool const encoded = other.engine ? other.pool_encoded : initial_pool_output(external, startup_receivers);
+                    auto const route = generation_estimate(other, external, encoded, unsigned(count), lane_batch);
+                    member_ns = route.member_ns;
+                    if (route.dated_prior)
+                    {
+                        route_prior_samples = route_prior_samples ? std::min(route_prior_samples, route.prior_min_samples) : route.prior_min_samples;
+                        route_prior_oldest = route_prior_oldest ? std::min(route_prior_oldest, route.prior_oldest_utc) : route.prior_oldest_utc;
+                    }
                 }
 #endif
-                if (!member_ns) return group_grow::ExecutionEstimate{};
-                if (other->needs_resume || other->needs_finish) return group_grow::ExecutionEstimate{};
+                auto const accepted = std::min<uint64_t>(other.maximum, other.metrics.members);
+                auto const pending = other.pending ? other.pending->scheduled_members : 0;
+                auto const remaining = other.maximum - std::min<uint64_t>(other.maximum, accepted + pending);
                 auto options = args; options.workers = grant;
-                auto source = construction_history(&histories, options, other->path,
-                    initial_identity(other->requested), grant, false, other->scratch ? &*other->scratch : nullptr, {}, true);
-                if (!source) return group_grow::ExecutionEstimate{};
-                auto const observed = source->snapshot();
-                long double const shape = group_grow::construction_shape(observed.shapes);
-                if (!shape || other->metrics.members >= other->maximum) return group_grow::ExecutionEstimate{};
-                auto cfg = configuration(options, other->metrics.capacity_bytes, shared_fixed, cpu_scheduler, backend->remote_encoder());
+                auto cfg = configuration(options, other.metrics.capacity_bytes, shared_fixed, cpu_scheduler, backend->remote_encoder());
                 cfg.path_bindings = path_bindings;
-                if (other->scratch) cfg.merge_inputs = other->scratch->fan_in;
-                auto const forecast = other->scratch ? group_grow::construction_external_forecast(other->requested.params.get_k(), cfg,
-                    uint16_t(other->metrics.members), batch, other->maximum, shape,
-                    group_grow::construction_shape(observed.execution_contributions), other->scratch->fan_in,
-                    other->scratch->packing_inputs ? other->scratch->packing_inputs : other->scratch->fan_in, other->execution_runs) :
-                    group_grow::construction_forecast(other->requested.params.get_k(), cfg, uint16_t(other->metrics.members),
-                        other->metrics.final_bytes, batch, other->maximum, shape,
-                        prefetched.members.empty() || prefetched.owner != other->owner);
-                bool const merging = other->scratch || other->mode == "merged" ||
-                    (args.construction == "auto" && group_grow::prefer_merged(forecast, cfg, observed));
-                auto work = group_grow::construction_execution_work(forecast, observed,
-                    member_ns * (forecast.members > other->metrics.members ? forecast.members - other->metrics.members : 0), merging, bool(other->scratch), args.io_overlap);
-                if (!work.known) return group_grow::ExecutionEstimate{};
-                lanes.push_back(execution_lane(*other, work, cfg.window_bytes, resources));
-                if (other->scratch) bandwidth = other->scratch->bandwidth.get();
-            }
-            return physical_estimate(lanes, resources.devices, count, grant,
-                args.generation_overlap && (pooled_generation ? count > 1 : backend->generation_overlap), bandwidth);
+                group_grow::ExecutionWork work;
+                work.generation = other.needs_finish ? 0 : member_ns * remaining;
+                work.batches = std::max<uint64_t>(1, (other.maximum - accepted + lane_batch - 1) / lane_batch);
+                work.io_overlap = args.io_overlap;
+                auto source = other.mode_history;
+                if (!source) source = execution_history(other, grant);
+                if (source && work.batches <= 4096 && !other.needs_resume && !other.needs_finish &&
+                    !other.stream_input_bytes && accepted < other.maximum)
+                {
+                    auto const observed = source->snapshot();
+                    auto const shape = group_grow::construction_shape(observed.shapes);
+                    auto const forecast = other.scratch ? group_grow::construction_external_forecast(other.requested.params.get_k(), cfg,
+                        uint16_t(accepted), uint16_t(lane_batch), other.maximum, shape,
+                        group_grow::construction_shape(observed.execution_contributions), other.scratch->fan_in,
+                        other.scratch->packing_inputs ? other.scratch->packing_inputs : other.scratch->fan_in, other.execution_runs) :
+                        group_grow::construction_forecast(other.requested.params.get_k(), cfg, uint16_t(accepted),
+                            other.metrics.final_bytes, uint16_t(lane_batch), other.maximum, shape,
+                            prefetched.members.empty() || prefetched.owner != other.owner);
+                    if (forecast.batches && forecast.members == other.maximum)
+                    {
+                        bool const merging = other.scratch || other.mode == "merged" ||
+                            (args.construction == "auto" && group_grow::prefer_merged(forecast, cfg, observed));
+                        // A receipted batch owes only its consumer work. Use a
+                        // nonzero marker to ask for that phase's complete rates.
+                        auto const generation = work.generation;
+                        work = group_grow::construction_execution_work(forecast, observed, remaining ? generation : 1,
+                            merging, bool(other.scratch), args.io_overlap);
+                        work.generation = generation;
+                    }
+                }
+                auto lane = execution_lane(other, work, cfg.window_bytes, resources);
+                lane.committed = bool(other.engine);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+                if (other.pending && (other.pending->generating.valid() || other.pending->fresh_members))
+                {
+                    if (other.pending->receipt_due > now) lane.ready_after = other.pending->receipt_due - now;
+                    else lane.work.known = false;
+                }
+#endif
+                if (other.needs_finish && source && other.mode_started)
+                {
+                    auto const typical = source->publication.rate(other.publication_shape) * other.maximum;
+                    lane.ready_after = std::max(lane.ready_after, typical - (now - other.mode_started));
+                }
+                if (coverage)
+                {
+                    auto const& measured = lane.work;
+                    (*coverage)[lanes.size()] = {true, measured.known, measured.generation > 0,
+                        measured.cpu + measured.serial > 0, measured.scratch_read + measured.scratch_write > 0,
+                        measured.destination > 0};
+                }
+                lanes.push_back(std::move(lane));
+                if (other.scratch) bandwidth = other.scratch->bandwidth.get();
+            };
+            // Occupied receivers and their scratch grants precede the next
+            // candidate, regardless of the caller's directory order.
+            for (auto const& other : destinations) if (!other->complete && other->engine) append(*other);
+            auto const target = lanes.size();
+            append(d);
+            for (auto const& other : destinations) if (!other->complete && !other->engine && other.get() != &d) append(*other);
+            auto projected = physical_estimate(lanes, resources.devices, std::min(count, lanes.size()), grant,
+                args.generation_overlap && (pooled_generation ? count > 1 : backend->generation_overlap), bandwidth, target);
+            projected.dated_route_prior = route_prior_samples != 0;
+            projected.route_prior_min_samples = route_prior_samples; projected.route_prior_oldest_utc = route_prior_oldest;
+            if (omitted) { projected.unmeasured += omitted; projected.known = false; }
+            ++total.execution_forecasts;
+            total.execution_forecast_ns = sum(total.execution_forecast_ns, group_grow::elapsed_ns(started));
+            return projected;
         };
+        unsigned forecasts = 0;
+        bool budget_stopped = false;
+        std::array<std::optional<ForecastCoverage>, 2> incumbent_coverage;
+        auto const planning_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
         auto cost = [&](size_t count, unsigned grant, uint16_t batch)
         {
-            auto const projected = estimate(count, grant, batch);
-            return projected.known ? projected.completion : std::numeric_limits<long double>::infinity();
+            if (++forecasts > 12 || std::chrono::steady_clock::now() > planning_deadline)
+            {
+                if (!budget_stopped) { ++total.execution_budget_stops; budget_stopped = true; }
+                return std::numeric_limits<long double>::infinity();
+            }
+            ForecastCoverage coverage{};
+            auto const projected = estimate(count, grant, batch, &coverage);
+            // A missing lane does not erase measured contention elsewhere.
+            // A candidate cannot win by losing a previously priced phase.
+            if (projected.known) coverage.fill({true, true, true, true, true, true});
+            else if (!projected.unmeasured || !(projected.destination || projected.scratch || projected.cpu))
+                return std::numeric_limits<long double>::infinity();
+            auto& incumbent = incumbent_coverage[bool(d.scratch)];
+            if (!incumbent) incumbent = coverage;
+            return coverage == *incumbent ? projected.completion : std::numeric_limits<long double>::infinity();
         };
         auto neutral = [](size_t count, unsigned, uint16_t) { return 1.0L / count; };
         auto recovery_cost = [&](uint64_t reserved, bool encoded, size_t active, unsigned grant, uint16_t batch)
@@ -14355,8 +15410,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (std::isfinite(projected) && (!tune_pool || !args.pool_writers))
             {
                 auto priced = destination_plan(args.max_ram, reserved, generation, storage, sampling ? unfinished_groups : groups,
-                    workers, maximum, minimum, memory, cost, limit, 0, false, packing_grant);
-                if (priced.active && cost(priced.active, priced.workers, priced.batch) <= projected) return priced;
+                    workers, maximum, minimum, memory, cost, limit, 0, false, packing_grant, group_grow::construction_margin(1));
+                if (priced.active && priced.cost <
+                    projected * (1 - group_grow::construction_margin(1))) return priced;
             }
             // Before timings are available, reserve parallel scratch for an
             // overlapping producer without shrinking its batch. CPU generation
@@ -14370,12 +15426,23 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             return plan;
         };
         auto plan = select_plan(shared_fixed);
-        if (!plan.active) return blocked(plan.empty_reason);
+        if (!plan.active) return admission_blocked(plan.empty_reason);
+        auto const ram_plan = plan;
+        auto const ram_generation = generation;
+        auto const ram_receivers = startup_receivers, ram_writers = startup_writers;
+        bool const partial = input_required || plan.batch < d.maximum;
+        bool compare_modes = args.construction == "auto" && !args.protected_resources && !input_required &&
+            fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) && !d.guard && !d.scratch;
+        group_grow::ConstructionModeChoice mode_choice{partial, partial ? group_grow::ConstructionModeReason::partial_batch :
+            group_grow::ConstructionModeReason::ordinary};
+        long double ram_finish = 0, scratch_finish = 0;
+        PublicationShape load;
+        CachedPublication cache;
         // A partial in-memory plan can switch to scratch. Price its bounded
         // receivers before comparing the active writers with that plan.
         bool const request_scratch = fresh_roots && scratch_pool && (!farm || !farm->scratch_grants_frozen) &&
             !d.guard && !d.scratch && (args.construction == "external" ||
-                (args.construction == "auto" && (input_required || plan.batch < d.maximum)));
+                (args.construction == "auto" && (partial || compare_modes)));
         size_t scratch_lanes = plan.active, stripe_lanes = SIZE_MAX;
         if (request_scratch && pooled_hdd && !farming_pressure && independent_input())
         {
@@ -14419,20 +15486,21 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
 #endif
         }
-        if (pooled_generation && fresh_hdd && active >= scratch_lanes) return blocked(ControllerWait::destination_lanes);
+        if (pooled_generation && fresh_hdd && active >= scratch_lanes && !compare_modes)
+            return admission_blocked(ControllerWait::destination_lanes);
         if (d.deferred_output)
         {
             // A queued farming output can take over a scratch spindle after
             // the active group has drained. Recheck real headroom at handoff.
             for (auto const& other : destinations) if (other->engine && other->scratch &&
                 !scratch_pool->io_compatible(other->scratch_owner, d.scratch_owner))
-                return blocked(ControllerWait::storage_lease);
+                return admission_blocked(ControllerWait::storage_lease);
             auto root = group_grow::ScratchRoot::inspect(d.path.parent_path());
             uint64_t const room = root.available_bytes - std::min(root.available_bytes, args.headroom);
             prior_capacity = std::min(prior_capacity, room);
             if (!prior_capacity) { d.metrics.capacity_bytes = 0; d.output_capacity_rejected = true; return false; }
             if (!scratch_pool->try_reserve_output(d.scratch_owner, std::move(root), prior_capacity))
-                return blocked(ControllerWait::storage_lease);
+                return admission_blocked(ControllerWait::storage_lease);
             d.metrics.capacity_bytes = prior_capacity; d.deferred_output = false;
         }
         // Saved roots only recover their existing jobs. Fresh roots come from
@@ -14446,9 +15514,66 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             };
             size_t const initial_slots = open_slots(scratch_lanes);
             size_t scratch_slots = initial_slots;
+            bool spare_spindle = false;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            if (pooled_hdd && active && unfinished_groups > active + 1 && !args.pool_writers &&
+                startup_receivers > 1 && !farming_pressure)
+            {
+                auto client = backend->acquire_pool_client();
+                auto const supply = client->generation_capacity(d.requested.params.get_k(), d.requested.params.get_strength());
+                auto const delivery = client->generation_estimate(d.requested.params.get_k(), d.requested.params.get_strength(),
+                    GenerationOutput::Contributions, unsigned(startup_receivers), maximum, maximum);
+                // On cold start, larger batches already have useful work on
+                // the compatible routes. A new singleton can learn without
+                // holding the following writer's disk until its first byte.
+                auto const width = supply.availability.independent_width(std::min<unsigned>(maximum, args.pool_inflight));
+                auto const established = delivery.measured_slots ? delivery.receivers :
+                    width > 1 ? supply.availability.independent_slots[width] : 0;
+                spare_spindle = established && established < supply.slots && active >= established &&
+                    ((delivery.measured_slots && delivery.measured_slots == supply.slots) ||
+                        client->probe_contribution_route(d.requested.params.get_k(), d.requested.params.get_strength()));
+            }
+#endif
+            if (compare_modes)
+            {
+                load = construction_load(args, *backend, d.requested, d.maximum, ram_plan.active);
+                auto const ordinary = estimate(ram_plan.active, ram_plan.workers, ram_plan.batch);
+                if (ordinary.known) ram_finish = ordinary.completion;
+                auto ram = execution_history(d, ram_plan.workers);
+                auto options = args; options.workers = ram_plan.workers;
+                auto cfg = configuration(options, prior_capacity, shared_fixed, cpu_scheduler, backend->remote_encoder());
+                cfg.path_bindings = path_bindings;
+                d.scratch = temporary_grant(*scratch_pool, d.scratch_owner, d.path.parent_path(), d.requested,
+                    d.maximum, ram_plan.batch, cfg, true, nullptr, true, false, scratch_slots, pooled_generation,
+                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), true, spare_spindle);
+                if (d.scratch)
+                {
+                    if (pipeline_hdd) size_pipeline(true);
+                    DestinationPlan candidate;
+                    if (admit_producer(memory(1, minimum), independent_input())) candidate = select_plan(shared_fixed);
+                    if (candidate.active > active)
+                    {
+                        auto const proposed = estimate(candidate.active, candidate.workers, candidate.batch);
+                        if (proposed.known) scratch_finish = proposed.completion;
+                        auto scratch = execution_history(d, candidate.workers);
+                        auto external_load = load; external_load.width = candidate.active;
+                        if (destinations.size() == 1 && ram_plan.active == 1 && candidate.active == 1 &&
+                            !owns_prefetch && !farming_pressure && !spare_spindle && (!farm || farm->all_replicas))
+                            cache = comparable_publications(*backend, args, d.path, initial_identity(d.requested), d.maximum,
+                                ram_plan.workers, ram_plan.batch, candidate.workers, candidate.batch, *d.scratch);
+                        mode_choice = group_grow::choose_construction_mode(partial, load, external_load, ram.get(), scratch.get(),
+                            !owns_prefetch && !farming_pressure && !spare_spindle && another_group(), ram_finish, scratch_finish,
+                            cache.ram, cache.scratch);
+                    }
+                    else mode_choice = {};
+                    d.scratch.reset();
+                }
+                generation = ram_generation; startup_receivers = ram_receivers; startup_writers = ram_writers;
+                if (mode_choice.external && pipeline_hdd) size_pipeline(true);
+            }
             DestinationPlan first_external;
             long double first_cost = std::numeric_limits<long double>::infinity();
-            for (;;)
+            while (!compare_modes || mode_choice.external)
             {
                 auto options = args; options.workers = plan.workers;
                 auto config = configuration(options, d.metrics.capacity_bytes, shared_fixed, cpu_scheduler, backend->remote_encoder());
@@ -14464,8 +15589,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 }
                 bool capacity_rejected = false;
                 d.scratch = temporary_grant(*scratch_pool, d.scratch_owner, d.path.parent_path(), d.requested,
-                    uint16_t(d.maximum), plan.batch, config, args.construction == "auto", &capacity_rejected, false, input_required,
-                    scratch_slots, reserve_probe, pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"));
+                    uint16_t(d.maximum), plan.batch, config, args.construction == "auto", &capacity_rejected,
+                    compare_modes && !partial, input_required, scratch_slots, reserve_probe,
+                    pooled_generation && (tune_pool ? !pool_choice(true).encoded : args.pool_output == "packed"), false, spare_spindle);
                 d.metrics.capacity_bytes = config.capacity_bytes; fresh_scratch = d.scratch.has_value();
                 update_pool_memory();
                 DestinationPlan external_plan;
@@ -14515,7 +15641,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     if (args.construction == "external" || input_required)
                     {
                         d.output_capacity_rejected = capacity_rejected;
-                        return capacity_rejected ? false : blocked(reason);
+                        return capacity_rejected ? false : admission_blocked(reason);
                     }
                     if (pooled_hdd) size_pipeline(false);
                 }
@@ -14537,8 +15663,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t const fragment_count = fragment_bound(d.requested.params) / sizeof(uint64_t);
         bool const trial_boundary = prefetched.members.empty() &&
             std::none_of(destinations.begin(), destinations.end(), [](auto const& other) { return bool(other->successor); });
-        auto candidate_context = construction_history(&histories, args, d.path, initial_identity(d.requested),
-            workers, false, d.scratch ? &*d.scratch : nullptr, {}, true);
+        auto candidate_context = execution_history(d, workers);
         if (!input_required && !pooled_generation && d.scratch && d.scratch->scratch.size() == 1 && !d.guard && !d.needs_resume && !d.needs_finish &&
             !d.metrics.members && args.member_storage == "compact" && args.io_overlap && args.generation_overlap &&
             backend->generation_overlap && fragment_count && fragment_count <= UINT32_MAX && trial_boundary &&
@@ -14644,8 +15769,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         // Reuse matching observations, but keep the existing bounded table;
         // a new context can use ordinary resource admission without a history.
         auto source = construction_history(&histories, options, d.path, initial_identity(d.requested), share,
-            !farm || history_contexts < paths.size(), d.scratch ? &*d.scratch : nullptr);
-        if (farm && histories.memory_bytes() > history_before) ++history_contexts;
+            true, d.scratch ? &*d.scratch : nullptr);
         fixed = sum(fixed, histories.memory_bytes() - history_before);
         auto generation_peak = [&](uint64_t workspace)
         { return sum(sum(sum(generation_fixed(checked_contributions), workspace), sum(generation_held, product(batch - 1, resident_member))), generation); };
@@ -14682,6 +15806,10 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             initial_identity(d.requested), args.construction, d.scratch, d.guard ? d.guard->retired : 0, detailed_output(args));
         if (engine->external && !args.checkpoint_set)
             engine->external->tune_packing_checkpoints(group_grow::PackingCheckpointHistory::maximum_bytes);
+        d.mode_history = compare_modes && !owns_prefetch ? source : nullptr;
+        d.publication_cache_key.clear();
+        if (cache.matches(share, batch, d.scratch ? &*d.scratch : nullptr))
+            d.publication_cache_key = std::move(cache.key);
         engine->attach_history(std::move(source));
         Construction::same_saved(d.saved, engine->identity());
         if (d.guard) check_guard(d);
@@ -14693,6 +15821,21 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             "active destination workspace exceeds --max-ram");
         require(fits_fallback(actual), "active destination consumed compact-input fallback headroom");
         engine->confirm_identity(true);
+        if (d.guard) mode_choice.reason = group_grow::ConstructionModeReason::recovery;
+        else if (args.construction != "auto" || input_required) mode_choice.reason = group_grow::ConstructionModeReason::required;
+        else if (mode_choice.external && !engine->external) mode_choice.reason = group_grow::ConstructionModeReason::fallback;
+        mode_choice.external = bool(engine->external);
+        d.metrics.construction_choice = total.construction_choice = mode_choice;
+        d.metrics.ram_finish_ns = total.ram_finish_ns = ram_finish;
+        d.metrics.scratch_finish_ns = total.scratch_finish_ns = scratch_finish;
+        construction_decision(args, d.path, d.requested, d.metrics, d.maximum, plan.active, d.scratch ? d.scratch->scratch.size() : 0,
+            actual, d.scratch ? &*d.scratch : nullptr, &total.execution_estimate);
+        if (d.mode_history || !d.publication_cache_key.empty())
+        {
+            load.width = plan.active; d.publication_shape = load; d.mode_started = execution_now();
+            if (d.mode_history) d.mode_history->publication.begin(load);
+        }
+        d.admission_wait = ControllerWait::count; d.admission_holder = nullptr;
         d.engine = std::move(engine); d.batch_cap = batch;
         d.fresh_declined = d.packed_declined = false;
         d.pool_encoded = choice.encoded;
@@ -14737,7 +15880,17 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         d.metrics.selected_window_bytes = engine.config.window_bytes;
         d.metrics.selected_checkpoint_bytes = engine.selected_checkpoint_bytes();
         d.metrics.construction_selected = engine.mode();
-        engine.confirm_identity(); clear_progress(args); engine.release_external(); engine.publish(); d.guard = snapshot(d.path, 0);
+        engine.confirm_identity(); clear_progress(args); engine.release_external();
+        bool const newly_published = engine.publish();
+        auto const durable_at = execution_now();
+        if (d.metrics.members && publication::enabled(d.path))
+        {
+            std::optional<group_grow::DashboardJob::LaneFile> file;
+            if (farm) file.emplace(d.owner, farm->lanes[d.owner].ordinal);
+            progress_reporter.published(d.metrics.members, newly_published ? d.inherited_members : d.metrics.members, file);
+        }
+        if (args.dashboard_job) args.dashboard_job->released(file_io::path_text(d.path), newly_published);
+        d.guard = snapshot(d.path, 0);
         d.metrics.scratch_peak_bytes = engine.peak_scratch_bytes;
         d.metrics.scratch_released = engine.scratch_cleanup_complete;
         static_cast<group_grow::Stats&>(d.metrics) = Construction::add_stats(d.metrics, engine.stats());
@@ -14745,6 +15898,22 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             scratch_pool->release_after_cleanup(d.scratch_owner, sum(allocated_bytes(d.path), engine.remaining_metadata_bytes));
         update_pool_memory();
         require(!d.workers, "destination released before its worker task joined");
+        if (d.mode_history || !d.publication_cache_key.empty())
+        {
+            auto const elapsed = durable_at - d.mode_started;
+            if (newly_published && d.metrics.members == d.maximum && !d.metrics.recovered && engine.scratch_cleanup_complete &&
+                (engine.mode() == "external") == d.metrics.construction_choice.external &&
+                d.publication_shape == construction_load(args, *backend, d.requested, d.maximum, d.publication_shape.width))
+            {
+                if (d.mode_history && d.mode_history->publication.shape == d.publication_shape)
+                    d.mode_history->publication.times.add(d.metrics.members, elapsed);
+                if (!d.publication_cache_key.empty() && !d.metrics.automatic_fallbacks &&
+                    d.metrics.construction_choice.reason != group_grow::ConstructionModeReason::fallback &&
+                    (!args.disk_io || !args.disk_io->status().pressured))
+                    backend->publication_cache->completed(d.publication_cache_key, d.metrics.construction_choice.external, elapsed);
+            }
+            d.mode_history.reset(); d.publication_cache_key.clear(); d.mode_started = 0;
+        }
         if (d.pool_trial)
         {
             d.pool_trial->publish(d.metrics.members, execution_now(), d.pool_comparable);
@@ -14816,7 +15985,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         check_farm(retained());
         accumulate(d.metrics, d.mode);
         d.path = farm->path(d.owner); d.requested = farm->identity(*keys, d.owner, lane.ordinal);
-        d.saved = initial_identity(d.requested); d.guard.reset(); d.scratch.reset(); d.metrics = {};
+        d.saved = initial_identity(d.requested); d.guard.reset(); d.scratch.reset(); d.metrics = {}; d.inherited_members = 0;
         d.maximum = maximum; d.batch_cap = d.recover_count = 0; d.observed_member_storage = 0;
         d.needs_resume = d.needs_finish = false; d.complete = d.farm_counted = false; d.mode = args.construction;
         d.capacity_limit = scratch_pool ? temporary_output_capacity(args, d.requested, maximum, room) : room;
@@ -15128,7 +16297,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     if (task->fresh_members)
                     {
                         auto result = d.engine->stream_fresh(*backend, d.requested, task->fresh_members,
-                            args, task->fresh_generation_ns, &task->cancel_generation);
+                            args, task->fresh_generation_ns, &task->cancel_generation, task->other_work_until);
                         if (result) task->appended = *result;
                         break;
                     }
@@ -15161,7 +16330,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         d.metrics.members = result.members; d.metrics.final_bytes = result.final_bytes;
         d.metrics.peak_file_bytes = std::max(d.metrics.peak_file_bytes, result.peak_file_bytes);
         d.metrics.workspace_bytes = std::max(d.metrics.workspace_bytes, result.workspace_bytes);
-        if (args.progress && !args.command.empty())
+        if (progress_reporter.state)
         {
             uint64_t members = total.members;
             for (auto const& destination : destinations) members = sum(members, destination->metrics.members);
@@ -15499,14 +16668,19 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         auto const& lane = farm->lanes[i];
         for (auto const& output : lane.outputs) if (output.ordinal < lane.ordinal)
         {
-            progress_reporter.published();
+            progress_reporter.published(output.members, output.members, group_grow::DashboardJob::LaneFile{i, output.ordinal});
             report_output(args, group_output_path(farm->directory_path(i), output),
                 uint16_t(output.members), output.bytes, true);
         }
     }
+    auto progress_file = [&](Destination const& d) -> std::optional<group_grow::DashboardJob::LaneFile>
+    {
+        if (!farm) return {};
+        return group_grow::DashboardJob::LaneFile{d.owner, farm->lanes[d.owner].ordinal};
+    };
     for (auto const& d : destinations) if (d->complete && d->metrics.members)
     {
-        progress_reporter.published();
+        progress_reporter.published(d->metrics.members, d->metrics.members, progress_file(*d));
         report_output(args, d->path, uint16_t(d->metrics.members), d->metrics.final_bytes, true);
     }
     {
@@ -15514,8 +16688,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         for (auto const& destination : destinations) members = sum(members, destination->metrics.members);
         progress_reporter.assembled(members);
     }
+    if (progress_reporter.state)
+    {
+        uint64_t target=0;
+        if (farm && !farm->state.capacity_fill)
+            for (auto const& dir : farm->state.directories) target=sum(target,group_grow::farming_layout_members(dir));
+        else if (!farm) for (auto const& d : destinations) target=sum(target,d->maximum);
+        progress_reporter.state->target=target;
+        if (farm && farm->state.capacity_fill) farm_peak();
+    }
     while (complete < destinations.size())
     {
+        if (progress_reporter.state) progress_reporter.state->waits = 0;
         auto const wake_generation = wake.generation();
         check_cancel(args);
         bool progress = false;
@@ -15547,6 +16731,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 auto& task = *d.pending;
                 if (task.generating.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
                 auto const generated = task.generating.get();
+                task.receipt_due = 0; task.scheduled_members = uint16_t(generated.members);
                 task.receiving_bytes = 0; task.io.reset(); task.fill_stop = generated.stop;
                 d.metrics.generated_members = sum(d.metrics.generated_members, generated.members);
                 if (task.prepared_input && !generated.members)
@@ -15752,7 +16937,6 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     if (d.metrics.stop_reason.empty()) d.metrics.stop_reason = d.maximum == 65535 ? "format-limit" : "member-limit";
                     release(d);
                     if (detailed_output(args)) std::cerr << d.path << ": finished " << d.metrics.members << " members, " << d.metrics.final_bytes << " bytes\n";
-                    if (d.metrics.members) progress_reporter.published();
                     report_output(args, d.path, uint16_t(d.metrics.members), d.metrics.final_bytes);
                     stream_cohort.complete(d.owner, uint16_t(d.metrics.members), d.metrics.final_bytes,
                         execution_now(), active, d.metrics.stream_input_batches != 0);
@@ -15977,6 +17161,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     (!farm || !farm->state.capacity_fill) && !streamed && !has_compute(args));
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             unsigned generation_destinations = 1;
+            long double delivery_member_ns = 0;
             std::chrono::steady_clock::time_point other_work_until{};
             if (backend->mode == "pool" && wanted && !d.needs_resume && !has_prefetched)
             {
@@ -15984,6 +17169,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 // Price only simultaneous generation until packing is measured.
                 auto const forecast = generation_estimate(d, contribution_members && !select_merged, d.pool_encoded && !select_merged,
                     unsigned(std::min<uint64_t>(active, args.pool_inflight)), unsigned(contribution_members ? contribution_members : wanted));
+                delivery_member_ns = forecast.member_ns * std::max(1u, forecast.receivers);
                 unsigned offered_slots = 0;
                 unsigned const receivers = backend->pool_receivers(d.requested, forecast, &offered_slots);
                 if (receivers)
@@ -16023,18 +17209,22 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     if (receiving >= receivers && !packed_queue && (!queue || backend->acquire_pool_client()->probe_contribution_route(
                         d.requested.params.get_k(), d.requested.params.get_strength())))
                     { blocked(ControllerWait::generation_order); continue; }
-                    if (queue && total.execution_active > 1 && offered_slots > 1 && contribution_members > 1 && forecast.member_ns > 0)
+                    if (can_queue && total.execution_active > 1 && offered_slots > 1 && forecast.member_ns > 0)
                     {
-                        // Queued leases omit destinations still waiting for their HDDs.
-                        // Count fresh groups with enough planned capacity for the full
-                        // output. Running receivers and tight capacity probes do not count.
+                        // Only independent, fitting work can hide a slower
+                        // delivery. A runnable writer needing this receiver's
+                        // spindle shortens its useful horizon to the present.
                         uint64_t future = 0;
                         for (auto const& other : destinations)
                             if (other->writer != d.writer && !other->complete && !other->pending && !other->guard &&
                                 !other->needs_resume && !other->needs_finish && !other->metrics.members &&
                                 other->maximum && !other->awaiting_extent && !other->output_capacity_rejected && same_shape(other) &&
                                 canonical_bound(other->requested, other->maximum) <= other->capacity_limit)
+                            {
+                                if (d.scratch && !scratch_pool->target_io_compatible(devices[other->owner], d.scratch_owner))
+                                { future = 0; break; }
                                 future = sum(future, other->maximum);
+                            }
                         auto const ns = std::min<long double>(future * forecast.member_ns, args.pool_timeout_ms * 1000000.L);
                         other_work_until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(int64_t(ns));
                     }
@@ -16042,6 +17232,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             }
 #endif
             d.pending = std::make_unique<Task>(); auto& task = *d.pending;
+            task.scheduled_members = uint16_t(contribution_members ? contribution_members : wanted);
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            task.other_work_until = other_work_until;
+            if (delivery_member_ns > 0)
+                task.receipt_due = sum(execution_now(), uint64_t(std::min<long double>(
+                    delivery_member_ns * task.scheduled_members, args.pool_timeout_ms * 1000000.L)));
+#endif
             task.work = d.needs_resume ? Work::recover : Work::append;
             task.select_merged = select_merged;
             if (has_prefetched)
@@ -16074,7 +17271,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     auto const packed = backend->pool_estimate(d.requested, GenerationOutput::Packed, 1, batch, batch);
                     auto const fresh = backend->pool_estimate(d.requested, GenerationOutput::Fresh, 1, batch, batch);
                     direct = pool_publications[0].final_group_encoded({unsigned(d.requested.params.get_k()),
-                        unsigned(d.requested.params.get_strength()), d.maximum}, direct, args.pool_writers != 0,
+                        unsigned(d.requested.params.get_strength()), d.maximum,
+                        construction_load(args, *backend, d.requested, d.maximum, 1).supply}, direct, args.pool_writers != 0,
                         packed.member_ns, fresh.member_ns);
                 }
                 if (auto slots = direct ? backend->fresh_group_slots(d.requested, wanted) : 0)
@@ -16132,7 +17330,8 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                         std::function<std::optional<group_grow::ScratchPool::IoLease>()> acquire_io;
                         if (scratch_pool) acquire_io = [&] { return scratch_pool->try_io(d.scratch_owner); };
                         auto const generated = pending->prepared_input ?
-                            producer.fill_pool_input(*pending->prepared_input, first, other_held, bytes, &pending->cancel_generation, acquire_io) :
+                            producer.fill_pool_input(*pending->prepared_input, first, other_held, bytes, &pending->cancel_generation, acquire_io,
+                                other_work_until) :
                             producer.fill_contributions(*pending->contribution_input, first,
                             other_held, bytes, file_io::path_text(d.path) + ": generating compressed pool member ",
                             &pending->cancel_generation, acquire_io, generation_destinations, other_work_until);
@@ -16170,7 +17369,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     producer.defer_pool_history = true;
                     auto const generated = producer.fill_pool(pending->members, first, wanted, other_held,
                         file_io::path_text(d.path) + ": generating pool member ", {}, &pending->cancel_generation,
-                        pending->hash.get(), generation_destinations);
+                        pending->hash.get(), generation_destinations, pending->other_work_until);
                     require(generated && (!d.needs_resume || pending->members.size() == wanted),
                         "saved destination batch exceeds pool generation admission");
                     producer.admit_engine(pending->members);
@@ -16308,6 +17507,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (completed) continue;
             auto const begin = std::chrono::steady_clock::now();
             wait_reasons |= wait_bit(ControllerWait::consumer);
+            if (progress_reporter.state) progress_reporter.state->waits = wait_reasons;
             ControllerTiming timing("wait", 0, wait_reasons);
             wake.wait_for(wake_generation, std::chrono::milliseconds(50));
             uint64_t const elapsed = group_grow::elapsed_ns(begin);
@@ -16741,6 +17941,7 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
         }
         auto controls = farming_control_view(saved.present ? saved.state.farm : review.farm, {});
         std::string coordinator_activity = "not-recorded", coordinator_status = "not-recorded";
+        std::optional<FarmingOwnerHealth> local_owner;
         if (saved.present)
         {
             auto const policy = replot_control_policy(saved.state.farm);
@@ -16755,6 +17956,7 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
                 FarmingOwnerHealth owner;
                 try { if (saved.replicas[lane].available) owner = observe_farming_owner(*saved.replicas[lane].metadata, policy, lane, args.max_ram); else owner.status = "unavailable"; }
                 catch (std::exception const&) { owner.status = "unavailable"; }
+                if (args.dashboard && owner.local_process_proven && !local_owner) local_owner = owner;
                 if (owner.lock_held && owner.heartbeat_current) { coordinator_activity = owner.last_state; coordinator_status = owner.status; }
                 else if (coordinator_status == "not-recorded" && owner.status != "not-recorded") { coordinator_activity = owner.last_state; coordinator_status = owner.status; }
                 if (lane) owners << ',';
@@ -16771,6 +17973,7 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
             {
                 auto const policy = replot_authority_owner_policy(saved.state.farm, file_io::native_path(saved.state.authority_directory));
                 auto const owner = observe_farming_owner(*saved.authority->metadata, policy, 0, args.max_ram);
+                if (args.dashboard && owner.local_process_proven) local_owner = owner;
                 if (owner.lock_held && owner.heartbeat_current) { coordinator_activity = owner.last_state; coordinator_status = owner.status; }
             }
             catch (std::exception const&) { coordinator_status = "controller-observation-unavailable"; }
@@ -16875,6 +18078,26 @@ int print_replot_status(Arguments const& args, ReplotInputs const& inputs)
         }
         next = diagnosis.next;
         if (!replot_journals_unchanged(saved) || (inputs.stamp && stream_state::stamp(args.from_plan) != *inputs.stamp)) continue;
+        if (args.dashboard)
+        {
+            using Frame=group_grow::DashboardFrame;
+            auto frame=status_dashboard(diagnosis,compute); frame.title="migration status   read-only";
+            frame.add(Frame::farm,services.diagnosis.status,services.diagnosis.condition);
+            frame.add(Frame::farm,services.diagnosis.next);
+            frame.add(Frame::resources,available ? "Saved destinations available" : "Some destinations unavailable");
+            if (local_owner)
+            {
+                uint64_t age = 0;
+                if (auto live = DashboardFeed::read(review.farm.job_id, *local_owner, &age))
+                {
+                    live->title += "   attached   "+std::to_string(age/1000)+" s ago";
+                    live->add(Frame::decisions, diagnosis.condition, diagnosis.next);
+                    frame = std::move(*live);
+                }
+            }
+            args.dashboard->observe(std::move(frame));
+            if (!args.json) return available && observations_ok && live_complete && !saved.authority_missing ? 0 : 2;
+        }
         if (args.json)
         {
             std::cout << "{\"replot_status\":true,\"read_only\":true,\"observed_at_unix_ms\":" << observed_at
@@ -18064,6 +19287,8 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     std::string activity = "preparing";
     auto publish_activity = [&](std::string_view value)
     {
+        if (activity != value && args.dashboard_job)
+            args.dashboard_job->decision(std::string(value), "Protected migration coordinator");
         activity = value;
         for (auto const& owner : migration_owners) if (owner) owner->activity(activity, controls.digest);
         if (controller_owner) controller_owner->activity(activity, controls.digest);
@@ -18136,13 +19361,37 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     });
     if (!effective.disk_io) effective.disk_io = std::make_shared<DiskIoGovernor>();
     std::vector<FarmingLogSampler> farming_samples;
-    for (auto const* route : source_routes) farming_samples.emplace_back(*route);
-    if (std::none_of(source_routes.begin(), source_routes.end(), [&](auto const* route) { return route->kind == target_options.kind && route->root == target_options.root && route->executable == target_options.executable && route->harvester == target_options.harvester; }))
-        farming_samples.emplace_back(target_options);
-    for (auto& sampler : farming_samples) (void)sampler.sample();
+    auto add_sampler = [&](HarvesterAdapterOptions const& route)
+    {
+        FarmingLogSampler sampler(route);
+        if (sampler.path().empty()) return;
+        if (std::none_of(farming_samples.begin(), farming_samples.end(), [&](auto const& old)
+        {
+            std::error_code error;
+            return old.path() == sampler.path() || fs::equivalent(old.path(), sampler.path(), error);
+        })) farming_samples.push_back(std::move(sampler));
+    };
+    for (auto const* route : source_routes) add_sampler(*route);
+    add_sampler(target_options);
     uint64_t farming_deadline_ns = 0;
     for (auto const& workload : replot_resources(inputs).workloads) if (product(workload.deadline_us, 1000) && (!farming_deadline_ns || product(workload.deadline_us, 1000) < farming_deadline_ns))
         farming_deadline_ns = product(workload.deadline_us, 1000);
+    auto sample_farming = [&](FarmingLogSampler& sampler)
+    {
+        return sampler.sample(FarmingLogSampler::Clock::now(), std::chrono::system_clock::now(),
+            [&](FarmingServiceRecord const& record) { effective.disk_io->record_farming_service(record, farming_deadline_ns); });
+    };
+    for (auto& sampler : farming_samples) (void)sample_farming(sampler);
+    auto monitor_args = effective;
+    monitor_args.replot = true;
+    monitor_args.directory_farm = true;
+    monitor_args.destinations.clear();
+    for (auto const& directory : review.farm.directories)
+        monitor_args.destinations.push_back(file_io::native_path(directory.directory));
+    if (!monitor_args.destinations.empty()) monitor_args.target = monitor_args.destinations.front();
+    if (farming_deadline_ns) monitor_args.farming_deadline_ms = farming_deadline_ns / 1000000;
+    ProgressReporter migration_progress(monitor_args, review.farm.job_id);
+    effective.parent_progress = migration_progress.state;
     auto last_remaining = replot_inventory_counts(inventory);
     // Before reading a journal, any previously published prefix is possible.
     // The immutable plan has already certified restart supervision for each;
@@ -18469,6 +19718,17 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
         }
         return members;
     };
+    if (args.dashboard_job && journal.present)
+    {
+        uint64_t files = 0;
+        if (journal.state.completed_lanes.empty()) files = journal.state.batch;
+        else for (auto const& lane : journal.state.completed_lanes) files = sum(files, lane.files);
+        if (journal.state.batch < review.batches.size() && !replot_lane_completed(journal.state, journal.state.batch) &&
+            (journal.state.published || (journal.state.verified_stage && fs::exists(final_path(journal.state.batch))))) ++files;
+        for (auto const& output : journal.state.queued)
+            if (output.published || (output.verified_stage && fs::exists(final_path(output.batch)))) ++files;
+        args.dashboard_job->inherited_snapshot(files, service_members());
+    }
     auto prepare_services = [&](bool fresh)
     {
         for (bool future : {false, true})
@@ -19547,7 +20807,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                         refresh_controls();
                         if (controls.effective(size_t(plan.lane)) == "paused")
                         { pause_reason = "ordinary-pause"; resource_pause.store(true, std::memory_order_release); return; }
-                        for (auto& sampler : farming_samples) if (auto const elapsed = sampler.sample())
+                        for (auto& sampler : farming_samples) if (auto const elapsed = sample_farming(sampler))
                         {
                             effective.disk_io->observe_farming(*elapsed, farming_deadline_ns);
                             if (farming_health) farming_health->observe_latency(*elapsed, farming_deadline_ns);
@@ -19968,7 +21228,10 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                 audit_file(batch, stage, *saved.verified_stage, false, saved.verified_stage_identity);
                 require(!file_io::rename_file(stage, final, false), "cannot publish queued migration output without overwriting a file");
                 if (stage.parent_path() != final.parent_path()) stream_state::sync_path(stage.parent_path(), true);
-                stream_state::sync_path(final.parent_path(), true); grow_failpoint("replot-queue-publication-renamed");
+                stream_state::sync_path(final.parent_path(), true);
+                migration_progress.published(review.farm.directories[size_t(plan.lane)].layout.file_members(plan.ordinal), 0,
+                    group_grow::DashboardJob::LaneFile{size_t(plan.lane), plan.ordinal});
+                grow_failpoint("replot-queue-publication-renamed");
             }
             audit_file(batch, final, *saved.verified_stage, true, saved.verified_stage_identity);
             auto const stamp = stream_state::stamp(final);
@@ -20244,7 +21507,10 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
                     audit_file(index, stage, *journal.state.verified_stage, false, journal.state.verified_stage_identity);
                     require(!file_io::rename_file(stage, final, false), "cannot publish migration replacement without overwriting a file");
                     if (stage.parent_path() != final.parent_path()) stream_state::sync_path(stage.parent_path(), true);
-                    stream_state::sync_path(final.parent_path(), true); grow_failpoint("replot-replacement-published");
+                    stream_state::sync_path(final.parent_path(), true);
+                    migration_progress.published(review.farm.directories[size_t(plan.lane)].layout.file_members(plan.ordinal), 0,
+                        group_grow::DashboardJob::LaneFile{size_t(plan.lane), plan.ordinal});
+                    grow_failpoint("replot-replacement-published");
                 }
                 audit_file(index, final, *journal.state.verified_stage, true, journal.state.verified_stage_identity);
                 auto const stamp = stream_state::stamp(final); persist([&](auto& state) { state.published = stamp; state.published_identity = state.verified_stage_identity; });
@@ -21032,13 +22298,26 @@ int run_farming(Arguments args)
         farm->metadata = sum(farm->metadata, product(policy_heads.capacity(), sizeof(policy_heads.front())));
         require(farm->metadata < args.max_ram, "farming recovery observations exceed --max-ram");
         farm->select_available();
-#ifdef XCHPLOT2_GROUP_COMMANDS
         bool const work = std::any_of(farm->lanes.begin(), farm->lanes.end(), [&](auto const& lane)
             { return farm->maximum(args, size_t(&lane - farm->lanes.data())) != 0; });
+#ifdef XCHPLOT2_GROUP_COMMANDS
         if (args.automatic_compute && work) args.compute_session = std::make_shared<pos2gpu::ComputeSession>(args);
 #endif
         int result = 0; bool interrupted = false;
-        try { result = multiple_destinations(args, &*keys, farm.get()); }
+        try
+        {
+            using group_grow::farm::LocalFarmingService;
+            auto monitor = work && args.farming_detect_local && !args.protected_resources && !args.disk_io ?
+                LocalFarmingService::start(args.chia_root, uint64_t(farm->state.config.deadline_seconds * 1e9L),
+                    (args.max_ram - farm->metadata) / 8) : nullptr;
+            if (monitor)
+            {
+                farm->metadata = sum(farm->metadata, LocalFarmingService::memory_bound());
+                auto observed = args; observed.disk_io = monitor->governor;
+                result = multiple_destinations(observed, &*keys, farm.get());
+            }
+            else result = multiple_destinations(args, &*keys, farm.get());
+        }
         catch (Interrupted const&)
         { if (!noticed->load() || (cancelled && cancelled())) throw; interrupted = true; }
         catch (std::runtime_error const&)
@@ -21466,6 +22745,13 @@ int run(Arguments const& supplied)
 int pos2gpu::run_group(GroupOptions const& options)
 {
     auto args = options;
+    if (!args.plan_only && !args.replot_status) args.dashboard_job = std::make_shared<group_grow::DashboardJob>(args.command_started);
+    if (args.tui)
+    {
+        args.dashboard = std::make_shared<group_grow::DashboardTerminal>(args.json);
+        if (!args.dashboard->active() || ((args.plan_only || args.replot_status) && !args.dashboard->interactive())) args.dashboard.reset();
+        else if (args.replot_status && args.dashboard->interactive()) args.status_watch = true;
+    }
     if (!args.max_ram && !args.max_ram_set) args.max_ram = group_grow::profile_detail::available_memory();
     require(args.max_ram >= 16 * mib, "available RAM is below 16 MiB; set --max-host-ram when memory is available");
 #ifdef XCHPLOT2_GROUP_COMMANDS
@@ -21488,6 +22774,8 @@ pos2gpu::BatchResult pos2gpu::run_group_batch(std::vector<BatchEntry> const& ent
 {
     BatchResult result;
     if (entries.empty()) return result;
+    args.dashboard_job = std::make_shared<group_grow::DashboardJob>(args.command_started);
+    if (args.tui) { args.dashboard = std::make_shared<group_grow::DashboardTerminal>(args.json); if (!args.dashboard->active()) args.dashboard.reset(); }
     if (!args.max_ram && !args.max_ram_set) args.max_ram = group_grow::profile_detail::available_memory();
     require(args.max_ram >= 16 * mib, "available RAM is below 16 MiB; set --max-host-ram when memory is available");
     std::vector<NamedGroup> named; named.reserve(entries.size());
@@ -21527,6 +22815,7 @@ pos2gpu::BatchResult pos2gpu::run_group_batch(std::vector<BatchEntry> const& ent
     { clear_progress(args); std::cerr << error.what() << '\n'; }
     catch (...) { clear_progress(args); throw; }
 
+    print_durable_summary(args);
     result.total_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return result;
 }

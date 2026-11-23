@@ -202,7 +202,7 @@ void print_usage(char const* prog, std::ostream& out = std::cerr)
         << "Usage:\n"
         << "  " << prog << " plan [OPTIONS] [--] [DIR...]\n"
         << "  " << prog << " fill [OPTIONS] [-r|--resume] [--] [DIR...]\n"
-        << "  " << prog << " status [DIR|PLAN|--manifest FILE] [--watch] [--inspect] [--live]\n"
+        << "  " << prog << " status [DIR|PLAN|--manifest FILE] [--watch] [--inspect] [--live] [--tui]\n"
         << "  " << prog << " pause|drain|resume|retire [DIR|--manifest FILE] [--destination DIR]...\n"
         << "  " << prog << " grow FILE [--max-members N] [OPTIONS]\n"
         << "  " << prog << " compute COMMAND [OPTIONS]\n"
@@ -465,6 +465,8 @@ void print_command_help(char const* prog, std::string_view command, std::ostream
             "  --dir PATH          test binary directory, default ./build/tools/parity\n";
     out << "  -v, --verbose       show diagnostics and detailed measurements\n"
         "  -q, --quiet         suppress informational output; keep results and errors\n";
+    if (command == "plot" || command == "batch")
+        out << "  --tui                     open the live plotting dashboard\n";
     if (command == "plot" || command == "batch" || command == "bench")
         out << "  --progress / --no-progress  override automatic terminal progress\n";
     out << "  --config FILE       load command settings\nUse " << prog << ' ' << command
@@ -1328,6 +1330,9 @@ bool group_commands_available()
 
 extern "C" int xchplot2_main(int argc, char* argv[])
 {
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    auto const command_started = std::chrono::steady_clock::now();
+#endif
     pos2gpu::install_cancel_signal_handlers();
     if (argc > 1 && (std::string_view(argv[1]) == "--version" || std::string_view(argv[1]) == "-V")) {
         std::cout << "xchplot2 " << XCHPLOT2_VERSION << " (" << XCHPLOT2_REVISION << ")\n";
@@ -1412,7 +1417,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 // Values such as devices="0", trials=1 and cpu-workers=off
                 // are arguments. Coerce only options that actually take a bool.
                 static constexpr std::string_view bool_flags[] = {
-                    "--verbose", "-v", "--quiet", "-q", "--progress",
+                    "--verbose", "-v", "--quiet", "-q", "--tui", "--no-tui", "--progress",
                     "--testnet", "-T", "--skip-existing", "--resume", "-r",
                     "--continue-on-error", "--cpu", "--shard-plot",
                     "--pipeline-plot", "--host-bounce", "--auto-spill",
@@ -1490,7 +1495,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         if (!group_commands_available()) return 1;
 #ifdef XCHPLOT2_GROUP_COMMANDS
         try {
-            return pos2gpu::run_group_command(mode, group_arguments({expanded.begin() + 2, expanded.end()}));
+            return pos2gpu::run_group_command(mode, group_arguments({expanded.begin() + 2, expanded.end()}), command_started);
         } catch (std::exception const& error) {
             std::cerr << '[' << mode << "] " << error.what() << '\n'; return 1;
         }
@@ -2096,6 +2101,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::string manifest;
         pos2gpu::BatchOptions opts{};
         std::vector<std::string> group_options;
+        std::string_view compute_mode = "auto";
         bool group_requested = false, literal = false;
         int progress_tri = -1;  // -1 auto (TTY), 0 off, 1 on
         for (int i = 2; i < argc; ++i) {
@@ -2106,9 +2112,11 @@ extern "C" int xchplot2_main(int argc, char* argv[])
                 if (!manifest.empty()) { std::cerr << "Error: unexpected argument: " << a << '\n'; return 1; }
                 manifest = a; continue;
             }
-            if (group_value_option(a)) {
+            if (a == "--tui" || a == "--no-tui") opts.tui = a == "--tui";
+            else if (group_value_option(a)) {
                 if (i + 1 == argc) { std::cerr << "Error: " << a << " requires a value\n"; return 1; }
-                group_requested = true;
+                if (a == "--compute") compute_mode = argv[i + 1];
+                else if (a != "--compute-directory") group_requested = true;
                 group_options.insert(group_options.end(), {a, argv[++i]});
             }
             else if (a == "-v" || a == "--verbose")        opts.verbose = true;
@@ -2239,7 +2247,8 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             return 1;
         }
         if (manifest.empty()) { print_command_help(argv[0], mode, std::cerr); return 1; }
-        opts.progress = resolve_progress(progress_tri, opts.quiet);
+        if (opts.tui && progress_tri == 0) { std::cerr << "Choose --tui or --no-progress.\n"; return 1; }
+        opts.progress = opts.tui || resolve_progress(progress_tri, opts.quiet);
         try {
             auto entries = pos2gpu::parse_manifest(manifest);
             if (!opts.quiet) {
@@ -2253,9 +2262,12 @@ extern "C" int xchplot2_main(int argc, char* argv[])
 #ifdef XCHPLOT2_GROUP_COMMANDS
                 auto grouped_options = pos2gpu::group_batch_options(opts, group_arguments(group_options));
                 grouped_options.command = "batch";
+                grouped_options.command_started = command_started;
                 res = pos2gpu::run_group_batch(entries, opts, std::move(grouped_options));
 #endif
             } else {
+                if (compute_mode != "auto" && compute_mode != "off")
+                    throw std::invalid_argument("--compute requires auto or off");
                 if (group_requested || opts.streaming_tier == "pool")
                     throw std::invalid_argument("group construction options require a grouped manifest created with plot --group-members");
                 res = pos2gpu::run_batch(entries, opts);
@@ -2451,6 +2463,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         std::vector<int> plot_cpu_node_ids;  // --devices cpu0,cpu1
         bool plot_use_all_cpu_nodes = false; // --devices cpu / all
         bool plot_shard_plot      = false;
+        bool plot_tui = false;
         int  plot_progress_tri    = -1;  // -1 auto (TTY), 0 off, 1 on
         bool plot_quiet           = false;
         bool plot_pipeline_plot   = false;
@@ -2504,6 +2517,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             else if  (a == "--no-verbose")              verbose = false;
             else if  (a == "-q" || a == "--quiet")      plot_quiet = true;
             else if  (a == "--no-quiet")                plot_quiet = false;
+            else if  (a == "--tui" || a == "--no-tui")  plot_tui = a == "--tui";
             else if  (a == "--progress")                plot_progress_tri = 1;
             else if  (a == "--no-progress")             plot_progress_tri = 0;
             else if  (a == "--skip-existing"
@@ -2766,13 +2780,16 @@ extern "C" int xchplot2_main(int argc, char* argv[])
             opts.has_max_host_ram  = plot_has_max_host_ram;
             opts.max_host_ram      = plot_max_host_ram;
             opts.quiet             = plot_quiet;
-            opts.progress          = resolve_progress(plot_progress_tri, plot_quiet);
+            if (plot_tui && plot_progress_tri == 0) throw std::invalid_argument("choose --tui or --no-progress");
+            opts.tui = plot_tui;
+            opts.progress          = plot_tui || resolve_progress(plot_progress_tri, plot_quiet);
             resolve_host_ram_env(opts);
             pos2gpu::GroupOptions parsed_group_options;
             if (group_requested) {
                 group_options = group_arguments(group_options);
 #ifdef XCHPLOT2_GROUP_COMMANDS
                 parsed_group_options = pos2gpu::group_batch_options(opts, group_options);
+                parsed_group_options.command_started = command_started;
                 if (have_base_seed && !parsed_group_options.pool_broker.empty())
                     base_seed = pos2gpu::compute_owner_seed(base_seed, parsed_group_options.pool_owner);
 #endif
@@ -2946,7 +2963,7 @@ _xchplot2() {
                     --temp-dirs|--exclude-destination|--farm-config) paths="$option" ;;
                     --replot|--no-replot|--discover-farm|--no-discover-farm) ;;
                     --policy-only|--no-policy-only|--upgrade-job|--no-upgrade-job) ;;
-                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--watch|--no-watch|--inspect|--no-inspect|--live|--no-live|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--update|--no-update|--cancel-update|--no-cancel-update|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
+                    -r|--resume|--no-resume|--plan-only|--no-plan-only|--metadata-only|--no-metadata-only|--assess-jobs|--no-assess-jobs|--inventory|--no-inventory|--status|--no-status|--watch|--no-watch|--tui|--no-tui|--inspect|--no-inspect|--live|--no-live|--revalidate|--no-revalidate|--calibrate|--no-calibrate|--extend|--no-extend|--update|--no-update|--cancel-update|--no-cancel-update|--allow-missing|--no-allow-missing|--json|--no-json|-q|--quiet|--no-quiet|-v|--verbose|--no-verbose|--progress|--no-progress|-h|--help|--help-all) ;;
                     -*) values=1 ;;
                 esac
             fi
@@ -2988,7 +3005,7 @@ _xchplot2() {
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
         --farm-adapter) COMPREPLY=( $(compgen -W "chia gigahorse drchia" -- "$cur") ); return 0 ;;
-        --manifest|--save-plan|-F|--from-plan|--replot-inventory|--save-profile|--chia-executable|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key)
+        --join|--manifest|--save-plan|-F|--from-plan|--replot-inventory|--save-profile|--chia-executable|--paths-from|--paths0-from|--config|--out-name|--dir|--ca|--cert|--key|--tls-ca|--tls-cert|--tls-key|--compute-ca|--compute-cert|--compute-key)
             while IFS= read -r path; do COMPREPLY+=("$path"); done < <(compgen -f -- "$cur")
             return 0 ;;
         -f|--farmer-pk|-p|--pool-pk|--pool-ph|-c|--seed|-S) return 0 ;;
@@ -3010,7 +3027,7 @@ _xchplot2() {
         return 0
     fi
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --collection --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-output --compute-writers --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "-v --verbose --no-verbose -q --quiet --no-quiet --tui --no-tui --progress --no-progress --cpu --cpu-workers --tier --devices --shard-plot --pipeline-plot --host-bounce --skip-existing --resume --manifest --config --strategy --pipeline-depth --pipeline-stage-tiers --max-host-ram --temp-dir --auto-spill --no-auto-spill --continue-on-error --warmup --keep --compute-only --target-size --json --trials --full --no-full --k --num --strength --plot-index --collection --out --farmer-pk --pool-pk --pool-ph --pool-contract-address --seed --raw --memo --out-name --profile --gpu-all --gpu-t1 --gpu-t2 --gpu-t3 --dir --compute --compute-directory --compute-local --directory --join --name --interface --discovery --role --worker --limit --max-brokers --broker-port --worker-port --firewall --from --zone --ca --cert --key --generation-threads --max-task-bytes --max-window-chunks --max-batch-members --task-timeout-ms --tls-timeout-ms --group-members --plan-only --alternative --upgrade-job --no-upgrade-job --policy-only --no-policy-only --metadata-only --no-metadata-only --assess-jobs --no-assess-jobs --inventory --no-inventory --status --no-status --watch --no-watch --inspect --no-inspect --live --no-live --destination --revalidate --no-revalidate --replot --no-replot --replot-inventory --replot-confirmation --discover-farm --no-discover-farm --farm-config --exclude-destination --temp-dirs --replot-verification --replot-proof-first-groups --replot-proof-every-groups --replot-source-root --replot-exclude-root --replot-max-source-files --replot-max-source-bytes --reclaim-before-bytes --farm-adapter --farm-adapter-timeout-ms --calibrate --no-calibrate --calibration-samples --calibration-timeout-ms --calibration-memory-bytes --save-plan -F --from-plan --save-profile --resource-setting --harvester --chia-root --chia-executable --help-all --paths-from --paths0-from --discover-drives --mounts-under --extend --update --cancel-update --allow-missing --relocate --construction --backend --device --max-ram --workers --batch-members --max-members --max-groups --max-total-members --capacity-bytes --leave-free --headroom-bytes --destination-temp --temp-capacity-bytes --member-storage --window-bytes --checkpoint-bytes --io-overlap --generation-overlap --cache-release --farming-reader --farming-objective --farming-cores --farming-lookup-workers --farming-memory-bytes --farming-index-cache-bytes --farming-filter-bits --farming-future-filter-bits --farming-deadline-ms --farming-chain-us-per-member --farming-index-ns-per-entry --farming-cpu-work-weight --farming-io-work-weight --farming-max-eligible-groups --compute-broker --compute-owner-id --compute-ca --compute-cert --compute-key --compute-inflight --compute-output --compute-writers --compute-codec-ram --compute-timeout-ms --compute-socket-timeout-ms --compute-frame-bytes --compute-listen --compute-advertise --compute-offer-ram --compute-offer-cpus --compute-offer-vram --compute-offer-slots --compute-offer-backend --listen --advertise --broker --tls-ca --tls-cert --tls-key --host-bytes --cpus --gpu-bytes --slots --timeout-ms --lease-ms --worker-ms --control-threads --max-connections --idle-ms --owner-share --max-workers --max-owners --max-tasks --max-frame-bytes -k -n -s -f -p -c -o -i -g -S -d -t -M -r -j --help" -- "$cur") )
         return 0
     fi
     if [[ "${COMP_WORDS[1]}" == plan || "${COMP_WORDS[1]}" == fill || "${COMP_WORDS[1]}" == status || "${COMP_WORDS[1]}" == pause || "${COMP_WORDS[1]}" == drain || "${COMP_WORDS[1]}" == resume || "${COMP_WORDS[1]}" == retire ]]; then
@@ -3056,6 +3073,7 @@ _xchplot2() {
         '--compute[Shared compute auto or off]:value:' \
         '--compute-directory[Saved compute setup directory]:value:' \
         '--compute-local[Offer local compute on or off]:value:' \
+        '--join[Enroll this foreground worker from an invitation]:invitation:_files' \
         '--directory[Saved compute setup directory]:value:' \
         '--role[Compute setup, service or firewall role]:role:(plotter worker broker both)' \
         '--worker[Worker status or control endpoint]:address:' \
@@ -3098,7 +3116,7 @@ _xchplot2() {
         '--replot-proof-first-groups[Proof-check the first N groups with the sampled policy]:count:' \
         '--replot-proof-every-groups[Proof-check every Nth group across destinations with the sampled policy; 0 disables]:count:' \
         '--status[Inspect saved farm progress]' \
-        '--watch[Refresh status until interrupted]' '--no-watch[Print status once]' \
+        '--tui[Open interactive dashboard]' '--no-tui[Use ordinary output]' '--watch[Refresh status until interrupted]' '--no-watch[Print status once]' \
         '--inspect[Scan outputs and check recovery checkpoints]' '--no-inspect[Read saved status]' \
         '--live[Query shared compute and migration service readiness]' '--no-live[Use saved status only]' \
         '*--destination[Saved destination to control]:directory:_files -/' \
@@ -3272,6 +3290,7 @@ complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_su
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l from -r -d 'Permitted peer or subnet'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l zone -r -d 'Firewalld LAN zone'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from firewall' -l role -r -a 'broker worker both' -d 'Inbound listener roles'
+complete -c xchplot2 -n '__fish_seen_subcommand_from compute; and __fish_seen_subcommand_from worker' -l join -r -F -d 'Enroll this foreground worker from an invitation'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l directory -r -d 'Saved compute setup directory'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l name -r -d 'Machine display name'
 complete -c xchplot2 -n '__fish_seen_subcommand_from compute' -l interface -r -d 'Sharing network interface'
@@ -3424,6 +3443,8 @@ complete -c xchplot2 -n '__fish_use_subcommand' -a 'completions'   -d 'Emit shel
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l tier      -x -a 'plain compact minimal tiny pinned auto'  -d 'Streaming tier'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan plot fill grow batch bench' -s d -l devices -x -a 'all gpu cpu 0 1 2 3' -d 'Device selector'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l manifest  -r -d 'Saved job'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow status batch plot; and not __fish_seen_subcommand_from compute' -l tui -d 'Open the terminal dashboard'
+complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow status batch plot; and not __fish_seen_subcommand_from compute' -l no-tui -d 'Use ordinary output'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l progress  -d 'Force aggregate progress line on'
 complete -c xchplot2 -n 'not __fish_seen_subcommand_from verify' -l no-progress -d 'Force aggregate progress line off'
 complete -c xchplot2 -n '__fish_seen_subcommand_from plan fill grow plot batch bench test verify devices parity-check compute' -s v -l verbose -d 'Verbose'

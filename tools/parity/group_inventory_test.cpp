@@ -1204,7 +1204,7 @@ void farming_log(fs::path const& directory)
     using namespace std::chrono;
     fs::create_directories(directory / "config"); fs::create_directory(directory / "logs");
     auto const config = directory / "config/config.yaml", log = directory / "logs/harvester.log";
-    std::string const settings = "logging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
+    std::string const settings = "self_hostname: localhost\nlogging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
     { std::ofstream out(config); out << settings; }
     auto const wall = system_clock::now(); auto const begin = FarmingLogSampler::Clock::now();
     auto record = [&](std::string_view elapsed, system_clock::time_point when = system_clock::now())
@@ -1219,10 +1219,44 @@ void farming_log(fs::path const& directory)
     write(record("9.00000", wall));
     HarvesterAdapterOptions options; options.root = directory; options.host = profile_detail::host_name();
     FarmingLogSampler sampler(options);
+    auto const grant = LocalFarmingService::memory_bound() + DiskIoGovernor::initial_memory_bytes();
+    require(!LocalFarmingService::start(directory, 8000000000, grant - 1), "local observation exceeded its owner memory grant");
+    auto local = LocalFarmingService::start(directory, 8000000000, grant);
+    require(local && local->governor->farming_service().log_observed && !local->governor->farming_service().completions &&
+        !local->governor->limits_io(), "headless selection replayed a historical lookup or throttled without pressure");
+    // The ordinary owner has no dashboard thread. Its selected reader alone
+    // must deliver timely pressure to the same permits used by external I/O.
+    auto wait_for = [&](auto const& predicate)
+    {
+        auto const until = steady_clock::now() + seconds(5);
+        while (!predicate() && steady_clock::now() < until) std::this_thread::sleep_for(milliseconds(25));
+        require(predicate(), "headless local farm sampler failed to observe an appended completion");
+    };
+    auto quick = record("0.04000"); quick.replace(quick.find("3 plots"), 1, "0"); write(quick);
+    wait_for([&] { return local->governor->farming_service().completions == 1; });
+    require(!local->governor->status().farming_known && !local->governor->limits_io(),
+        "zero-eligible service alone established farming capacity");
+    write(record("8.82000")); wait_for([&] { return local->governor->limits_io(); });
+    auto const incident = local->governor->farming_service();
+    require(incident.eligible_completions == 1 && incident.zero_eligible_completions == 1 && incident.missed_deadline == 1 &&
+        incident.max_ns == 8820000000 && !local->governor->limits_io(steady_clock::now() + seconds(31)),
+        "ordinary eligible deadline miss did not back off the I/O governor or stale pressure persisted");
+    local.reset();
     require(!sampler.sample(begin, wall), "historical farming log was accepted as a current observation");
     write(record("0.25000", wall));
     require(sampler.sample(begin + seconds(1), wall) == 250000000, "fresh completed farming lookup time was not observed");
     require(!sampler.sample(begin + seconds(2), wall), "one farming completion was counted repeatedly");
+    FarmingServiceHistory observed;
+    auto observe = [&](FarmingServiceRecord const& event) { observed.add(event, 1000000000); };
+    auto zero = record("0.05000", wall); zero.replace(zero.find("3 plots"), 1, "0");
+    write(zero + record("2.00000", wall));
+    auto const polled = begin + milliseconds(2500);
+    require(sampler.sample(polled, wall, observe) == 2000000000, "multiple lookup records lost the governor's maximum");
+    auto const window = observed.window(polled);
+    require(window.log_observed && window.counts_known && window.completions == 2 && window.eligible_completions == 1 &&
+        window.zero_eligible_completions == 1 && window.loaded_plots == 500 && window.deadline_known && window.missed_deadline == 1 &&
+        window.p50_ns == 50000000 && window.p95_ns == 2000000000 && !observed.window(polled + seconds(31)).completions,
+        "completed log observations mixed arrivals, lost eligibility, or retained stale timing");
     auto partial = record("2.00000", wall); write(partial.substr(0, partial.size() - 1));
     require(!sampler.sample(begin + seconds(3), wall), "partial farming log record was accepted");
     write("\n"); require(sampler.sample(begin + seconds(4), wall) == 2000000000, "split farming record was lost");
@@ -1230,7 +1264,8 @@ void farming_log(fs::path const& directory)
     write(record("nan", wall)); write(record("-1", wall));
     require(!sampler.sample(begin + seconds(5), wall), "stale, future or invalid log duration became farming feedback");
     fs::rename(log, log.string() + ".1"); write(record("7.00000", wall));
-    require(!sampler.sample(begin + seconds(6), wall), "log rotation replayed an existing record");
+    require(!sampler.sample(begin + seconds(6), wall, observe) && observed.window(begin + seconds(6)).incomplete,
+        "log rotation replayed an existing record or left a complete-coverage claim");
     write(record("0.50000", wall)); require(sampler.sample(begin + seconds(7), wall) == 500000000, "rotated log did not recover on a fresh append");
     write("truncated\n", false); require(!sampler.sample(begin + seconds(8), wall), "truncation reused an old partial record");
     write(record("0.75000", wall)); require(sampler.sample(begin + seconds(9), wall) == 750000000, "truncated log could not resume observations");
@@ -1244,7 +1279,14 @@ void farming_log(fs::path const& directory)
     write(record("1.25000", wall)); require(sampler.sample(begin + seconds(11), wall) == 1250000000,
         "ordinary plot-directory retirement permanently disabled unchanged farming telemetry");
     { std::ofstream out(config); out << settings << "changed: true\n"; }
-    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall), "changed reader logging configuration supplied old-context feedback");
+    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall, observe), "changed reader logging configuration supplied old-context feedback");
+    { std::ofstream out(config); out << settings; }
+    require(!sampler.sample(begin + seconds(13), wall, observe), "restoring the selected reader replayed records from an unbound interval");
+    write(record("0.12500", wall)); require(sampler.sample(begin + seconds(14), wall, observe) == 125000000,
+        "restored local reader did not recover fresh farming evidence");
+    auto remote_config = settings; remote_config.replace(remote_config.find("localhost"), std::string("localhost").size(), "remote.example");
+    { std::ofstream out(config); out << remote_config; }
+    require(!LocalFarmingService::start(directory, 8000000000, grant), "an ordinary remote RPC configuration supplied local farming evidence");
     fs::remove_all(directory);
 }
 int main(int argc, char** argv)

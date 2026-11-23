@@ -97,6 +97,57 @@ stderr is redirected it prints one line per plot and defaults to off.
 plots-based (average s/plot × remaining), formatted as
 hours/minutes/seconds when the estimate exceeds one hour.
 
+`--tui` opens a terminal dashboard for `plot`, `batch`, `grow` and `fill`.
+For a directory fill, run `xchplot2 status DIR --tui` in another terminal
+to attach to an active local owner, even if the fill started with
+`--no-progress`. When the owner is remote or offline, status shows saved
+drive observations. Add `--live` to request bounded service and compute
+checks from status. `plan DIR --tui` lets you inspect the proposed layout.
+
+Press `1` through `5` or Tab to switch between Overview, Resources, Workers,
+Decisions and Farm. Use the arrow keys to select a row and Enter to see its
+details. Press `/` to filter the current view by name or detail, then Enter
+to apply the filter. An empty filter shows all rows. Press `a` for the
+commands to add a helper during a fill and `?` for keyboard help. In a
+foreground fill, `q` returns to ordinary progress and Ctrl-C requests a
+cooperative stop. In an attached view either key closes the observer.
+Output paths and JSON still go to stdout. Redirected stderr and terminals
+with `TERM=dumb` use ordinary output. Use `--no-tui` to select it explicitly.
+
+For grouped jobs, Overview measures from this invocation's start through the
+last new durable publication. Members already visible at a final output
+name when the job opens are inherited. Work recovered from a private
+construction file counts when its output becomes visible. The recent rate
+and remaining-time estimates use observed publication intervals. For an open
+fill, Overview shows the remaining destination allowance. The final construction
+JSON includes `new_durable_members`, `inherited_members`,
+`first_new_publication_seconds`, `last_new_publication_seconds`
+and `seconds_per_new_durable_member`. Timing fields are null until new work
+reaches publication. The construction reason and available RAM and scratch
+forecasts describe the last construction choice.
+
+Resources shows owner CPU and resident memory. On Linux it also samples
+physical disks and interfaces and reads GPU activity where the driver
+exposes it. Disk details include the controller's measured bulk service and
+estimated available bandwidth when sampled. Identified PCI storage controllers
+show the combined traffic through the selected disks and their negotiated
+PCIe link. Disk and network rates include other traffic on the same devices.
+[Linux block I/O counters](https://docs.kernel.org/admin-guide/iostats.html)
+
+Workers shows registrations, free and eligible slots, admission waits and
+deliveries validated by the owner. Select a delivery to see its size, worker
+time, send time and owner receive time. These intervals can overlap. Farm
+shows the selected harvester's recent completed lookup times when its log
+is available, including eligible and zero-eligible challenges. A quiet
+window leaves lookup latency unknown.
+
+With `--harvester local`, an ordinary fill can use fresh completions from
+the selected local reader to reduce new HDD work when lookups approach the
+configured deadline. This operates with the dashboard open or closed.
+The Farm view shows when normal disk concurrency is available and when the
+controller is limiting I/O. A remote harvester or missing local log leaves
+live lookup pressure unknown.
+
 Quiet mode suppresses automatic progress and plotting summaries. Explicit
 `--progress` still enables progress; `--no-progress` does not disable verbose
 details. `plot` writes each absolute output path to stdout after that
@@ -169,9 +220,11 @@ Ordinary grouped plotting, filling and growth accept the same `--devices`
 selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
 combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
 Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
-CPU budget and `--max-host-ram` budget. Three quarters of that RAM is divided
-equally among the producers; the remainder covers receiving and construction.
-Each producer must fit its share. These explicit local executors need no pool
+CPU budget and `--max-host-ram` budget. The producers share three quarters
+of the RAM under one admission limit. The remainder covers receiving and
+construction. The owner accounts for each device's available slots and VRAM,
+the current batch, observed delivery times and work already assigned when
+choosing a producer. These explicit local executors need no pool
 enrollment or network listener and cannot be combined with shared compute
 connection/offer options. Repeat the device selection when resuming; it is an
 execution choice, separate from saved plot identities and farming policy.
@@ -654,10 +707,23 @@ have their own construction budget.
 
 Automatic construction chooses among incremental rewriting, staging,
 merging and external contributions according to available RAM and scratch.
-`--construction auto|incremental|staged|merged|external` forces a method when
-needed. `--batch-members N` bounds construction batches independently of the
+`--construction auto` is the default. When RAM and scratch both fit, the
+owner compares feasible grants at the same RAM cap using available evidence
+through publication. The forecast accounts for occupied scratch disks,
+pending receipts, codec workers and the final writer. Missing observations
+can still give a lower bound. The Decisions view shows the reason for an
+admission and the resources it holds. Use `--construction incremental`,
+`staged`, `merged` or `external` to select a specific method.
+`--batch-members N` bounds construction batches independently of the
 final file membership. `--member-storage compact|raw` selects retained
 fragments; compact is the default.
+
+For a local CPU job with one writer and identified storage, automatic mode
+can reuse recent observations from completed groups in the user's private
+cache. It checks the boot, build, physical devices, CPU allocation, memory
+cap and workload before using a previous observation. The cache expires
+after 24 hours. Direct measurements from the current run take precedence.
+Shared compute and protected migration use their own live evidence.
 
 When automatic construction admits a fresh group in one incremental batch,
 the members stay in RAM and the plotter writes the final file directly to the
@@ -1263,8 +1329,13 @@ observed, declared or unknown. Observed CPU affinity and effective
 physical/container memory supply local hardware ceilings during migration setup.
 Configured lookup threads and live free-memory snapshots do not establish
 another service's workload bounds.
-Saved quality-reader calibration retains its sample scope and cannot establish
-worst-case queues or a full-proof solver reserve.
+Saved quality-reader calibration includes the smallest and largest sampled
+group membership when known. The Farm view shows when a requested group
+size lies outside that range. Older profiles without a known sample range
+show unknown coverage. Worst-case queues and the full-proof solver reserve
+require separate inputs.
+Profiles exported with a measured membership range use schema 3. Use a
+build that supports that schema to read them or their saved plans.
 
 For a local setup, start with the controller, selected Chia services and source
 files on the same physical host. Inventory all source and existing destination
@@ -1950,6 +2021,29 @@ Transfer the invitation privately to that machine, then run there:
 ```bash
 xchplot2 compute setup worker-b.invite
 ```
+
+You can run this step while an enrolled owner is plotting. For a temporary
+helper, run `xchplot2 compute worker --join worker-b.invite` in its terminal.
+It uses the invited identity and saved resource limits and offers compute
+until you stop the process. Repeating the command for the same enrollment
+preserves the credentials already in use.
+`compute setup` also accepts the same invitation again. Repeating identical
+settings keeps the running helper and its active tasks in place.
+
+On the plotting host, open the dashboard's Workers view or run
+`xchplot2 compute status -v`. Registration confirms contact with the
+broker. Eligibility also depends on the request's k, strength, device
+requirements and the helper's available resources. A first validated
+delivery confirms that the plotting host received usable work. The owner
+reconsiders unassigned work as the roster changes and measures each new
+worker instance on its own. A short remaining queue, a busy receiver or
+an occupied shared link can leave an eligible helper idle. A broker from
+an earlier build can still supply aggregate capacity during an upgrade.
+
+A participating owner can reuse recent timings for the same worker instance,
+physical receiving interface, resource request and output width. A fresh
+delivery on that route must confirm the cached interval. Decisions shows
+the sample count and age when the estimate uses earlier deliveries.
 
 Create a separate invitation for each additional machine. An invitation holds
 that machine's private TLS identity, not the pool's signing key. Delete

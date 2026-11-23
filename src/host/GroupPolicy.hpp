@@ -5,6 +5,7 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <tuple>
 
 namespace group_grow
@@ -84,13 +85,23 @@ struct GenerationHistory
     }
 };
 
+// Equality includes the authenticated instances behind an unchanged slot count.
+// A weak reference keeps expired observations outside live worker reservations.
+struct GenerationSupply
+{
+    uint64_t slots = 0;
+    std::weak_ptr<void const> roster;
+    bool operator==(GenerationSupply const& other) const
+    { return slots == other.slots && !roster.owner_before(other.roster) && !other.roster.owner_before(roster); }
+};
+
 // Compare complete waves of like-sized groups on rotating destinations. A wave
 // starts before the first generation request and ends after its last publication.
 // This charges transfer, temporary I/O and contention across overlapping writers.
 class PoolPublicationHistory
 {
 public:
-    struct Shape { unsigned k, strength, members; bool operator==(Shape const&) const = default; };
+    struct Shape { unsigned k, strength, members; GenerationSupply supply; bool operator==(Shape const&) const = default; };
     struct Choice { size_t width; bool encoded, trial; };
     bool observed(Shape shape) const { return shape == shape_; }
     Choice select(Shape shape, size_t available, size_t initial, unsigned fixed_width, std::string_view output,
@@ -308,6 +319,28 @@ struct SharedConstructionHistory
     ExternalBatchHistory successor_batches;
     std::array<uint64_t, 2> fresh_checkpoint_bytes{};
     unsigned successor_batch_workers = 0;
+    // This owner-local observation includes generation, receiver stalls,
+    // engine work, final sync and publication. A changed workload or pool
+    // supply starts a new comparison even on the same physical storage.
+    struct Publication
+    {
+        struct Shape
+        {
+            uint16_t members = 0;
+            size_t width = 0;
+            GenerationSupply supply;
+            bool operator==(Shape const&) const = default;
+        };
+        Shape shape;
+        GenerationHistory times;
+        bool attempted = false;
+        void begin(Shape next)
+        {
+            if (shape != next) { times = {}; shape = next; }
+            attempted = true;
+        }
+        long double rate(Shape next) const { return shape == next ? times.member_ns() : 0; }
+    } publication;
     ConstructionHistory snapshot()
     { std::lock_guard lock(mutex); return history; }
 };
@@ -315,12 +348,13 @@ class ConstructionHistories
 {
 public:
     explicit ConstructionHistories(size_t limit) : limit_(limit) { entries_.reserve(limit); }
+    bool empty() const { return entries_.empty(); }
     std::shared_ptr<SharedConstructionHistory> find(ConstructionContext context, bool create = true)
     {
         if (context.drives.empty()) return {};
         for (auto const& entry : entries_) if (entry.context == context) return entry.source;
         if (!create) return {};
-        require(entries_.size() < limit_, "construction history exceeds destination count");
+        if (entries_.size() == limit_) return {};
         auto source = std::make_shared<SharedConstructionHistory>();
         entries_.push_back({std::move(context), source}); return source;
     }
@@ -372,6 +406,76 @@ private:
     size_t limit_;
     std::vector<Entry> entries_;
 };
+
+struct ConstructionPrior
+{
+    uint64_t low_ns = 0, high_ns = 0, oldest_utc = 0;
+    unsigned samples = 0;
+};
+enum class ConstructionModeReason { ordinary, partial_batch, forecast, measured, prior, trial, required, recovery, fallback };
+inline char const* construction_reason(ConstructionModeReason reason)
+{
+    switch (reason)
+    {
+        case ConstructionModeReason::ordinary: return "whole group fits in RAM";
+        case ConstructionModeReason::partial_batch: return "partial RAM batch";
+        case ConstructionModeReason::forecast: return "predicted last publication";
+        case ConstructionModeReason::measured: return "time through publication at this load";
+        case ConstructionModeReason::prior: return "prior durable publications at the same host, load and RAM cap";
+        case ConstructionModeReason::trial: return "bounded trial after a comparable RAM publication";
+        case ConstructionModeReason::required: return "requested construction or required streaming input";
+        case ConstructionModeReason::recovery: return "resuming the recorded construction";
+        case ConstructionModeReason::fallback: return "scratch capacity or workspace unavailable";
+    }
+    return "";
+}
+struct ConstructionModeChoice
+{
+    bool external = false;
+    ConstructionModeReason reason = ConstructionModeReason::ordinary;
+    uint64_t prior_oldest_utc = 0;
+    unsigned prior_samples = 0;
+};
+inline ConstructionModeChoice choose_construction_mode(bool partial,
+    SharedConstructionHistory::Publication::Shape ram_shape, SharedConstructionHistory::Publication::Shape scratch_shape,
+    SharedConstructionHistory const* ram, SharedConstructionHistory const* scratch, bool allow_trial,
+    long double ram_finish = 0, long double scratch_finish = 0,
+    ConstructionPrior ram_prior = {}, ConstructionPrior scratch_prior = {})
+{
+    // Both candidates have already passed admission. Only compare complete
+    // work at the same target. Keep the existing choice inside timing error.
+    auto const margin = construction_margin(1);
+    auto choose = [&](long double ordinary, long double external, ConstructionModeReason reason)
+    {
+        return ConstructionModeChoice{partial ? !(ordinary < external * (1 - margin)) :
+            external < ordinary * (1 - margin), reason};
+    };
+    if (ram_finish > 0 && scratch_finish > 0) return choose(ram_finish, scratch_finish, ConstructionModeReason::forecast);
+    auto const ordinary = ram ? ram->publication.rate(ram_shape) : 0.L;
+    auto const external = scratch ? scratch->publication.rate(scratch_shape) : 0.L;
+    if (ordinary && external && ram_shape.width == scratch_shape.width)
+        return choose(ordinary, external, ConstructionModeReason::measured);
+    if (ram_shape.width == 1 && scratch_shape.width == 1 && ram_shape.members == scratch_shape.members)
+    {
+        auto const ram_low = ordinary ? ordinary * ram_shape.members : ram_prior.low_ns;
+        auto const ram_high = ordinary ? ordinary * ram_shape.members : ram_prior.high_ns;
+        auto const scratch_low = external ? external * scratch_shape.members : scratch_prior.low_ns;
+        auto const scratch_high = external ? external * scratch_shape.members : scratch_prior.high_ns;
+        if (ram_low && scratch_low && (scratch_high < ram_low * (1 - margin) || ram_high < scratch_low * (1 - margin)))
+        {
+            uint64_t const stamp = ordinary ? scratch_prior.oldest_utc : external ? ram_prior.oldest_utc :
+                std::min(ram_prior.oldest_utc, scratch_prior.oldest_utc);
+            return {scratch_high < ram_low, ConstructionModeReason::prior, stamp,
+                (ordinary ? 0u : ram_prior.samples) + (external ? 0u : scratch_prior.samples)};
+        }
+    }
+    bool const earlier_ram = !ordinary && ram_shape.width == 1 && scratch_shape.width == 1 &&
+        ram_shape.members == scratch_shape.members && ram_prior.samples && !scratch_prior.samples;
+    if (allow_trial && !partial && (ordinary || earlier_ram) && (!scratch || scratch->publication.shape != scratch_shape ||
+        !scratch->publication.attempted)) return {true, ConstructionModeReason::trial,
+            earlier_ram ? ram_prior.oldest_utc : 0, earlier_ram ? ram_prior.samples : 0};
+    return {partial, partial ? ConstructionModeReason::partial_batch : ConstructionModeReason::ordinary};
+}
 inline long double construction_shape(ConstructionSamples const& samples, bool chunk = false)
 {
     if (!samples.count) return 0;
@@ -402,14 +506,26 @@ struct ExecutionEstimate
 {
     long double completion = 0, generation = 0, cpu = 0, scratch = 0, destination = 0;
     bool known = false;
+    // A partial schedule prices its observed work, including any receipted
+    // input. Unmeasured phases have no finite upper bound.
+    size_t unmeasured = 0;
+    long double lower_bound = 0;
+    bool dated_route_prior = false;
+    long double target_release = 0;
+    unsigned route_prior_min_samples = 0;
+    uint64_t route_prior_oldest_utc = 0;
 };
 struct ExecutionLane
 {
     ExecutionWork work;
     size_t destination = 0;
-    struct Scratch { size_t resource; long double weight; long double transfer_ns = 0; };
+    struct Scratch { size_t resource; long double weight; long double transfer_ns = 0; bool rotating = false; };
     std::vector<Scratch> scratch;
     bool parallel_scratch = false;
+    bool committed = false;
+    // A committed receipt or writer can still be outstanding at this instant.
+    // Its time is relative to this forecast, on the owner's clock.
+    long double ready_after = 0;
 };
 struct ExecutionReady
 {
@@ -546,8 +662,6 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
     // With cold timing, let an idle writer start packing a partially filled
     // group. Equal candidates retain the caller's rotating order.
     bool const all_tight = std::all_of(ready.begin(), ready.end(), [](auto const& item) { return item.tight_capacity; });
-    bool const measured = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
-        { return item.known || (!all_tight && item.tight_capacity); });
     bool const timed_writes = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
         { return item.members_to_pack == UINT16_MAX || item.time_to_write > 0 || (!all_tight && item.tight_capacity); });
     return std::min_element(ready.begin(), ready.end(), [&](auto const& a, auto const& b)
@@ -556,21 +670,42 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
         if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
             a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
         if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
-        return measured && a.remaining > b.remaining;
+        if (a.known != b.known) return a.known;
+        return a.known && a.remaining > b.remaining;
     })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
     size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap,
-    long double concurrent_scratch_bandwidth = 0)
+    long double concurrent_scratch_bandwidth = 0, size_t target = SIZE_MAX)
 {
     ExecutionEstimate result;
     if (lanes.empty() || !active || active > lanes.size() || !workers || !granted || !resources) return result;
-    std::vector<long double> io(resources, 0), local(resources, 0);
-    long double cpu = 0, consumers = 0, longest = 0, drain = 0, scratch_bytes = 0;
-    for (auto const& lane : lanes)
+    // The order is a proposed dispatch order. Model release at publication,
+    // rather than dividing aggregate disk time by the number of destinations.
+    // Combine consecutive batches on very large fills to bound planning work.
+    struct Demand
     {
+        size_t id;
+        long double service;
+    };
+    struct State
+    {
+        std::vector<Demand> scratch;
+        size_t blocks = 0, consumed = 0;
+        long double consumer = 0;
+        bool admitted = false;
+    };
+    std::vector<State> states(lanes.size());
+    std::vector<long double> demand(resources);
+    size_t const max_blocks = std::max(size_t(1), size_t(4096) / lanes.size());
+    long double cpu = 0, scratch_bytes = 0;
+    for (size_t index = 0; index < lanes.size(); ++index)
+    {
+        auto const& lane = lanes[index]; auto& state = states[index];
         auto const& work = lane.work;
-        if (!work.known || !work.batches || lane.destination >= resources) return {};
+        if (lane.destination >= resources || !(lane.ready_after >= 0)) return {};
+        if (!work.known) ++result.unmeasured;
+        state.blocks = std::clamp<uint64_t>(work.batches, 1, max_blocks);
         long double const scratch = work.scratch_read + work.scratch_write;
         long double weights = 0;
         for (auto const& part : lane.scratch)
@@ -580,36 +715,113 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
         }
         if (scratch && !weights) return {};
         scratch_bytes += work.scratch_bytes;
-        local[lane.destination] = work.destination;
+        demand[lane.destination] += work.destination;
         long double scratch_service = 0;
         for (auto const& part : lane.scratch)
         {
             long double const service = std::max(part.transfer_ns, scratch * (part.weight / weights));
-            local[part.resource] += service; scratch_service += service;
+            // Several stripes or partitions can resolve to one physical disk.
+            auto at = std::find_if(state.scratch.begin(), state.scratch.end(),
+                [&](auto const& prior) { return prior.id == part.resource; });
+            if (at == state.scratch.end()) state.scratch.push_back({part.resource, service});
+            else at->service += service;
+            demand[part.resource] += service; scratch_service += service;
         }
-        long double lane_io = local[lane.destination];
-        auto charge = [&](size_t resource)
-        {
-            lane_io = std::max(lane_io, local[resource]);
-            io[resource] += local[resource]; local[resource] = 0;
-        };
-        charge(lane.destination);
-        for (auto const& part : lane.scratch) charge(part.resource);
-        if (!lane.parallel_scratch) lane_io = std::max(lane_io, scratch_service);
         result.generation += work.generation; cpu += work.cpu + work.serial;
         result.scratch += scratch_service; result.destination += work.destination;
-        long double const compute = std::max(work.cpu / granted, work.serial);
-        long double const consumer = work.io_overlap ? std::max(compute, lane_io) :
-            work.cpu / granted + work.serial + scratch_service + work.destination;
-        consumers += consumer; longest = std::max(longest, consumer);
-        drain = std::max(drain, std::min(work.generation, consumer) / work.batches);
+        result.lower_bound = std::max(result.lower_bound, lane.ready_after +
+            std::max({work.generation, work.cpu / workers + work.serial, work.destination}));
     }
-    result.cpu = cpu / std::min<long double>(workers, active * granted);
-    long double const downstream = std::max({result.cpu, *std::max_element(io.begin(), io.end()),
-        concurrent_scratch_bandwidth > 0 ? scratch_bytes / concurrent_scratch_bandwidth : 0, consumers / active, longest});
-    result.completion = generation_overlap ? std::max(result.generation, downstream) + drain :
-        result.generation + downstream;
-    result.known = std::isfinite(result.completion) && result.completion > 0;
+    result.cpu = cpu / std::min<long double>(workers, active * static_cast<long double>(granted));
+    result.lower_bound = std::max({result.lower_bound, result.generation, result.cpu,
+        *std::max_element(demand.begin(), demand.end()),
+        concurrent_scratch_bandwidth > 0 ? scratch_bytes / concurrent_scratch_bandwidth : 0});
+    enum Stage { generate, consume, publish };
+    struct Event { long double at; size_t sequence, lane; Stage stage; };
+    auto later = [](Event const& a, Event const& b)
+    { return std::tie(a.at, a.sequence) > std::tie(b.at, b.sequence); };
+    std::priority_queue<Event, std::vector<Event>, decltype(later)> events(later);
+    size_t sequence = 0, live = 0, published = 0, first = 0;
+    std::vector<unsigned> held(resources), targets(resources);
+    std::vector<long double> disk(resources);
+    std::priority_queue<long double, std::vector<long double>, std::greater<>> codecs;
+    for (size_t i = 0; i < std::min(active, size_t(std::max(1u, workers / granted))); ++i) codecs.push(0);
+    long double producer = 0, writers = 0, shared_scratch = 0;
+    auto admit = [&](size_t i, long double at)
+    {
+        ++live; states[i].admitted = true; ++targets[lanes[i].destination];
+        for (auto const& part : lanes[i].scratch) if (part.rotating) ++held[part.resource];
+        events.push({std::max(at, lanes[i].ready_after), sequence++, i, generate});
+    };
+    auto fill = [&](long double at)
+    {
+        while (first < lanes.size() && states[first].admitted) ++first;
+        for (size_t i = first; i < lanes.size() && live < active; ++i)
+            if (!states[i].admitted && !held[lanes[i].destination] && std::none_of(
+                lanes[i].scratch.begin(), lanes[i].scratch.end(),
+                [&](auto const& part) { return part.rotating && targets[part.resource]; })) admit(i, at);
+    };
+    for (size_t i = 0; i < lanes.size(); ++i) if (lanes[i].committed) admit(i, 0);
+    if (live > active) return {};
+    fill(0);
+    while (!events.empty())
+    {
+        auto const [at, order, i, stage] = events.top(); events.pop();
+        auto const& lane = lanes[i]; auto const& work = lane.work; auto& state = states[i];
+        if (stage == publish)
+        {
+            ++published; --live; --targets[lane.destination];
+            result.completion = std::max(result.completion, at);
+            if (i == target) result.target_release = at;
+            for (auto const& part : lane.scratch) if (part.rotating) --held[part.resource];
+            fill(at); continue;
+        }
+        if (stage == generate)
+        {
+            // Already received input can go straight to its consumer even if
+            // the producer has since been booked by a different destination.
+            auto ready = at;
+            if (work.generation > 0)
+            {
+                producer = std::max({producer, at, generation_overlap ? 0.L : writers}) + work.generation / state.blocks;
+                ready = producer;
+            }
+            events.push({std::max(ready, state.consumer), sequence++, i, consume});
+            continue;
+        }
+        auto const start = generation_overlap ? at : std::max(at, producer);
+        auto cpu_done = start;
+        if (work.cpu || work.serial)
+        {
+            cpu_done = std::max(start, codecs.top()) + (work.cpu / std::min(workers, granted) + work.serial) / state.blocks;
+            codecs.pop(); codecs.push(cpu_done);
+        }
+        auto const io_start = work.io_overlap ? start : cpu_done;
+        auto scratch_done = io_start;
+        for (auto const& part : state.scratch) if (part.service > 0)
+        {
+            auto& free = disk[part.id];
+            free = std::max(free, lane.parallel_scratch ? io_start : scratch_done) + part.service / state.blocks;
+            scratch_done = std::max(scratch_done, free);
+        }
+        if (concurrent_scratch_bandwidth > 0 && work.scratch_bytes > 0)
+        {
+            shared_scratch = std::max(io_start, shared_scratch) + work.scratch_bytes / concurrent_scratch_bandwidth / state.blocks;
+            scratch_done = std::max(scratch_done, shared_scratch);
+        }
+        auto written = work.io_overlap ? io_start : scratch_done;
+        if (work.destination)
+        {
+            auto& free = disk[lane.destination];
+            free = std::max(free, written) + work.destination / state.blocks; written = free;
+        }
+        state.consumer = std::max({cpu_done, scratch_done, written});
+        writers = std::max(writers, state.consumer);
+        if (++state.consumed == state.blocks) events.push({state.consumer, sequence++, i, publish});
+        else events.push({generation_overlap ? start : state.consumer, sequence++, i, generate});
+    }
+    if (published != lanes.size() || !std::isfinite(result.completion)) return {};
+    result.known = !result.unmeasured && result.completion > 0;
     return result;
 }
 
@@ -1047,7 +1259,8 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
     ExecutionWork result;
     result.batches = !merging && forecast.incremental_batches ? forecast.incremental_batches : forecast.batches;
     result.generation = generation; result.io_overlap = io_overlap;
-    if (!result.batches || generation <= 0) return result;
+    if (!result.batches) return result;
+    bool measured = generation > 0;
     auto io = [](ConstructionCost const& work, ConstructionRates const& rates)
     { return work.read * rates.read + work.write * rates.write + work.read_calls * rates.read_call +
         work.write_calls * rates.write_call + work.syncs * rates.sync; };
@@ -1058,31 +1271,32 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
     };
     if (!merging)
     {
-        auto const measured = execution_cpu_rates(history); if (!measured) return result;
-        result.destination = io(forecast.incremental, construction_rates(history)); cpu(forecast.incremental, *measured);
+        if (history.count) result.destination = io(forecast.incremental, construction_rates(history));
+        auto const rates = execution_cpu_rates(history);
+        if (rates) cpu(forecast.incremental, *rates); else measured = false;
     }
     else
     {
         auto const& contributions = external ? history.execution_contributions : history.contributions;
         auto const& packing = external ? history.execution_packing : history.packing;
         auto const contribution_cpu = execution_cpu_rates(contributions), packing_cpu = execution_cpu_rates(packing);
-        if (!contribution_cpu || !packing_cpu) return result;
         auto const& all = forecast.merged; auto const& pack = forecast.packing; auto const& place = forecast.layout;
         ConstructionCost runs{std::max(0.0L, all.read - pack.read - place.read),
             std::max(0.0L, all.write - pack.write - place.write), std::max(0.0L, all.codec - pack.codec),
             std::max(0.0L, all.syncs - pack.syncs - place.syncs),
             std::max(0.0L, all.read_calls - pack.read_calls - place.read_calls),
             std::max(0.0L, all.write_calls - pack.write_calls - place.write_calls), all.serial_codec};
-        cpu(runs, *contribution_cpu); cpu(pack, *packing_cpu);
+        if (contribution_cpu) cpu(runs, *contribution_cpu); else measured = false;
+        if (packing_cpu) cpu(pack, *packing_cpu); else measured = false;
         if (external)
         {
             auto const packed_read = execution_io_rate(packing, true, true);
             auto const written = execution_io_rate(contributions, true, false);
             auto read = execution_io_rate(contributions, true, true);
             if (!read) read = packed_read;
-            if (!read || !packed_read || !written) return {};
-            result.scratch_read = runs.read * *read + pack.read * *packed_read;
-            result.scratch_write = runs.write * *written;
+            if (!read || !packed_read || !written) measured = false;
+            result.scratch_read = runs.read * read.value_or(0) + pack.read * packed_read.value_or(0);
+            result.scratch_write = runs.write * written.value_or(0);
             result.scratch_bytes = runs.read + pack.read + runs.write;
             auto median = [](ConstructionSamples const& samples, auto field) -> std::optional<long double>
             {
@@ -1104,17 +1318,19 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
                 return sample.written_bytes ? (static_cast<long double>(io.read_ns) + io.write_ns + io.sync_ns) /
                     sample.written_bytes : std::numeric_limits<long double>::infinity();
             });
-            if (!metadata || !target || !std::isfinite(*target)) return {};
-            result.destination = forecast.batches * *metadata + pack.write * *target;
+            if (!metadata || !target || !std::isfinite(*target)) measured = false;
+            result.destination = forecast.batches * metadata.value_or(0);
+            if (target && std::isfinite(*target)) result.destination += pack.write * *target;
         }
         else
         {
-            if (!history.layout.count) return {};
-            result.destination = io(runs, construction_rates(history.contributions)) + io(pack, construction_rates(history.packing)) +
-                io(place, construction_rates(history.layout));
+            if (history.contributions.count) result.destination += io(runs, construction_rates(history.contributions));
+            if (history.packing.count) result.destination += io(pack, construction_rates(history.packing));
+            if (history.layout.count) result.destination += io(place, construction_rates(history.layout));
+            else measured = false;
         }
     }
-    result.known = true; return result;
+    result.known = measured; return result;
 }
 
 inline bool prefer_merged(ConstructionForecast const& forecast, Config const& config,

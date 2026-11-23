@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -10,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; class DiskIoGovernor; class WorkerIdentityReservation; }
+namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; struct ProgressRegistry; class DiskIoGovernor; class WorkerIdentityReservation; class DashboardTerminal; class DashboardJob; }
 
 namespace pos2gpu {
 class ComputeSession;
@@ -44,6 +45,11 @@ struct GroupOptions : GroupComputeOptions
 {
     std::string command;
     bool json = false, quiet = false, verbose = false, progress = false, report_metrics = true;
+    bool tui = false;
+    std::chrono::steady_clock::time_point command_started = std::chrono::steady_clock::now();
+    std::shared_ptr<group_grow::DashboardTerminal> dashboard;
+    std::shared_ptr<group_grow::DashboardJob> dashboard_job;
+    std::shared_ptr<group_grow::ProgressRegistry> parent_progress;
     std::function<bool()> cancelled;
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;

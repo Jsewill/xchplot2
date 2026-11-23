@@ -19,7 +19,7 @@ void command_usage(std::string_view command)
 {
     if (command == "status")
     {
-        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--watch] [--inspect] [--live]\n";
+        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--tui] [--watch] [--inspect] [--live]\n";
         return;
     }
     if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
@@ -179,6 +179,7 @@ void command_help_all(std::string_view command)
         "  --json                    machine-readable plan/metrics on stdout\n"
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions, construction details and metrics\n"
+        "  --tui                     show the live dashboard and helper onboarding\n"
         "  --progress / --no-progress  force aggregate progress on or off\n";
     std::cout << "Construction recovery requires compatible checkpoint format, algorithm and\n"
         "native representation. Legacy checkpoints need their original build.\n";
@@ -198,6 +199,7 @@ void command_help(std::string_view command, bool all)
         std::cout << "Read saved farm progress through any destination in the job, a plan, or its manifest.\n"
             "Without a selector, use the current destination directory.\n\n"
             "  --watch                  refresh until interrupted\n"
+            "  --tui                    watch in an interactive dashboard (q closes)\n"
             "  --inspect                scan outputs and check recovery checkpoints\n"
             "  --live                   query shared compute and migration service readiness\n"
             "  --timeout-ms N           total live query time in milliseconds, 100..60000; default 5000\n"
@@ -312,6 +314,7 @@ void command_help(std::string_view command, bool all)
         "  --json                    machine-readable output\n"
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions and construction details\n"
+        "  --tui                     show the live dashboard and helper onboarding\n"
         "  --progress / --no-progress  force aggregate progress on or off\n"
         "\nk28 is the farming size; smaller sizes are for testing.\n"
         "Estimates cover this job and use assumed service costs.\n"
@@ -353,14 +356,14 @@ pos2gpu::GroupOptions pos2gpu::group_batch_options(pos2gpu::BatchOptions const& 
     if (options.skip_existing) tokens.emplace_back("--resume");
     if (options.quiet) tokens.emplace_back("--quiet");
     if (options.verbose) tokens.emplace_back("--verbose");
-    tokens.emplace_back(options.progress ? "--progress" : "--no-progress");
+    tokens.emplace_back(options.tui ? "--tui" : options.progress ? "--progress" : "--no-progress");
     tokens.insert(tokens.end(), extra.begin(), extra.end());
     auto args = command_arguments("plot", std::move(tokens));
     args.report_metrics = false;
     return args;
 }
 
-int pos2gpu::run_group_command(std::string_view command, std::vector<std::string> const& tokens)
+int pos2gpu::run_group_command(std::string_view command, std::vector<std::string> const& tokens, std::chrono::steady_clock::time_point started)
 {
     for (size_t i = 0; i < tokens.size(); ++i)
     {
@@ -370,7 +373,12 @@ int pos2gpu::run_group_command(std::string_view command, std::vector<std::string
         { command_help(command, token == "--help-all"); return 0; }
         i += pos2gpu::group_option_values(token);
     }
-    try { return run_group(command_arguments(command, tokens)); }
+    try
+    {
+        auto args = command_arguments(command, tokens);
+        args.command_started = started;
+        return run_group(args);
+    }
     catch (std::exception const& error)
     { std::cerr << '[' << command << "] FAILED: " << error.what() << '\n'; return 2; }
 }

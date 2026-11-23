@@ -108,8 +108,8 @@ void prepare_group_compute(GroupOptions& args)
         std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())));
     if (!identity)
     {
-        require(args.pool_broker.empty(), "shared compute needs saved pool membership; use compute init or compute join");
-        require(args.automatic_local_compute, "--compute-local needs saved pool membership; use compute init or compute join");
+        require(args.pool_broker.empty(), "shared compute needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
+        require(args.automatic_local_compute, "--compute-local needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
         return;
     }
     args.automatic_compute = true;
@@ -180,7 +180,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         if (!result.configured)
         {
             result.status = "not-configured"; result.reason = "no saved compute enrollment or explicit connection was selected";
-            result.next_action = "continue with local execution, or use compute init or compute join to enroll this machine"; return result;
+            result.next_action = "continue with local execution, or use compute setup on a plotting host or compute setup INVITATION on a helper to enroll this machine"; return result;
         }
 #ifdef _WIN32
         result.service_lifecycle = "background compute uses Task Scheduler for the logged-in user; changed defaults, executable or imported credentials require compute service restart; manager state was not queried";

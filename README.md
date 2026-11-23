@@ -25,8 +25,10 @@ save a layout for later execution. Add `fill --replot` to
 configured farm directories and optional exclusions. Use the intended harvester's profile when plotting
 on another machine. Repeat `fill DIR` to continue through any member, or add
 options to change future work while keeping existing plots and reservations.
-`pause`, `drain`, `resume` and `retire` control a job or selected destinations;
-`status DIR --watch` follows saved progress.
+`pause`, `drain`, `resume` and `retire` control a job or selected destinations.
+Use `fill DIR --tui` to see seconds per newly published member, construction
+decisions, hardware activity and worker deliveries. From another terminal,
+`xchplot2 status DIR --tui` opens a read-only view. Press `q` to close it.
 `--discover-drives DIR` selects supported drives mounted beneath a directory
 at any depth. See [drive filling](REFERENCE.md#grouped-plotting-and-drive-filling)
 for recovery and policy changes. [Shared compute](REFERENCE.md#shared-compute)
@@ -124,12 +126,19 @@ recover old plots already deleted under the allowance.
 |---|---|
 | [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
 
-Run `xchplot2 compute setup` on the first machine to start its broker, then
-create an invitation for each helper. On a helper,
-`xchplot2 compute setup INVITATION` enrolls it and starts its persistent
-worker. Plotting jobs discover enrolled helpers automatically. For the
-default ports and commands to allow connections through a firewall, see the
-[network guide](REFERENCE.md#networks-and-dedicated-brokers).
+Run `xchplot2 compute setup` on the plotting host before starting its first
+shared job. You can add a helper while the plotter is running.
+
+1. On the pool administrator, run `xchplot2 compute invite helper.invite --name helper`.
+2. Transfer that invitation privately to the helper and run `xchplot2 compute setup helper.invite` there.
+3. Open **Workers** in the dashboard to see when the helper becomes eligible
+   and when it delivers its first validated work. The owner adjusts new
+   assignments while existing work finishes. Press `a` in the dashboard to
+   bring up these commands.
+
+For a temporary helper, `xchplot2 compute worker --join helper.invite` runs
+in the foreground. For broker discovery, direct addresses and firewall ports,
+see the [network guide](REFERENCE.md#networks-and-dedicated-brokers).
 
 ### Plotting jobs
 

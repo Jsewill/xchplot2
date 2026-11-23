@@ -46,13 +46,21 @@ struct ReaderCalibrationScope
     std::string method = reader_calibration_method;
     long double margin = 2;
     std::string host_name, captured_at;
+    uint16_t sampled_min_members = 0, sampled_max_members = 0;
+    std::string_view coverage(uint16_t low, uint16_t high) const
+    {
+        if (!sampled_min_members) return "unknown-sampled-range";
+        if (!low || !high) return "no-planned-members";
+        return low < sampled_min_members || high > sampled_max_members ? "extrapolated" : "within-sampled-range";
+    }
     bool operator==(ReaderCalibrationScope const&) const = default;
 };
 inline void validate_reader_calibration_scope(ReaderCalibrationScope const& scope)
 {
     if (scope.k < 18 || scope.k > 28 || (scope.k & 1) || scope.strength < 2 || scope.strength > scope.k - 3 ||
         (scope.reader != FarmingReader::stateless && scope.reader != FarmingReader::cached) ||
-        scope.method != reader_calibration_method || !std::isfinite(scope.margin) || scope.margin < 1)
+        scope.method != reader_calibration_method || !std::isfinite(scope.margin) || scope.margin < 1 ||
+        bool(scope.sampled_min_members) != bool(scope.sampled_max_members) || scope.sampled_min_members > scope.sampled_max_members)
         throw std::runtime_error("unsupported or invalid reader calibration scope");
 }
 struct FarmingProfileMetadata
@@ -313,7 +321,7 @@ inline FarmingProfile parse_farming_profile(Json const& document)
     auto const* nested = field(document, "farming_profile"); auto const& object = nested ? *nested : document;
     FarmingProfile result; auto& c = result.config;
     auto const* schema = field(object, "schema_version");
-    profile_require(schema && (integer(*schema) == 1 || integer(*schema) == 2), "unsupported or missing farming profile schema_version");
+    profile_require(schema && integer(*schema) >= 1 && integer(*schema) <= 3, "unsupported or missing farming profile schema_version");
     auto const* model = field(object, "model");
     profile_require(model && text(*model) == farming_model_identity, "farming profile model differs from this build");
     auto set_integer = [&](char const* name, auto& target)
@@ -358,7 +366,7 @@ inline FarmingProfile parse_farming_profile(Json const& document)
         result.assumptions.clear(); for (auto const& item : p->items) result.assumptions.push_back(text(item));
     }
     auto const* calibration = field(object, "reader_calibration");
-    profile_require((integer(*schema) == 2) == bool(calibration), "reader calibration scope requires farming profile schema_version 2");
+    profile_require((integer(*schema) >= 2) == bool(calibration), "reader calibration scope requires a versioned farming profile");
     if (calibration)
     {
         profile_require(calibration->kind == Json::object, "invalid reader calibration scope");
@@ -373,6 +381,24 @@ inline FarmingProfile parse_farming_profile(Json const& document)
         scope.reader = reader == "cached" ? FarmingReader::cached : FarmingReader::stateless;
         scope.method = text(*field(*calibration, "method")); scope.margin = real(*field(*calibration, "margin"));
         scope.host_name = text(*field(*calibration, "host_name")); scope.captured_at = text(*field(*calibration, "captured_at"));
+        auto const* range = field(*calibration, "sampled_members");
+        profile_require(bool(range) == (integer(*schema) == 3), "sampled membership requires farming profile schema_version 3");
+        auto read_range = [&](Json const& object)
+        {
+            auto const* minimum = field(object, "min"); auto const* maximum = field(object, "max");
+            profile_require(minimum && maximum, "incomplete calibration membership range");
+            auto const low = integer(*minimum), high = integer(*maximum);
+            profile_require(low && low <= high && high <= UINT16_MAX, "invalid calibration membership range");
+            profile_require(!scope.sampled_min_members || (low == scope.sampled_min_members && high == scope.sampled_max_members),
+                "report and profile calibration membership differ");
+            scope.sampled_min_members = uint16_t(low); scope.sampled_max_members = uint16_t(high);
+        };
+        if (range) read_range(*range);
+        // Original full calibration reports retained the range outside their
+        // schema-2 profile. A standalone legacy profile has unknown coverage.
+        auto const* measured = field(document, "reader_calibration");
+        if (nested && measured && measured->kind == Json::boolean && boolean(*measured))
+            if (auto const* outer = field(document, "sampled_members")) read_range(*outer);
         validate_reader_calibration_scope(scope); result.reader_calibration = std::move(scope);
         c.k = result.reader_calibration->k; c.strength = result.reader_calibration->strength;
     }
@@ -409,7 +435,8 @@ inline void write_farming_profile_json(std::ostream& out, FarmingProfile const& 
     std::ostringstream text; text.imbue(std::locale::classic());
     text << std::setprecision(std::numeric_limits<long double>::max_digits10);
     auto const& c = value.config;
-    text << "{\"schema_version\":" << (value.reader_calibration ? 2 : 1) << ",\"model\":"; quote(text, farming_model_identity);
+    text << "{\"schema_version\":" << (value.reader_calibration ? (value.reader_calibration->sampled_min_members ? 3 : 2) : 1)
+        << ",\"model\":"; quote(text, farming_model_identity);
     text << ",\"reader\":"; quote(text, c.reader == FarmingReader::cached ? "cached" : "stateless");
     text << ",\"objective\":"; quote(text, c.objective == FarmingObjective::latency ? "latency" : "energy");
     text << ",\"harvester_cores\":" << c.harvester_cores << ",\"lookup_workers\":" << c.lookup_workers
@@ -431,7 +458,10 @@ inline void write_farming_profile_json(std::ostream& out, FarmingProfile const& 
         text << ",\"reader_calibration\":{\"k\":" << unsigned(scope.k) << ",\"strength\":" << unsigned(scope.strength)
             << ",\"reader\":"; quote(text, scope.reader == FarmingReader::cached ? "cached" : "stateless");
         text << ",\"method\":"; quote(text, scope.method); text << ",\"margin\":" << scope.margin << ",\"host_name\":";
-        quote(text, scope.host_name); text << ",\"captured_at\":"; quote(text, scope.captured_at); text << '}';
+        quote(text, scope.host_name); text << ",\"captured_at\":"; quote(text, scope.captured_at);
+        if (scope.sampled_min_members) text << ",\"sampled_members\":{\"min\":" << scope.sampled_min_members
+            << ",\"max\":" << scope.sampled_max_members << '}';
+        text << '}';
     }
     text << ",\"detected_logical_cpus\":" << value.detected_logical_cpus
         << ",\"detected_available_memory_bytes\":" << value.detected_available_memory_bytes

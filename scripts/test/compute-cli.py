@@ -118,7 +118,16 @@ def check(binary, root, service_manager=False):
         for name in ("worker", "owner"):
             invitation = root / (name + ".invite")
             run("authority", "invite", invitation, "--name", name)
-            run(name, "join", invitation)
+            if name == "owner":
+                run(name, "join", invitation)
+            else:
+                port = pool.port()
+                new = start(name, "worker", "--join", invitation, "--backend", "cpu", "--cpus", 1,
+                            "--host-bytes", "512M", "--listen", f"127.0.0.1:{port}", "--discovery", "off",
+                            "--broker", f"127.0.0.1:{pool.port()}", port=port)
+                new.stop()
+        refused = run("worker", "worker", "--join", root / "owner.invite", code=1)
+        assert "differs from this machine's saved compute enrollment" in refused.stderr
         broker_port, worker_port = pool.port(), pool.port()
         broker_address, worker_address = f"127.0.0.1:{broker_port}", f"127.0.0.1:{worker_port}"
         for name in ("authority", "worker", "owner"):
@@ -147,7 +156,7 @@ def check(binary, root, service_manager=False):
         print("PASS concise/verbose/quiet output, configuration overrides and invariant JSON status", flush=True)
         worker_args = ("worker", "--slots", 1, "--generation-threads", 1,
                        "--max-frame-bytes", "64K", "--max-task-bytes", "16M", "--quiet", "--no-quiet")
-        worker = start("worker", *worker_args, port=worker_port)
+        worker = start("worker", *worker_args, "--join", root / "worker.invite", port=worker_port)
         until(lambda: "Waiting for an authenticated broker connection." in worker.log.read_text(encoding="utf-8"))
         broker = start("authority", "broker", "--worker-ms", 3000,
                        "--lease-ms", 3000, "--verbose", "--no-verbose", port=broker_port)
@@ -201,7 +210,7 @@ def check(binary, root, service_manager=False):
         run("authority", "renew-sign", request, replacement)
         run("worker", "renew-import", replacement)
         worker.stop()
-        worker = start("worker", *worker_args, port=worker_port)
+        worker = start("worker", *worker_args, "--join", root / "worker.invite", port=worker_port)
         renewed = until(lambda: (value if (value := status("worker", "--worker", worker_address))["workers"] else None))
         assert renewed["workers"][0]["node_id"] == worker_node
         assert renewed["workers"][0]["identity"] != before
@@ -296,6 +305,14 @@ def check(binary, root, service_manager=False):
         run("setup-worker", "setup", invitation, "--backend", "cpu", "--cpus", 1, "--host-bytes", "512M",
             "--discovery", "off", env=environment)
         helper = status("setup-worker")
+        previous_calls = len(calls.read_text().splitlines())
+        run("setup-worker", "setup", invitation, "--cpus", 1, env=environment)
+        repeated = [json.loads(line) for line in calls.read_text().splitlines()[previous_calls:]]
+        assert not any("restart" in action for action in repeated)
+        previous_calls = len(calls.read_text().splitlines())
+        rejected = run("setup-worker", "setup", root / "worker.invite", env=environment, code=1)
+        assert "differs from this machine" in rejected.stderr and len(calls.read_text().splitlines()) == previous_calls
+        assert status("setup-worker")["node_id"] == helper["node_id"]
         run("setup-worker", "setup", "--cpus", 2, "--worker-port", 0, env=environment)
         assert status("setup-worker")["node_id"] == helper["node_id"]
         assert status("setup-worker")["defaults"]["worker_port"] == 0
@@ -340,6 +357,7 @@ def main():
     args = parser.parse_args()
     args.scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="compute cli é-", dir=args.scratch) as directory:
+        os.environ["XDG_CACHE_HOME"] = str(Path(directory).resolve() / "performance-cache")
         check(args.binary.resolve(), Path(directory).resolve(), args.service_manager)
 
 

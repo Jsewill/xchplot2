@@ -1,7 +1,11 @@
 // Like grow-merge-test, exercise the actual controller producer in this TU.
 #include "host/GroupPlotter.cpp"
+#include "host/GroupDashboardFeed.hpp"
 #include "compute_pool_fixture.hpp"
 #include "host/ComputeThreads.hpp"
+#ifdef _WIN32
+#include <process.h>
+#endif
 
 using namespace group_grow;
 using group_tools::require;
@@ -431,14 +435,226 @@ void owner_broker_restart()
     stop.store(true); // Also drain safely if a regression extends the deadline.
     require(expired.get() && bounded, "transient owner retry extended its original absolute deadline");
 }
+
+void private_local_delegation(std::optional<fs::path> retained = {})
+{
+    using namespace grow_controller_test;
+    PrivateLocalSchedule model(3, 100);
+    model.devices.resize(2);
+    auto& fast = model.devices[0]; auto& slow = model.devices[1];
+    PrivateLocalSchedule::Shape shape{18, 2, 1, pool::GenerationOutput::Packed};
+    using Clock = std::chrono::steady_clock;
+    auto const now = Clock::now();
+    fast.offer = {{3, 1, 90, 1}, {3, 1, 55, 1}, 10};
+    slow.offer = {{3, 1, 90, 0}, {3, 1, 20, 0}, 10};
+    fast.recent[0] = {shape, 2, 4};
+    require(model.choose(shape, now, 100).device == 1, "explicit unmeasured local device never received a trial");
+    slow.recent[0] = {shape, 1, 9};
+    auto choice = model.choose(shape, now, 100);
+    require(choice.device == 0 && !choice.wait_ns && choice.grant.cpu_threads == 2, "fast local GPU did not leave CPU room for its peer");
+    fast.started = now - std::chrono::nanoseconds(2); fast.expected_ns = 4;
+    fast.held = choice.grant; fast.standing_at_start = 10;
+    choice = model.choose(shape, now, 100);
+    require(choice.device == 0 && choice.wait_ns == 2, "idle slow local route displaced an earlier fast-device release");
+    slow.recent[0].ns = 5;
+    choice = model.choose(shape, now, 100);
+    require(choice.device == 1 && !choice.wait_ns && choice.grant.cpu_threads == 1, "committed local work was ignored or double-booked CPUs");
+    fast.offer.standing_host_bytes = 70;
+    require(model.choose(shape, now, 100).device == 1, "retained fast-device buffers hid the only usable local executor");
+    slow.offer.demand.host_bytes = 30;
+    require(!model.choose(shape, now, 100).possible, "idle persistent GPU RAM was spent a second time");
+    fast.offer.standing_host_bytes = 10; slow.offer.demand.host_bytes = 20;
+    fast.offer.demand.slots = 0; fast.held = {0, 0, 0, 0};
+    choice = model.choose(shape, now, 100);
+    require(choice.device == 1 && choice.grant.cpu_threads == 3, "sole eligible slow CPU did not receive the available grant");
+    require(model.choose(shape, now, 30).device == SIZE_MAX, "physical host pressure was ignored");
+    fast.offer.demand = {3, 1, 55, 0};
+    choice = model.choose(shape, now, 100);
+    require(choice.device == 0 && choice.grant.cpu_threads == 2, "one CPU service occupied every permit despite a fitting peer");
+    choice = model.choose(shape, now, 85);
+    require(choice.device == 0 && choice.grant.cpu_threads == 3, "a peer blocked by RAM reduced the only useful CPU grant");
+
+    Arguments args; args.local_compute = true; args.quiet = true; args.window = uint64_t(1) << 20;
+    args.pool_frame_bytes = 4096; args.pool_inflight = 2; args.pool_offer_cpus = 1;
+    args.pool_offer_ram = uint64_t(240) << 20; args.pool_timeout_ms = 10000;
+    args.k = 18; args.strength = 2; args.seed = std::string(64, '5'); args.pool_ph = std::string(64, '4');
+    args.farmer = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    auto const requested = Keys(args).derive(0);
+    // Neither of these services could fit a member under the old equal split.
+    args.local_devices = {{pos2gpu::cpu_device_id(0), "auto", {}}, {pos2gpu::cpu_device_id(1), "auto", {}}};
+    args.dashboard_job = std::make_shared<DashboardJob>();
+    Backend backend; backend.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    backend.initialize(args, requested, 0, false);
+    auto client = backend.acquire_pool_client();
+    auto const hint = client->generation_capacity(18, 2);
+    require(hint.slots == 1 && hint.batch >= 2 && !backend.fresh_group_slots(requested, 2),
+        "private hints lost a fitting batch, advertised duplicate host capacity or offered a network-only manifest");
+    std::array<std::array<uint8_t, 32>, 2> ids;
+    for (uint16_t i = 0; i < ids.size(); ++i) ids[i] = requested.params.get_plot_params_for_index(i).get_plot_id().data();
+    std::vector<std::unique_ptr<CompactMemberReceiver>> received;
+    client->generate_packed(18, 2, ids, [&](PackedFragmentTile const& tile, uint64_t count)
+    {
+        if (!tile.boundaries.empty()) received.push_back(std::make_unique<CompactMemberReceiver>(18, size_t(count)));
+        require(!received.empty(), "private packed batch omitted the member boundary"); received.back()->append(tile);
+    });
+    require(received.size() == ids.size(), "private packed batch lost a member");
+    client->generate_packed(18, 2, ids, [](PackedFragmentTile const&, uint64_t) {});
+    DashboardFrame frame; args.dashboard_job->fill(frame, false);
+    for (auto const* selector : {"Local cpu0", "Local cpu1"})
+        require(std::any_of(frame.rows[DashboardFrame::workers].begin(), frame.rows[DashboardFrame::workers].end(),
+            [&](auto const& row) { return row.value.starts_with(selector) && row.value.find("2 delivered") != row.value.npos; }),
+            "private selector did not receive its own displayed delivery count");
+    worker_detail::CpuLimit limit(1);
+    std::vector<std::vector<uint64_t>> reference;
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        auto member = received[i]->finish(); auto view = member.view();
+        std::vector<uint64_t> values;
+        for (size_t c = 0; c < PlotGroupFile::getChunkCountForK(18); ++c)
+            for (auto value : view.region(c)) values.push_back(value);
+        reference.push_back(worker_original_reference(18, 2, ids[i]));
+        require(values == reference.back(), "private shared grant changed CPU-reference output");
+    }
+    Directory scratch; auto const output = retained.value_or(scratch.path);
+    require(fs::is_directory(output) && fs::is_empty(output), "private owner fixture requires an empty output directory");
+    args.target = output / "private.gplot"; args.workers = 1; args.max_ram = uint64_t(512) << 20;
+    args.capacity = uint64_t(64) << 20; args.max_members = args.batch = ids.size();
+    Config cfg; cfg.capacity_bytes = args.capacity; cfg.window_bytes = args.window; cfg.codec_bytes = uint64_t(8) << 20;
+    cfg.checkpoint_bytes = args.checkpoint_bytes; cfg.memory_limit_bytes = args.max_ram; cfg.workers = 1;
+    auto const cpu = output / "reference.gplot";
+    { Engine engine(cpu.string(), cfg, false, initial_identity(requested)); engine.confirm_identity();
+      require(engine.append(Members(reference)).accepted, "reference failed to append private test group"); }
+    std::unique_ptr<Backend> constructing;
+    auto result = run_group(args, args.target, nullptr, requested, uint16_t(ids.size()), args.capacity, 0, constructing);
+    require(result.members == ids.size() && !publication::pending(args.target) && contents(args.target) == contents(cpu),
+        "complete private local publication differs from the independently generated CPU-reference group");
+}
+
+#if defined(__linux__) || defined(_WIN32)
+std::string const multi_observer_job(64, 'e');
+int dashboard_reader(char** argv)
+{
+    FarmingOwnerHealth owner; owner.lock_held = owner.local_process_proven = owner.heartbeat_current = true;
+    owner.local_pid = std::stoull(argv[2]); owner.local_process_start = std::stoull(argv[3]);
+    auto const marker = file_io::native_path(argv[4]);
+    (void)DashboardFeed::read(multi_observer_job, owner);
+    { std::ofstream ready(marker); require(bool(ready), "could not signal observer readiness"); }
+    auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    do
+    {
+        auto frame = DashboardFeed::read(multi_observer_job, owner);
+        if (frame && frame->title == "Shared owner" && frame->rows[DashboardFrame::resources].size() == 1 &&
+            frame->rows[DashboardFrame::resources].front().value == "resource visible") return 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < until);
+    return 1;
+}
+int run_dashboard_reader(FarmingOwnerHealth const& owner, fs::path const& marker)
+{
+    auto const self = group_grow::calibration_process::executable();
+#ifdef _WIN32
+    auto const pid = std::to_wstring(owner.local_pid), start = std::to_wstring(owner.local_process_start);
+    // _wspawnl passes its arguments through the Windows command-line parser.
+    auto const exe = profile_detail::windows_argument(self.native());
+    auto const ready = profile_detail::windows_argument(marker.native());
+    return int(::_wspawnl(_P_WAIT, self.c_str(), exe.c_str(), L"--dashboard-reader", pid.c_str(),
+        start.c_str(), ready.c_str(), static_cast<wchar_t const*>(nullptr)));
+#else
+    std::array<std::string, 5> args{self.string(), "--dashboard-reader", std::to_string(owner.local_pid),
+        std::to_string(owner.local_process_start), marker.string()};
+    std::array<char*, 6> command{};
+    for (size_t i = 0; i < args.size(); ++i) command[i] = args[i].data();
+    pid_t child = -1;
+    if (::posix_spawn(&child, self.c_str(), nullptr, nullptr, command.data(), environ)) return -1;
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) if (errno != EINTR) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+#endif
+void owner_dashboard_feed()
+{
+#if defined(__linux__) || defined(_WIN32)
+    std::string const job(64, 'f');
+    DashboardFeed feed(job);
+    require(!feed.wants_frame(), "inactive dashboard sampled a frame without a reader");
+    FarmingOwnerHealth owner; owner.lock_held = owner.local_process_proven = owner.heartbeat_current = true;
+#ifdef _WIN32
+    owner.local_pid = ::GetCurrentProcessId();
+#else
+    owner.local_pid = uint64_t(::getpid());
+#endif
+    owner.local_process_start = std::stoull(farming_owner_detail::process_start(owner.local_pid));
+    require(!DashboardFeed::read(job, owner) && feed.wants_frame(), "reader did not signal a new local attachment");
+    DashboardFrame sent; sent.title = "Local owner"; sent.summary = "Publishing";
+    sent.add(DashboardFrame::workers, "ready", "registered"); sent.add(DashboardFrame::decisions, "packed", "RAM admitted");
+    for (size_t row = 0; row < 96; ++row)
+        sent.add(DashboardFrame::resources, "HDD " + std::to_string(row), "Read and write service on the selected farm volume");
+    feed.publish(sent);
+    uint64_t age = UINT64_MAX;
+    auto got = DashboardFeed::read(job, owner, &age);
+    require(got && got->title == sent.title && got->summary == sent.summary && age < 5000 &&
+        got->rows[DashboardFrame::workers].at(0).detail == "registered" &&
+        got->rows[DashboardFrame::decisions].at(0).value == "packed" &&
+        got->rows[DashboardFrame::resources].size() == 96 && got->rows[DashboardFrame::resources].back().value == "HDD 95" &&
+        got->rows[DashboardFrame::resources].back().detail == sent.rows[DashboardFrame::resources].back().detail,
+        "attached local snapshot lost its job, age, data or full 96-volume resource inventory");
+    for (size_t row = 96; row < 310; ++row) sent.add(DashboardFrame::resources, "HDD " + std::to_string(row), std::string(900, 'x'));
+    sent.add(DashboardFrame::farm, "one late lookup");
+    feed.publish(sent); got = DashboardFeed::read(job, owner);
+    require(got && got->rows[DashboardFrame::farm].at(0).value == "one late lookup",
+        "busy resources crowded out another dashboard view");
+    auto const& rows = got->rows[DashboardFrame::resources];
+    require(rows.size() > 96 && rows.size() < 256 && rows.back().value ==
+        std::to_string(310 - (rows.size() - 1)) + " additional rows on the plotting host",
+        "bounded packed snapshot lost the total rows omitted by its source or transfer");
+    require(!DashboardFeed::read(std::string(64, 'a'), owner), "snapshot from another job was attached");
+    auto stale = owner; ++stale.local_process_start;
+    require(!DashboardFeed::read(job, stale), "reused owner PID supplied another generation's snapshot");
+    stale = owner; stale.heartbeat_current = false;
+    require(!DashboardFeed::read(job, stale), "stale owner heartbeat supplied a live snapshot");
+    stale = owner; stale.local_process_proven = false;
+    require(!DashboardFeed::read(job, stale), "remote owner was treated as a proven local dashboard");
+
+    Directory scratch; DashboardFeed shared(multi_observer_job);
+    auto const first_path = scratch.path / "first", second_path = scratch.path / "second";
+    auto first = std::async(std::launch::async, run_dashboard_reader, owner, first_path);
+    auto second = std::async(std::launch::async, run_dashboard_reader, owner, second_path);
+    auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while ((!fs::exists(first_path) || !fs::exists(second_path) || !shared.wants_frame()) &&
+        std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(fs::exists(first_path) && fs::exists(second_path) && shared.wants_frame(),
+        "separate local observers could not attach to their live job");
+    DashboardFrame common; common.title = "Shared owner"; common.add(DashboardFrame::resources, "resource visible");
+    // Readers or writer may deliberately skip a busy frame.
+    while (std::chrono::steady_clock::now() < until)
+    {
+        shared.publish(common);
+        if (first.wait_for(std::chrono::milliseconds(20)) == std::future_status::ready &&
+            second.wait_for(std::chrono::milliseconds(20)) == std::future_status::ready) break;
+    }
+    require(first.get() == 0 && second.get() == 0, "separate observers did not both receive the owner's frame");
+#ifdef __linux__
+    require(!shared.wants_frame(), "owner kept sampling after both monitoring processes exited");
+#endif
+#endif
+}
 }
 
 int main(int argc, char** argv)
 try
 {
+#if defined(__linux__) || defined(_WIN32)
+    if (argc == 5 && std::string_view(argv[1]) == "--dashboard-reader") return dashboard_reader(argv);
+#endif
     if (argc == 3 && std::string_view(argv[1]) == "--codec-publication")
     { accepted_remote_publication(fs::path(argv[2])); return 0; }
-    require(argc == 1, "usage: grow_pool_owner_test [--codec-publication EMPTY_DIRECTORY]");
+    if (argc == 3 && std::string_view(argv[1]) == "--private-publication")
+    { private_local_delegation(fs::path(argv[2])); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--private-local") { private_local_delegation(); owner_dashboard_feed(); return 0; }
+    require(argc == 1, "usage: grow_pool_owner_test [--private-local | --private-publication EMPTY_DIRECTORY | --codec-publication EMPTY_DIRECTORY]");
+    private_local_delegation();
+    owner_dashboard_feed();
     repartition_and_global_admission();
     owner_broker_restart();
     accepted_remote_publication();

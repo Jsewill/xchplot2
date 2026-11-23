@@ -2,6 +2,7 @@
 
 #include "host/BatchPlotter.hpp"
 #include "host/Cancel.hpp"
+#include "host/GroupDashboard.hpp"
 #include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
 #include "host/GpuBufferPool.hpp"
 #include "host/VramBudget.hpp"
@@ -809,6 +810,25 @@ void emit_progress_line(std::string const& log_prefix,
         static_cast<double>(live.bytes.load(std::memory_order_relaxed))
         / elapsed_s / kTibBytes;
 
+    if (opts.display_progress) {
+        using Frame = group_grow::DashboardFrame;
+        Frame view; view.title=log_prefix+"   local plotting"; view.sharing = Frame::Sharing::local;
+        double last_write = 0;
+        for (auto const& w : model) last_write = std::max(last_write, w.last_done);
+        view.summary=std::to_string(written)+" newly written   "+std::to_string(skipped)+" existing   "+
+            (written ? group_grow::dashboard_number(last_write / written)+" s/new plot" : "Waiting for first new plot");
+        view.add(Frame::overview,std::to_string(retired)+" / "+std::to_string(total)+" queue entries finished");
+        view.add(Frame::overview,std::string(eta.lower_bound ? "Estimated remaining at least  " : "Estimated remaining  ")+format_duration_hms(eta.seconds));
+        for (auto const& w : live.workers)
+            view.add(Frame::workers,(w.label.empty() ? log_prefix : w.label)+"   "+std::to_string(w.written.load())+
+                " written   "+std::to_string(w.in_flight.load())+" in flight");
+        view.add(Frame::resources,"Process memory   "+std::to_string(self_rss_bytes()/(1u<<20))+" MiB resident");
+        view.add(Frame::resources,"Output rate   "+group_grow::dashboard_number(rate_tib_s*3600)+" TiB/hour");
+        view.add(Frame::decisions,std::to_string(unclaimed)+" queued entries   "+std::to_string(in_flight_total)+" already assigned");
+        view.add(Frame::farm,"Live harvester data unavailable for this job");
+        if (opts.display_progress(std::move(view))) return;
+    }
+
     // On a TTY, rewrite one line in place ("\r" + clear-to-EOL); keep
     // one-line-per-plot when redirected to a file/pipe or when verbose
     // logging would interleave and garble the in-place line.
@@ -817,7 +837,7 @@ void emit_progress_line(std::string const& log_prefix,
 #else
     static bool const stderr_tty = ::isatty(::fileno(stderr)) != 0;
 #endif
-    bool const in_place = stderr_tty && !opts.verbose;
+    bool const in_place = stderr_tty && !opts.verbose && !group_grow::DashboardTerminal::plain_terminal();
 
     // Only surfaces on a resume (--skip-existing). Without it the line counts
     // skipped entries as done in "N/M" while excluding them from every rate
@@ -4065,6 +4085,37 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                       BatchOptions const& opts)
 {
     if (entries.empty()) return BatchResult{};
+    if (opts.tui) {
+        group_grow::DashboardTerminal terminal(false);
+        auto run_opts=opts; run_opts.tui=false; run_opts.progress=true;
+        if (!terminal.active()) return run_batch(entries,run_opts);
+        std::mutex mutex;
+        group_grow::DashboardFrame frame; frame.title="local plotting";
+        frame.sharing = group_grow::DashboardFrame::Sharing::local;
+        frame.summary="Waiting for first publication";
+        frame.add(group_grow::DashboardFrame::overview,std::to_string(entries.size())+" plots requested");
+        frame.add(group_grow::DashboardFrame::workers,"Initializing local workers");
+        run_opts.display_progress = [&](group_grow::DashboardFrame next) {
+            if (!terminal.active()) return false;
+            std::lock_guard lock(mutex); frame=std::move(next); return true;
+        };
+        if (opts.on_plot_ready) run_opts.on_plot_ready = [&](BatchEntry const& entry) {
+            terminal.output([&] { opts.on_plot_ready(entry); });
+        };
+        std::jthread renderer([&](std::stop_token stop) {
+            auto next=std::chrono::steady_clock::now();
+            while (!stop.stop_requested() && terminal.active()) {
+                bool keys=terminal.keys(); auto now=std::chrono::steady_clock::now();
+                if (keys || now>=next) {
+                    group_grow::DashboardFrame current;
+                    { std::lock_guard lock(mutex); current=frame; }
+                    terminal.draw(current); next=now+std::chrono::seconds(1);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        return run_batch(entries,run_opts);
+    }
     std::set<std::filesystem::path> outputs;
     for (auto const& entry : entries) {
         validate_batch_entry(entry);

@@ -2,7 +2,10 @@
 // its configured private-CA client authentication and explicit local service bindings.
 #pragma once
 #include "host/GroupFarmInventory.hpp"
+#include "host/GroupFarmService.hpp"
 #include "host/GroupFarmAdapterProcess.hpp"
+#include "host/GroupStorage.hpp"
+#include <charconv>
 #include <cctype>
 #include <ctime>
 #include <mutex>
@@ -1097,7 +1100,7 @@ public:
     static constexpr uint64_t memory_bytes = 8 * 1024 * 1024;
     static uint64_t memory_bound(size_t readers)
     { return resource_detail::add(memory_bytes, resource_detail::multiply(readers, 4 * 65536)); }
-    explicit FarmingLogSampler(HarvesterAdapterOptions const& options)
+    explicit FarmingLogSampler(HarvesterAdapterOptions const& options, bool require_local_rpc = false)
     {
         try
         {
@@ -1110,6 +1113,11 @@ public:
             if (stamp.bytes > 1024 * 1024) return;
             std::ifstream input(config); if (!input) return;
             auto contents = profile_detail::read_text(input, 1024 * 1024);
+            if (require_local_rpc)
+            {
+                std::istringstream yaml(contents);
+                if (!profile_detail::read_chia_config(yaml, memory_bytes / 2).local_rpc) return;
+            }
             auto const filename = adapter_detail::RetirementConfigReader(contents, memory_bytes / 2).log_filename();
             if (!filename || stream_state::stamp(config) != stamp) return;
             inventory_detail::bounded_text(*filename);
@@ -1121,11 +1129,21 @@ public:
         }
         catch (std::exception const&) { path_.clear(); }
     }
+    std::filesystem::path const& path() const { return path_; }
     std::optional<uint64_t> sample(Clock::time_point now = Clock::now(),
-        std::chrono::system_clock::time_point wall = std::chrono::system_clock::now())
+        std::chrono::system_clock::time_point wall = std::chrono::system_clock::now(),
+        std::function<void(FarmingServiceRecord const&)> const& observe = {})
     {
         if (path_.empty() || (polled_ != Clock::time_point{} && now >= polled_ && now - polled_ < std::chrono::milliseconds(250))) return {};
         polled_ = now;
+        auto gap = [&] { if (observe) { FarmingServiceRecord record; record.at = now; record.gap = true; observe(record); } };
+        auto log_seen = [&] { if (observe) { FarmingServiceRecord record; record.at = now; record.log_seen = true; observe(record); } };
+        auto unavailable = [&]() -> std::optional<uint64_t>
+        {
+            if (identity_) gap();
+            identity_.reset(); partial_.clear();
+            return {};
+        };
         try
         {
             auto const configuration = stream_state::stamp(config_);
@@ -1134,40 +1152,42 @@ public:
                 // The existing retirement identity excludes only the plot
                 // directory list. Authorized directory retirement must not
                 // disable otherwise unchanged reader telemetry indefinitely.
-                if (config_identity_.empty() || configuration.bytes > 1024 * 1024) return {};
-                std::ifstream input(config_); if (!input) return {};
+                if (config_identity_.empty() || configuration.bytes > 1024 * 1024) return unavailable();
+                std::ifstream input(config_); if (!input) return unavailable();
                 auto contents = profile_detail::read_text(input, 1024 * 1024);
                 if (adapter_detail::retirement_config(contents, memory_bytes / 2).identity != config_identity_ ||
-                    stream_state::stamp(config_) != configuration) return {};
+                    stream_state::stamp(config_) != configuration) return unavailable();
                 config_stamp_ = configuration;
             }
             file_io::Stat named{};
-            if (file_io::inspect_link(path_, &named) || !file_io::is_regular(named.st_mode) || named.st_size < 0) return {};
+            if (file_io::inspect_link(path_, &named) || !file_io::is_regular(named.st_mode) || named.st_size < 0) return unavailable();
             auto const identity = std::pair{uint64_t(named.st_dev), uint64_t(named.st_ino)};
             uint64_t const size = uint64_t(named.st_size);
-            if (!identity_ || *identity_ != identity || size < offset_)
-            {
-                // Starting/rotating logs may contain historical records.
-                // Establish a new end cursor and wait for an actual append.
-                identity_ = identity; offset_ = size; partial_.clear(); return {};
-            }
-            if (size == offset_) return {};
+            bool const restarted = !identity_ || *identity_ != identity || size < offset_;
+            if (!restarted && size == offset_) { log_seen(); return {}; }
             inventory_detail::Handle file(file_io::open_file(path_, file_io::read_only | file_io::no_follow | file_io::close_on_exec));
             file_io::Stat opened{};
             if (file_io::inspect_fd(file.fd, &opened) || !file_io::is_regular(opened.st_mode) ||
-                std::pair{uint64_t(opened.st_dev), uint64_t(opened.st_ino)} != identity) return {};
+                std::pair{uint64_t(opened.st_dev), uint64_t(opened.st_ino)} != identity) return unavailable();
+            if (restarted)
+            {
+                // Starting/rotating logs may contain historical records.
+                // Establish a new end cursor and wait for an actual append.
+                gap(); identity_ = identity; offset_ = size; partial_.clear(); began_ = now; log_seen(); return {};
+            }
             constexpr uint64_t tail = 65536;
             bool const skipped = size - offset_ > tail;
-            if (skipped) { offset_ = size - tail; partial_.clear(); }
+            if (skipped) { gap(); offset_ = size - tail; partial_.clear(); }
             std::string bytes(size_t(size - offset_), '\0'); size_t read = 0;
             while (read < bytes.size())
             {
                 auto const count = file_io::read_at(file.fd, bytes.data() + read, bytes.size() - read, offset_ + read);
                 if (count < 0 && errno == EINTR) continue;
-                if (count <= 0) return {};
+                if (count <= 0) return unavailable();
                 read += size_t(count);
             }
             offset_ = size;
+            log_seen();
             if (skipped)
             {
                 auto const end = bytes.find('\n'); if (end == bytes.npos) return {};
@@ -1176,18 +1196,30 @@ public:
             partial_ += bytes; std::optional<uint64_t> result; size_t first = 0;
             for (auto end = partial_.find('\n'); end != partial_.npos; end = partial_.find('\n', first))
             {
-                if (auto value = parse(std::string_view(partial_).substr(first, end - first), wall))
-                    result = std::max(result.value_or(0), *value);
+                auto const line = std::string_view(partial_).substr(first, end - first);
+                if (auto value = parse(line, now, wall))
+                {
+                    value->began_before_sampling = value->at - std::chrono::nanoseconds(value->response_ns) < began_;
+                    result = std::max(result.value_or(0), value->response_ns);
+                    if (observe) observe(*value);
+                }
+                else if (line.find("plots were eligible for farming") != line.npos && line.find("harvester.harvester") != line.npos) gap();
                 first = end + 1;
             }
             partial_.erase(0, first);
-            if (partial_.size() > 4096) partial_.clear();
+            if (partial_.size() > 4096) { gap(); partial_.clear(); }
             return result;
         }
-        catch (std::exception const&) { return {}; }
+        catch (std::exception const&) { return unavailable(); }
     }
     static std::optional<uint64_t> parse(std::string_view line,
-        std::chrono::system_clock::time_point now = std::chrono::system_clock::now())
+        std::chrono::system_clock::time_point wall = std::chrono::system_clock::now())
+    {
+        auto record = parse(line, Clock::now(), wall);
+        return record ? std::optional(record->response_ns) : std::nullopt;
+    }
+    static std::optional<FarmingServiceRecord> parse(std::string_view line, Clock::time_point now,
+        std::chrono::system_clock::time_point wall)
     {
         if (line.size() > 4096 || line.size() < 24 || line.find("harvester.harvester") == line.npos ||
             line.find("plots were eligible for farming") == line.npos || line.find(" INFO ") == line.npos) return {};
@@ -1203,9 +1235,28 @@ public:
         if (!timestamp || line[19] != '.' || line[23] != ' ' ||
             line.substr(20, 3).find_first_not_of("0123456789") != line.npos) return {};
         auto const epoch = std::mktime(&time); if (epoch < 0) return {};
-        auto const observed = std::chrono::system_clock::from_time_t(epoch);
-        if (observed > now || now - observed > std::chrono::seconds(30)) return {};
-        return uint64_t(seconds * 1000000000.L);
+        auto const millis = (line[20] - '0') * 100 + (line[21] - '0') * 10 + (line[22] - '0');
+        auto const observed = std::chrono::system_clock::from_time_t(epoch) + std::chrono::milliseconds(millis);
+        if (observed > wall || wall - observed > std::chrono::seconds(30)) return {};
+        FarmingServiceRecord record; record.at = now - std::chrono::duration_cast<Clock::duration>(wall - observed);
+        record.response_ns = uint64_t(std::llround(seconds * 1000000000.L));
+        auto const eligible = line.find(" plots were eligible for farming"), total = line.find(" s. Total ", at);
+        auto number_at = [](std::string_view digits, uint64_t& out)
+        {
+            auto const parsed = std::from_chars(digits.data(), digits.data() + digits.size(), out);
+            return parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size();
+        };
+        if (eligible != line.npos && total != line.npos)
+        {
+            auto const prefix = line.substr(0, eligible);
+            auto const start = prefix.find_last_not_of("0123456789");
+            auto const suffix = line.substr(total + std::string_view(" s. Total ").size());
+            auto const last = suffix.find(" plots");
+            record.counts_known = start != prefix.npos && prefix[start] == ' ' && last != suffix.npos &&
+                number_at(prefix.substr(start + 1), record.eligible) && number_at(suffix.substr(0, last), record.loaded) &&
+                record.eligible <= record.loaded;
+        }
+        return record;
     }
 private:
     std::filesystem::path path_, config_;
@@ -1214,7 +1265,68 @@ private:
     std::optional<std::pair<uint64_t, uint64_t>> identity_;
     uint64_t offset_ = 0;
     std::string partial_;
-    Clock::time_point polled_{};
+    Clock::time_point polled_{}, began_{};
+};
+
+// An ordinary fill owner can observe its explicitly selected local reader.
+// The scheduler and every dashboard share these observations.
+class LocalFarmingService
+{
+public:
+    std::shared_ptr<DiskIoGovernor> const governor = std::make_shared<DiskIoGovernor>(
+        DiskIoGovernor::sample_device, 4096, DiskIoGovernor::Mode::observed_farm);
+private:
+    using Clock = FarmingLogSampler::Clock;
+    FarmingLogSampler sampler_;
+    uint64_t deadline_ns_;
+    std::jthread thread_;
+    LocalFarmingService(std::filesystem::path const& root, uint64_t deadline_ns)
+        : sampler_([&] { HarvesterAdapterOptions options; options.root = profile_detail::chia_root(root); return options; }(), true),
+          deadline_ns_(deadline_ns) {}
+    bool sample()
+    {
+        bool seen = false;
+        std::optional<FarmingServiceRecord> slowest;
+        sampler_.sample(Clock::now(), std::chrono::system_clock::now(), [&](FarmingServiceRecord const& record)
+        {
+            governor->record_farming_service(record, deadline_ns_);
+            seen |= record.log_seen;
+            if (record.log_seen || record.gap) return;
+            // A fast zero-eligible completion cannot demonstrate spare I/O
+            // capacity for an eligible lookup. A slow response can still
+            // signal pressure, even when the reader omits the eligible count.
+            if ((record.counts_known && record.eligible) || (deadline_ns_ && record.response_ns >= deadline_ns_ / 2))
+                if (!slowest || record.response_ns >= slowest->response_ns) slowest = record;
+        });
+        if (slowest) governor->observe_farming(slowest->response_ns, deadline_ns_, false, slowest->at);
+        return seen;
+    }
+public:
+    static uint64_t memory_bound() { return FarmingLogSampler::memory_bound(1) + sizeof(LocalFarmingService); }
+    static std::unique_ptr<LocalFarmingService> start(std::filesystem::path const& root, uint64_t deadline_ns, uint64_t grant) noexcept
+    {
+        try
+        {
+            if (grant < memory_bound() + DiskIoGovernor::initial_memory_bytes()) return {};
+            std::unique_ptr<LocalFarmingService> result(new LocalFarmingService(root, deadline_ns));
+            if (result->sampler_.path().empty() || !result->sample()) return {};
+            result->thread_ = std::jthread([service = result.get()](std::stop_token stop)
+            {
+                try
+                {
+                    std::mutex mutex; std::condition_variable_any wake; std::unique_lock lock(mutex);
+                    while (!stop.stop_requested())
+                    {
+                        wake.wait_for(lock, stop, std::chrono::milliseconds(250), [] { return false; });
+                        if (!stop.stop_requested()) service->sample();
+                    }
+                }
+                catch (std::exception const&) {} // A lost observer expires from the governor.
+            });
+            return result;
+        }
+        catch (std::exception const&) { return {}; }
+    }
 };
 
 // The catalog is immutable throughout an invocation. Keep its path and reader

@@ -252,8 +252,8 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
     auto identity = pool::load_pool(directory);
     if (!identity)
     {
-        require(!control && brokers.empty() && workers.empty(), "shared compute is not configured; use compute init or compute join");
-        std::cout << (json ? "{\"configured\":false}\n" : "Shared compute is not configured. Use compute init or compute join.\n"); return 0;
+        require(!control && brokers.empty() && workers.empty(), "shared compute is not configured; use compute setup on a plotting host or compute setup INVITATION on a helper");
+        std::cout << (json ? "{\"configured\":false}\n" : "Shared compute is not configured. Run xchplot2 compute setup on a plotting host or xchplot2 compute setup INVITATION on a helper.\n"); return 0;
     }
     bool const explicit_workers = !workers.empty();
     bool const explicit_endpoints = explicit_workers || !brokers.empty();

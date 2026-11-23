@@ -32,6 +32,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string_view>
 
@@ -153,17 +154,37 @@ struct Socket
     ~Socket() { if (value != invalid_socket) close_socket(value); }
     SocketHandle release() { auto const result = value; value = invalid_socket; return result; }
 };
-bool allowed_interface(SocketHandle fd, TlsOptions const& options)
+template<class Match> bool socket_interface(SocketHandle fd, Match match, bool* local_peer = nullptr)
 {
-    auto const& names = options.listen_interfaces;
-    if (names.empty() && !options.listen_lan) return true;
     sockaddr_storage local{}; AddressSize size = sizeof(local);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &size)) return false;
-    if (local.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr))
+    auto normalize = [](sockaddr_storage& value)
     {
-        in_addr ipv4{}; std::memcpy(&ipv4, reinterpret_cast<sockaddr_in6&>(local).sin6_addr.s6_addr + 12, sizeof(ipv4));
-        local = {}; auto& value = reinterpret_cast<sockaddr_in&>(local); value.sin_family = AF_INET; value.sin_addr = ipv4;
+        if (value.ss_family != AF_INET6 || !IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<sockaddr_in6&>(value).sin6_addr)) return;
+        in_addr ipv4{}; std::memcpy(&ipv4, reinterpret_cast<sockaddr_in6&>(value).sin6_addr.s6_addr + 12, sizeof(ipv4));
+        value = {}; auto& address = reinterpret_cast<sockaddr_in&>(value); address.sin_family = AF_INET; address.sin_addr = ipv4;
+    };
+    normalize(local);
+    sockaddr_storage peer{};
+    if (local_peer)
+    {
+        size = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &size)) return false;
+        normalize(peer);
     }
+    auto same_address = [](sockaddr_storage const& value, sockaddr const* address)
+    {
+        if (!address || address->sa_family != value.ss_family) return false;
+        if (value.ss_family == AF_INET) return reinterpret_cast<sockaddr_in const&>(value).sin_addr.s_addr ==
+            reinterpret_cast<sockaddr_in const*>(address)->sin_addr.s_addr;
+        return value.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6 const&>(value).sin6_addr,
+            &reinterpret_cast<sockaddr_in6 const*>(address)->sin6_addr, sizeof(in6_addr));
+    };
+    auto inspect = [&](auto const& item, sockaddr const* address)
+    {
+        if (local_peer && same_address(peer, address)) { *local_peer = true; return true; }
+        return same_address(local, address) && match(item, local.ss_family);
+    };
 #ifdef _WIN32
     ULONG bytes = 16384; std::vector<uint8_t> storage(bytes); ULONG result = ERROR_BUFFER_OVERFLOW;
     for (unsigned attempt = 0; attempt < 3 && result == ERROR_BUFFER_OVERFLOW; ++attempt)
@@ -176,26 +197,8 @@ bool allowed_interface(SocketHandle fd, TlsOptions const& options)
     if (result != NO_ERROR) return false;
     for (auto item = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()); item; item = item->Next)
     {
-        std::string friendly;
-        if (item->FriendlyName)
-        {
-            auto size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item->FriendlyName, -1, nullptr, 0, nullptr, nullptr);
-            if (size > 0 && size <= 1024)
-            { friendly.resize(size_t(size)); ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item->FriendlyName, -1, friendly.data(), size, nullptr, nullptr); friendly.pop_back(); }
-        }
-        bool const lan = options.listen_lan && item->OperStatus == IfOperStatusUp && !(item->Flags & IP_ADAPTER_NO_MULTICAST) &&
-            item->IfType != IF_TYPE_SOFTWARE_LOOPBACK && item->IfType != IF_TYPE_PPP && item->IfType != IF_TYPE_TUNNEL;
-        auto index = std::to_string(local.ss_family == AF_INET6 ? item->Ipv6IfIndex : item->IfIndex);
-        bool const named = std::any_of(names.begin(), names.end(), [&](auto const& name)
-        { return name == item->AdapterName || name == friendly || name == index || (name == "lo" && item->IfType == IF_TYPE_SOFTWARE_LOOPBACK); });
-        if (!lan && !named) continue;
         for (auto address = item->FirstUnicastAddress; address; address = address->Next)
-        {
-            auto value = address->Address.lpSockaddr;
-            if (!value || value->sa_family != local.ss_family) continue;
-            if (local.ss_family == AF_INET && reinterpret_cast<sockaddr_in&>(local).sin_addr.s_addr == reinterpret_cast<sockaddr_in*>(value)->sin_addr.s_addr) return true;
-            if (local.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr, &reinterpret_cast<sockaddr_in6*>(value)->sin6_addr, sizeof(in6_addr))) return true;
-        }
+            if (inspect(*item, address->Address.lpSockaddr)) return true;
     }
 #else
     ifaddrs* interfaces = nullptr;
@@ -203,17 +206,37 @@ bool allowed_interface(SocketHandle fd, TlsOptions const& options)
     std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> cleanup(interfaces, freeifaddrs);
     for (auto item = interfaces; item; item = item->ifa_next)
     {
-        bool const lan = options.listen_lan && (item->ifa_flags & IFF_UP) &&
-            (item->ifa_flags & IFF_MULTICAST) && !(item->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT));
-        if (!item->ifa_addr || item->ifa_addr->sa_family != local.ss_family ||
-            (!lan && std::find(names.begin(), names.end(), item->ifa_name) == names.end())) continue;
-        if (local.ss_family == AF_INET && reinterpret_cast<sockaddr_in&>(local).sin_addr.s_addr ==
-            reinterpret_cast<sockaddr_in*>(item->ifa_addr)->sin_addr.s_addr) return true;
-        if (local.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr,
-            &reinterpret_cast<sockaddr_in6*>(item->ifa_addr)->sin6_addr, sizeof(in6_addr))) return true;
+        if (inspect(*item, item->ifa_addr)) return true;
     }
 #endif
     return false;
+}
+bool allowed_interface(SocketHandle fd, TlsOptions const& options)
+{
+    auto const& names = options.listen_interfaces;
+    if (names.empty() && !options.listen_lan) return true;
+    return socket_interface(fd, [&](auto const& item, int family)
+    {
+#ifdef _WIN32
+        std::string friendly;
+        if (item.FriendlyName)
+        {
+            auto size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item.FriendlyName, -1, nullptr, 0, nullptr, nullptr);
+            if (size > 0 && size <= 1024)
+            { friendly.resize(size_t(size)); ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item.FriendlyName, -1, friendly.data(), size, nullptr, nullptr); friendly.pop_back(); }
+        }
+        bool const lan = options.listen_lan && item.OperStatus == IfOperStatusUp && !(item.Flags & IP_ADAPTER_NO_MULTICAST) &&
+            item.IfType != IF_TYPE_SOFTWARE_LOOPBACK && item.IfType != IF_TYPE_PPP && item.IfType != IF_TYPE_TUNNEL;
+        auto index = std::to_string(family == AF_INET6 ? item.Ipv6IfIndex : item.IfIndex);
+        return lan || std::any_of(names.begin(), names.end(), [&](auto const& name)
+        { return name == item.AdapterName || name == friendly || name == index || (name == "lo" && item.IfType == IF_TYPE_SOFTWARE_LOOPBACK); });
+#else
+        (void)family;
+        bool const lan = options.listen_lan && (item.ifa_flags & IFF_UP) &&
+            (item.ifa_flags & IFF_MULTICAST) && !(item.ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT));
+        return lan || std::find(names.begin(), names.end(), item.ifa_name) != names.end();
+#endif
+    });
 }
 // OpenSSL's default socket BIO writes can raise SIGPIPE on Linux. Use the
 // socket flag here so the library does not change the process signal policy.
@@ -756,6 +779,36 @@ bool Channel::peer_closed()
     if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) return false;
     try { ssl_failure(impl_->ssl, result, error, error_number); }
     catch (TransientTransport const&) { return true; }
+}
+uint32_t Channel::ingress_interface() const noexcept
+{
+    if (!impl_) return 0;
+    try
+    {
+        uint32_t index = 0; bool ambiguous = false, local_peer = false;
+        socket_interface(impl_->fd, [&](auto const& item, int)
+        {
+            uint32_t physical = 0;
+#ifdef _WIN32
+            MIB_IF_ROW2 row{}; row.InterfaceLuid = item.Luid;
+            if (::GetIfEntry2(&row) == NO_ERROR && row.InterfaceAndOperStatusFlags.HardwareInterface &&
+                row.InterfaceAndOperStatusFlags.ConnectorPresent) physical = row.InterfaceIndex;
+#else
+            std::string name(item.ifa_name);
+            if (auto alias = name.find(':'); alias != name.npos) name.resize(alias);
+            auto const device = std::filesystem::path("/sys/class/net") / name / "device";
+            std::error_code error;
+            if (std::filesystem::exists(device, error) && !std::filesystem::exists(device / "physfn", error) && !error)
+                physical = ::if_nametoindex(name.c_str());
+#endif
+            ambiguous |= !physical || (index && physical != index); index = physical;
+            return ambiguous;
+        }, &local_peer);
+        // A socket to another address owned by this host does not consume
+        // that network adapter, even when both ends use its unicast address.
+        return ambiguous || local_peer ? 0 : index;
+    }
+    catch (...) { return 0; }
 }
 bool Channel::generation_timing() const
 {

@@ -403,6 +403,48 @@ void broker(BrokerOptions options, TlsOptions const& a_tls, TlsOptions const& b_
     auto incompatible = task("bad-format", 3); incompatible.compatibility = "wrong-format";
     require(!a.acquire(new_owner, incompatible), "incompatible worker accepted task"); a.cancel(new_owner, "bad-format", 1);
 }
+void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& client_tls)
+{
+    Listener listener({"127.0.0.1", 0}, server_tls);
+    auto legacy = std::async(std::launch::async, [&]
+    {
+        auto channel = listener.accept(3000);
+        for (auto operation : {19, 18, 18, 2, 2, 2})
+        {
+            auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
+            require(frame.type == Message::Control && input.u32() == 8 && input.u8() == operation,
+                "client repeated an unsupported broker operation");
+            if (operation == 19)
+            { reply.u8(1); reply.string("unknown broker operation"); channel.send(Message::Error, reply.data()); }
+            else if (operation == 18)
+            {
+                reply.u32(3); reply.u32(1); reply.u32(0); reply.u8(1);
+                for (unsigned n = 1; n <= max_generation_batch_members; ++n) reply.u32(0);
+                channel.send(Message::Reply, reply.data());
+            }
+            else
+            {
+                Reader backlog(std::span<uint8_t const>(frame.payload).last(4));
+                if (backlog.u32())
+                { reply.u8(1); reply.string("invalid generation backlog"); channel.send(Message::Error, reply.data()); }
+                else { reply.u8(0); channel.send(Message::Reply, reply.data()); }
+            }
+        }
+    });
+    BrokerClient owner(listener.endpoint(), client_tls); OwnerSession session{"old-owner", "session", "epoch", 1};
+    BrokerClient::GenerationAvailability availability; uint32_t slots = 0;
+    std::shared_ptr<GenerationRoster const> roster; auto request = task("older");
+    for (unsigned n = 0; n < 2; ++n)
+        require(owner.generation_hint(session, request, &slots, &availability, {}, &roster) == 3 && slots == 1 &&
+            !roster && !availability.admission,
+            "older broker lost its ordinary aggregate capacity hint");
+    auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto bounded = owner.with_deadline(until);
+    require(!bounded.acquire(session, request, until) && !bounded.acquire(session, request, until),
+        "older broker backlog fallback changed queued work");
+    legacy.get();
+}
+
 void selection(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
     RunningBroker running(options); auto endpoint = running.server.endpoint();
@@ -1069,6 +1111,42 @@ void independent_members(BrokerOptions options, TlsOptions const& owner_tls, Tls
     spill = owner.acquire(session, request);
     require(spill && spill->worker_identity == slow->worker_identity, "a stalled packed batch outwaited its last member");
     owner.cancel(session, request.task_id, 1); worker.finish(*packed_pair);
+
+    // The tail of a live fill had an RTX finishing its first joint pair
+    // while a second Wi-Fi singleton and another independent triple waited.
+    // Proportional pricing of a joint triple underestimated its pair's drain.
+    worker.unregister_worker(packed.instance); packed.instance = "joint-tail";
+    packed.capacity.host_bytes = 4096; packed.generation_profiles = {model}; worker.register_worker(packed);
+    session = owner.open_owner("joint-pair-tail");
+    request.generation_output = GenerationOutput::Contributions;
+    auto sample = [&](bool independent, unsigned units, uint64_t elapsed)
+    {
+        request.independent_members = independent; request.work_units = units;
+        request.task_id = "joint-tail-" + std::to_string(++request.sequence);
+        auto granted = owner.acquire(session, request);
+        require(granted && execute(*granted).begin(*granted, granted->owner_identity), "could not calibrate the tail");
+        execute(*granted).finish(*granted); owner.delivered(*granted, {elapsed, 32, 1024}); return granted->worker_identity;
+    };
+    second.worker_admission(batch.instance, WorkerAdmission::Paused);
+    auto const wired = sample(false, 3, 900000000);
+    require(sample(true, 3, 600000000) == wired, "independent calibration chose a different route");
+    second.worker_admission(batch.instance, WorkerAdmission::Accepting);
+    require(sample(false, 1, 7000000000ULL) != wired, "a newly available singleton was not calibrated");
+    request.sequence++; request.task_id = "first-joint-pair"; request.work_units = 2;
+    auto pair_tail = owner.acquire(session, request);
+    require(pair_tail && pair_tail->worker_identity == wired && worker.begin(*pair_tail, pair_tail->owner_identity),
+        "joint pair missed the fast worker");
+    auto const joint_started = std::chrono::steady_clock::now();
+    request.sequence++; request.task_id = "waiting-singleton"; request.work_units = 1;
+    auto triple_tail = request; triple_tail.sequence++; triple_tail.task_id = "next-independent-triple";
+    triple_tail.work_units = 3; triple_tail.independent_members = true;
+    require(!owner.acquire(session, request) && !owner.acquire(session, triple_tail), "a known slow helper claimed the initial tail");
+    std::this_thread::sleep_until(joint_started + std::chrono::milliseconds(730));
+    require(!owner.acquire(session, request), "a joint pair overrun dispatched the last singleton to the slow helper");
+    worker.finish(*pair_tail);
+    auto last_single = owner.acquire(session, request);
+    require(last_single && last_single->worker_identity == wired, "the waiting singleton failed to follow the joint pair");
+    owner.close_owner(session);
 }
 void parallel_generation_tail(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls,
                               TlsOptions const& second_tls, TlsOptions const& third_tls)
@@ -1136,7 +1214,11 @@ void generation_pending_delivery(BrokerOptions options, TlsOptions const& owner_
         auto advertised = offer(instance, port);
         advertised.capabilities |= capability(Kind::GenerateGpu);
         advertised.generation_profiles = {profile(Kind::GenerateGpu)};
-        advertised.capacity.gpu_bytes = advertised.generation_profiles.front().resources.gpu_bytes;
+        // Leave a spare slot on the cold worker while it delivers its first
+        // job. Repeated work on the measured worker must not trigger another
+        // blind sample just because the assignment sequence advances.
+        if (&worker == &slow) advertised.capacity.slots = 2;
+        advertised.capacity.gpu_bytes = advertised.capacity.slots * advertised.generation_profiles.front().resources.gpu_bytes;
         worker.register_worker(advertised);
     };
     auto submit = [&](std::string id)
@@ -1669,6 +1751,24 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
     altered_authority = *lease; altered_authority.broker_node_id = "altered-node";
     permanent_rejects([&] { worker.begin(altered_authority, altered_authority.owner_identity); });
     auto second = task("second-status-task", 2); require(!owner.acquire(session, second), "status fixture exceeded one slot");
+    auto admission = [&](OwnerSession const& observer, Task const& request)
+    {
+        BrokerClient::GenerationAvailability available; std::shared_ptr<GenerationRoster const> roster;
+        (void)owner.generation_hint(observer, request, nullptr, &available, {}, &roster);
+        require(roster && roster->complete && available.admission && available.admission->eligible == roster->routes.size(),
+            "generation registration counts differed from the eligible roster");
+        return *available.admission;
+    };
+    auto const busy = admission(session, second);
+    require(busy.registered == 1 && busy.eligible == 1 && !busy.available_slots && !busy.other_owner_tasks &&
+        busy.waiting[size_t(WaitReason::SlotReserved)] == 1, "an occupied helper appeared ready for a second grant");
+    auto observer = owner.open_owner("other-observer", true);
+    require(admission(observer, second).other_owner_tasks == 1, "another owner's reservation was invisible");
+    owner.close_owner(observer);
+    auto incompatible = second; incompatible.compatibility = "unrelated-format";
+    auto const mismatch = admission(session, incompatible);
+    require(mismatch.registered == 1 && !mismatch.eligible && mismatch.waiting[size_t(WaitReason::Incompatible)] == 1,
+        "a registered incompatible helper disappeared from the admission summary");
     page = owner.status({StatusSection::Jobs}); bool found_reserved = false;
     for (auto const& job : page.job_records) found_reserved |= job.state == JobState::Queued && job.waiting == WaitReason::SlotReserved;
     require(found_reserved, "status did not identify the reserved slot");
@@ -1676,6 +1776,9 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
         workers.worker_records[0].capacity == offered.capacity && workers.worker_records[0].endpoint == offered.endpoint,
         "status confused broker reservations with registered worker capacity");
     worker.worker_admission(offered.instance, WorkerAdmission::Paused);
+    auto const paused = admission(session, second);
+    require(paused.registered == 1 && !paused.eligible && paused.waiting[size_t(WaitReason::WorkerPaused)] == 1,
+        "a paused helper looked unregistered or available");
     bool awaiting_admission = false;
     require(!worker.begin(*lease, lease->owner_identity, &awaiting_admission) && awaiting_admission,
         "paused broker lost the live grant or admitted it prematurely");
@@ -1702,7 +1805,9 @@ void live_status(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions 
         "status leaked private task or authorization material");
     worker.finish(*lease);
     owner.cancel(session, second.task_id, second.attempt);
+    require(admission(session, second).available_slots == 1, "a released helper still appeared occupied");
     require(worker.retire_worker(offered.instance) && owner.status().worker_records.empty(), "idle authority did not retire after reservations finished");
+    require(!admission(session, second).registered, "a withdrawn helper remained visible as registered");
     for (unsigned index = 0; index < 40; ++index) owner.open_owner("paged-owner-" + std::to_string(index));
     uint64_t cursor = 0, seen = 0;
     do { auto owners = owner.status({StatusSection::Owners, cursor, 7}); require(owners.owner_records.size() <= 7, "unbounded owner status page");
@@ -1802,6 +1907,7 @@ int main() try
     transport(broker_tls, a_tls, tls(ca, rogue), certificate_identity(broker_tls.cert_file));
     cn_only(tls(ca, cn), a_tls);
     task_deadlines(broker_tls, a_tls);
+    older_generation_hints(broker_tls, a_tls);
     BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = broker_tls;
     options.lease_ms = 800; options.worker_ms = 3000; options.max_tasks = 4;
     broker(options, a_tls, b_tls, tls(ca, wa), tls(ca, wb));

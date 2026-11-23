@@ -17,6 +17,7 @@ struct ComputeDefaults
     uint64_t host_bytes = 0, gpu_bytes = 0;
     std::string backend = "auto";
     bool discovery = true;
+    bool operator==(ComputeDefaults const&) const = default;
 };
 struct PoolIdentity
 {
@@ -44,7 +45,7 @@ std::filesystem::path pool_directory();
 std::optional<PoolIdentity> load_pool(std::filesystem::path const&);
 PoolIdentity create_pool(std::filesystem::path const&, std::string const& name);
 void invite_pool(PoolIdentity const&, std::filesystem::path const& invitation, std::string const& name);
-PoolIdentity join_pool(std::filesystem::path const& invitation, std::filesystem::path const& directory);
+PoolIdentity join_pool(std::filesystem::path const& invitation, std::filesystem::path const& directory, bool reuse_matching = false);
 void configure_pool(PoolIdentity const&, ComputeDefaults const&);
 void validate_compute_defaults(ComputeDefaults const&);
 std::vector<PoolMember> pool_members(PoolIdentity const&);

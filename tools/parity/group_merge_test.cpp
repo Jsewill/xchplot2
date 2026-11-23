@@ -2927,6 +2927,65 @@ void destination_admission()
 void execution_planning()
 {
     using namespace grow_controller_test;
+    // Independent small oracle: enumerate every integer start for the two
+    // writes after serial generation, rejecting overlapping shared writers.
+    // Fixed orders let us check incumbent commitments as well as the optimum.
+    auto oracle = [](unsigned first, unsigned second, bool shared)
+    {
+        unsigned best = 8 + first + second;
+        for (unsigned a = 4; a + first <= best; ++a)
+            for (unsigned b = 8; b + second <= best; ++b)
+                if (!shared || a + first <= b || b + second <= a)
+                    best = std::min(best, std::max(a + first, b + second));
+        return best;
+    };
+    std::array<ExecutionLane, 2> two;
+    for (auto& lane : two)
+    { lane.work.generation = 4; lane.work.batches = 1; lane.work.known = lane.work.io_overlap = true; }
+    auto finish = [&] { return pipeline_execution_estimate(two, 2, 1, 1, 3, true); };
+    for (bool shared : {false, true}) for (unsigned a : {1u, 4u, 9u}) for (unsigned b : {1u, 4u, 9u})
+    {
+        two[0].destination = 0; two[1].destination = shared ? 0 : 1;
+        two[0].work.destination = a; two[1].work.destination = b;
+        auto const projected = finish();
+        require(projected.known && projected.completion == oracle(a, b, shared) && projected.lower_bound <= projected.completion,
+            "independent enumeration disagreed with the forecast for a fixed dispatch order");
+    }
+    require(oracle(1, 9, false) == 17 && oracle(9, 1, false) == 13, "small scheduling oracle lost the final drain");
+    two[0].destination = 0; two[0].work.destination = 1;
+    two[1].destination = 1; two[1].work.destination = 9;
+    auto const grant = pipeline_execution_estimate(two, 2, 1, 1, 3, true, 0, 0);
+    require(grant.target_release == 5 && grant.completion == 17,
+        "a group grant acquired the cohort's final publication time");
+    two[1].committed = true; two[1].ready_after = 10;
+    two[1].work.generation = 0; two[1].work.destination = 3; two[1].destination = 1;
+    two[0].work.destination = 1;
+    two[1].scratch = {{two[0].destination, 1, 0, true}};
+    require(finish().completion == 18, "a queued destination used a committed scratch spindle before durable release");
+    two[1].scratch = {{2, 1, 0, true}};
+    require(finish().completion == 13, "a delayed delivery blocked an independent destination");
+    two[1].work.known = false;
+    require(!finish().known && finish().unmeasured == 1 && finish().lower_bound > 0,
+        "missing service evidence erased the committed receipt or invented a complete upper bound");
+    SharedConstructionHistory ram, scratch;
+    SharedConstructionHistory::Publication::Shape load{3, 1};
+    auto modes = [&](bool trial)
+    { return choose_construction_mode(false, load, load, &ram, &scratch, trial); };
+    require(!modes(true).external, "a cold optional mode displaced a whole fitting group");
+    ram.publication.begin(load); ram.publication.times.add(3, 300);
+    require(!modes(false).external && modes(true).reason == ConstructionModeReason::trial,
+        "scratch trial ignored remaining useful work or the measured RAM control");
+    scratch.publication.begin(load);
+    require(!modes(true).external, "an incomplete scratch trial ran repeatedly");
+    scratch.publication.times.add(3, 150);
+    require(modes(false).external, "a fitting RAM group excluded faster measured scratch at the same cap");
+    auto old_roster = std::make_shared<int>(), joined = std::make_shared<int>();
+    load.supply = {2, old_roster}; scratch.publication.begin(load); scratch.publication.times.add(3, 150);
+    load.supply = {2, joined};
+    require(!scratch.publication.rate(load), "an equal-slot worker replacement retained the previous route comparison");
+    require(!choose_construction_mode(false, load, load, nullptr, nullptr, false, 100, 99).external &&
+        choose_construction_mode(false, load, load, nullptr, nullptr, false, 100, 70).external,
+        "whole-schedule selection lost its incumbent or ignored a faster feasible scratch schedule");
     GenerationHistory generation;
     require(generation.member_ns() == 0, "cold generation acquired an invented rate");
     for (unsigned i = 0; i < 8; ++i) generation.add(4, 400);
@@ -2944,7 +3003,8 @@ void execution_planning()
     {
         return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), workers, 16, 1, memory,
             [&](size_t active, unsigned grant, uint16_t)
-            { return pipeline_execution_estimate(lanes, active, workers, grant, resources, true).completion; }, lanes.size());
+            { return pipeline_execution_estimate(lanes, active, workers, grant, resources, true).completion; },
+            lanes.size(), 0, false, {}, construction_margin(1));
     };
     auto const producer_bound = select(lanes.size());
     require(producer_bound.active == 1,
@@ -2970,7 +3030,7 @@ void execution_planning()
     std::array<ExecutionReady, 3> ready{{{7, 0, 100, true}, {8, 0, 300, true}, {9, 0, 200, true}}};
     require(execution_generation_order(ready) == 8, "generation did not start the longest measured downstream tail");
     ready.back().known = false;
-    require(execution_generation_order(ready) == 7, "unknown consumers changed the safe rotating generation order");
+    require(execution_generation_order(ready) == 8, "an unmeasured consumer erased observed downstream tails");
     ready[1].members_to_pack = 2; ready[2].members_to_pack = 1;
     require(execution_generation_order(ready) == 9, "cold generation did not release the nearest packable group");
     ready[2].known = true;
@@ -5681,6 +5741,58 @@ void farming_joint_forecasts(fs::path const& root)
     reject(options({excessive_path}), "joint assessment expanded a forecast beyond the file work bound");
 }
 
+void cached_publications(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    auto const directory = root / "publication-cache";
+    Arguments args; args.max_ram = 1024; group_grow::Identity plot; plot.header.k = 18; plot.header.strength = 2;
+    ExternalConfig external; external.scratch.push_back({"unused fixture path", 50});
+    auto const key = publication_cache_key("host/boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external);
+    auto const at = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    {
+        ConstructionCache first(directory); require(first.available(), "first private publication-cache session unavailable");
+        ConstructionCache competing(directory); require(!competing.available(), "concurrent construction cache was treated as a comparable run");
+        ConstructionCache routes(root / "cache-routes", ConstructionCache::Kind::Generation);
+        require(routes.available(), "generation evidence competed for the whole-publication cache lock");
+        routes.completed(key, true, 20, at); routes.completed(key, true, 22, at);
+        first.completed(key, false, 100, at); first.completed(key, false, 102, at); first.completed(key, true, 59, at);
+        require(!first.evidence(key, false).samples, "live evidence was counted again as a preceding invocation");
+    }
+    {
+        ConstructionCache second(directory);
+        ConstructionCache routes(root / "cache-routes", ConstructionCache::Kind::Generation);
+        require(routes.evidence(key, true, at).low_ns == 20 && fs::exists(root / "cache-routes/generation-v1"),
+            "the separate generation prior store lost its version or bounded samples");
+        require(second.evidence(key, false, at).samples == 2 && !second.evidence(key, true, at).samples,
+            "cross-run durable observations lost their mode or treated a lone trial as a comparison");
+        second.completed(key, true, 62, at);
+    }
+    {
+        ConstructionCache third(directory);
+        auto ram = third.evidence(key, false, at), scratch = third.evidence(key, true, at);
+        PublicationShape shape{3, 1};
+        auto choose = [&] { return choose_construction_mode(false, shape, shape, nullptr, nullptr, false, 0, 0, ram, scratch); };
+        auto const choice = choose();
+        require(choice.external && choice.reason == ConstructionModeReason::prior && choice.prior_oldest_utc == at && choice.prior_samples == 4,
+            "dated disjoint durable ranges failed to choose comparable external construction");
+        scratch.high_ns = 101;
+        require(!choose().external && choose().reason != ConstructionModeReason::prior, "overlapping prior ranges displaced the incumbent");
+        ++args.max_ram;
+        require(!third.evidence(publication_cache_key("host/boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external), false, at).samples &&
+            !third.evidence(key, false, at + 86401).samples && !third.evidence(key, false, at - 1).samples,
+            "a changed memory cap, past horizon or backward clock reused cached construction evidence");
+        --args.max_ram;
+        require(!third.evidence(publication_cache_key("other boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external), true).samples,
+            "construction evidence crossed a host or device identity boundary");
+    }
+    {
+        ConstructionCache changed(directory); changed.completed(key, false, 102, at);
+        std::ofstream broken(directory / "publication-v1", std::ios::trunc); broken << "incomplete";
+    }
+    ConstructionCache interrupted(directory);
+    require(interrupted.available() && !interrupted.evidence(key, false).samples, "damaged cache interrupted construction or supplied an estimate");
+}
 void farming_reader_scope()
 {
     using namespace grow_controller_test;
@@ -5705,6 +5817,21 @@ void farming_reader_scope()
     std::istringstream in(json.str()); auto const exported = read_farming_profile(in);
     require(exported.reader_calibration == profile.reader_calibration,
         "re-exported farming profile lost its reader calibration scope");
+    auto ranged_profile = profile;
+    ranged_profile.reader_calibration->sampled_min_members = 2; ranged_profile.reader_calibration->sampled_max_members = 7;
+    auto ranged = state; set_farming_state_profile(ranged, ranged_profile);
+    auto const ranged_text = farming_state_text(ranged);
+    require(farming_state_profile(parse_farming_state(ranged_text))->reader_calibration == ranged_profile.reader_calibration &&
+        farming_state_text(parse_farming_state(ranged_text)) == ranged_text && farming_state_text(restored) == text,
+        "versioned calibration scope changed saved membership, old provenance or recovery bytes");
+    std::ostringstream membership; print_farming_membership(membership, ranged, ranged.directories.front(), true);
+    require(membership.str().find("\"reader_calibration_coverage\":\"extrapolated\"") != std::string::npos,
+        "planned or admitted membership outside the reader sample range was presented without its extrapolation");
+    auto update = farming_update_snapshot(ranged);
+    for (size_t i = 0; i < update.directories.size(); ++i) update.directories[i] = fs::absolute("scope-" + std::to_string(i));
+    update.generation = 1; update.id = farming_update_id(update);
+    require(parse_farming_update(farming_update_text(update)).profile == ranged.profile_metadata,
+        "queued farming policy update discarded the reader's measured membership range");
     auto foreign = state; foreign.producer_build.assign(64, 'e');
     auto const foreign_text = farming_state_text(foreign);
     require(farming_state_text(parse_farming_state(foreign_text)) == foreign_text &&
@@ -8301,7 +8428,7 @@ int main(int argc, char** argv) try
         replot_publication_names(external_cleanup.root, input);
         farming_compatibility_format(external_cleanup.root);
         farming_joint_forecasts(external_cleanup.root);
-        farming_reader_scope();
+        farming_reader_scope(); cached_publications(external_cleanup.root);
         farming_legacy_format();
         farming_compact_format();
         farming_replica_staging(external_cleanup.root);
@@ -8344,7 +8471,7 @@ int main(int argc, char** argv) try
         farming_saved_reads(external_cleanup.root);
         farming_compatibility_format(external_cleanup.root);
         farming_joint_forecasts(external_cleanup.root);
-        farming_reader_scope();
+        farming_reader_scope(); cached_publications(external_cleanup.root);
         farming_legacy_format();
         farming_compact_format();
         farming_replica_staging(external_cleanup.root);

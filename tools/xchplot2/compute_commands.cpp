@@ -249,11 +249,11 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
         if (command == "setup")
         {
             auto identity = pool::load_pool(directory); bool const existed = identity.has_value();
-            require(file.empty() || !identity, "this machine is already enrolled; omit the invitation to reuse its setup");
             auto initial = identity ? identity->defaults : pool::ComputeDefaults{};
             if (!identity) initial.worker_port = 18445;
             auto defaults = configured(initial, settings);
-            if (!identity) identity = file.empty() ? pool::create_pool(directory, name) : pool::join_pool(file, directory);
+            if (!file.empty()) identity = pool::join_pool(file, directory, true);
+            else if (!identity) identity = pool::create_pool(directory, name);
             if (role.empty()) role = identity->can_invite ? "plotter" : "worker";
             bool const broker_selected = std::any_of(settings.begin(), settings.end(),
                 [](auto const& setting) { return setting.first == "--broker"; });
@@ -262,7 +262,8 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
             bool const start_broker = role == "plotter" && !broker_selected &&
                 (!existed || defaults.broker == previous_broker || defaults.broker == local_broker);
             if (start_broker) defaults.broker = local_broker;
-            pool::configure_pool(*identity, defaults);
+            bool const changed = defaults != identity->defaults;
+            if (changed) pool::configure_pool(*identity, defaults);
             std::cout << "Shared compute is configured for " << identity->name << ".\n";
             if (!file.empty()) std::cout << "Delete the transferred invitation copies after joining.\n";
             if (role == "worker" || start_broker)
@@ -278,7 +279,7 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
                     return run_compute_service(int(arguments.size()), arguments.data());
                 };
                 auto result = service("install");
-                if (!result && existed && !settings.empty()) result = service("restart");
+                if (!result && existed && changed) result = service("restart");
                 if (result)
                 {
                     std::cerr << "Enrollment and resource settings are saved. Complete startup with xchplot2 compute service install --role "
@@ -294,7 +295,12 @@ int pos2gpu::run_compute_setup(int argc, char** argv)
                     std::cout << ". Use compute status to check authenticated connections.\n"
                         "Use compute firewall --help for source-scoped firewall commands.\n";
                 }
-                if (role == "worker") return 0;
+                if (role == "worker")
+                {
+                    if (!output.quiet) std::cout << "Enrolled plotting hosts can use this helper during a running job.\n"
+                        << "On the plotting host, run xchplot2 compute status -v to check registration and admission.\n";
+                    return 0;
+                }
             }
             if (!output.quiet) std::cout << "Plot, fill and grow will discover enrolled workers automatically.\n"
                 << "Add a helper with xchplot2 compute invite FILE --name NAME, then run xchplot2 compute setup FILE on that machine.\n";

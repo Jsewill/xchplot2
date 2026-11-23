@@ -482,8 +482,10 @@ private:
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
+    DiskIoGovernor* io_limit() const
+    { return external_.io_governor && external_.io_governor->limits_io() ? external_.io_governor.get() : nullptr; }
     external_detail::IOContext io_context(char const* role, ExecutionIO* service = nullptr)
-    { return {role, &path_, service, external_.io_governor.get(), &config_}; }
+    { return {role, &path_, service, io_limit(), &config_}; }
     template<class Counters, class Sample> static void add_io(Counters& to, Sample const& from)
     {
         to.read_bytes += from.read_bytes; to.written_bytes += from.written_bytes;
@@ -1953,15 +1955,16 @@ public:
                     engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
                     file_io::matches_durable_identity(file_->fd, segment.identity)), "external output segment was replaced"); opened_ = segment_;
             }
-            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
-            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !engine_.external_.io_governor)
+            auto const io = engine_.io_context(role_, &engine_.execution_scratch_);
+            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, io);
+            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
                 engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[segment.root], n, 0, DiskIoGovernor::Transfer::write);
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
             if (position_ == segment.bytes)
             {
                 // Start writeback while subsequent writes and receives run. finish()
                 // still verifies and synchronizes every completed extent.
-                if (!engine_.external_.io_governor && (!engine_.disk_workers_.empty() ||
+                if (!engine_.io_limit() && (!engine_.disk_workers_.empty() ||
                     (gated_copy_ && engine_.contributions_ && engine_.single_scratch_writeback_)))
                     file_io::start_writeback(file_->fd, 0, 0);
                 ++segment_; position_ = 0;
@@ -1999,8 +2002,9 @@ public:
                 file_io::matches_durable_identity(file.fd, segment.identity)), "external completed segment handle was replaced");
             require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution");
             uint64_t const before = service->sync_ns;
-            external_detail::sync(file.fd, stats, engine_.io_context(role_, service));
-            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !engine_.external_.io_governor)
+            auto const io = engine_.io_context(role_, service);
+            external_detail::sync(file.fd, stats, io);
+            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
                 engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[segment.root], segment.bytes,
                     service->sync_ns - before, DiskIoGovernor::Transfer::flush);
             engine_.roots_[segment.root].used -= segment.capacity - capacity; segment.capacity = capacity;
@@ -2131,8 +2135,9 @@ private:
     void transfer(int fd, size_t root, uint64_t offset, std::span<uint8_t> bytes, Stats* stats, ExecutionIO* service)
     {
         uint64_t const before = service->read_ns;
-        external_detail::read(fd, segment_header_bytes + offset, bytes, stats, engine_.io_context(role_, service));
-        if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !engine_.external_.io_governor)
+        auto const io = engine_.io_context(role_, service);
+        external_detail::read(fd, segment_header_bytes + offset, bytes, stats, io);
+        if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
             engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[root], bytes.size(), service->read_ns - before);
     }
     void read_direct(std::span<uint8_t> bytes)
@@ -2751,7 +2756,7 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
     }
     auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound, final_capacity));
 #if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
-    single_scratch_writeback_ = config_.io_overlap && !external_.io_governor && roots_.size() == 1 &&
+    single_scratch_writeback_ = config_.io_overlap && !io_limit() && roots_.size() == 1 &&
         storage_device(file_io::native_path(roots_.front().path)).rotating;
 #endif
     contributions_ = input.get();
@@ -3660,7 +3665,7 @@ inline void ExternalEngine::pack(Members members)
             // One scratch spindle can refill its readers while the codec and
             // independent output run. Fund its queue from the shared cache.
             if (roots_.size() == 1 && runs_.size() > 1 && disk_workers_.empty() &&
-                source.rotating && target.rotating && !external_.io_governor)
+                source.rotating && target.rotating && !io_limit())
             {
                 auto const queues = scratch_queue_bytes(external_);
                 if (queues <= config_.window_bytes / 2 &&
@@ -3669,7 +3674,7 @@ inline void ExternalEngine::pack(Members members)
             }
         }
 #if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
-        if (output_overlap && target.rotating && !external_.io_governor)
+        if (output_overlap && target.rotating && !io_limit())
         {
             auto const page = file_io::page_size();
             if (page > 0) writeback_window = size_t(config_.window_bytes) / size_t(page) * size_t(page);
@@ -3755,7 +3760,7 @@ inline void ExternalEngine::pack(Members members)
                     auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, io_context("final_output", &output_service));
                     // Keep the output spindle writing while the next chunks
                     // are packed. The checkpoint still syncs data and index.
-                    if (writeback_window && (offset + writing_window.size()) % writeback_window == 0)
+                    if (writeback_window && !io_limit() && (offset + writing_window.size()) % writeback_window == 0)
                         file_io::start_writeback(fd_, offset, writing_window.size());
                 });
             }
