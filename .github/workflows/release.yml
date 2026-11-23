@@ -527,6 +527,12 @@ jobs:
                   remote = generate(false, 2);
                   std::cerr << "growth helper delivered" << std::endl;''')
           s=replace_one(s,"    release.set_value(); auto local = original.get();","    std::cerr << \"growth release original\" << std::endl;\n    release.set_value(); auto local = original.get();")
+          s=replace_one(s,"    require(deliveries.size() == 5 && deliveries[1].worker_identity == helper",r"""    std::cerr << "growth evidence";
+              for (auto const& item : deliveries) std::cerr << " [helper=" << (item.worker_identity == helper) << " local=" << item.local_direct << " members=" << item.work_units << "]";
+              std::cerr << " rosters=";
+              for (auto count : rosters) std::cerr << count << ",";
+              std::cerr << std::endl;
+              require(deliveries.size() == 5 && deliveries[1].worker_identity == helper""")
           path.write_text("#include <cstdio>\n"+s)
       - name: Identify the native worker phase which reaches its deadline
         if: inputs.phase == 'trace-worker' || inputs.phase == 'trace-refusal' || inputs.phase == 'trace-growth'
@@ -564,7 +570,7 @@ jobs:
           cmake --build build/qa-host --parallel 4 --target pos2_pr118_grow_worker_client_test
           $PSNativeCommandUseErrorActionPreference = $false
           $failed = 0
-          $repeats = if ($env:QA_TRACE -eq 'trace-refusal') { 20 } elseif ($env:QA_TRACE -eq 'trace-growth') { 8 } else { 5 }
+          $repeats = if ($env:QA_TRACE -eq 'trace-refusal') { 20 } elseif ($env:QA_TRACE -eq 'trace-growth') { 24 } else { 5 }
           foreach ($attempt in 1..$repeats) {
             Write-Output "Native worker trial $attempt"
             & ./build/qa-host/tools/parity/pos2_pr118_grow_worker_client_test.exe
