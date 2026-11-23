@@ -75,48 +75,32 @@ inline BackgroundPriority install_background_priority() noexcept
 #endif
     return result;
 }
+inline uint64_t install_cpu_cap(uint64_t requested)
+{
 #ifdef _WIN32
-inline DWORD_PTR windows_cpu_mask(HANDLE process)
-{
+    // Only the group count is needed. The sizing query also avoids Server
+    // 2022's DWORD alignment requirement for the output array of USHORTs.
+    USHORT groups = 0;
+    check(!::GetProcessGroupAffinity(::GetCurrentProcess(), &groups, nullptr) &&
+        ::GetLastError() == ERROR_INSUFFICIENT_BUFFER && groups == 1,
+        "bounded proof CPU affinity requires a single Windows processor group");
     DWORD_PTR allowed = 0, system = 0;
-    check(::GetProcessAffinityMask(process, &allowed, &system) && allowed, "cannot inspect bounded proof CPU affinity");
-    return allowed;
-}
-inline DWORD_PTR current_windows_cpu_mask()
-{
-    // A single machine group makes the process mask unambiguous. On a larger
-    // host the primary group's mask alone cannot describe a spanning process.
-    if (::GetActiveProcessorGroupCount() != 1)
-    {
-        USHORT groups = 0;
-        check(!::GetProcessGroupAffinity(::GetCurrentProcess(), &groups, nullptr) &&
-            ::GetLastError() == ERROR_INSUFFICIENT_BUFFER && groups == 1,
-            "bounded proof CPU affinity requires a single Windows processor group");
-    }
-    return windows_cpu_mask(::GetCurrentProcess());
-}
-inline uint64_t apply_windows_cpu_cap(HANDLE process, DWORD_PTR allowed, uint64_t requested)
-{
+    check(::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system) && allowed,
+        "cannot inspect bounded proof CPU affinity");
     uint64_t const count = uint64_t(std::popcount(allowed));
     check(requested <= count, "proof CPU cap exceeds inherited affinity");
     if (!requested) return count;
     DWORD_PTR selected = 0; uint64_t picked = 0;
     for (unsigned id = 0; id < sizeof(allowed) * CHAR_BIT && picked < requested; ++id)
         if (allowed & (DWORD_PTR(1) << id)) { selected |= DWORD_PTR(1) << id; ++picked; }
-    check(picked == requested && ::SetProcessAffinityMask(process, selected), "cannot enforce bounded proof CPU affinity");
-    DWORD_PTR actual = 0, system = 0;
-    if (!::GetProcessAffinityMask(process, &actual, &system) || actual != selected)
+    DWORD_PTR actual = 0;
+    check(picked == requested && ::SetProcessAffinityMask(::GetCurrentProcess(), selected), "cannot enforce bounded proof CPU affinity");
+    if (!::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) || actual != selected)
     {
-        (void)::SetProcessAffinityMask(process, allowed);
+        (void)::SetProcessAffinityMask(::GetCurrentProcess(), allowed);
         throw std::runtime_error("cannot verify bounded proof CPU affinity");
     }
     return requested;
-}
-#endif
-inline uint64_t install_cpu_cap(uint64_t requested)
-{
-#ifdef _WIN32
-    return apply_windows_cpu_cap(::GetCurrentProcess(), current_windows_cpu_mask(), requested);
 #elif defined(__linux__)
     cpu_set_t allowed, selected, actual; CPU_ZERO(&allowed); CPU_ZERO(&selected); CPU_ZERO(&actual);
     check(!::sched_getaffinity(0, sizeof(allowed), &allowed), "cannot inspect bounded proof CPU affinity");
@@ -151,8 +135,9 @@ public:
     explicit ScopedCpuCap(uint64_t requested)
     {
 #ifdef _WIN32
-        original_ = current_windows_cpu_mask();
-        lanes_ = apply_windows_cpu_cap(::GetCurrentProcess(), original_, requested); active_ = requested != 0;
+        DWORD_PTR system = 0;
+        check(::GetProcessAffinityMask(::GetCurrentProcess(), &original_, &system) && original_, "cannot save scoped CPU affinity");
+        lanes_ = install_cpu_cap(requested); active_ = requested != 0;
 #elif defined(__linux__)
         check(!::sched_getaffinity(0, sizeof(original_), &original_), "cannot save scoped CPU affinity");
         try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }
@@ -421,7 +406,16 @@ inline std::string run_worker(std::filesystem::path const& plot, uint64_t sample
     ::CloseHandle(write.value); write.value = nullptr;
     check(::AssignProcessToJobObject(job.value, child.process.hProcess), "cannot assign calibration worker to its memory job");
     if (proof_cpus)
-        apply_windows_cpu_cap(child.process.hProcess, windows_cpu_mask(child.process.hProcess), proof_cpus);
+    {
+        DWORD_PTR allowed = 0, system = 0, selected = 0; uint64_t count = 0;
+        check(::GetProcessAffinityMask(child.process.hProcess, &allowed, &system) && allowed, "cannot inspect suspended proof CPU affinity");
+        for (unsigned id = 0; id < sizeof(allowed) * CHAR_BIT && count < proof_cpus; ++id)
+            if (allowed & (DWORD_PTR(1) << id)) { selected |= DWORD_PTR(1) << id; ++count; }
+        DWORD_PTR actual = 0;
+        check(count == proof_cpus && ::SetProcessAffinityMask(child.process.hProcess, selected) &&
+            ::GetProcessAffinityMask(child.process.hProcess, &actual, &system) && actual == selected,
+            "cannot enforce suspended proof CPU affinity");
+    }
     check_running(until, limits.cancelled);
     check(::ResumeThread(child.process.hThread) != DWORD(-1), "cannot resume capped calibration worker");
     for (;;)
