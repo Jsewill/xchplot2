@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: host
-        options: [host, pushed-cli, candidate-cli]
+        options: [host, pushed-cli, candidate-cli, candidate-gates]
 
 permissions:
   contents: read
@@ -95,8 +95,8 @@ jobs:
         run: cmake --build build/qualification-planner --parallel 2 --target qualification_controller
 
   hardware:
-    name: Windows AMD test archive
-    if: inputs.phase == 'pushed-cli' || inputs.phase == 'candidate-cli'
+    name: ${{ inputs.phase == 'candidate-gates' && 'Windows release host checks' || 'Windows AMD test archive' }}
+    if: inputs.phase == 'pushed-cli' || inputs.phase == 'candidate-cli' || inputs.phase == 'candidate-gates'
     runs-on: windows-2022
     timeout-minutes: 160
     permissions:
@@ -197,8 +197,9 @@ jobs:
           fail-on-cache-miss: true
           path: build/windows-toolchain/install
           key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
-      - name: Build the production executable and runtime for hardware testing
+      - name: Build the selected production target or run the native release host checks
         env:
+          QA_PHASE: ${{ inputs.phase }}
           ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
         run: |
           $ErrorActionPreference = 'Stop'
@@ -211,6 +212,13 @@ jobs:
           cmake --build $BuildDir --parallel 2 --target xchplot2
           cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')
           '@
+          if ($env:QA_PHASE -eq 'candidate-gates') {
+              $group = $script.Substring($end)
+              $next = [regex]::Match($group, '(?m)^cmake --build \$BuildDir --parallel 2\r?$')
+              if (!$next.Success) { throw 'Cannot locate the end of the regular host test suite' }
+              $commands = $group.Substring(0,$next.Index)
+              if (!$commands.Contains('^compute_(membership|worker)_network_test$')) { throw 'The native network suite was omitted' }
+          }
           $opensslLine = '& (Join-Path $PSScriptRoot ''../ci/release/build-openssl-windows.ps1'') -BuildDir (Join-Path $BuildDir ''openssl'')'
           $prefix = $script.Substring(0,$end)
           if (!$prefix.Contains($opensslLine)) { throw 'The normal OpenSSL build hook changed' }
@@ -223,6 +231,7 @@ jobs:
           $source = (git rev-parse HEAD).Trim()
           if (!(Select-String -LiteralPath build/release-windows/BUILDINFO.txt -Pattern "^Source: $source$" -Quiet)) { throw 'Package source differs from the checkout' }
       - uses: actions/upload-artifact@v7
+        if: inputs.phase != 'candidate-gates'
         with:
           name: windows-hardware-x86_64
           path: |
