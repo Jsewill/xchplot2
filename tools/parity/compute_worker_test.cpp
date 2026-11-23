@@ -218,28 +218,35 @@ struct RunningBroker
 void multiple_brokers(char const* ca, char const* cert, char const* key)
 {
     pool::TlsOptions tls{ca, cert, key, 10000, 65536};
+    for (auto const [listen, simultaneous] : {std::pair{"::", false}, std::pair{"::", true}, std::pair{"0.0.0.0", false}})
     {
-        pool::BrokerOptions options; options.listen = {"::", 0}; options.tls = tls;
+        pool::BrokerOptions options; options.listen = {listen, 0}; options.tls = tls;
         RunningBroker home(options), later(options);
         pool::Endpoint primary{"127.0.0.1", home.server.endpoint().port, "localhost"};
-        pool::Endpoint alternate{"::1", primary.port, "localhost"};
+        // A wildcard listener falls back to IPv4 when the host disables IPv6.
+        // The numeric TLS name exercises a second route on those listeners.
+        auto alternate = primary;
+        if (home.server.endpoint().host == "::") alternate.host = "::1";
+        else alternate.server_name.clear();
         pool::Endpoint addition{"127.0.0.1", later.server.endpoint().port, "localhost"};
-        auto dual = config(); dual.broker = primary; dual.listen = {"::", 0}; dual.tls = tls; dual.max_brokers = 2;
-        dual.available_resources = [capacity = dual.capacity](unsigned) { return capacity; };
-        unsigned browse = 0;
-        dual.discover_brokers = [&]
+        auto offered = config(); offered.broker = primary; offered.listen = {listen, 0}; offered.tls = tls; offered.max_brokers = 2;
+        offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+        std::atomic<unsigned> browse{0};
+        offered.discover_brokers = [&]
         {
-            if (++browse == 1) return std::vector<pool::Endpoint>{};
-            if (browse == 2) return std::vector<pool::Endpoint>{alternate};
+            auto const round = ++browse;
+            if (round == 1 && !simultaneous) return std::vector<pool::Endpoint>{};
+            if (round <= 2) return std::vector<pool::Endpoint>{alternate};
             return std::vector<pool::Endpoint>{alternate, addition};
         };
-        WorkerService worker(dual); worker.start();
+        WorkerService worker(offered); worker.start();
         pool::BrokerClient original(primary, tls), alias(alternate, tls), peer(addition, tls);
         auto const advertised = original.status().worker_records.at(0).endpoint;
-        require(advertised.host == primary.host && alias.status().worker_records.at(0).endpoint == advertised,
-            "dual-stack broker fixture did not establish its primary worker route");
+        require((advertised.host == primary.host || (simultaneous && advertised.host == alternate.host)) &&
+            alias.status().worker_records.at(0).endpoint == advertised,
+            "broker fixture did not establish its primary worker route");
         auto const until = Clock::now() + std::chrono::seconds(3);
-        while ((worker.status().healthy_brokers != 2 || !peer.status().workers) && Clock::now() < until)
+        while ((browse.load() < 4 || worker.status().healthy_brokers != 2 || !peer.status().workers) && Clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         auto const status = worker.status();
         require(peer.status().workers == 1 && status.known_brokers == 2 && status.healthy_brokers == 2 &&
