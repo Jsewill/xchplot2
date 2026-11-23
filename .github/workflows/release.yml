@@ -1,154 +1,24 @@
-name: Binary release
+name: Windows hardware qualification
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - CMakeLists.txt
-      - LICENSE
-      - NOTICE
-      - cmake/**
-      - ci/release/**
-      - keygen-rs/**
-      - src/host/**
-      - src/gpu/**
-      - tools/**
-      - contrib/pos2-*.patch
-      - contrib/cccl-*.patch
-      - contrib/adaptivecpp-windows-*.patch
-      - scripts/build-release.sh
-      - scripts/build-release.ps1
-      - scripts/test/recovery.py
-      - scripts/test/release.py
-      - scripts/test/group-cli.py
-      - scripts/test/compute-cli.py
-      - scripts/test/group-pool-test.py
-  push:
-    tags: ['v*', '!v*-cuda-only']
   workflow_dispatch:
     inputs:
-      platform:
-        description: Release builds to check
+      phase:
+        description: Windows check
         type: choice
-        default: all
-        options: [all, linux, windows]
-      architecture:
-        description: Host CPU architecture
-        type: choice
-        default: all
-        options: [all, x86_64, aarch64]
+        required: true
+        default: host
+        options: [host, pushed-cli, candidate-cli]
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.architecture || 'all' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  changes:
-    name: Select release checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      shared: ${{ steps.filter.outputs.shared }}
-      linux: ${{ steps.filter.outputs.linux }}
-      windows: ${{ steps.filter.outputs.windows }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
-        id: filter
-        if: github.event_name == 'pull_request'
-        with:
-          predicate-quantifier: some-with-excludes
-          filters: |
-            shared:
-              - '.github/workflows/release.yml'
-              - '{CMakeLists.txt,LICENSE,NOTICE}'
-              - 'cmake/**'
-              - 'keygen-rs/{Cargo.toml,Cargo.lock,about.toml,src/**,include/**}'
-              - 'src/{host,gpu}/**'
-              - 'tools/**'
-              - '!tools/xchplot2/*.{rc,manifest}'
-              - '!tools/xchplot2/compute_service_windows.cpp'
-              - '!tools/xchplot2/compute_service.cpp'
-              - 'contrib/pos2-*.patch'
-              - 'contrib/cccl-arch-list.patch'
-              - 'ci/release/adaptivecpp-*.patch'
-              - 'ci/release/{adaptivecpp-third-party.txt,llvm-third-party.txt,licenses.hbs,check-cuda-ptx.py}'
-              - 'scripts/test/{recovery,release,group-cli,compute-cli,group-pool-test}.py'
-            linux:
-              - 'ci/release/{Containerfile,README.txt}'
-              - 'scripts/build-release.sh'
-              - 'tools/xchplot2/compute_service.cpp'
-            windows:
-              - 'ci/release/*.ps1'
-              - 'ci/release/{README.windows.txt,amd-runtime.txt,microsoft-runtime.txt}'
-              - 'scripts/build-release.ps1'
-              - 'tools/xchplot2/*.{rc,manifest}'
-              - 'tools/xchplot2/compute_service_windows.cpp'
-              - 'contrib/adaptivecpp-windows-*.patch'
-              - 'contrib/cccl-windows-ptx.patch'
-
-  linux-sycl:
-    needs: changes
-    if: >-
-      inputs.platform != 'windows' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
-       needs.changes.outputs.linux == 'true')
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
-    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build release image
-        run: |
-          docker build --build-arg BASE_IMAGE=${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'nvidia/cuda:12.9.1-devel-ubuntu24.04' }} \
-            -t xchplot2-release -f ci/release/Containerfile ci/release
-      - name: Build and package
-        id: package
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: |
-          docker run --rm -e RELEASE_TAG -v "$PWD:/src" xchplot2-release \
-            bash scripts/build-release.sh
-      - name: Check the extracted runtime and CPU proofs
-        run: |
-          docker run --rm -e DEBIAN_FRONTEND=noninteractive \
-            -v "$PWD:/src:ro" -w /src ${{ matrix.arch == 'aarch64' && 'ubuntu:26.04' || 'ubuntu:24.04' }} bash -euc '
-            apt-get update
-            apt-get install -y --no-install-recommends \
-              python3 libstdc++6 libnuma1 libelf1t64 libdrm2 libdrm-amdgpu1
-            python3 scripts/test/release.py build/release-linux/dist/*.tar.gz \
-              --sycl-probe build/release-linux/tools/sanity/hellosycl
-          '
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
-        with:
-          name: linux-${{ matrix.arch }}-sycl
-          path: |
-            build/release-linux/dist/*.tar.gz
-            build/release-linux/dist/*.sha256
-          if-no-files-found: error
-
-  windows-sycl:
-    needs: changes
-    if: >-
-      inputs.platform != 'linux' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
-       needs.changes.outputs.windows == 'true')
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: ${{ fromJSON(inputs.architecture && inputs.architecture != 'all' && format('["{0}"]', inputs.architecture) || '["x86_64", "aarch64"]') }}
-    runs-on: ${{ matrix.arch == 'aarch64' && 'windows-11-arm' || 'windows-2022' }}
-    timeout-minutes: 240
+  host:
+    name: Windows planner fixtures
+    if: inputs.phase == 'host'
+    runs-on: windows-2022
+    timeout-minutes: 20
     defaults:
       run:
         shell: pwsh
@@ -156,6 +26,85 @@ jobs:
       - name: Preserve source line endings
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: Chia-Network/pos2-chip
+          ref: 077c692b51a32cde748e6a8f1ccefe5354c81fa8
+          path: build/qualification-upstream
+          persist-credentials: false
+      - name: Configure Visual Studio
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $arm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64'
+          $component = if ($arm64) { 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+          $visualStudio = & $vswhere -latest -products '*' -requires $component -property installationPath
+          if (-not $visualStudio) { throw 'Visual Studio C++ build tools are required' }
+          $vcvars = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvarsall.bat'
+          $target = if ($arm64) { 'arm64' } else { 'x64' }
+          # LLVM 20 needs the VS 2022 STL supplied by this side-by-side toolset.
+          $toolset = if ($arm64) { '-vcvars_ver=14.44' } else { '' }
+          cmd /c "call `"$vcvars`" $target $toolset >nul && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $env:PATH = "$env:ProgramFiles\LLVM\bin;$env:CUDA_PATH\bin;$env:HIP_PATH\bin;" + $env:PATH
+          foreach ($name in 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsRedistDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
+              "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
+          }
+          clang-cl --version
+      - name: Build and run resource and handoff fixtures with the Windows SDK
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $repo = (Get-Location).Path.Replace('\','/')
+          $upstream = "$repo/build/qualification-upstream"
+          $fixture = 'build/qualification-project'
+          [void][IO.Directory]::CreateDirectory($fixture)
+          @'
+          cmake_minimum_required(VERSION 3.24)
+          project(windows_planner LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+          add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+          find_package(Git REQUIRED)
+          find_package(Threads REQUIRED)
+          add_subdirectory("@UPSTREAM@/lib/fse" fse)
+          include("@REPO@/cmake/GroupPlotter.cmake")
+          pos2_grow_prepare("@UPSTREAM@" grow_include)
+          include("@REPO@/cmake/GroupTests.cmake")
+          pos2_group_tests("@UPSTREAM@" "${grow_include}")
+          foreach(target pos2_pr118_grow_replot_resources_test pos2_pr118_grow_farming_test pos2_pr118_grow_gpu_output_test)
+            target_link_libraries(${target} PRIVATE advapi32 bcrypt psapi)
+          endforeach()
+          '@.Replace('@REPO@',$repo).Replace('@UPSTREAM@',$upstream) | Set-Content "$fixture/CMakeLists.txt"
+          $build = 'build/qualification-planner'
+          cmake -S $fixture -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          $tests = @('pos2_pr118_grow_replot_resources_test','pos2_pr118_grow_farming_test','pos2_pr118_grow_gpu_output_test')
+          cmake --build $build --parallel 2 --target $tests
+          foreach ($test in $tests) { & "$build/tools/parity/$test.exe" }
+
+  hardware:
+    name: Windows AMD test archive
+    if: inputs.phase == 'pushed-cli' || inputs.phase == 'candidate-cli'
+    runs-on: windows-2022
+    timeout-minutes: 100
+    strategy:
+      matrix:
+        arch: [x86_64]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || github.sha }}
+          persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
         run: |
@@ -190,6 +139,7 @@ jobs:
       - uses: actions/cache/restore@v6
         id: toolchain
         with:
+          fail-on-cache-miss: true
           path: build/windows-toolchain/install
           key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Configure Visual Studio
@@ -213,100 +163,36 @@ jobs:
               "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
           }
           clang-cl --version
-      - name: Build AdaptiveCpp with LLVM
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        run: ./ci/release/build-adaptivecpp-windows.ps1
-      - name: Check Windows AMDGPU bitcode ABI
-        if: matrix.arch == 'x86_64'
-        run: |
-          $ir = & build/windows-toolchain/install/bin/llvm-dis.exe `
-              build/windows-toolchain/install/lib/hipSYCL/bitcode/libkernel-sscp-amdgpu-amdhsa-full.bc -o -
-          if ($LASTEXITCODE -ne 0 -or -not ($ir -match '!"wchar_size", i32 2')) {
-              throw 'AMDGPU bitcode must use the Windows HIP wchar size'
-          }
-      - uses: actions/cache/save@v6
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        with:
-          path: build/windows-toolchain/install
-          key: ${{ steps.toolchain.outputs.cache-primary-key }}
       - name: Install release Rust tooling
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
           cargo install --locked --features cli cargo-about --version 0.9.2
-      - name: Build and package
-        id: package
+      - name: Build the production executable and runtime for hardware testing
         env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           ACPP_PREFIX: ${{ github.workspace }}/build/windows-toolchain/install
-        run: ./scripts/build-release.ps1
-      - name: Check the extracted runtime and Windows CPU proofs
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $python = (Get-Command python.exe).Source
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          foreach ($name in 'LIB', 'LIBPATH', 'INCLUDE', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsRedistDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion', 'UniversalCRTSdkDir') {
-              [Environment]::SetEnvironmentVariable($name, $null, 'Process')
-          }
-          $archive = (Get-ChildItem build/release-windows/dist/*.zip).FullName
-          # Hide the absolute fallback paths compiled into AdaptiveCpp, too.
-          Rename-Item build/windows-toolchain/install install-hidden
-          $hip = $env:HIP_PATH
-          $cuda = $env:CUDA_PATH
-          if ($hip) { Rename-Item $hip ((Split-Path $hip -Leaf) + '-hidden') }
-          Rename-Item $cuda ((Split-Path $cuda -Leaf) + '-hidden')
-          foreach ($name in 'HIP_PATH', 'ROCM_PATH', 'CUDA_PATH', 'CUDA_PATH_V12_9', 'ACPP_PREFIX') {
-              [Environment]::SetEnvironmentVariable($name, $null, 'Process')
-          }
-          try {
-              & $python scripts/test/release.py $archive `
-                  --sycl-probe build/release-windows/tools/sanity/hellosycl.exe
-          } finally {
-              if ($hip) { Rename-Item "$hip-hidden" (Split-Path $hip -Leaf) }
-              Rename-Item "$cuda-hidden" (Split-Path $cuda -Leaf)
-              Rename-Item build/windows-toolchain/install-hidden install
-          }
+          $script = [IO.File]::ReadAllText((Resolve-Path 'scripts/build-release.ps1'))
+          $marker = '# Catch host regressions before compiling CUDA for every supported architecture.'
+          $end = $script.IndexOf($marker,[StringComparison]::Ordinal)
+          if ($end -lt 0) { throw 'Could not find the normal post-configuration build boundary' }
+          $commands = @'
+          cmake --build $BuildDir --parallel 2 --target xchplot2
+          cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')
+          '@
+          [IO.File]::WriteAllText((Join-Path $PWD 'scripts/build-hardware-qualification.ps1'), $script.Substring(0,$end) + $commands)
+          & ./scripts/build-hardware-qualification.ps1
+          git diff --exit-code HEAD --
+          $source = (git rev-parse HEAD).Trim()
+          if (!(Select-String -LiteralPath build/release-windows/BUILDINFO.txt -Pattern "^Source: $source$" -Quiet)) { throw 'Package source differs from the checkout' }
       - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         with:
-          name: windows-${{ matrix.arch }}-sycl
+          name: windows-hardware-x86_64
           path: |
             build/release-windows/dist/*.zip
             build/release-windows/dist/*.sha256
+          retention-days: 5
           if-no-files-found: error
-
-  draft:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [linux-sycl, windows-sycl]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    concurrency:
-      group: binary-release
-      cancel-in-progress: false
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: '*-sycl*'
-          merge-multiple: true
-          path: dist
-      - name: Attach archives to the shared draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          RELEASE_TAG="${RELEASE_TAG%-cuda-only}"
-          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
-            if [[ "$draft" != true ]]; then
-              echo "Release $RELEASE_TAG is already published" >&2
-              exit 1
-            fi
-            gh release upload "$RELEASE_TAG" dist/*
-          else
-            gh release create "$RELEASE_TAG" dist/* \
-              --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
-          fi
