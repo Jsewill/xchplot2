@@ -1102,13 +1102,16 @@ struct WorkerService::Impl
                 if (same != brokers.end())
                 {
                     auto& registered = **same;
-                    if (registered.routes.size() < max_broker_routes &&
-                        std::find(registered.routes.begin(), registered.routes.end(), address) == registered.routes.end())
-                        registered.routes.push_back(address);
-                    if (!registered.healthy)
+                    auto route = std::find(registered.routes.begin(), registered.routes.end(), address);
+                    if (route == registered.routes.end() && registered.routes.size() < max_broker_routes)
+                        route = registered.routes.insert(route, address);
+                    // Heartbeat the route on which the advertised endpoint was
+                    // accepted so loss of that path actually triggers failover.
+                    if (!registered.healthy || (!registered.alternate_source.empty() && source == value.endpoint.host))
                     {
+                        if (route == registered.routes.end()) registered.routes[registered.route_cursor] = address;
+                        else registered.route_cursor = size_t(route - registered.routes.begin());
                         registered.client.reroute(address); registered.endpoint = address;
-                        registered.route_cursor = registered.routes.size() - 1;
                         registered.alternate_source.clear();
                     }
                     registered.seen = Clock::now(); registered.healthy = true;

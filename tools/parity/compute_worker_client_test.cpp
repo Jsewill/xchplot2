@@ -1654,6 +1654,17 @@ void automatic_pool_growth()
     require(initial.roster && initial.roster->complete && initial.roster->routes.size() == 1 &&
         initial.roster->routes.front().cpu_slots == 1 && !initial.roster->routes.front().gpu_slots,
         "automatic owner did not observe its original CPU executor");
+    auto wait_for_roster = [&](auto matches)
+    {
+        auto const until = Clock::now() + std::chrono::seconds(5);
+        do
+        {
+            auto value = client.generation_capacity(18, 2);
+            if (value.roster && value.roster->complete && matches(*value.roster)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (Clock::now() < until);
+        return false;
+    };
     // Enroll and start the peer after an actual lease has delivered its
     // first output. Both normal plotting sessions advertise on loopback.
     auto invitation = directory.path / "addition.invite"; pool::invite_pool(owner_id, invitation, "addition");
@@ -1665,6 +1676,8 @@ void automatic_pool_growth()
         auto helper_args = options(helper_id); pos2gpu::ComputeSession helper(helper_args);
         helper.offer_local(offer(helper_args));
         remote = generate(false, 2);
+        require(wait_for_roster([](auto const& roster) { return roster.routes.size() == 2; }),
+            "the owner did not report both workers while the helper was present");
         std::lock_guard lock(mutex);
         require(!deliveries.empty() && deliveries.front().local_direct && deliveries.front().work_units == 1,
             "the cold member did not finish on the original worker");
@@ -1683,11 +1696,7 @@ void automatic_pool_growth()
     require(!local.empty() && local == baseline && remote.size() == local.size() * 2 &&
         std::equal(local.begin(), local.end(), remote.begin()) && std::equal(local.begin(), local.end(), remote.begin() + local.size()),
         "newly enrolled executor changed the live owner's ordered member data");
-    auto const until = Clock::now() + std::chrono::seconds(5);
-    auto current = client.generation_capacity(18, 2);
-    while ((!current.roster || *current.roster != *initial.roster) && Clock::now() < until)
-    { std::this_thread::sleep_for(std::chrono::milliseconds(50)); current = client.generation_capacity(18, 2); }
-    require(current.roster && *current.roster == *initial.roster && generate(false) == local,
+    require(wait_for_roster([&](auto const& roster) { return roster == *initial.roster; }) && generate(false) == local,
         "the same plotting owner did not continue on its original worker after departure");
     std::lock_guard lock(mutex);
     require(deliveries.size() == receipts_before_release + 2 &&
