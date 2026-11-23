@@ -118,6 +118,7 @@ struct WorkerOffer
     WorkerAdmission admission = WorkerAdmission::Accepting;
     WorkerHardware hardware;
     uint32_t independent_k_mask = 0;
+    std::string gpu_recovery; // bounded authenticated device-loss diagnostic, optional on V8
 };
 struct Task
 {
@@ -212,6 +213,7 @@ struct BrokerWorkerStatus
     WorkerAdmission admission = WorkerAdmission::Accepting;
     uint64_t seen_ms = 0;
     WorkerHardware hardware;
+    std::string gpu_recovery;
 };
 struct BrokerOwnerStatus
 {
@@ -258,6 +260,12 @@ struct GenerationRoster
     // the whole registry when additional rows do not fit this observation.
     std::vector<GenerationRoute> routes;
     bool complete = true;
+    struct RecoveringGpu
+    {
+        std::string host, cause;
+        bool operator==(RecoveringGpu const&) const = default;
+    };
+    std::vector<RecoveringGpu> recovering_gpus;
     bool operator==(GenerationRoster const&) const = default;
 };
 struct GenerationAdmission
@@ -354,6 +362,8 @@ public:
     ControlMetrics metrics() const;
     static uint64_t memory_bytes(unsigned channels = control_channel_limit);
 private:
+    std::optional<std::pair<std::string, Endpoint>> register_recovering_gpu(WorkerOffer const&, bool retain_route,
+        std::string* peer_identity, std::string* peer_node_id);
     struct Connections;
     std::vector<uint8_t> call(Writer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     Endpoint endpoint_;

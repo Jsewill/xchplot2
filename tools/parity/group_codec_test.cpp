@@ -1078,9 +1078,16 @@ void adaptive_overlap()
         engine.apply(*fresh, first);
         require(engine.stats().encode_chunks == chunks && !engine.stats().overlap_windows,
                 "large chunk did not use a single bounded serial encoding pass");
+        auto const before = engine.stats();
         auto append = engine.plan(second);
         require(append.accepted, "subsequent smaller operation was not admitted");
+        auto const retained = engine.stats().encode_chunks - before.encode_chunks;
+        auto const sized = engine.stats().sized_chunks - before.sized_chunks;
+        require(retained && sized && retained + sized == chunks,
+                "exact planning did not size each preceding chunk and encode its final window");
         engine.apply(append, second);
+        require(engine.stats().encode_chunks - before.encode_chunks == chunks,
+                "append encoded its retained planning window again");
         require(bool(engine.stats().overlap_windows) == overlap,
                 "smaller operation did not restore requested overlap");
     }

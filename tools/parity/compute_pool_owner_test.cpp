@@ -352,6 +352,87 @@ void repartition_and_global_admission()
         "single-owner packed pipeline prefetch changed canonical publication");
 }
 
+void late_packed_capacity()
+{
+    using namespace grow_controller_test;
+    pool_test::Directory certificates;
+    auto ca = pool_test::issue(certificates.path, "packed-start-ca");
+    auto certificate = pool_test::issue(certificates.path, "packed-start-host", &ca);
+    auto tls = pool_test::tls(ca, certificate); tls.timeout_ms = 5000; tls.max_frame_bytes = 65536;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    RunningBroker broker(options);
+    WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
+    offered.tls = tls; offered.capacity = {1, 1, uint64_t(512) << 20, 0}; offered.generation_threads = 1;
+    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+    WorkerService worker(offered);
+    Arguments args; args.backend = "cpu"; args.pool_inflight = 2; args.pool_timeout_ms = 15000;
+    args.pool_frame_bytes = tls.max_frame_bytes; args.max_ram = uint64_t(1) << 30;
+    Backend backend; backend.mode = "pool"; backend.cpu_scheduler = std::make_shared<CodecScheduler>(2);
+    auto& config = backend.pool_client_config; config.tls = tls; config.broker = offered.broker;
+    config.owner_id = "packed-start-owner"; config.generation_kind = pool::Kind::GenerateCpu;
+    config.max_active_generation = args.pool_inflight; config.task_timeout_ms = args.pool_timeout_ms;
+    std::mutex mutex; std::vector<WorkerTaskObservation> receipts;
+    config.observe = [&](auto const& value) { std::lock_guard lock(mutex); receipts.push_back(value); };
+    auto client = backend.acquire_pool_client();
+    auto empty = client->generation_capacity(18, 2);
+    require(empty.roster && empty.roster->complete && !empty.slots, "packed owner did not start with an empty broker");
+    grow_controller_test::Identity requested{PlotGroupParams(PlotGroupId(std::string(64, '7')), 18, 2, 0), {}};
+    Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+    MemberBatchHash hash(3); std::vector<Member> members;
+    auto filling = std::async(std::launch::async, [&] { return producer.fill_pool(members, 0, 3, 0, "", {}, nullptr, &hash, 2); });
+    pool::BrokerClient control(offered.broker, tls);
+    auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!control.status().queued && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(control.status().queued, "cold packed owner did not submit useful work");
+    worker.start();
+    require(filling.get() == 3 && members.size() == 3 && hash.size() == 3 && receipts.size() == 2 &&
+        hash.digest_for(Members(members)) == members_digest(18, Members(members), nullptr, [] {}),
+        "newly available packed capacity did not batch and hash the unsent pair");
+    worker_detail::CpuLimit cpu(1);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        auto const id = requested.params.get_plot_params_for_index(uint16_t(i)).get_plot_id().data();
+        auto const receipt = std::find_if(receipts.begin(), receipts.end(), [&](auto const& value) { return value.work_units == (i ? 2 : 1); });
+        require(receipt != receipts.end() && receipt->member_id_count == receipt->work_units && receipt->member_ids[i ? i - 1 : 0] == id,
+            "packed rescheduling changed the assigned plot IDs");
+        std::vector<uint64_t> raw; auto view = members[i].view();
+        for (size_t c = 0; c < PlotGroupFile::getChunkCountForK(18); ++c)
+            for (auto value : view.region(c)) raw.push_back(value);
+        require(raw == worker_original_reference(18, 2, id), "packed rescheduling changed ordered CPU-reference output");
+    }
+    auto second_cert = pool_test::issue(certificates.path, "packed-start-second", &ca);
+    offered.tls = pool_test::tls(ca, second_cert); offered.tls.max_frame_bytes = tls.max_frame_bytes;
+    WorkerService second(offered); second.start();
+    Backend probing; probing.mode = "pool"; probing.cpu_scheduler = backend.cpu_scheduler;
+    probing.pool_client_config = config; probing.pool_client_config.owner_id = "packed-probes-owner";
+    std::promise<void> relief, release; auto resume = release.get_future().share();
+    std::string held; bool relieved = false;
+    probing.pool_client_config.selected = [&](auto const& task)
+    {
+        {
+            std::lock_guard lock(mutex);
+            if (!held.empty()) return;
+            held = task.worker_identity;
+        }
+        require(resume.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "first packed probe was never released");
+    };
+    probing.pool_client_config.observe = [&](auto const& task)
+    {
+        std::lock_guard lock(mutex);
+        if (task.worker_identity != held && !std::exchange(relieved, true)) relief.set_value();
+    };
+    auto const roster = probing.acquire_pool_client()->generation_capacity(18, 2);
+    require(roster.roster && roster.roster->complete && roster.roster->routes.size() == 2 && roster.slots == 2,
+        "second compatible packed worker was unavailable");
+    Producer competing{requested, nullptr, probing, args, args.max_ram, uint64_t(64) << 20};
+    std::vector<Member> progress;
+    auto filling_two = std::async(std::launch::async, [&]
+    { return competing.fill_pool(progress, 0, 3, 0, "", {}, nullptr, nullptr, 2); });
+    auto const concurrent = relief.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.set_value();
+    require(filling_two.get() == 3 && concurrent, "a held first probe kept another compatible worker idle");
+}
+
 void owner_broker_restart()
 {
     using namespace grow_controller_test;
@@ -674,6 +755,7 @@ try
     private_local_delegation();
     owner_dashboard_feed();
     repartition_and_global_admission();
+    late_packed_capacity();
     owner_broker_restart();
     accepted_remote_publication();
     std::cout << "owner scratch recovery, global admission, packed prefetch, broker restart and remote publication passed\n";

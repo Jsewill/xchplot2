@@ -957,8 +957,20 @@ void offered_cpus()
     require(cancelled_waiter, "worker CPU queue ignored cancellation");
     CpuWork reused(offered, &shared, cancel, 2);
 }
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "compute_worker_gpu_fixture.hpp"
+#endif
 int main(int argc, char** argv)
 {
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (argc == 8 && std::string_view(argv[5]) == "--gpu-recovery-worker")
+    { worker_gpu_test::child = true; return run_worker_gpu_child(argv[6], argv[7]); }
+    if (argc == 2 && (std::string_view(argv[1]) == "--gpu-recovery" || std::string_view(argv[1]) == "--gpu-recovery-network"))
+    {
+        try { worker_gpu_test::recovery(std::string_view(argv[1]) == "--gpu-recovery-network"); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+#endif
     try { scoped_threads(); packed_word_validation(); budget(); fitted_broker_budget(); retained_budget(); chunk_headers(); renewal_errors(); offered_cpus(); generation(); if (argc == 4) network(argv[1], argv[2], argv[3]);
         else if (argc == 2 && std::string_view(argv[1]) == "--network")
         { pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "worker-ca");

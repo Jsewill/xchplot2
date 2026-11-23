@@ -236,7 +236,7 @@ struct GpuProducer::Impl
                             try
                             {
                                 candidate_queue = std::make_unique<sycl::queue>(queue->get_context(),
-                                    queue->get_device(), pos2gpu::sycl_backend::async_error_handler,
+                                    queue->get_device(), pos2gpu::sycl_backend::queue_error_handler(),
                                     sycl::property_list{sycl::property::queue::in_order{},
                                                         sycl::property::queue::enable_profiling{}});
                                 copy_event_profiling = true;
@@ -245,7 +245,7 @@ struct GpuProducer::Impl
                         }
                         if (!candidate_queue)
                             candidate_queue = std::make_unique<sycl::queue>(queue->get_context(),
-                                queue->get_device(), pos2gpu::sycl_backend::async_error_handler,
+                                queue->get_device(), pos2gpu::sycl_backend::queue_error_handler(),
                                 sycl::property::queue::in_order{});
                         auto* candidate_output = sycl::malloc_device<uint64_t>(capacity, *queue);
                         if (candidate_output)
@@ -561,6 +561,19 @@ void GpuProducer::release_host_output()
     impl_->prepared_borrowed_output = false;
     wall.complete = true;
 }
+std::string GpuProducer::device_loss(std::exception_ptr failure)
+{
+    try { if (failure) std::rethrow_exception(failure); }
+    catch (sycl::exception const& e) {
+        if (pos2gpu::is_gpu_device_loss(e.what())) return std::string(e.what()).substr(0, 240);
+    }
+    catch (pos2gpu::InsufficientVramError const& e) {
+        // An allocation can surface a pre-existing terminal driver error.
+        if (pos2gpu::is_gpu_device_loss(e.what())) return std::string(e.what()).substr(0, 240);
+    }
+    catch (...) {}
+    return {};
+}
 uint64_t GpuProducer::runtime_host_allowance_bytes() noexcept { return runtime_host_bytes; }
 uint64_t GpuProducer::device_resident_bytes() const
 {
@@ -761,9 +774,10 @@ std::shared_future<uint64_t> GpuProducer::generate_output_async(
                                      pos2gpu::first_async_error());
         if (!result.fragments().empty() || result.t3_count > impl_->capacity)
             throw std::logic_error("GPU producer device output returned invalid fragment storage or count");
-        auto pending = impl_->handoff.launch([impl = impl_.get(), count = result.t3_count, member = wall.member,
+        auto pending = impl_->handoff.launch([impl = impl_.get(), count = result.t3_count, member = wall.member, scope = pos2gpu::scoped_async_errors(),
                                       consume = std::move(consume), consume_packed = std::move(consume_packed)]() mutable
         {
+            pos2gpu::ScopedAsyncErrors bind(scope);
             OutputWallTimings wall(impl->profile, consume_packed ? "output-packed" : "output-raw", member);
             wall.observes_copy_wait = true;
             auto& queue = *impl->copy_queue;

@@ -186,6 +186,7 @@ struct WorkerConfig
     pool::Resources capacity;
     std::string backend = "cpu", tier = "auto";
     int device = 0;
+    bool gpu_capacity_measured = false;
     // Optional CPU/NUMA selection. CPU generation restores the caller's mask
     // after scoped pinning; GPU runtime/codec threads keep their own policy.
     std::vector<int> cpu_affinity;
@@ -198,6 +199,9 @@ struct WorkerConfig
     // retained GPU allocations. An optional embedding reservation owns it.
     std::shared_ptr<CodecScheduler> cpu_scheduler;
     std::shared_ptr<void> host_reservation;
+    // Private device lanes share their owner's RAM partition. A recovery
+    // probe must acquire a real reservation alongside already granted jobs.
+    std::function<std::shared_ptr<void>(uint64_t)> reserve_gpu_probe;
     // Optional embedding policy, called with finalized configuration before
     // service/GPU executor construction. Throws before unreviewed work starts.
     std::function<void(WorkerConfig const&)> admit_start;
@@ -221,6 +225,7 @@ struct WorkerStatus
     uint64_t broker_limit = 0, known_brokers = 0, healthy_brokers = 0, deferred_brokers = 0;
     uint64_t broker_transport_bytes = 0;
     bool broker_saturated = false;
+    std::string gpu_recovery;
     pool::WorkerHardware hardware;
 };
 struct WorkerTaskAdmission
@@ -235,6 +240,7 @@ struct WorkerLocalOffer
     pool::Resources capacity, demand{0, 0, 0, 0};
     uint64_t standing_host_bytes = 0, member_host_bytes = 0;
     unsigned max_batch_members = 0;
+    std::string gpu_recovery;
 };
 class WorkerAdmissionRejected : public std::runtime_error
 {
@@ -289,6 +295,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+int run_worker_gpu_child(char const* handle, char const* bytes);
 void default_worker_resources(WorkerConfig&);
 // Complete startup service/transport and selected GPU runtime host allowance,
 // inside capacity.host_bytes rather than additional to that total partition.
@@ -392,7 +399,7 @@ public:
     uint64_t max_task_bytes() const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
-                                     WorkerPackedRoute* batch_route = nullptr) const;
+                                     WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr) const;
     unsigned independent_contribution_width(uint8_t k, uint8_t strength, unsigned ready_members = 1,
         unsigned destinations = 1, bool dispatch = false) const;
     // A zero joint width selects the independent pipeline for this ready work.
