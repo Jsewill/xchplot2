@@ -113,7 +113,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || '33ad40ea7158bccee206ff90d63d379cb6842334' }}
+          ref: ${{ inputs.phase == 'pushed-cli' && '57ed5bca0d612a17f3ead53d011bd27fa6ebc084' || 'c655be9731a4710dbdf10ec1b02ce48fa38c2f60' }}
           persist-credentials: false
       - name: Install CUDA 12.9.1
         if: matrix.arch == 'x86_64'
@@ -281,7 +281,7 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: 33ad40ea7158bccee206ff90d63d379cb6842334
+          ref: c655be9731a4710dbdf10ec1b02ce48fa38c2f60
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
