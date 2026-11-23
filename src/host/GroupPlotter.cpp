@@ -14715,8 +14715,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         std::atomic<bool> cancel_generation{false};
         group_grow::NotifiedFuture<Generated> generating;
         uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
-        uint64_t accepted_peak = 0;
-        std::atomic<uint64_t> write_due{0};
+        std::atomic<uint64_t> accepted_peak{0}, write_due{0};
         std::chrono::steady_clock::time_point other_work_until{};
         // A producer can still own provisional scratch or its member vector.
         // Join before any of those fields, or the engine, are destroyed.
@@ -16749,10 +16748,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             args.io_overlap && group_prefetch_enabled(args, *backend) && args.pool_output != "encoded")
             d.engine->incremental->fresh_write([task, &wake, &execution_now](uint64_t peak, long double remaining)
             {
-                task->accepted_peak = peak;
-                task->write_due.store(sum(execution_now(), uint64_t(std::min<long double>(remaining, INT64_MAX))),
-                    std::memory_order_release);
-                wake.notify();
+                auto due = task->write_due.load(std::memory_order_relaxed);
+                // A zero deadline after the first observation belongs to an already
+                // submitted successor, including one whose optional receipt failed.
+                if (!due && task->accepted_peak.load(std::memory_order_relaxed)) return;
+                task->accepted_peak.store(peak, std::memory_order_relaxed);
+                auto const next = sum(execution_now(), uint64_t(std::min<long double>(remaining, INT64_MAX)));
+                if (task->write_due.compare_exchange_strong(due, next, std::memory_order_release)) wake.notify();
             });
 #endif
         d.ready = writers[d.writer]->submit([&, task, final_batch]
@@ -16852,12 +16854,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             if (ram_rollover)
             {
+                auto const peak = d.pending->accepted_peak.load(std::memory_order_relaxed);
                 if (maximum != d.maximum || identity.params.get_k() != d.requested.params.get_k() ||
                     identity.params.get_strength() != d.requested.params.get_strength() ||
                     !group_grow::farming_grant_covers(farm->state, d.owner, lane.ordinal + 1, maximum) ||
-                    d.pending->accepted_peak > d.capacity_limit ||
+                    peak > d.capacity_limit ||
                     d.engine->incremental->fresh_storage_bytes(canonical_bound(identity, maximum), true) >
-                        d.capacity_limit - d.pending->accepted_peak) return false;
+                        d.capacity_limit - peak) return false;
                 auto client = backend->acquire_pool_client();
                 auto const k = identity.params.get_k(), strength = identity.params.get_strength();
                 if (client->local_available()) return false;
