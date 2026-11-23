@@ -667,6 +667,28 @@ bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes,
 
 } // namespace
 
+#ifdef _WIN32
+HMODULE retained_hip_runtime()
+{
+    // A cold probe can release AdaptiveCpp's last device just after enumeration.
+    // Own the runtime used for the cached entry points before that happens.
+    struct Module {
+        std::mutex mutex;
+        HMODULE handle = nullptr;
+        ~Module() { if (handle) ::FreeLibrary(handle); }
+    };
+    static Module module;
+    std::lock_guard lock(module.mutex);
+    if (!module.handle) {
+        for (auto name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
+            HMODULE handle;
+            if (::GetModuleHandleExW(0, name, &handle)) { module.handle = handle; break; }
+        }
+    }
+    return module.handle;
+}
+#endif
+
 bool hip_query_device_memory(int device_ordinal,
                              size_t& free_bytes,
                              size_t& total_bytes)
@@ -675,13 +697,10 @@ bool hip_query_device_memory(int device_ordinal,
     using SetDeviceFn  = int (*)(int);
     using GetDeviceFn  = int (*)(int*);
 
-    static void* const handle = [] () -> void* {
 #ifdef _WIN32
-        // Query the runtime AdaptiveCpp loaded, including versioned HIP SDK DLLs.
-        for (wchar_t const* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
-            if (auto handle = ::GetModuleHandleW(name)) return handle;
-        }
+    void* const handle = retained_hip_runtime();
 #else
+    static void* const handle = [] () -> void* {
         // Already in-process? A ROCm build has it loaded before we get here.
         if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
             if (dlsym(self, "hipMemGetInfo")) return self;
@@ -691,9 +710,9 @@ bool hip_query_device_memory(int device_ordinal,
                                    "libamdhip64.so.5"}) {
             if (void* h = dlopen(soname, RTLD_LAZY | RTLD_LOCAL)) return h;
         }
-#endif
         return nullptr;
     }();
+#endif
     if (!handle) return false;
 
     static auto const mem_get_info =
@@ -864,6 +883,9 @@ ProbeTarget probe_target_for(int device_ordinal)
             if (rt == ProbeRuntime::LevelZero)
                 t.host_unified_memory = devs[idx].get_info<sycl::info::device::host_unified_memory>();
             if (rt != ProbeRuntime::None) {
+#ifdef _WIN32
+                if (rt == ProbeRuntime::Hip && !retained_hip_runtime()) return {};
+#endif
                 // Rank among devices sharing this backend — that IS the
                 // runtime's own ordinal, whereas idx counts every vendor.
                 int rank = 0;
@@ -878,9 +900,9 @@ ProbeTarget probe_target_for(int device_ordinal)
         // None leaves the probe unavailable, so admission fails closed.
     }
 
+    if (t.runtime == ProbeRuntime::None) return t;
     std::lock_guard<std::mutex> lk(m);
-    cache[device_ordinal] = t;
-    return t;
+    return cache.emplace(device_ordinal, t).first->second;
 }
 
 } // namespace
