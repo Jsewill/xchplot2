@@ -1,4 +1,5 @@
 #include "host/GroupGpu.hpp"
+#include "host/GpuCleanup.hpp"
 #include "host/GroupGpuPacked.hpp"
 
 #include "gpu/SyclBackend.hpp"
@@ -121,16 +122,17 @@ struct TimedCopyEvent
     }
 };
 
-struct FreeU64
+template<class T, void (*Free)(T*)>
+struct FreePinned
 {
-    void operator()(uint64_t* p) const { if (p) pos2gpu::streaming_free_pinned_uint64(p); }
+    uint64_t bytes = 0;
+    void operator()(T* p) const noexcept
+    {
+        if (p) pos2gpu::release_gpu_memory("group pinned buffer", bytes, &pos2gpu::GpuCleanupCharges::host, [&] { Free(p); });
+    }
 };
-struct FreeU32
-{
-    void operator()(uint32_t* p) const { if (p) pos2gpu::streaming_free_pinned_uint32(p); }
-};
-using PinnedU64 = std::unique_ptr<uint64_t, FreeU64>;
-using PinnedU32 = std::unique_ptr<uint32_t, FreeU32>;
+using PinnedU64 = std::unique_ptr<uint64_t, FreePinned<uint64_t, pos2gpu::streaming_free_pinned_uint64>>;
+using PinnedU32 = std::unique_ptr<uint32_t, FreePinned<uint32_t, pos2gpu::streaming_free_pinned_uint32>>;
 
 uint64_t device_peak(int k, std::string const& tier)
 {
@@ -192,6 +194,9 @@ struct GpuProducer::Impl
             throw std::invalid_argument("same-file GPU growth does not permit XCHPLOT2_SPILL_T1META disk offload");
         pos2gpu::bind_current_device(options.device_id);
         capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
+        for (auto* buffer : {&output, &meta, &t3, &t2_meta}) buffer->get_deleter().bytes = capacity * sizeof(uint64_t);
+        transfer.get_deleter().bytes = transfer_capacity() * sizeof(uint64_t);
+        for (auto* buffer : {&keys, &xbits}) buffer->get_deleter().bytes = capacity * sizeof(uint32_t);
         queue = &pos2gpu::sycl_backend::queue();
         locked_output = locked_host_allocations(*queue);
         // Match production admission: discard earlier cached scratch before
@@ -335,18 +340,14 @@ struct GpuProducer::Impl
             // later resources after the first error.
             cleanup("GPU generation queue", [&] { queue->wait_and_throw(); });
             cleanup("GPU copy queue", [&] { copy_queue->wait_and_throw(); });
-            cleanup("GPU device output", [&]
-            {
-                sycl::free(device_output, *queue);
-                device_output = nullptr;
-            });
-            cleanup("GPU compact output", [&]
-            {
-                if (device_packed) sycl::free(device_packed, *queue);
-                device_packed = nullptr;
-            });
+            pos2gpu::release_gpu_memory("GPU device output", capacity * sizeof(uint64_t), &pos2gpu::GpuCleanupCharges::device,
+                [&] { sycl::free(device_output, *queue); });
+            if (device_packed)
+                pos2gpu::release_gpu_memory("GPU compact output", packed_scratch_words * sizeof(uint64_t),
+                    &pos2gpu::GpuCleanupCharges::device, [&] { sycl::free(device_packed, *queue); });
         }
-        cleanup("two-phase scratch", [&] { pos2gpu::sycl_backend::release_twophase_scratch(*queue); });
+        if (pos2gpu::gpu_cleanup_charges) pos2gpu::sycl_backend::retire_worker_twophase_scratch(*queue);
+        else cleanup("two-phase scratch", [&] { pos2gpu::sycl_backend::release_twophase_scratch(*queue); });
     }
 
     void check_generation() const
@@ -442,8 +443,9 @@ struct GpuProducer::Impl
     {
         if (!buffer) return;
         queue->wait_and_throw();
-        pos2gpu::streaming_free_pinned_uint64(buffer.get());
-        (void)buffer.release();
+        auto* owned = buffer.release();
+        pos2gpu::checked_gpu_free(buffer.get_deleter().bytes, &pos2gpu::GpuCleanupCharges::host,
+            [&] { pos2gpu::streaming_free_pinned_uint64(owned); });
     }
 
     uint64_t retained() const
@@ -561,15 +563,23 @@ void GpuProducer::release_host_output()
     impl_->prepared_borrowed_output = false;
     wall.complete = true;
 }
-std::string GpuProducer::device_loss(std::exception_ptr failure)
+std::string GpuProducer::device_loss(std::exception_ptr failure, std::string_view backend)
 {
+    auto device_error = [&](char const* what) -> std::string
+    {
+        auto const native = pos2gpu::lost_gpu_backend(what);
+        if (native.empty()) return {};
+        if (native != backend) { pos2gpu::record_async_error(what); return {}; }
+        auto const message = std::string_view(what);
+        return std::string(message.substr(message.size() > 240 ? message.size() - 240 : 0));
+    };
     try { if (failure) std::rethrow_exception(failure); }
     catch (sycl::exception const& e) {
-        if (pos2gpu::is_gpu_device_loss(e.what())) return std::string(e.what()).substr(0, 240);
+        return device_error(e.what());
     }
     catch (pos2gpu::InsufficientVramError const& e) {
         // An allocation can surface a pre-existing terminal driver error.
-        if (pos2gpu::is_gpu_device_loss(e.what())) return std::string(e.what()).substr(0, 240);
+        return device_error(e.what());
     }
     catch (...) {}
     return {};

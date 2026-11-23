@@ -309,6 +309,49 @@ void repartition_and_global_admission()
         else engine.finish();
         require(contents(paths[destination]) == contents(reference), "owner scratch repartition changed canonical publication");
     }
+    // Feed the next external group through the same asynchronous contribution
+    // receiver as fill. Its full output writer stays fenced until the predecessor releases it.
+    {
+        auto target = ScratchRoot::inspect(directory.path); target.device = {"target", {"target"}, false, true};
+        std::vector<ScratchRoot> scratch;
+        for (std::string name : {"left", "right"})
+        {
+            auto const path = directory.path / name; fs::create_directory(path);
+            auto root = ScratchRoot::inspect(path); root.device = {name, {name}, false, true};
+            scratch.push_back(std::move(root));
+        }
+        ScratchPool pool(scratch, 0);
+        require(pool.try_reserve_output(0, target, cfg.capacity_bytes) && pool.try_reserve_output(1, target, cfg.capacity_bytes),
+            "successor test could not reserve both target files");
+        pool.seal_recovery();
+        require(pool.grant(0, cfg.capacity_bytes, cfg.capacity_bytes, mib, 2).has_value(), "old writer lost its scratch");
+        auto old = pool.try_io(0);
+        auto grant = pool.grant(1, cfg.capacity_bytes, cfg.capacity_bytes, mib, 2);
+        require(old && grant && !pool.try_io(1), "same-output owners acquired two full writer leases");
+        GroupSuccessor next(directory.path / "next-contributions.gplot", requested, batch, cfg.capacity_bytes);
+        next.io = pool.try_stage_io(1); require(bool(next.io), "disjoint successor staging was unavailable");
+        next.engine = std::make_unique<Construction>(next.path.string(), cfg, false, initial, "external", grant);
+        next.engine->confirm_identity(true);
+        Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        next.contribution_bytes = producer.contribution_bytes(cfg, batch);
+        ControllerWake wake; std::atomic<bool> cancel{true};
+        std::unique_ptr<ExternalEngine::ContributionInput> input;
+        auto stopped = receive_successor_contributions(next, args, backend, producer.fixed, 0, wake, cancel, input);
+        bool cancelled = false;
+        try { (void)stopped.get(); } catch (std::exception const&) { cancelled = true; }
+        input.reset();
+        require(cancelled && !next.engine->external->committed_member_count(), "cancelled provisional input changed the successor");
+        cancel.store(false);
+        auto receiving = receive_successor_contributions(next, args, backend, producer.fixed, 0, wake, cancel, input);
+        auto const received = receiving.get();
+        require(received.members == batch && received.peak <= args.max_ram && !next.engine->external->committed_member_count(),
+            "successor contributions did not finish privately inside the RAM bound");
+        next.io.reset(); require(!pool.try_io(1), "received successor bypassed its predecessor's publication fence");
+        old.reset(); auto writing = pool.try_io(1); require(bool(writing), "published predecessor kept the successor fenced");
+        require(next.engine->append(*input, batch, true).accepted, "ordinary handoff rejected the sealed successor");
+        input.reset(); next.engine->finish();
+        require(contents(next.path) == contents(reference), "asynchronous external successor differs from the canonical group");
+    }
     // Network receivers already own compact words; they do not pass through
     // CompactMemberBuilder, which alone populates the producer prefix cache.
     // Transfer a real prefetched group and then exercise the single-owner
@@ -539,6 +582,11 @@ void private_local_delegation(std::optional<fs::path> retained = {})
 {
     using namespace grow_controller_test;
     PrivateLocalSchedule model(3, 100);
+    // A previous GPU lane may already be retrying while the next lane is
+    // still being constructed. No probe may inspect this partial schedule.
+    model.devices.emplace_back();
+    require(!model.reserve_probe(1), "a recovery probe used an unpublished private schedule");
+    model.devices.clear();
     model.devices.resize(2);
     auto& fast = model.devices[0]; auto& slow = model.devices[1];
     PrivateLocalSchedule::Shape shape{18, 2, 1, pool::GenerationOutput::Packed};

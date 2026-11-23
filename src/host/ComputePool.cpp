@@ -15,6 +15,14 @@
 
 namespace group_grow::pool
 {
+std::string gpu_recovery_reason(std::string text)
+{
+    // Driver status is printed on terminals on the owner as well as the worker.
+    // Keep a bounded ASCII line even when a peer sends arbitrary diagnostics.
+    if (text.size() > 240) text.erase(0, text.size() - 240);
+    for (char& c : text) if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) c = ' ';
+    return text;
+}
 void write_worker_hardware(Writer& out, WorkerHardware const& value)
 {
     out.string(value.host); out.string(value.gpu_identity);
@@ -414,7 +422,7 @@ uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& ta
             {
                 auto count = reader.u8(); require(count <= max_status_page_size && count <= admission.registered,
                     "invalid GPU recovery count");
-                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), reader.string(240)});
+                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), gpu_recovery_reason(reader.string(240))});
             }
             availability->admission = admission;
             *roster = std::move(snapshot);
@@ -557,7 +565,7 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
             value.hardware = read_worker_hardware(in);
-            if (recovery) value.gpu_recovery = in.string(240);
+            if (recovery) value.gpu_recovery = gpu_recovery_reason(in.string(240));
             result.worker_records.push_back(std::move(value));
         }
         else if (result.section == StatusSection::Owners)
@@ -1482,7 +1490,7 @@ struct BrokerServer::Impl
             bool retain_route = operation == Operation::RegisterWorkerRoute;
             if (operation == Operation::RegisterGpuRecovery)
             {
-                auto const flag = reader.u8(); offer.gpu_recovery = reader.string(240);
+                auto const flag = reader.u8(); offer.gpu_recovery = gpu_recovery_reason(reader.string(240));
                 require(flag <= 1 && !offer.capacity.gpu_bytes && !offer.gpu_recovery.empty() &&
                     (offer.capabilities & capability(Kind::GenerateGpu)), "invalid withdrawn GPU registration");
                 retain_route = flag;

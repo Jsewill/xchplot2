@@ -7,6 +7,8 @@
 namespace worker_gpu_test
 {
 inline bool child = false;
+inline constexpr uint64_t failed_host_free = 1ull << 20, failed_device_free = 40ull << 20;
+inline std::atomic<bool> lose_preflight{false};
 inline std::filesystem::path directory()
 {
     auto const* path = std::getenv("XCHPLOT2_TEST_GPU_STATE");
@@ -40,12 +42,26 @@ struct GpuProducer::Impl
     int k, strength, device;
     std::atomic<bool> borrowed{false};
     std::vector<uint64_t> words;
+    bool fail_cleanup = false;
 };
 GpuProducer::GpuProducer(int k,int strength,GpuProducerOptions options)
     : impl_(new Impl{k,strength,options.device_id}) {}
-GpuProducer::~GpuProducer() = default;
+GpuProducer::~GpuProducer()
+{
+    if (!impl_->fail_cleanup) return;
+    auto fail = [] { throw std::runtime_error("injected driver deallocation failure"); };
+    pos2gpu::release_gpu_memory("test pinned output", worker_gpu_test::failed_host_free, &pos2gpu::GpuCleanupCharges::host, fail);
+    pos2gpu::release_gpu_memory("test device output", worker_gpu_test::failed_device_free, &pos2gpu::GpuCleanupCharges::device, fail);
+    pos2gpu::release_gpu_memory("test remaining allocation", 4096, &pos2gpu::GpuCleanupCharges::device,
+        [] { worker_gpu_test::mark("last-free-attempted"); });
+}
 GpuProducerPreflight GpuProducer::preflight(int k, int, GpuProducerOptions const& options)
 {
+    if (worker_gpu_test::lose_preflight.exchange(false))
+    {
+        pos2gpu::record_async_error("ZE_RESULT_ERROR_DEVICE_LOST");
+        throw std::runtime_error("device lost during preflight");
+    }
     if (k != 18 || options.max_vram_bytes < (16ull<<20)) throw pos2gpu::InsufficientVramError("insufficient test VRAM");
     return {"pool", 12ull<<20, 16ull<<20, 16ull<<20, pos2gpu::list_gpu_devices().at(options.device_id).physical_identity};
 }
@@ -59,7 +75,7 @@ void GpuProducer::release_host_output() {}
 std::string const& GpuProducer::tier() const { static std::string const value = "pool"; return value; }
 bool GpuProducer::compact_transfer_available() const { return false; }
 void GpuProducer::wait_for_output() {}
-std::string GpuProducer::device_loss(std::exception_ptr) { return {}; } // fixture injects real async records
+std::string GpuProducer::device_loss(std::exception_ptr, std::string_view) { return {}; } // fixture injects real async records
 GpuProducer::BorrowedFragments::BorrowedFragments(std::span<uint64_t const> words,std::atomic<bool>& held)
     : fragments_(words), borrowed_(&held) { held.store(true); }
 GpuProducer::BorrowedFragments::~BorrowedFragments() { if (borrowed_) borrowed_->store(false); }
@@ -75,6 +91,7 @@ std::vector<uint64_t> GpuProducer::generate(std::array<uint8_t,32> const& id)
     if (pos2gpu::async_error_count()) throw std::runtime_error("synthetic device retained an async error");
     if (!impl_->device && !worker_gpu_test::child && id[0] == 0xfd)
     {
+        impl_->fail_cleanup = true;
         pos2gpu::record_async_error("ZE_RESULT_ERROR_DEVICE_LOST");
         throw std::runtime_error("generation failed after an asynchronous error");
     }
@@ -94,6 +111,14 @@ uint64_t GpuProducer::generate_into(std::array<uint8_t,32> const& id,
     std::function<void(std::span<uint64_t const>,uint64_t)> const& sink)
 {
     group_tools::require(worker_gpu_test::child && impl_->device == 0, "recovery reused the failed process or wrong GPU");
+    if (id[0] == 0xfb)
+    {
+#ifdef _WIN32
+        std::_Exit(73);
+#else
+        std::raise(SIGKILL);
+#endif
+    }
     if (id[0] == 0xfc)
     { worker_gpu_test::mark("child-started"); std::this_thread::sleep_for(std::chrono::seconds(60)); }
     auto result = generate(id);
@@ -157,6 +182,7 @@ inline void recovery(bool network)
         uint64_t count = 0; worker.generate_local(18,2,key,[&](auto const&,uint64_t total) { count = total; },cancel,kind);
         require(count, "worker produced no fragments");
     };
+    require(pool::gpu_recovery_reason("lost\n\x1b[2J") == "lost  [2J", "peer GPU diagnostics contain terminal controls");
     auto const kind = pool::Kind::GenerateGpu;
     {
         auto cuda = std::make_shared<pos2gpu::AsyncErrorLog>();
@@ -166,10 +192,16 @@ inline void recovery(bool network)
         pos2gpu::ScopedAsyncErrors use(cuda);
         pos2gpu::record_async_error("driver event wait failed (error code = ze:1879048193)");
         require(!cuda->count && ze->count == 1, "a foreign queue mistook a Level Zero fault for a CUDA fault");
+        auto idle = std::make_shared<pos2gpu::AsyncErrorLog>();
+        pos2gpu::WorkerErrorRegistration c(*idle,"level_zero",[] {});
+        pos2gpu::ScopedAsyncErrors late(idle);
+        pos2gpu::record_async_error("ZE_RESULT_ERROR_DEVICE_LOST");
+        require(idle->count == 1 && ze->count == 2, "late device loss skipped its own reporting queue");
     }
     rejects([&] { generate(service,kind,0xfe); });
     require(service.status().gpu_recovery.empty() && service.status().capacity.gpu_bytes, "an allocation failure withdrew the GPU");
     generate(service,kind,41);
+    auto const baseline = service.status().baseline_host_bytes;
     std::atomic<bool> entered{false}, release{false};
     struct Release { std::atomic<bool>& value; ~Release() { value.store(true); } };
     auto pending = std::async(std::launch::async,[&] {
@@ -183,6 +215,8 @@ inline void recovery(bool network)
     wait_until([&] { return entered.load(); }, "CPU task never began");
     rejects([&] { generate(service,kind,0xfd); });
     auto status = service.status();
+    require(std::filesystem::exists(directory.path / "last-free-attempted") &&
+        status.baseline_host_bytes == baseline + failed_host_free, "failed frees skipped cleanup or released uncertain host pages");
     require(status.admission == pool::WorkerAdmission::Accepting && status.accepted_tasks == 1 && !status.capacity.gpu_bytes &&
         status.capacity.cpu_threads > 0 && status.gpu_recovery == "ZE_RESULT_ERROR_DEVICE_LOST" &&
         !service.local_generation_offer(18,2,1).demand.slots, "fault did not withdraw only the GPU");
@@ -213,7 +247,8 @@ inline void recovery(bool network)
     require(paused.admission == pool::WorkerAdmission::Paused && !paused.gpu_recovery.empty(), "operator pause masked device loss");
     service.control(WorkerControl::Resume);
     wait_until([&] { return service.status().capacity.gpu_bytes; }, "verified fresh GPU was never re-admitted");
-    require(service.status().capacity.gpu_bytes == (32ull<<20) && service.status().gpu_recovery.empty() &&
+    require(service.status().capacity.gpu_bytes == (64ull<<20) - failed_device_free &&
+        service.status().baseline_host_bytes == baseline + failed_host_free && service.status().gpu_recovery.empty() &&
         service.local_generation_offer(18,2,1).demand.slots == 1, "recovery ignored live GPU capacity");
     if (network)
         wait_until([&] { auto peers = routes(); return peers && peers->recovering_gpus.empty() &&
@@ -226,5 +261,26 @@ inline void recovery(bool network)
     stop.store(true);
     require(cancelled.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "cancelled child stayed active"); cancelled.get();
     require(service.status().capacity.gpu_bytes, "cancellation withdrew a healthy GPU");
+    rejects([&] { generate(service,kind,0xfb); });
+    auto crashed = service.status();
+    require(!crashed.capacity.gpu_bytes && (crashed.gpu_recovery.find("signal ") != std::string::npos ||
+        crashed.gpu_recovery.find("exit") != std::string::npos), "an exited GPU child stayed advertised");
+    wait_until([&] { return service.status().capacity.gpu_bytes; }, "a crashed recovery child was never reprobed");
+    generate(service,kind,42);
+
+    auto startup = options; startup.broker = {}; startup.brokers.clear();
+    std::atomic<unsigned> before_publish{0}; std::atomic<bool> published{false};
+    startup.reserve_gpu_probe = [&](uint64_t) -> std::shared_ptr<void> {
+        if (!published.load()) { ++before_publish; return {}; }
+        return std::make_shared<int>(1);
+    };
+    lose_preflight.store(true); WorkerService interrupted(startup);
+    require(!interrupted.status().capacity.gpu_bytes && interrupted.status().capacity.cpu_threads,
+        "preflight device loss removed CPU capacity");
+    wait_until([&] { return before_publish.load(); }, "preflight fault skipped private probe admission");
+    require(!interrupted.status().capacity.gpu_bytes, "private probe bypassed the shared RAM grant");
+    published.store(true);
+    wait_until([&] { return interrupted.status().capacity.gpu_bytes; }, "worker could not recover without an original GPU profile");
+    generate(interrupted,kind,42);
 }
 }

@@ -7,6 +7,7 @@
 // CUDA host code share the same primary CUDA context).
 
 #include "host/GpuBufferPool.hpp"
+#include "host/GpuCleanup.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
@@ -312,16 +313,6 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     // d_storage + d_pair_a have already succeeded) frees the pre-allocated
     // buffers instead of leaking ~10 GB of device VRAM and ~7 GB of host
     // pinned memory per failed pool ctor across a batch retry loop.
-    auto cleanup_partial = [&]{
-        if (d_storage)       { sycl::free(d_storage,      q); d_storage      = nullptr; }
-        if (d_pair_a)        { sycl::free(d_pair_a,       q); d_pair_a       = nullptr; }
-        if (d_pair_b)        { sycl::free(d_pair_b,       q); d_pair_b       = nullptr; }
-        if (d_sort_scratch)  { sycl::free(d_sort_scratch, q); d_sort_scratch = nullptr; }
-        if (d_counter)       { sycl::free(d_counter,      q); d_counter      = nullptr; }
-        for (int i = 0; i < kNumPinnedBuffers; ++i) {
-            if (h_pinned_t3[i]) { sycl::free(h_pinned_t3[i], q); h_pinned_t3[i] = nullptr; }
-        }
-    };
     try {
         d_storage      = sycl_alloc_device_or_throw(storage_bytes,      q, "d_storage");
         // d_pair_a is allocated lazily in ensure_pair_a(), called by
@@ -338,7 +329,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
         // touch slot 0 so the other two 2.2 GB malloc_host calls
         // aren't paid at all.
     } catch (...) {
-        cleanup_partial();
+        release_allocations();
         throw;
     }
 }
@@ -357,8 +348,8 @@ void GpuBufferPool::release_pair_a()
 {
     std::lock_guard<std::mutex> lk(pair_a_mu_);
     if (!d_pair_a) return;
-    sycl::free(d_pair_a, sycl_backend::queue());
-    d_pair_a = nullptr;
+    auto* owned = std::exchange(d_pair_a, nullptr);
+    checked_gpu_free(pair_a_bytes, &GpuCleanupCharges::device, [&] { sycl::free(owned, sycl_backend::queue()); });
 }
 
 uint64_t* GpuBufferPool::ensure_pinned(int idx)
@@ -390,21 +381,24 @@ void GpuBufferPool::release_pinned(int idx)
     if (!h_pinned_t3[idx]) return;
     sycl::queue& q = sycl_backend::queue();
     q.wait_and_throw();
-    sycl::free(h_pinned_t3[idx], q);
-    h_pinned_t3[idx] = nullptr;
+    auto* owned = std::exchange(h_pinned_t3[idx], nullptr);
+    checked_gpu_free(pinned_bytes, &GpuCleanupCharges::host, [&] { sycl::free(owned, q); });
 }
 
-GpuBufferPool::~GpuBufferPool()
+GpuBufferPool::~GpuBufferPool() { release_allocations(); }
+
+void GpuBufferPool::release_allocations() noexcept
 {
-    sycl::queue& q = sycl_backend::queue();
-    if (d_storage)       sycl::free(d_storage,      q);
-    if (d_pair_a)        sycl::free(d_pair_a,       q);
-    if (d_pair_b)        sycl::free(d_pair_b,       q);
-    if (d_sort_scratch)  sycl::free(d_sort_scratch, q);
-    if (d_counter)       sycl::free(d_counter,      q);
-    for (int i = 0; i < kNumPinnedBuffers; ++i) {
-        if (h_pinned_t3[i]) sycl::free(h_pinned_t3[i], q);
-    }
+    auto release = [](auto*& pointer, uint64_t bytes, auto kind) {
+        if (auto* owned = std::exchange(pointer, nullptr))
+            release_gpu_memory("GPU buffer pool", bytes, kind, [&] { sycl::free(owned, sycl_backend::queue()); });
+    };
+    release(d_storage, storage_bytes, &GpuCleanupCharges::device);
+    release(d_pair_a, pair_a_bytes, &GpuCleanupCharges::device);
+    release(d_pair_b, pair_b_bytes, &GpuCleanupCharges::device);
+    release(d_sort_scratch, sort_scratch_bytes, &GpuCleanupCharges::device);
+    release(d_counter, sizeof(uint64_t), &GpuCleanupCharges::device);
+    for (auto& pointer : h_pinned_t3) release(pointer, pinned_bytes, &GpuCleanupCharges::host);
 }
 
 #ifdef XCHPLOT2_HAVE_CUB
