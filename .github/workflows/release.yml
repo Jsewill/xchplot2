@@ -364,7 +364,11 @@ jobs:
             register_qualification_groups()
           endif()
           '@.Replace('@REPO@',$repo) | Set-Content 'build/diagnostic-groups.cmake'
-          cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$repo/build/qa-tls/install" -DOPENSSL_USE_STATIC_LIBS=ON
+          $tls = "$repo/build/qa-tls/install"
+          $crypto = "$tls/lib/libcrypto.lib"
+          $ssl = "$tls/lib/libssl.lib"
+          foreach ($file in $crypto, $ssl, "$tls/include/openssl/ssl.h") { if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "TLS cache lacks $file" } }
+          cmake -S . -B build/qa-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXCHPLOT2_HOST_TESTS_ONLY=ON "-DCMAKE_PROJECT_INCLUDE=$repo/build/diagnostic-groups.cmake" "-DOPENSSL_ROOT_DIR=$tls" -DOPENSSL_USE_STATIC_LIBS=ON "-DLIB_EAY_RELEASE:FILEPATH=$crypto" "-DSSL_EAY_RELEASE:FILEPATH=$ssl" "-DLIB_EAY:FILEPATH=$crypto" "-DSSL_EAY:FILEPATH=$ssl"
           $targets = @('cli_host_test','group_calibration_process_test','compute_membership_test','pos2_pr118_grow_inventory_test','pos2_pr118_grow_retirement_test','pos2_pr118_grow_worker_test','pos2_pr118_grow_worker_client_test','pos2_pr118_grow_pool_codec_test','pos2_pr118_grow_pool_owner_test')
           cmake --build build/qa-host --parallel 4 --target $targets
       - name: Run standalone authenticated network checks
