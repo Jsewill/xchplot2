@@ -811,13 +811,12 @@ bool Channel::peer_closed()
     try { ssl_failure(impl_->ssl, result, error, error_number); }
     catch (TransientTransport const&) { return true; }
 }
-uint32_t Channel::ingress_interface() const noexcept
+static uint32_t socket_ingress(SocketHandle fd) noexcept
 {
-    if (!impl_) return 0;
     try
     {
         uint32_t index = 0; bool ambiguous = false, local_peer = false;
-        socket_interface(impl_->fd, [&](auto const& item, int)
+        socket_interface(fd, [&](auto const& item, int)
         {
             uint32_t physical = 0;
 #ifdef _WIN32
@@ -841,6 +840,19 @@ uint32_t Channel::ingress_interface() const noexcept
     }
     catch (...) { return 0; }
 }
+uint32_t Channel::ingress_interface() const noexcept
+{ return impl_ ? socket_ingress(impl_->fd) : 0; }
+static std::string socket_local_address(SocketHandle fd)
+{
+    sockaddr_storage address{}; AddressSize length = sizeof(address);
+    std::array<char, NI_MAXHOST> host{};
+    if (!::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) &&
+        !::getnameinfo(reinterpret_cast<sockaddr*>(&address), length, host.data(), host.size(), nullptr, 0, NI_NUMERICHOST))
+        return host.data();
+    return {};
+}
+std::string Channel::local_address() const
+{ return impl_ ? socket_local_address(impl_->fd) : std::string{}; }
 bool Channel::generation_timing() const
 {
     unsigned char const* selected = nullptr; unsigned size = 0;
@@ -990,7 +1002,7 @@ Endpoint parse_endpoint(std::string const& value)
     require(!host.empty() && port, "endpoint requires host and nonzero port");
     return {std::move(host), uint16_t(port)};
 }
-std::string local_address(Endpoint const& endpoint)
+std::string local_address(Endpoint const& endpoint, uint32_t* physical_interface)
 {
     initialize_sockets();
     addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM;
@@ -1007,11 +1019,12 @@ std::string local_address(Endpoint const& endpoint)
         Socket socket{::socket(item->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
 #endif
         if (socket.value == invalid_socket || ::connect(socket.value, item->ai_addr, item->ai_addrlen)) continue;
-        sockaddr_storage address{}; AddressSize length = sizeof(address);
-        std::array<char, NI_MAXHOST> host{};
-        if (!::getsockname(socket.value, reinterpret_cast<sockaddr*>(&address), &length) &&
-            !::getnameinfo(reinterpret_cast<sockaddr*>(&address), length, host.data(), host.size(), nullptr, 0, NI_NUMERICHOST))
-            return host.data();
+        auto local = socket_local_address(socket.value);
+        if (!local.empty())
+        {
+            if (physical_interface) *physical_interface = socket_ingress(socket.value);
+            return local;
+        }
     }
     throw TransientTransport("cannot determine local route to broker");
 }

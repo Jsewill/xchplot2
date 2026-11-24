@@ -22,6 +22,7 @@ inline constexpr uint64_t default_codec_task_bytes = uint64_t(64) << 20;
 // ordinal, old membership/blob length and contribution/new-member counts.
 inline constexpr uint32_t codec_window_header_bytes = 4, codec_chunk_header_bytes = 18;
 enum class FailureCode : uint8_t { UnsupportedResources = 1, RefusedBeforeBegin };
+class CapacityReserved : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedResources : public std::runtime_error
 {
 public:
@@ -80,6 +81,9 @@ struct GenerationProfile
     Resources resources;
     uint64_t member_host_bytes = 0;
     uint32_t max_batch_members = 1;
+    // A worker can retain its V8 pooled-k capability while this generation
+    // profile temporarily requires a streaming tier.
+    bool independent_unavailable = false;
     bool operator==(GenerationProfile const&) const = default;
 };
 struct CodecLimits
@@ -100,6 +104,7 @@ struct WorkerHardware
     uint64_t total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, standing_host_bytes = 0, observed_at_unix_ms = 0;
     bool operator==(WorkerHardware const&) const = default;
 };
+std::string worker_diagnostic(std::string);
 void write_worker_hardware(Writer&, WorkerHardware const&);
 WorkerHardware read_worker_hardware(Reader&);
 struct WorkerOffer
@@ -118,6 +123,7 @@ struct WorkerOffer
     WorkerAdmission admission = WorkerAdmission::Accepting;
     WorkerHardware hardware;
     uint32_t independent_k_mask = 0;
+    std::string gpu_recovery; // bounded authenticated device-loss diagnostic, optional on V8
 };
 struct Task
 {
@@ -212,6 +218,7 @@ struct BrokerWorkerStatus
     WorkerAdmission admission = WorkerAdmission::Accepting;
     uint64_t seen_ms = 0;
     WorkerHardware hardware;
+    std::string gpu_recovery;
 };
 struct BrokerOwnerStatus
 {
@@ -252,12 +259,25 @@ struct GenerationRoute
     uint32_t cpu_slots = 0, gpu_slots = 0;
     bool operator==(GenerationRoute const&) const = default;
 };
+struct PublicationRoute
+{
+    std::string identity, instance;
+    Endpoint endpoint;
+    Kind kind = Kind::GenerateAny;
+    Resources resources;
+};
 struct GenerationRoster
 {
     // At most one ordinary status page. Aggregate slot counts still cover
     // the whole registry when additional rows do not fit this observation.
     std::vector<GenerationRoute> routes;
     bool complete = true;
+    struct RecoveringGpu
+    {
+        std::string host, cause;
+        bool operator==(RecoveringGpu const&) const = default;
+    };
+    std::vector<RecoveringGpu> recovering_gpus;
     bool operator==(GenerationRoster const&) const = default;
 };
 struct GenerationAdmission
@@ -301,6 +321,10 @@ public:
         std::chrono::steady_clock::time_point other_work_until = {});
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
+    using GenerationPaths = std::vector<std::pair<std::string, std::string>>;
+    bool generation_paths(OwnerSession const&, GenerationPaths const&);
+    std::optional<std::pair<std::string, Kind>> finite_packed_route(OwnerSession const&, Task const&);
+    std::optional<PublicationRoute> publication_route(OwnerSession const&, Task const&);
     struct GenerationAvailability
     {
         // Common width for planning, or the largest eligible width when
@@ -344,7 +368,7 @@ public:
     void finish(Lease const&, std::optional<CapacityUpdate> const& update = {});
     // Owner reports successful receipt and validation, independently of local
     // durable plot commit. Failure to report must not discard accepted data.
-    void delivered(Lease const&, DeliveryObservation const&);
+    void delivered(Lease const&, DeliveryObservation const&, std::string const& generation_path = {});
     // Worker rejects unsupported admission before starting compute or output.
     // A retry of this logical task skips that concrete worker/backend pair.
     void reject(Lease const&, FailureCode, std::optional<CapacityUpdate> const& update = {});
@@ -354,7 +378,11 @@ public:
     ControlMetrics metrics() const;
     static uint64_t memory_bytes(unsigned channels = control_channel_limit);
 private:
+    std::optional<std::pair<std::string, Endpoint>> register_recovering_gpu(WorkerOffer const&, bool retain_route,
+        std::string* peer_identity, std::string* peer_node_id);
     struct Connections;
+    std::vector<uint8_t> call_profiles(std::span<GenerationProfile const>, std::function<Writer(bool)> const&,
+        std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     std::vector<uint8_t> call(Writer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     Endpoint endpoint_;
     TlsOptions tls_;

@@ -226,6 +226,12 @@ void test_windows_hip_worker()
              "Windows HIP: honor this process's remaining operating-system budget");
     check_eq(windows_hip_worker_headroom(4 * MiB, 9 * MiB, MiB, 12 * MiB, MiB), 4 * MiB,
              "Windows HIP: honor a smaller runtime allowance");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 12 * MiB, 0, 12 * MiB, 11 * MiB, 6 * MiB), MiB,
+             "Windows HIP: this process cannot reclaim another process's dedicated memory");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 12 * MiB, 2 * MiB, 12 * MiB, 11 * MiB, 6 * MiB), 3 * MiB,
+             "Windows HIP: reusable allocations cannot exceed this process's WDDM usage");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 5 * MiB, 9 * MiB, 12 * MiB, 9 * MiB, 2 * MiB), 0,
+             "Windows HIP: the process remains over budget after releasing its confirmed buffers");
     check(!windows_hip_worker_headroom(9, 3, 4, 9, 1) && !windows_hip_worker_headroom(9, 8, 4, 9, 10),
           "Windows HIP: oversubscription leaves zero headroom");
 }

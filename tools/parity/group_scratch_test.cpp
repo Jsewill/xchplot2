@@ -522,6 +522,28 @@ void rotating_bandwidth(fs::path const& directory)
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
 
+    // A measured successor must fit on a separate, sufficiently fast stripe
+    // while the original final writer still owns the shared output spindle.
+    for (auto [rate, demand, measured, split] : std::array<std::tuple<long double, uint64_t, bool, bool>, 4>{{
+        {2.L, 60 * unit, true, true}, {2.1L, 60 * unit, true, false},
+        {2.L, 210 * unit, true, false}, {2.L, 60 * unit, false, false}}})
+    {
+        ScratchPool adjacent(disks, 0);
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        adjacent.set_io_governor(rates);
+        if (measured) for (auto const& disk : disks) rates->observe_transfer(disk.device, unit, unit);
+        require(adjacent.try_reserve_output(0, first, unit) && adjacent.try_reserve_output(1, first, unit),
+            "adjacent output reservations did not fit");
+        adjacent.seal_recovery();
+        auto prior = adjacent.grant(0, demand, demand, unit, 2, true, 4, unit, 4, 1, {}, false, false, rate);
+        require(prior && prior->scratch.size() == (split ? 2 : 4), "successor stripe lost capacity or measured service");
+        if (!split) continue;
+        auto packing = adjacent.try_io(0);
+        auto incoming = adjacent.grant(1, demand, demand, unit, 2, true, 4, unit, 4, 1);
+        require(packing && incoming && incoming->scratch.size() == 2 && !adjacent.try_io(1) && adjacent.try_stage_io(1),
+            "disjoint successor input could not overlap packing with its target write still fenced");
+    }
+
     ScratchPool rotating_owners(disks, 0);
     require(rotating_owners.try_reserve_output(0, first, unit) && rotating_owners.try_reserve_output(1, second, unit) &&
         rotating_owners.try_reserve_output(2, first, unit), "rotating output reservations failed");
@@ -916,10 +938,30 @@ void nvme_topology()
     require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller namespaces were accepted");
 #endif
 }
+#ifdef _WIN32
+void windows_disk_identity()
+{
+    STORAGE_DEVICE_NUMBER_EX disk{};
+    disk.Size = disk.Version = sizeof(disk);
+    disk.DeviceType = FILE_DEVICE_DISK; disk.DeviceNumber = 3;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)).empty(), "missing disk GUID established a measurement identity");
+    disk.DeviceGuid.Data1 = 1;
+    auto const original = storage_detail::disk_guid(3, disk, sizeof(disk));
+    require(original.size() == 32, "Windows disk GUID missing from measurement identity");
+    ++disk.DeviceGuid.Data1;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)) != original,
+        "Windows disk number reuse retained the previous measurement identity");
+    require(storage_detail::disk_guid(4, disk, sizeof(disk)).empty() &&
+        storage_detail::disk_guid(3, disk, sizeof(disk) - 1).empty(), "mismatched or short Windows disk identity was accepted");
+    disk.DeviceNumber = MAXDWORD;
+    require(storage_detail::disk_guid(MAXDWORD, disk, sizeof(disk)).empty(), "an MPIO path established a physical disk identity");
+}
+#endif
 int main() try
 {
     nvme_topology();
 #ifdef _WIN32
+    windows_disk_identity();
     fs::path directory;
     std::random_device random;
     for (unsigned attempt = 0; attempt < 32; ++attempt)

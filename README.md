@@ -132,9 +132,18 @@ shared job. You can add a helper while the plotter is running.
 1. On the pool administrator, run `xchplot2 compute invite helper.invite --name helper`.
 2. Transfer that invitation privately to the helper and run `xchplot2 compute setup helper.invite` there.
 3. Open **Workers** in the dashboard to see when the helper becomes eligible
-   and when it delivers its first validated work. The owner adjusts new
-   assignments while existing work finishes. Press `a` in the dashboard to
-   bring up these commands.
+   and when it delivers its first validated work. Press `a` in the
+   dashboard to bring up these commands.
+
+For one group, one drive or a whole farm, the scheduler aims to finish the
+last requested file as soon as possible. It uses observed generation,
+transfer, encoding and storage times to assign work, and adjusts those
+assignments as workers join, leave or change how much work they can take.
+GPU workers update the plot sizes they can produce as other applications
+take or release video memory. A helper on a slow link can shorten
+a large fill even when a small job would finish before its first member
+arrived. The Overview and final summary show elapsed seconds per newly
+published member. A resumed job counts inherited members separately.
 
 For a temporary helper, `xchplot2 compute worker --join helper.invite` runs
 in the foreground. For broker discovery, direct addresses and firewall ports,

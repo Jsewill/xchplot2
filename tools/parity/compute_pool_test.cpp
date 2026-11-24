@@ -170,7 +170,11 @@ void transport(TlsOptions server_tls, TlsOptions const& client_tls, TlsOptions c
         auto channel = listener.accept(1000); require(bool(channel), "echo connection missing");
         auto frame = channel.receive(); channel.send(frame.type, frame.payload); return channel.peer_identity();
     });
-    auto channel = Channel::connect(listener.endpoint(), client_tls, identity); Writer message; message.string("direct result");
+    auto channel = Channel::connect(listener.endpoint(), client_tls, identity);
+    uint32_t ingress = UINT32_MAX;
+    require(local_address(listener.endpoint(), &ingress) == channel.local_address() && ingress == channel.ingress_interface(),
+        "the route forecast did not match the authenticated loopback socket");
+    Writer message; message.string("direct result");
     channel.send(Message::Data, message.data()); auto frame = channel.receive();
     require(frame.type == Message::Data && frame.payload == message.data(), "direct payload changed");
     require(echo.get() == certificate_identity(client_tls.cert_file), "direct owner identity changed"); channel.close();
@@ -409,13 +413,20 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto legacy = std::async(std::launch::async, [&]
     {
         auto channel = listener.accept(3000);
-        for (auto operation : {19, 18, 18, 2, 2, 2})
+        for (auto operation : {23, 19, 18, 18, 2, 2, 2, 25, 2, 1, 24, 2, 26, 8, 23, 19, 18, 2, 2})
         {
             auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
             require(frame.type == Message::Control && input.u32() == 8 && input.u8() == operation,
                 "client repeated an unsupported broker operation");
-            if (operation == 19)
+            if (operation == 23 || operation == 19 || operation == 24 || operation == 25 || operation == 26)
             { reply.u8(1); reply.string("unknown broker operation"); channel.send(Message::Error, reply.data()); }
+            else if (operation == 8)
+                channel.send(Message::Reply, reply.data());
+            else if (operation == 1)
+            {
+                reply.string("new-owner"); reply.string("new-session"); reply.string("epoch"); reply.u64(2);
+                channel.send(Message::Reply, reply.data());
+            }
             else if (operation == 18)
             {
                 reply.u32(3); reply.u32(1); reply.u32(0); reply.u8(1);
@@ -442,7 +453,45 @@ void older_generation_hints(TlsOptions const& server_tls, TlsOptions const& clie
     auto bounded = owner.with_deadline(until);
     require(!bounded.acquire(session, request, until) && !bounded.acquire(session, request, until),
         "older broker backlog fallback changed queued work");
+    auto const finite = std::chrono::steady_clock::now();
+    auto packed = request; packed.work_units = 3;
+    require(!owner.finite_packed_route(session, packed) && !owner.acquire(session, request, finite),
+        "older broker lost ordinary placement after declining finite pricing");
+    session = owner.open_owner("new-owner");
+    require(!owner.acquire(session, request, finite) && !owner.finite_packed_route(session, packed),
+        "finite generation did not renegotiate on a new owner session");
+    std::string const path(64, 'd');
+    require(!owner.generation_paths(session, {{"old-worker", path}}), "an older broker accepted scoped paths");
+    owner.delivered(Lease{}, {1, 4, 32}, path);
+    require(owner.generation_hint(session, request, &slots, &availability, {}, &roster) == 3 && !roster &&
+        !bounded.acquire(session, request, until), "new session lost the older broker's capacity fallback");
     legacy.get();
+    Listener successor({"127.0.0.1", 0}, server_tls);
+    auto upgraded = std::async(std::launch::async, [&]
+    {
+        auto channel = successor.accept(3000); auto frame = channel.receive(); Reader input(frame.payload); Writer reply;
+        require(frame.type == Message::Control && input.u32() == 8 && input.u8() == 25, "new endpoint skipped finite pricing");
+        reply.string("known-worker"); reply.u8(uint8_t(Kind::GenerateGpu)); channel.send(Message::Reply, reply.data());
+        frame = channel.receive(); Reader hints(frame.payload);
+        require(hints.u32() == 8 && hints.u8() == 23, "new endpoint skipped detailed worker admission");
+        reply.clear(); reply.u32(0); reply.u32(0); reply.u32(0); reply.u8(0);
+        for (unsigned n = 1; n <= max_generation_batch_members; ++n) reply.u32(0);
+        reply.u8(1); reply.u8(0); // complete roster, no eligible routes
+        reply.u32(0); reply.u32(0); reply.u32(0); reply.u32(0);
+        for (auto count : GenerationAdmission{}.waiting) reply.u32(count);
+        reply.u8(0); channel.send(Message::Reply, reply.data());
+        frame = channel.receive(); Reader acquire(frame.payload), backlog(std::span<uint8_t const>(frame.payload).last(4));
+        require(acquire.u32() == 8 && acquire.u8() == 2 && backlog.u32() > 0, "new endpoint lost the owner's work horizon");
+        reply.clear(); reply.u8(0); channel.send(Message::Reply, reply.data());
+    });
+    owner.reroute(successor.endpoint());
+    auto choice = owner.finite_packed_route(session, packed);
+    require(choice && choice->first == "known-worker", "an old broker disabled its replacement's placement API");
+    auto const horizon = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    require(!owner.generation_hint(session, request, &slots, &availability, {}, &roster) && roster && roster->complete &&
+        availability.admission && !owner.with_deadline(horizon).acquire(session, request, horizon),
+        "a rerouted owner failed to discover its new broker's roster or queue");
+    upgraded.get();
 }
 
 void selection(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls, TlsOptions const& second_tls)
@@ -509,6 +558,54 @@ void concrete_resources(BrokerOptions options, TlsOptions const& owner_tls, TlsO
     auto missing = task("unspecified", 6); missing.resources.host_bytes = 0;
     rejects([&] { (void)owner.acquire(session, missing); });
 }
+void publication_route(BrokerOptions options, TlsOptions const& owner_tls,
+                       TlsOptions const& first_tls, TlsOptions const& second_tls)
+{
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls);
+    auto const session = owner.open_owner("publication-route");
+    auto hybrid = offer("hybrid", 45001); hybrid.capacity = {2, 1, 8192, 4096};
+    hybrid.capabilities |= capability(Kind::GenerateGpu);
+    hybrid.generation_profiles = {profile(Kind::GenerateGpu), profile(Kind::GenerateCpu)};
+    for (auto& profile : hybrid.generation_profiles) { profile.max_batch_members = 3; profile.member_host_bytes = 512; }
+    first.register_worker(hybrid);
+    auto request = task("terminal"); request.kind = Kind::GenerateAny; request.work_units = 3;
+    auto const quote = owner.publication_route(session, request);
+    require(quote && quote->instance == hybrid.instance && quote->endpoint == hybrid.endpoint &&
+        quote->kind == Kind::GenerateGpu && quote->resources == Resources{1, 1, 2048, 2048},
+        "a single-slot hybrid did not quote its eligible full-width default generation shape");
+    request.generation_output = GenerationOutput::Fresh;
+    auto const lease = owner.acquire(session, request);
+    require(lease && lease->worker_identity == quote->identity && lease->task.kind == quote->kind &&
+        lease->task.resources == quote->resources, "a cold paid grant did not match its full-width publication quote");
+    request.generation_output = GenerationOutput::Packed;
+    require(!owner.publication_route(session, request), "a live signed lease was priced as idle capacity");
+    owner.cancel(session, request.task_id, request.attempt);
+    ++hybrid.capacity_revision; hybrid.generation_profiles.front().max_batch_members = 1;
+    first.register_worker(hybrid);
+    auto const cpu = owner.publication_route(session, request);
+    require(cpu && cpu->kind == Kind::GenerateCpu && cpu->resources == Resources{1, 1, 2048, 0},
+        "a full-width CPU offer was hidden by an ineligible single-member GPU tier");
+    second.register_worker(offer("another-lane", 45002));
+    require(!owner.publication_route(session, request), "a competing worker lane was priced as a single paid route");
+    second.unregister_worker("another-lane");
+    ++hybrid.capacity_revision; hybrid.capacity.slots = 2; hybrid.capacity.gpu_bytes = 2048;
+    first.register_worker(hybrid);
+    require(!owner.publication_route(session, request), "a VRAM-limited GPU hid an independent CPU lane on the same worker");
+    auto gpu = task("concurrent-gpu", 2); gpu.kind = Kind::GenerateGpu;
+    auto cpu_task = task("concurrent-cpu", 3);
+    require(owner.acquire(session, gpu) && owner.acquire(session, cpu_task), "the quoted multi-lane worker could not run CPU and GPU together");
+    owner.cancel(session, gpu.task_id, gpu.attempt); owner.cancel(session, cpu_task.task_id, cpu_task.attempt);
+    ++hybrid.capacity_revision; hybrid.capacity.host_bytes = 2048;
+    for (auto& profile : hybrid.generation_profiles) { profile.resources.host_bytes = 1400; profile.member_host_bytes = 128; }
+    first.register_worker(hybrid);
+    auto constrained = owner.publication_route(session, request);
+    require(constrained && constrained->kind == Kind::GenerateCpu && constrained->resources.host_bytes == 1656,
+        "a second nominal slot without RAM for a second task hid the only feasible publication lane");
+    ++hybrid.capacity_revision; hybrid.capacity.host_bytes = 8192; hybrid.capacity.gpu_bytes = 4096;
+    first.register_worker(hybrid);
+    require(!owner.publication_route(session, request), "parallel GPU reservations were priced as a single paid route");
+}
 void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
                          TlsOptions const& small_tls, TlsOptions const& large_tls)
 {
@@ -564,6 +661,7 @@ void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
 }
 void retry_eligibility(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
+    options.lease_ms = 5000;
     RunningBroker running(options); auto endpoint = running.server.endpoint();
     BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls);
     auto gpu_offer = offer("gpu-rejection", 46001); gpu_offer.capacity.gpu_bytes = 8192;
@@ -598,12 +696,43 @@ void retry_eligibility(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     { return lease.worker_identity == certificate_identity(first_tls.cert_file) ? first : second; };
     require(worker(*disconnected).begin(*disconnected, disconnected->owner_identity), "network retry lease did not begin");
     owner.abandon(*disconnected); request.attempt = 2;
-    require(!owner.acquire(session, request), "retry released an abandoned running reservation early");
-    rejects([&] { worker(*disconnected).renew(*disconnected); });
-    worker(*disconnected).finish(*disconnected);
     auto replacement = owner.acquire(session, request);
-    require(replacement && replacement->worker_identity != disconnected->worker_identity, "network retry did not try an alternative worker");
-    owner.cancel(session, "network", 2);
+    require(replacement && replacement->worker_identity != disconnected->worker_identity &&
+        worker(*replacement).begin(*replacement, replacement->owner_identity), "network retry waited for the lost worker's lease");
+    auto third = owner.open_owner("competing-owner"); auto waiting = task("waiting");
+    require(!owner.acquire(third, waiting), "retry released the lost worker's physical reservation early");
+    stale_lease_rejects([&] { worker(*disconnected).renew(*disconnected); });
+    worker(*disconnected).finish(*disconnected);
+    bool stale = false;
+    try { owner.delivered(*disconnected, {1000000, 0, 1024}); } catch (StaleDelivery const&) { stale = true; }
+    require(stale, "late output from the abandoned worker was accepted");
+    auto next = owner.acquire(third, waiting);
+    require(next && next->worker_identity == disconnected->worker_identity, "old Finish changed the replacement reservation");
+    rejects([&] { owner.cancel(session, request.task_id, 1); });
+    worker(*replacement).renew(*replacement); worker(*replacement).finish(*replacement);
+    owner.delivered(*replacement, {1000000, 0, 1024}); owner.cancel(third, waiting.task_id, 1);
+
+    auto cancelled = task("ordinary-cancellation", 3); auto original = owner.acquire(session, cancelled);
+    require(original && worker(*original).begin(*original, original->owner_identity), "ordinary cancellation did not begin");
+    owner.cancel(session, cancelled.task_id, cancelled.attempt); ++cancelled.attempt;
+    require(!owner.acquire(session, cancelled), "ordinary cancellation detached an unacknowledged lease");
+    worker(*original).finish(*original);
+    require(bool(owner.acquire(session, cancelled)), "completed cancellation retained its reservation");
+
+    // A second attempt also needs space for its own broker record. At the
+    // configured limit the same retry waits for the lost reservation to expire.
+    options.max_tasks = 1; options.lease_ms = 800;
+    RunningBroker limited(options); auto address = limited.server.endpoint();
+    BrokerClient client(address, owner_tls), lost(address, first_tls), survivor(address, second_tls);
+    lost.register_worker(offer("bounded-lost", 46003)); auto active = client.open_owner("bounded-retry");
+    auto work = task("bounded"); auto held = client.acquire(active, work);
+    require(held && lost.begin(*held, held->owner_identity), "bounded lost worker did not begin");
+    survivor.register_worker(offer("bounded-survivor", 46004)); client.abandon(*held); ++work.attempt;
+    require(!client.acquire(active, work) && client.status({StatusSection::Jobs}).jobs == 1, "retry exceeded the broker task limit");
+    std::this_thread::sleep_for(std::chrono::milliseconds(options.lease_ms + 100));
+    auto resumed = client.acquire(active, work);
+    require(resumed && resumed->worker_instance == "bounded-survivor" && client.status({StatusSection::Jobs}).jobs == 1,
+        "expired physical reservation prevented the bounded retry");
 }
 void queued_eligibility(BrokerOptions options, TlsOptions const& owner_tls,
                         TlsOptions const& first_tls, TlsOptions const& second_tls)
@@ -1345,6 +1474,218 @@ void generation_pending_delivery(BrokerOptions options, TlsOptions const& owner_
     auto const preferred = start(slow, "authoritative");
     slow.finish(preferred);
 }
+void finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& fast_tls, TlsOptions const& entrant_tls)
+{
+    options.lease_ms = 5000; options.worker_ms = 10000;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), fast(endpoint, fast_tls), entrant(endpoint, entrant_tls);
+    auto offer_a = offer("established", 49452);
+    auto gpu = profile(Kind::GenerateGpu); gpu.max_batch_members = 3;
+    offer_a.generation_profiles = {gpu}; offer_a.capacity.gpu_bytes = gpu.resources.gpu_bytes;
+    offer_a.capabilities |= capability(Kind::GenerateGpu);
+    auto offer_b = offer_a; offer_b.instance = "arriving"; ++offer_b.endpoint.port;
+    fast.register_worker(offer_a);
+    auto session = owner.open_owner("finite-job");
+    std::string const path_a(64, 'a'), path_b(64, 'b');
+    auto job = task("finite"); job.kind = Kind::GenerateGpu; job.sequence = 0;
+    auto next = [&](GenerationOutput output, unsigned width)
+    {
+        job.generation_output = output; job.work_units = width;
+        job.task_id = "finite-" + std::to_string(++job.sequence);
+    };
+    auto accepted = [&](GenerationOutput output, unsigned width, uint64_t elapsed)
+    {
+        next(output, width); auto lease = owner.acquire(session, job);
+        require(lease && fast.begin(*lease, lease->owner_identity), "finite incumbent calibration did not begin");
+        fast.finish(*lease); owner.delivered(*lease, {elapsed, 32 * width, 1024 * width}, path_a);
+    };
+    accepted(GenerationOutput::Fresh, 3, 900000000);
+    accepted(GenerationOutput::Packed, 1, 300000000);
+    // A farm can fill the fast worker with wide batches before the final
+    // singletons compete for its slot. Its singleton delivery is still fresh.
+    for (unsigned i = 0; i < 8; ++i) accepted(GenerationOutput::Packed, 3, 700000000);
+    owner.close_owner(session); session = owner.open_owner("finite-job");
+    entrant.register_worker(offer_b);
+    auto const finite = std::chrono::steady_clock::now();
+    next(GenerationOutput::Fresh, 3); auto whole = owner.acquire(session, job, finite);
+    require(whole && fast.begin(*whole, whole->owner_identity), "a new worker displaced a measured indivisible fresh group");
+    fast.finish(*whole);
+    next(GenerationOutput::Packed, 3); auto route = owner.finite_packed_route(session, job);
+    require(route && route->first == whole->worker_identity, "an unpriced arrival broke the measured final packed batch");
+    next(GenerationOutput::Packed, 1); auto first = owner.acquire(session, job, finite);
+    require(first && first->worker_instance == offer_a.instance && fast.begin(*first, first->owner_identity),
+        "wide deliveries evicted the measured terminal singleton route");
+    next(GenerationOutput::Packed, 1);
+    require(!owner.acquire(session, job, finite), "an unpriced terminal member outranked a measured imminent release");
+    fast.finish(*first); auto last = owner.acquire(session, job, finite);
+    require(last && fast.begin(*last, last->owner_identity), "the terminal member did not resume on release"); fast.finish(*last);
+    next(GenerationOutput::Fresh, 3);
+    auto parallel = owner.with_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(5)).acquire(session, job,
+        std::chrono::steady_clock::now() + std::chrono::seconds(4));
+    require(parallel && entrant.begin(*parallel, parallel->owner_identity), "independent work stopped exploring an unpriced worker");
+    entrant.finish(*parallel);
+    auto different_job = owner.open_owner("different-logical-job");
+    next(GenerationOutput::Packed, 3);
+    owner.generation_paths(different_job, {{whole->worker_identity, path_a}});
+    require(owner.finite_packed_route(different_job, job).has_value(),
+        "the same authenticated host and direct route lost a recent incumbent across logical jobs");
+    owner.generation_paths(different_job, {{whole->worker_identity, path_b}});
+    require(!owner.finite_packed_route(different_job, job), "a changed data path reused another route's incumbent");
+    auto different_principal = entrant.open_owner("other-plotting-host");
+    entrant.generation_paths(different_principal, {{whole->worker_identity, path_a}});
+    require(!entrant.finite_packed_route(different_principal, job), "another TLS principal inherited the plotting host's incumbent");
+    // A second slot only shortens the finite batch when both grants fit.
+    offer_a.capacity.slots = 2; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    require(owner.finite_packed_route(session, job).has_value(), "two slots sharing one GPU grant broke the measured packed batch");
+    offer_a.capacity.gpu_bytes *= 2; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    require(!owner.finite_packed_route(session, job), "one worker's two available grants were forced into a slower packed batch");
+    next(GenerationOutput::Packed, 1); auto busy = owner.acquire(session, job, finite);
+    require(busy && fast.begin(*busy, busy->owner_identity), "the first of two finite grants did not begin");
+    next(GenerationOutput::Packed, 3);
+    require(owner.finite_packed_route(session, job).has_value(), "an occupied grant was counted towards a finite split");
+    fast.finish(*busy);
+    offer_a.capacity.slots = 1; ++offer_a.capacity_revision; fast.register_worker(offer_a);
+    entrant.worker_admission(offer_b.instance, WorkerAdmission::Paused);
+    accepted(GenerationOutput::Packed, 2, 300000000);
+    next(GenerationOutput::Packed, 3);
+    require(!owner.finite_packed_route(session, job), "a slower whole batch displaced its measured smaller batches");
+    ++offer_a.capacity_revision; offer_a.endpoint.port += 2; fast.register_worker(offer_a);
+    next(GenerationOutput::Packed, 3);
+    require(!owner.finite_packed_route(session, job), "a moved worker inherited its former finite placement");
+}
+void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOptions const& fast_tls, TlsOptions const& slow_tls)
+{
+    using Clock = std::chrono::steady_clock;
+    options.lease_ms = options.worker_ms = 1500; options.max_tasks = 64;
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), fast(endpoint, fast_tls), slow(endpoint, slow_tls);
+    auto gpu = profile(Kind::GenerateGpu); gpu.max_batch_members = 3;
+    auto a = offer("idle-fast", 49462); a.capabilities |= capability(gpu.kind);
+    a.capacity.gpu_bytes = gpu.resources.gpu_bytes; a.generation_profiles = {gpu};
+    auto b = a; b.instance = "idle-slow"; ++b.endpoint.port;
+    auto const training = owner.open_owner("training"); uint64_t sequence = 0;
+    std::string const fast_path(64, 'a'), slow_path(64, 'b');
+    auto const fast_id = certificate_identity(fast_tls.cert_file), slow_id = certificate_identity(slow_tls.cert_file);
+    auto request = [&](GenerationOutput output, unsigned members)
+    {
+        ++sequence; auto t = task("idle-" + std::to_string(sequence), sequence); t.kind = gpu.kind;
+        t.generation_output = output; t.work_units = members; return t;
+    };
+    auto learn = [&](BrokerClient& worker, GenerationOutput output, unsigned members, uint64_t elapsed, std::string const& path)
+    {
+        auto lease = owner.acquire(training, request(output, members));
+        require(lease && worker.begin(*lease, lease->owner_identity), "long-idle generation sample did not begin");
+        worker.finish(*lease); owner.delivered(*lease, {elapsed, 32, 4096}, path);
+    };
+    fast.register_worker(a);
+    for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 3, cost, fast_path);
+    for (auto cost : {70000000, 90000000}) learn(fast, GenerationOutput::Packed, 2, cost, fast_path);
+    for (unsigned i = 0; i < 4; ++i)
+        for (auto cost : {100000000, 300000000}) learn(fast, GenerationOutput::Packed, 3, cost, fast_path);
+    learn(fast, GenerationOutput::Fresh, 2, 100000000, fast_path);
+    for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 1, cost, fast_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused); slow.register_worker(b);
+    for (auto cost : {180000000, 230000000}) learn(slow, GenerationOutput::Packed, 3, cost, slow_path);
+    for (auto cost : {350000000, 400000000}) learn(slow, GenerationOutput::Packed, 2, cost, slow_path);
+    learn(slow, GenerationOutput::Fresh, 1, 800000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    auto const until = Clock::now() + std::chrono::milliseconds(options.lease_ms + 80);
+    do {
+        require(fast.heartbeat(a.instance, a.capacity_revision) && slow.heartbeat(b.instance, b.capacity_revision),
+            "a live worker expired during the repeat-job interval");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (Clock::now() < until);
+    // Make the slow worker the next ordinary trial regardless of certificate order.
+    auto rotate = [&]
+    {
+        require(fast.heartbeat(a.instance, a.capacity_revision) && slow.heartbeat(b.instance, b.capacity_revision),
+            "a live worker expired during repeat-job placement");
+        slow.worker_admission(b.instance, WorkerAdmission::Paused);
+        ++sequence; auto marker = pack_task("marker-" + std::to_string(sequence), sequence);
+        auto lease = owner.acquire(training, marker);
+        require(lease && fast.begin(*lease, lease->owner_identity), "could not set the next ordinary worker trial");
+        fast.finish(*lease); owner.delivered(*lease, {1000, 32, 64});
+        slow.worker_admission(b.instance, WorkerAdmission::Accepting);
+    };
+    auto repeat = [&](GenerationOutput output, unsigned members, bool finite, std::string const& path, BrokerClient* different = nullptr)
+    {
+        auto& issuer = different ? *different : owner;
+        auto repeat_job = issuer.open_owner("repeat-" + std::to_string(sequence));
+        BrokerClient::GenerationPaths paths{{fast_id, path}, {slow_id, slow_path}};
+        std::sort(paths.begin(), paths.end()); issuer.generation_paths(repeat_job, paths);
+        auto control = issuer.with_deadline(Clock::now() + std::chrono::seconds(5));
+        auto lease = control.acquire(repeat_job, request(output, members), finite ? Clock::now() : Clock::now() + std::chrono::seconds(4));
+        require(bool(lease), "a dated finite route delayed an immediately available grant");
+        auto& worker = lease->worker_instance == a.instance ? fast : slow;
+        require(worker.begin(*lease, lease->owner_identity), "repeat-job grant did not begin");
+        worker.finish(*lease); issuer.close_owner(repeat_job); return lease->worker_instance;
+    };
+    auto packed_batch = [&](unsigned members, std::string const& origin)
+    {
+        auto session = owner.open_owner("price-" + std::to_string(sequence));
+        BrokerClient::GenerationPaths paths{{fast_id, origin}, {slow_id, slow_path}};
+        std::sort(paths.begin(), paths.end()); owner.generation_paths(session, paths);
+        auto route = owner.finite_packed_route(session, request(GenerationOutput::Packed, members));
+        owner.close_owner(session); return route;
+    };
+    auto full = packed_batch(2, fast_path);
+    require(full && full->first == fast_id && full->second == Kind::GenerateGpu,
+        "a finite packed group split into unpriced singleton trials after its whole-batch receipts aged");
+    require(!packed_batch(3, fast_path), "overlapping dated batch times pinned a packed route");
+    auto moved = packed_batch(2, slow_path);
+    require(!moved || moved->first != fast_id, "a new receiving path reused an old packed-batch estimate");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == a.instance,
+        "a finite repeat job lost two matching whole deliveries after the fresh interval");
+    rotate(); require(repeat(GenerationOutput::Packed, 2, true, fast_path) == a.instance,
+        "separate dated intervals lost the faster available route");
+    rotate(); require(repeat(GenerationOutput::Packed, 3, true, fast_path) == b.instance,
+        "overlapping dated intervals overruled ordinary placement");
+    rotate(); require(repeat(GenerationOutput::Fresh, 2, true, fast_path) == b.instance,
+        "one dated delivery pinned the initial finite request");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, false, fast_path) == b.instance,
+        "dated service suppressed an independent-work trial");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, slow_path) == b.instance, "a changed path reused the dated bound");
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path, &slow) == b.instance, "a different TLS principal reused the dated bound");
+    a.generation_profiles.front().member_host_bytes = 128; ++a.capacity_revision; fast.register_worker(a);
+    rotate(); require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "changed generation RAM demand reused old elapsed times");
+    a.generation_profiles.front().member_host_bytes = 0; ++a.capacity_revision; fast.register_worker(a);
+    auto occupy = [&](unsigned width)
+    {
+        slow.worker_admission(b.instance, WorkerAdmission::Paused);
+        auto lease = owner.acquire(training, request(GenerationOutput::Fresh, width));
+        require(lease && fast.begin(*lease, lease->owner_identity), "could not occupy the repeat-job route");
+        slow.worker_admission(b.instance, WorkerAdmission::Accepting); return *lease;
+    };
+    auto held = occupy(3);
+    auto busy = packed_batch(2, fast_path);
+    require(!busy || busy->first != fast_id, "dated packed pricing waited on a busy worker");
+    require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "an idle worker waited for dated history on a busy peer");
+    fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    learn(slow, GenerationOutput::Fresh, 3, 400000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    require(repeat(GenerationOutput::Fresh, 3, true, fast_path) == b.instance, "an older faster estimate displaced a fresh receipt");
+    BrokerClient::GenerationPaths same_paths{{fast_id, fast_path}, {slow_id, slow_path}};
+    std::sort(same_paths.begin(), same_paths.end()); owner.generation_paths(training, same_paths);
+    auto singleton = [&](char const* failure)
+    {
+        auto immediate = owner.acquire(training, request(GenerationOutput::Fresh, 1), Clock::now());
+        require(immediate && slow.begin(*immediate, immediate->owner_identity), failure); slow.finish(*immediate);
+    };
+    held = occupy(1); singleton("a stable owner's finite grant waited on expired release timings"); fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    learn(slow, GenerationOutput::Fresh, 1, 800000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    slow.worker_admission(b.instance, WorkerAdmission::Paused);
+    learn(fast, GenerationOutput::Fresh, 1, 80000000, fast_path);
+    learn(fast, GenerationOutput::Fresh, 2, 1000000000, fast_path);
+    held = occupy(2); singleton("an older short delivery overruled the current running width's slower release"); fast.finish(held);
+    fast.worker_admission(a.instance, WorkerAdmission::Paused);
+    slow.worker_admission(b.instance, WorkerAdmission::Accepting);
+    learn(slow, GenerationOutput::Packed, 1, 30000000, slow_path);
+    fast.worker_admission(a.instance, WorkerAdmission::Accepting);
+    require(!packed_batch(2, fast_path), "a slower dated batch displaced a measured idle singleton");
+}
 void generation_output_selection(BrokerOptions options, TlsOptions const& owner_tls,
                                  TlsOptions const& first_tls, TlsOptions const& second_tls)
 {
@@ -1993,6 +2334,7 @@ int main() try
     broker(options, a_tls, b_tls, tls(ca, wa), tls(ca, wb));
     selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     concrete_resources(options, a_tls, tls(ca, wa));
+    publication_route(options, a_tls, tls(ca, wa), tls(ca, wb));
     codec_window_limits(options, a_tls, tls(ca, wa), tls(ca, wb));
     retry_eligibility(options, a_tls, tls(ca, wa), tls(ca, wb));
     queued_eligibility(options, a_tls, tls(ca, wa), tls(ca, wb));
@@ -2007,6 +2349,8 @@ int main() try
     parallel_generation_tail(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
     other_owner_generation_release(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_pending_delivery(options, a_tls, tls(ca, wa), tls(ca, wb), b_tls);
+    finite_generation(options, a_tls, tls(ca, wa), tls(ca, wb));
+    dated_finite_generation(options, a_tls, tls(ca, wa), tls(ca, wb));
     generation_output_selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa));
     weighted_shares(options, a_tls, b_tls, tls(ca, wa), 3);

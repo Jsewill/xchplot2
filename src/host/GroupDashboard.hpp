@@ -80,6 +80,8 @@ class DashboardJob
         double last_seconds = 0;
         uint64_t last_units = 0, last_bytes = 0, worker_ns = 0, send_ns = 0, receiver_ns = 0;
         uint32_t ingress = 0;
+        uint64_t failures = 0;
+        std::string last_failure;
     };
     mutable std::mutex mutex_;
     Clock::time_point const started_;
@@ -89,6 +91,7 @@ class DashboardJob
     std::deque<DashboardFrame::Row> decisions_;
     std::vector<DashboardFrame::Row> roster_;
     std::vector<DashboardFrame::Row> admission_rows_;
+    std::map<std::string, DashboardFrame::Row> local_gpu_status_;
     std::optional<unsigned> registered_;
     std::string roster_state_;
     struct Grant
@@ -110,6 +113,15 @@ class DashboardJob
     // extending its last file must count only the additional durable members.
     std::map<size_t, std::pair<uint64_t, uint64_t>> lane_publications_;
 
+    Delivery& worker_record(std::string const& id, std::string const& instance, std::string local_device)
+    {
+        auto const at = std::find_if(deliveries_.begin(), deliveries_.end(), [&](auto const& d)
+            { return d.worker == id && d.instance == instance && d.local_device == local_device; });
+        if (at != deliveries_.end()) return *at;
+        if (deliveries_.size() == 128) deliveries_.pop_front();
+        return deliveries_.emplace_back(Delivery{id, instance, std::move(local_device)});
+    }
+
   public:
     explicit DashboardJob(Clock::time_point started = Clock::now()) : started_(started) {}
     struct Route
@@ -120,7 +132,7 @@ class DashboardJob
     struct Progress
     {
         uint64_t fresh, inherited, files;
-        double first_seconds, last_seconds;
+        double first_seconds, last_seconds, elapsed_seconds;
     };
     using LaneFile = std::pair<size_t, uint64_t>;
     void published(uint64_t members, uint64_t inherited, std::optional<LaneFile> file = {})
@@ -158,7 +170,8 @@ class DashboardJob
         std::lock_guard lock(mutex_);
         return {fresh_, inherited_, files_,
                 fresh_ ? std::chrono::duration<double>(first_publication_ - started_).count() : 0,
-                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0};
+                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0,
+                std::chrono::duration<double>(Clock::now() - started_).count()};
     }
     void inherited_snapshot(uint64_t files, uint64_t members)
     {
@@ -206,26 +219,19 @@ class DashboardJob
                                         uint64_t receiver_ns, uint32_t ingress, std::string local_device = {})
     {
         std::lock_guard lock(mutex_);
-        auto at = std::find_if(deliveries_.begin(), deliveries_.end(),
-                               [&](auto const& d) { return d.worker == id && d.instance == instance && d.local_device == local_device; });
-        bool const first = at == deliveries_.end();
-        if (first)
-        {
-            if (deliveries_.size() == 128) deliveries_.pop_front();
-            deliveries_.push_back({id, instance, std::move(local_device)});
-            at = std::prev(deliveries_.end());
-        }
-        at->members += members;
-        at->bytes += bytes;
-        at->last_seconds = double(ns) / 1e9;
-        at->last_units = members;
-        at->last_bytes = bytes;
-        at->worker_ns = worker_ns;
-        at->send_ns = send_ns;
-        at->receiver_ns = receiver_ns;
-        at->ingress = ingress;
+        auto& record = worker_record(id, instance, std::move(local_device));
+        bool const first = !record.members;
+        record.members += members;
+        record.bytes += bytes;
+        record.last_seconds = double(ns) / 1e9;
+        record.last_units = members;
+        record.last_bytes = bytes;
+        record.worker_ns = worker_ns;
+        record.send_ns = send_ns;
+        record.receiver_ns = receiver_ns;
+        record.ingress = ingress;
         if (!first) return {};
-        if (!at->local_device.empty()) return "Local " + at->local_device;
+        if (!record.local_device.empty()) return "Local " + record.local_device;
         auto const route = std::find_if(previous_routes_.begin(), previous_routes_.end(),
                                         [&](auto const& r) { return r.id == id && r.instance == instance; });
         return route == previous_routes_.end() || route->host.empty() ? id : route->host;
@@ -288,6 +294,20 @@ class DashboardJob
         }
         return change;
     }
+    void failed_delivery(std::string const& id, std::string const& instance, std::string_view cause)
+    {
+        std::lock_guard lock(mutex_);
+        auto& record = worker_record(id, instance, {});
+        ++record.failures;
+        record.last_failure = cause;
+    }
+    void local_gpu_health(std::string const& device, std::string const& cause, bool waiting_for_memory)
+    {
+        std::lock_guard lock(mutex_);
+        if (!cause.empty()) local_gpu_status_[device] = {"GPU recovering", cause};
+        else if (waiting_for_memory) local_gpu_status_[device] = {"Waiting for GPU memory", {}};
+        else local_gpu_status_.erase(device);
+    }
     void decision(std::string chosen, std::string why)
     {
         std::lock_guard lock(mutex_);
@@ -304,7 +324,7 @@ class DashboardJob
         auto const elapsed = std::chrono::duration<double>(now - started_).count();
         auto const last = std::chrono::duration<double>(last_publication_ - started_).count();
         frame.summary = std::to_string(fresh_) + " new durable members   " +
-                        (fresh_ ? dashboard_number(last / fresh_) + " s/member through publication"
+                        (fresh_ ? dashboard_number(elapsed / fresh_) + " s/member since start"
                                 : "Waiting for first new publication");
         frame.add(DashboardFrame::overview,
                   std::to_string(files_) + " published files   " + std::to_string(inherited_) + " inherited members");
@@ -391,7 +411,13 @@ class DashboardJob
                                         : roster_state_);
         for (auto const& row : admission_rows_)
             frame.add(DashboardFrame::workers, row.value, row.detail);
+        for (auto const& [device, status] : local_gpu_status_)
+            frame.add(DashboardFrame::workers, "Local " + device + "   " + status.value, status.detail);
         auto delivered = [&](Delivery const& d, std::string const& name) {
+            if (d.failures)
+                frame.add(DashboardFrame::workers, name + "   " + std::to_string(d.failures) +
+                    (d.failures == 1 ? " failed assignment" : " failed assignments"), d.last_failure);
+            if (!d.members) return;
             if (!d.local_device.empty())
             {
                 frame.add(DashboardFrame::workers, "Local " + d.local_device + "   " + std::to_string(d.members) +

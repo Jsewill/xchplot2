@@ -2,7 +2,8 @@
 
 The September GPU measurements use the pre-1.0 cipher and raw format.
 Current `.gplot` measurements cover [native Windows grouped plotting](#native-windows-grouped-plotting)
-and [grouped plots on HDDs](#grouped-plots-on-hdds).
+and [grouped plots on HDDs](#grouped-plots-on-hdds). See also the
+[CPU plotting memory experiment](#cpu-plotting-memory-experiment).
 Use [`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
 
 Single-GPU results measured September 9, 2026, at **k=28, strength=2**.
@@ -163,6 +164,50 @@ verified file. Sending took 9.21 seconds in the first trial and 97.78
 seconds in the second. Windows reported a negotiated Ethernet speed of
 100 Mb/s after the second trial. Payload throughput during that send was
 94.74 Mb/s.
+
+On November 23, 2026, with Windows reporting a 1 Gb/s Ethernet link, the same singleton took
+37.14 seconds through durable publication on the Linux owner. The worker
+reported 22.88 seconds of processing and 9.16 seconds sending the result.
+The owner received 1,157,902,871 bytes in 9.93 seconds, or 0.93 Gb/s of
+plot data. The 1,002,771,036-byte file matched the CPU reference and
+passed 79 full proofs. The preceding trial
+at 100 Mb/s took 117.98 seconds through publication, including 97.67 seconds
+of worker send time. These were single-member runs with a fresh Windows
+worker and a waiting owner.
+
+On the same Radeon, a separate process allocated 192 MiB of GPU memory
+while a worker advertised a k=18 GPU profile. The test set the worker's
+memory reserve close to the available headroom so this small allocation
+would cross its admission threshold. The broker withdrew GPU availability
+and held the owner's request in its queue. After the allocation was
+released, the same worker instance became eligible and delivered the
+member. The published file matched the reference and passed 84 full-proof
+checks. Plot construction used RAM throughout.
+
+## CPU plotting memory experiment
+
+On Linux, each variant published the same k=28, strength-2 member using
+four pinned E-cores on a shared Core Ultra 7 270K Plus. The three C++
+variants used the same writer and publication path in a test harness.
+Each row is one run through process exit.
+
+| CPU generation path | Peak process RAM | Seconds per published member |
+|---|---:|---:|
+| Upstream final fragment vector copy, used by the standalone adapter | 12.13 GiB | 43.43 |
+| Move the fragment vector, as grouped and pooled workers already do | 10.13 GiB | 42.93 |
+| Move the vector and release unused table pages before export (prototype) | 8.13 GiB | 42.94 |
+| cpos v0.3.0, normal CPU plot and group writer | 7.28 GiB | 58.18 |
+
+The cpos generator reused seven arrays of 32-bit words across plotting
+stages. Its separate 16 GiB scratch reservation is virtual address space.
+The RAM column measures peak resident memory for each process.
+
+All three C++ files matched byte for byte. The cpos file differed only
+in its memo. All four passed full-proof checks. At k=22, nine interleaved
+runs per variant measured two independent timing improvements. Skipping
+eager zeroing of the table arena reduced median time from 0.602 to
+0.574 s/member. Reserving matched-output space in batches took
+0.572 s/member. Their combined effect and their k=28 timings are unmeasured.
 
 ## Grouped plots on HDDs
 
@@ -1471,6 +1516,334 @@ matched the reference group for that drive, and fresh proof checks passed.
 David's harvester reported 17,886 farm plots throughout the 147 eligible
 challenge samples recorded during these fills. The longest recorded lookup
 took 7.24 s.
+
+#### A Windows Radeon over 1 Gb Ethernet
+
+David published 48 k=28, strength=2 members as 16 three-member groups on
+separate 18 TB HDDs. The owner used 32 GiB for construction. The RTX 4090
+used 10 Gb Ethernet. The Windows RX 6700 XT used its 1 Gb Ethernet link
+through authenticated SSH forwards and kept plot data in RAM. The existing
+mainnet harvester reported 17,886 plots on its separate farming HDDs.
+
+| Owner and workers | RTX / Radeon members | Last durable group | Seconds per member | Harvester p95 |
+|---|---:|---:|---:|---:|
+| Previous owner, RTX only | 48 / 0 | 173.49 s | 3.61 | 18.62 s |
+| Earlier payload writeback, RTX only | 48 / 0 | 170.14 s | 3.54 | 13.03 s |
+| Previous owner, RTX and Radeon | 43 / 5 | 170.15 s | 3.54 | 14.79 s |
+| Revised batching and writeback, RTX and Radeon | 45 / 3 | 158.09 s | 3.29 | 15.08 s |
+
+Each row is one November 23, 2026 run. The Linux worker service was
+already running, and each Radeon run enrolled a fresh Windows worker
+from `69a33e4`. The candidate owners were built from `8cdcd21` with
+the indicated changes. Each run produced the same 47,731,349,036 bytes. Every file matched
+its independently proof-checked reference, and each run also checked fresh
+full proofs. The revised owner received its first two-member RTX result
+at 28.56 s. The previous owner received its first
+multi-member RTX result at 34.82 s.
+
+In a farming-only window before the plotting series, the
+harvester recorded 17 lookups with a median of 9.23 s and p95 of 19.86 s.
+Farming was already exceeding the eight-second target during that window.
+
+In the RTX control the last group spent 3.56 s hashing its three members
+and 15.97 s writing its payload, including 11.83 s inside sync calls. The
+final file commit took 0.13 s. Renaming the file and syncing its directory
+took 0.013 s. With earlier writeback as the only change, the last group's
+payload took 15.60 s. Time inside its sync calls fell to 0.22 s, while
+time in writes rose from 0.36 to 12.10 s. The full 48-member run gained
+3.36 s. These timings use the owner's monotonic clock.
+
+#### Time to complete a job
+
+These matched runs used 32 GiB of owner RAM and three k=28
+members per file. Time runs from launching `fill` to successful process
+exit. Each pair wrote identical files. Reference hashing and full-proof
+checks ran afterward.
+
+| Job and change | Members | Previous job | Updated job | Previous s/member | Updated s/member |
+|---|---:|---:|---:|---:|---:|
+| One file, three GPUs available, measured route selection | 3 | 67.10 s | 19.04 s | 22.37 | 6.35 |
+| Four files on one HDD, RTX only, packed transfers with next-file generation in RAM | 12 | 111.78 s | 86.33 s | 9.32 | 7.19 |
+| Three files per HDD on two drives, RTX only, scheduling from measured checkpoint time | 18 | 87.25 s | 80.36 s | 4.85 | 4.46 |
+| Four files per HDD on eight drives, RTX only, updated batching and writeback | 96 | 406.59 s | 387.77 s | 4.24 | 4.04 |
+
+For the one-file job the previous scheduler sent all three members to
+the Windows Radeon. After the broker had measured the RTX route,
+the revised scheduler sent the entire three-member request to the RTX.
+Both jobs published the same 2,983,316,893-byte file and passed fresh
+full-proof checks. An earlier RTX-only control finished the same file
+in 19.20 s.
+
+In the single-HDD comparison, all nine members of the three subsequent
+files arrived while the preceding file was being written. The eight-drive
+jobs each published 95,459,665,643 bytes.
+
+A separate four-file job measured the cost of hashing the next file's
+packed members on that HDD. The RTX worker delivered the same 12 members
+in each run. The owner used spare CPU time to hash members already in RAM
+while the preceding file was being written. With the original and updated
+owners run in opposite orders across two pairs, the original took 86.04
+and 86.41 seconds (7.17 and 7.20 s/member). Overlapping the hashing took
+79.42 and 75.64 seconds (6.62 and 6.30 s/member). All four runs published
+the same 11,932,394,244 bytes and passed fresh full-proof checks.
+
+#### Whole-job cost of changing the compute pool
+
+A separate control used ordinary pool enrollment, 32 GiB of owner RAM,
+eight owner CPU threads and three k=28 members per file. The RTX 4090
+used 10 GbE, the Windows RX 6700 XT used 1 GbE, and the Arc B580 used
+Wi-Fi. The harvester had 17,886 plots loaded on separate drives. Times
+include process startup and exit. Each configuration produced the same
+files as its matched control and passed full-proof verification.
+
+| Work requested | RTX only | RTX and Radeon | RTX, Radeon and Arc |
+|---|---:|---:|---:|
+| One file on each of 16 HDDs, 48 members | 172.27 s (3.59 s/member) | 165.24–166.77 s (3.44–3.47 s/member) | 172.23–175.72 s (3.59–3.66 s/member) |
+| Four files on each of eight HDDs, 96 members | 377.73 s (3.93 s/member) | — | 387.56 s (4.04 s/member) |
+
+Each 48-member run with the wired pair credited five members to the Radeon.
+Across the two three-worker runs the Radeon delivered six and seven members,
+the Arc delivered zero, and the owner recorded 30 and 39 failed assignments.
+The RTX returned every member individually in those runs. With the wired
+pair it also returned batches of two or three. The Radeon transferred packed
+payloads at 0.92–0.93 Gb/s while delivering them.
+
+In a separate 48-member run a Radeon joining during plotting delivered
+five members. The job finished in 194.12 s. When it disconnected during
+an active transfer, the RTX finished all 48 in 276.66 s. The next RTX
+assignment spent 115.20 s waiting for its grant and 3.51 s executing and
+transferring the result. The files matched in both cases.
+
+On one HDD, a 12-member control with all three GPUs available waited for
+a packed member from the Arc and finished in 186.87 s (15.57 s/member).
+The revised scheduler compared the cost of trying a new route with the
+remaining work on that HDD. After measuring a whole-group delivery from
+the RTX, it assigned all four groups to that worker. The job finished in
+75.99 s (6.33 s/member). A repeat after the short-term route timings
+expired took 76.14 s (6.35 s/member). All three runs produced the same
+11,932,394,244 bytes. For the Arc's packed member, the owner measured
+15.46 s for execution and 95.73 s for transfer over Wi-Fi. A separate
+Windows Radeon test transferred a comparable 1.16 GB member over its
+wired link in 9.94 s.
+
+In a later 16-HDD comparison the broker could keep a measured RTX batch
+intact while a different destination tried the Radeon. The wired pair
+finished 48 members in 158.95 s (3.31 s/member). With the Arc also
+enrolled, the same job took 158.51 s (3.30 s/member). Both jobs credited
+43 members to the RTX and five to the Radeon, wrote the same 16 files
+and passed fresh full-proof checks. The Arc reported a lost device
+during the second job and delivered zero members.
+In the wired run the Radeon averaged 0.92 Gb/s over its accepted
+transfers. The RTX averaged 4.02 Gb/s on its 10 GbE link. The 16
+destination disks together averaged 302 MB/s of writes and reached
+573 MB/s over a five-second interval.
+
+The machines remained in ordinary use. These fills used the generic
+harvester profile while David's mainnet harvester continued farming.
+Of 18 eligible lookups during the wired run, 16 exceeded the eight-second
+target and p95 was 20.53 s. All 20 during the three-worker run exceeded
+the target and p95 was 38.96 s. An earlier farming-only window had p95
+19.86 s across 17 eligible lookups.
+
+In a second block, with a fresh Windows worker registration, the
+three-worker job ran first and finished in 160.67 s (3.35 s/member).
+The wired pair took 162.24 s (3.38 s/member). Both jobs matched the
+reference files and passed fresh proof checks. The Arc again delivered
+zero members. David's farming GPU showed 99% median utilization across
+ten samples in each job. Before this block, 27 of 34 eligible farm
+lookups exceeded eight seconds and p95 was 15.22 s. During the two
+jobs p95 was 16.75 s and 26.59 s, respectively. The plotter's share of
+the delay in these separate windows is unknown.
+
+On eight HDDs, the earlier scheduler finished a 96-member job in
+397.28 s (4.14 s/member). With the changes to batch placement and retries,
+the job took 347.11 s (3.62 s/member). Both runs delivered 83 members
+from the RTX and 13 from the Radeon. Larger packed batches reduced the
+number of successful generation tasks from 80 to 41. The earlier run
+retried seven tasks and the later one retried zero. All 32 files matched
+byte for byte and both runs passed fresh proof checks. Measured at the last
+durable file, the two runs took 396.91 and 346.87 s (4.13 and
+3.61 s/member).
+
+In a 48-member comparison, the Windows worker disconnected during its
+first active transfer, before any file had been published. The earlier
+run finished in 262.84 s (5.48 s/member). Allowing the broker to reassign
+the remaining work as soon as the owner reported the loss shortened the
+job to 175.45 s (3.66 s/member). The disconnect occurred 6.45 s and
+14.86 s after launch, respectively. Both runs retried once, and the RTX
+delivered all 48 members. All 16 final files matched.
+
+#### Choosing how the last group reaches its HDD
+
+A 16-drive experiment changed the RTX 4090's output format for the final
+three members of a 48-member job. In the first pair, the preceding 45
+members followed the same assignments in the same order. The same three
+other HDDs were still writing when the owner requested the final group.
+
+| Delivery of the last group | Worker lease | Grant to last durable file | Whole job | Seconds per member |
+|---|---:|---:|---:|---:|
+| Packed members, assembled by the owner | 8.48 s | 29.32–29.38 s | 170.11 s | 3.54 |
+| Encoded group, streamed into the destination | 17.96 s | 18.22–18.27 s | 159.19 s | 3.32 |
+
+Streaming took longer on the worker. It let the owner write the file while
+receiving it, shortening the time to publication. The other drives finished
+about 16.6 seconds after the grant in both runs. In reverse order, streaming
+took 162.03 seconds and packed delivery took 169.45 seconds. Two other HDDs
+were writing at the streamed grant and three at the packed grant in that
+pair. All four runs produced 16 identical files and freshly verified full
+proofs from the final file. The first pair measures the effect of changing
+the final delivery on this configuration. The owner had observed only
+packed deliveries when it made that choice. During that pair, David's
+farming GPU showed median utilization of 98.5% and 99%, respectively,
+from samples taken every 15 seconds. The harvester took over eight
+seconds for 16 of 18 eligible lookups in the packed run and 15 of 16
+in the streamed run.
+
+A separate RTX-only test gave each of 16 HDDs two three-member files.
+The previous scheduler finished in 342.83 s (3.57 s/member). With the
+final-batch ordering enabled it took 344.73 s (3.59 s/member). When three
+destinations remained, two already had every member they needed. Only one
+could take the final grant, and both jobs used 32 three-member packed
+transfers. All 32 files matched and passed fresh full-proof checks.
+Across the two runs the 16 disks averaged 279–280 MB/s of writes and the
+10 GbE receive link peaked at 4.44–4.48 Gb/s over five seconds.
+
+On one HDD, one remote RTX 4090 produced a single three-member group with
+32 GiB of owner RAM. In alternating runs, packed delivery took 27.68 and
+27.51 s through publication. Streaming the encoded group took 19.12 and
+18.72 s. The worker instance, granted resources and output file matched
+in all four runs. The owner retained its per-drive timings across a
+broker restart after the first packed run. Automatic mode then selected
+streaming and published in 18.88 s (6.29 s/member). The previous policy
+also chose streaming, finishing in 19.12 s before the comparison and
+18.80 s afterward. All seven jobs produced the same file and passed
+fresh full-proof checks.
+
+#### Mixed workers on shared machines
+
+With delivery times recorded separately for each batch size, four automatic
+k=28 runs each wrote the same 48 members to 16 HDDs using 32 GiB of owner
+RAM. They shared a broker and followed one RTX-only calibration run. Times
+below end when the last file was durable.
+
+| Workers in run order | Members from RTX / Radeon / Arc | Last file | Seconds per member |
+|---|---:|---:|---:|
+| RTX and Radeon | 43 / 5 / 0 | 167.30 s | 3.49 |
+| RTX, Radeon and Arc | 43 / 5 / 0 | 164.88 s | 3.43 |
+| RTX and Radeon, repeated | 42 / 6 / 0 | 183.56 s | 3.82 |
+| RTX alone | 48 / 0 / 0 | 172.75 s | 3.60 |
+
+In both wired runs the last file received one Radeon member followed by two
+separate RTX members. Each RTX delivery took about 3.7 s once assigned. In
+the first run those requests also waited 11.90 and 8.82 s for a grant. In
+the repeat they waited about 4 ms each. After the final delivery the owner
+took another 19.81–21.57 s to publish the last file across the four runs.
+Every output matched the reference. Fresh full-proof checks covered all
+16 files in each of the last two runs and five files in each of the first
+two, including every file to which the Radeon contributed.
+
+David farmed 17,886 plots throughout. At 15-second sampling intervals,
+median utilization of its farming GPU was 98.5–99%. During the two wired
+runs the RTX host averaged 9.9% and 15.3% CPU use. No sample showed Luanti
+on the Windows host. The fastest and slowest wired runs fell on opposite
+sides of the RTX-only time. In the four minutes immediately after the
+comparison the plotting broker was idle. David's farming GPU still
+showed 99% median utilization and 24 of 26 eligible lookups exceeded
+eight seconds, with p95 at 15.84 s. During the four plotting runs the
+harvester's p95 ranged from 13.36 to 24.79 s.
+
+In a separate two-worker comparison the updated owner ran first. It
+published the 48 members in 157.69 s (3.29 s/member), followed by
+162.79 s (3.39 s/member) with the previous owner. Both used the same
+worker instances, 16 drives and initial owner-cache contents. The broker
+retained its growing delivery history between runs. The updated owner
+accepted 46 RTX members and two Radeon members. The previous owner
+accepted 43 and five. Both GPUs held active work simultaneously.
+
+At 34.23 s the updated owner declined a three-member Radeon grant for
+a batch it had priced on the RTX. It checked the two remaining members
+and selected single-member transfers. That file finished at 75.55 s.
+In both runs the RTX delivered the last file's three members in one batch.
+The 5.10 s whole-job difference cannot be attributed to regrouping that one file.
+All 16 files matched. Both runs checked fresh full proofs on the first
+and last files and every file containing a Radeon member. The updated
+run averaged 303 MB/s of HDD writes and peaked at 590 MB/s over five
+seconds. The 10 GbE link reached 4.46 Gb/s over five seconds, and Ramen
+delivered payload at 0.92 Gb/s during transfer on its 1 Gb/s link.
+
+#### Adding a 1 Gb/s Radeon worker to a 10 Gb/s RTX worker
+
+The same plotting executable built 48 k=28 members on 16 HDDs, first
+with the RTX 4090 alone and then with the RX 6700 XT available. Both
+jobs used automatic construction, batching and output format, 32 GiB
+of owner RAM and eight owner threads. They started from identical copies
+of the owner's timing cache. Before the first job the broker measured two
+three-member RTX deliveries. It retained those and the solo job's 16 RTX
+deliveries when the Radeon joined with no prior delivery on that broker.
+
+| Available GPUs | Members from RTX / Radeon | Last durable file | Seconds per durable member | Job exit |
+|---|---:|---:|---:|---:|
+| RTX 4090 | 48 / 0 | 178.09 s | 3.71 | 178.65 s |
+| RTX 4090 and RX 6700 XT | 44 / 4 | 157.02 s | 3.27 | 157.55 s |
+
+The Radeon delivered four single members while the RTX supplied 11 triples,
+four pairs and three singles. Both workers ran concurrently and each job
+retried zero tasks. With the Radeon, the last file was durable 21.06 s
+earlier, a reduction of 0.44 s/member (11.8%) in this comparison.
+In both runs the RTX delivered the final three members for the same HDD.
+They arrived at 157.32 s in the solo run and 135.97 s in the paired run.
+That HDD's file became durable about 21 s after delivery in each run.
+Ramen delivered 0.925 Gb/s of payload while transferring. David's 10 GbE
+receive link peaked at 4.43 Gb/s over five seconds. The 16 output disks
+averaged 305 MB/s of writes and peaked at 599 MB/s over five seconds.
+
+Both jobs produced the same 16 files, totaling 47,730,868,909 bytes.
+Fresh full-proof checks covered the first and last files in each run and
+every file containing a Radeon member. David farmed 17,886 plots throughout.
+Its farming GPU had median utilization of 98% in the solo run and 99%
+in the paired run. Eligible harvester lookups had a p95 of 11.33 s
+across 20 samples in the solo run and 17.92 s across 18 in the paired
+run. The short samples and the variation seen with farming alone limit
+how much of the difference can be attributed to plotting.
+
+#### Dedicated destinations with 4 GiB of construction RAM
+
+One RTX 4090 supplied 48 members to the same 16 HDDs on November 23, 2026.
+Each run had eight owner threads and produced 16 three-member files. The regular farming
+planner chose the collections. With dedicated destinations the other
+HDDs were available exclusively for scratch. With all destinations
+eligible the planner could temporarily use idle destinations for scratch.
+Job times include successful process exit.
+
+| Destination HDDs | Scratch HDDs used at peak | Previous job | Revised job | Previous s/member | Revised s/member |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 15 | 392.31 s | 291.36 s | 8.17 | 6.07 |
+| 2 | 14 | 272.61 s | 266.51 s | 5.68 | 5.55 |
+| 16 | 14 | 162.09 s | 148.62 s | 3.38 | 3.10 |
+
+On the single destination, 13 succeeding groups received their 39 members
+while the preceding file packed. The first publication took 23.08 s,
+compared with 23.29 s before the change. The last publication moved from
+392.15 s to 291.24 s. The output HDD delivered 163.9 MB/s of final plot
+bytes over that full interval. Aggregate writes across scratch and output
+rose from 258 to 348 MB/s. Linux block counters put the destination's
+busy time at 75.6%, up from 54.9%. All 16 final files matched the previous run.
+With two destinations, three groups received nine members in total while
+their predecessors packed. The two runs finished writing identical files in 272.53 s
+and 266.39 s. Each of the 16 destinations received a single group, making
+that row a control for the other scheduling changes and run-to-run variation.
+
+Each layout was compared against its own reference because automatic
+collection assignment can change the output when files move between drives.
+
+For a byte-identical comparison across layouts, the storage controls fixed
+collection 0 and used the previous owner. The harvester model allowed 16
+eligible families, eight cores, eight lookup workers and 1 GiB of reader
+memory. Plot construction still had 4 GiB. One destination took 393.60 s,
+two took 271.21 s and 16 took 148.89 s. All three layouts produced the
+same 47,731,349,036 bytes. The one- and two-drive modeled response bounds were 5.70 s and
+3.55 s against the same 8 s deadline. The default four-core reader with
+these 16 families on one HDD would have required 10.44 s.
 
 #### Scheduling GPU deliveries and HDD packing
 

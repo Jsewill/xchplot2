@@ -114,17 +114,22 @@ cooperative stop. In an attached view either key closes the observer.
 Output paths and JSON still go to stdout. Redirected stderr and terminals
 with `TERM=dumb` use ordinary output. Use `--no-tui` to select it explicitly.
 
-For grouped jobs, Overview measures from this invocation's start through the
-last new durable publication. Members already visible at a final output
+For grouped jobs, Overview divides the time since this invocation started
+by the number of newly published members. The rate includes time spent
+waiting between publications. Members already visible at a final output
 name when the job opens are inherited. Work recovered from a private
 construction file counts when its output becomes visible. The recent rate
 and remaining-time estimates use observed publication intervals. For an open
 fill, Overview shows the remaining destination allowance. The final construction
 JSON includes `new_durable_members`, `inherited_members`,
 `first_new_publication_seconds`, `last_new_publication_seconds`
-and `seconds_per_new_durable_member`. Timing fields are null until new work
-reaches publication. The construction reason and available RAM and scratch
-forecasts describe the last construction choice.
+and `seconds_per_new_durable_member`. Those publication times are null until
+new work reaches publication. Each construction summary also reports
+`elapsed_seconds` from command start to that report and
+`elapsed_seconds_per_new_durable_member`, which is null for an inherited-only
+run. The final text summary includes shutdown of the invocation's compute
+session. The construction reason and the RAM and scratch forecasts describe
+the last construction choice.
 
 Resources shows owner CPU and resident memory. On Linux it also samples
 physical disks and interfaces and reads GPU activity where the driver
@@ -723,7 +728,11 @@ can reuse recent observations from completed groups in the user's private
 cache. It checks the boot, build, physical devices, CPU allocation, memory
 cap and workload before using a previous observation. The cache expires
 after 24 hours. Direct measurements from the current run take precedence.
-Shared compute and protected migration use their own live evidence.
+On Windows the owner checks the device GUID of every disk behind the
+volume. Replacing a disk starts a new comparison. A process running in a
+Windows job object uses measurements from its current run.
+Protected migration uses current resource observations. Shared plotting
+also measures delivery from its workers. See [Shared compute](#shared-compute).
 
 When automatic construction admits a fresh group in one incremental batch,
 the members stay in RAM and the plotter writes the final file directly to the
@@ -848,6 +857,27 @@ regenerated after the receivers drain. An ordinary retry can also wait for
 a running final HDD pack to publish and release its workspace. Incoming
 chunks can use idle threads from the shared codec pool within the
 destination's validation memory budget.
+
+When several groups are planned for the same output HDD, the next group
+can receive sealed GPU contributions while the current group packs. The
+planner uses measured transfer and packing times and reserves independent
+scratch bandwidth and RAM for both groups. The next group starts writing
+the destination after its predecessor publishes. Limited space, a busy
+scratch path or an unmeasured route can keep the two groups sequential.
+With RAM construction, an idle pool worker can instead send the next
+group's packed members while the output HDD writes its current file. The
+owner first offers work to ready destinations, then checks the next file's
+grant, available RAM, measured delivery time and remaining write time.
+It updates the write estimate after the first durable checkpoint, which
+accounts for drives that acknowledge buffered writes quickly and take
+longer to flush them. With spare CPU and RAM, the owner can also hash
+the next file's members during that write. If another task needs the CPU,
+the writer can resume hashing at the first unfinished member after verifying
+the identities of the completed prefix.
+If that worker leaves or its grant expires, the current file can still
+publish. The owner requests the missing work through normal admission
+afterward, preserving the next file's identity.
+
 After the scratch is released, the same disk can take its turn
 writing a final plot. The planner rechecks free space above `--leave-free`
 at that handoff. Saved scratch grants and the farming limits still apply.
@@ -1916,6 +1946,28 @@ For the final group in automatic mode, the owner uses comparable
 single-writer publication timings when available. If it has a measured
 packed route and no such comparison, it switches to a whole-group stream
 only when it has a faster delivery estimate for that group size.
+When one HDD has a bounded number of members left and only one output
+format has been timed through publication, the owner also compares the
+remaining job time with the cost of trying the other format. If a group
+would be split among workers, that cost includes the slowest member the
+group must wait for. An unmeasured transfer is budgeted at the task
+timeout. Jobs with enough work left can still sample it. A changed worker
+roster or a different physical HDD requires a new comparison.
+
+For a final group built in RAM, the owner can also reuse measurements from
+jobs completed in the previous 24 hours. It compares packed delivery and
+whole-group streaming from the final request until the last file is durable.
+The comparison needs two completed observations of each format with the
+same worker instance, network path, resource grant and output drives. It
+can include up to four other drives already writing their final groups
+when their progress matches the observed range. The owner changes format
+only when the faster choice clears the observed variation and the margin
+for its sample count. If the quoted lane becomes busy, the grant or path
+changes, or the disk governor reports new farming pressure before the
+request starts, the owner returns to the ordinary choice. Explicit
+`--compute-output` settings keep their selected format. With
+`POS2GPU_PHASE_TIMING=1`, `terminal_publication` shows the ordinary
+choice, the measured ranges and the selected format.
 
 For independent GPU contributions, the owner sizes the next request using
 the available workers' measured time to generate and deliver a member and
@@ -1980,29 +2032,93 @@ finish the ready queue sooner. An overdue GPU batch can have up to one
 measured singleton delivery beyond its expected finish. For independently
 streamed members, the broker uses that allowance when the waiting job
 would commit another whole batch to the slower worker.
-A larger backlog, another queued owner, an unmeasured route, or a job running
-past its observed range lets an idle compatible worker take work immediately.
+A larger backlog, another queued owner, or a job running past its observed
+range lets an idle compatible worker take work. When one destination has
+the remaining work, the broker can keep an indivisible encoded group on
+a worker that recently delivered that exact batch. For packed members it
+also checks whether smaller measured requests can finish sooner using the
+worker's free slots and available CPU, RAM and GPU capacity. Independent
+destinations give new workers opportunities to establish their rates.
+
+A running broker can reuse a receipt across jobs from the same authenticated
+plotting host when the worker instance, data endpoint, receiving interface,
+host settings and exact resource request match. A receipt can guide a wait
+for the longer of the lease and worker registration timeouts, two minutes
+by default. The broker keeps the last eight deliveries at each batch size
+so it can still price the final single member after a run of larger batches.
+For a finite job, two or more matching deliveries from the past
+24 hours can guide the choice between immediately available workers. When
+their measured time ranges overlap, the usual scheduling order applies.
+The same comparison can keep a finite packed group on a worker that
+has repeatedly delivered that whole group size. The broker also checks
+whether smaller batches can finish sooner within the available grants.
+A newly started broker has an empty delivery history. The first assignment
+on an unmeasured route has no observed completion time. When the connection
+moves to another broker endpoint, the client checks its support for detailed
+worker availability and for reporting how much work remains in the job.
 
 The scheduler prioritizes the next batch that can start an idle output drive.
 Compatible worker slots and measured transfer rates limit concurrent receivers.
 When enough destinations are ready to keep the pool occupied, a compact
 in-memory receiver can request several packed members from a fast worker.
-The owner sizes these requests from measured packed deliveries. A fresh HDD
-destination can queue another packed batch within the memory and inflight
+The owner sizes these requests from measured packed deliveries. While workers
+are unmeasured, ready destinations share the available probe slots. A newly
+joined worker can take waiting work. When a grant or delivery changes the
+estimate, the owner can batch the remaining unsent members of a group. A
+failed transfer releases unfinished work for retry. Successful receipts
+keep their position in the group.
+
+If the broker grants a measured packed batch to a different worker, the
+owner can decline before sending the member IDs. It submits the first
+member and checks the price of the remaining batch at its exact size.
+With two funded receivers, a helper can deliver the first member while
+the faster worker delivers the rest. With one receiver, the first delivery
+finishes before the remaining batch starts. Both paths preserve member
+order and the original deadline. With `POS2GPU_PHASE_TIMING=1`, the
+`packed_route_decline` and `packed_route_reprice` events identify the
+group, first member and batch width.
+
+A fresh HDD destination can queue another packed batch within the memory and inflight
 limits. With one GPU slot, automatic admission uses deliveries at the same
 batch size to check that the remaining wait and the next delivery fit the
-task deadline. It can then open an independent HDD destination early and
-keep the GPU working while the owner hashes the previous batch. If a busy worker
+task deadline. After a complete packed batch arrives, its writer can finish
+hashing while an independent destination starts the next transfer. The
+owner checks both writers, CPU availability and the memory needed by both
+destinations. If a busy worker
 can deliver before an idle worker and another destination can feed the idle
-one, the owner sizes the batch for the earlier delivery. When all slots are
-busy, it can also size queued work for the next known delivery. A cold pool
-with several slots starts with singletons.
+one, the owner sizes the batch for the earlier delivery. If the other
+workers would each take longer to deliver one member, the owner checks
+that the grant matches the worker and backend it used to size that batch.
+A first trial at a new batch size can still split into smaller requests.
+An idle helper can take a member when that shortens the fast worker’s
+batch and the helper can deliver during work left on other outputs. The
+estimate includes shared network bandwidth, receive memory, output space
+and any scratch disks those outputs need. An unfinished group contributes
+only its next admissible batch. At the end of a job, a fast worker can keep
+an entire group if its batch should arrive before the helper’s first member.
+When all slots are busy, the owner can size queued work for the next known
+delivery. A new worker’s first transfer can proceed while measured workers
+continue using larger batches.
 Observed member sizes help it serve destinations with room before probing
 nearly full ones. A repeatedly deferred destination still gets a turn.
+When one measured producer has final packed batches ready for independent
+output disks, the controller compares dispatch orders using the predicted
+finish of the last file. It accounts for the turn a destination earns as
+it waits. For up to six eligible batches it checks every order consistent
+with those turns, including the effect of shared packing CPU and the time
+each disk needs to publish. For seven to 64 ready batches with independent
+writers and sufficient packing CPU, it compares the feasible first grants.
+It can keep a longer sequence when that sequence reaches the shortest time
+possible at the observed generation and write rates. Each grant rechecks
+the remaining members, workers, receiver memory and output drives. A
+change in those resources or new farming pressure releases the saved order.
+With `POS2GPU_PHASE_TIMING=1`, `terminal_grant` records the ordinary,
+proposed and issued writer and member range when the controller grants work.
 
-When the pool offers one compatible generation slot, a fresh fixed-size group
-that fits one lease can arrive as encoded chunks in file order. The destination
-validates the chunks, starts disk writeback during transfer, and publishes
+When a fresh fixed-size group fits one worker lease, it can arrive as
+encoded chunks in file order. The destination validates the chunks and can
+read the next network frame during validation or writing when an extra
+frame fits in RAM. It starts disk writeback during transfer and publishes
 after the complete stream and index are durable. A brokered worker in the
 owner's process can deliver the manifest and chunks directly to the same
 writer. A saved prefix can resume
@@ -2099,14 +2215,32 @@ xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
 xchplot2 compute status
 ```
 
+On Windows and Linux, a compute worker that detects a lost GPU withdraws its
+GPU capacity while continuing CPU and codec work. Its next GPU offer requires
+a small generation in a fresh process to match the CPU reference. Recovery
+needs enough host RAM for the additional runtime and output, and a uniquely
+identifiable device. If a driver reports only the backend during concurrent
+generation, active GPUs on that backend verify independently. The worker
+retries with backoff while it accepts work.
+`compute status` and the worker view of `status --live --tui` show the
+driver error during recovery. After recovery, GPU members run in isolated
+processes until the worker restarts. If only smaller plots fit when the GPU
+recovers, a fresh process periodically checks whether larger ones can run.
+
 A standalone worker adapts to its available CPU affinity and host RAM, with one
 task slot and automatic CPU/GPU selection. Saved or explicit limits remain
-caps. Automatic GPU allocation uses available VRAM at startup with the backend's
-required safety allowance; it does not infer spare GPU compute time from free
-memory. On Windows, a HIP worker also checks its OS-assigned memory budget and
-the dedicated memory in use on its selected GPU. Set `--gpu-bytes` to a known
+caps. The worker rechecks available VRAM between assignments and while idle.
+When another application takes or releases GPU memory, the same worker can
+change tiers, withdraw plot sizes or offer them again. Each tier includes the
+backend's safety allowance and its own host RAM requirement. The broker uses
+observed delivery times to estimate how quickly a busy helper can finish.
+On Windows, a HIP worker also checks its OS-assigned memory budget and the
+dedicated memory in use on its selected GPU. Set `--gpu-bytes` to a known
 safe limit when Windows cannot identify the physical GPU or report these
-counters. A GPU worker can encode the last member of a batch directly from its
+counters. The Workers view shows **Waiting for GPU memory** when a selected
+local GPU could resume after other applications release memory.
+
+A GPU worker can encode the last member of a batch directly from its
 pinned output buffer. Its host RAM reservation includes separate raw copies
 only for earlier members and accounts for retained GPU buffers across tasks.
 The worker releases its host output buffer if keeping it would prevent
@@ -2344,6 +2478,10 @@ deadline still bounds execution.
 When a worker pauses or its queue fills before it starts a task, it can
 confirm the refusal directly with the broker. The broker can assign a retry
 to that worker once it has capacity, even if the owner's upload was interrupted.
+If the connection breaks during execution, the owner can retry on another
+eligible worker as soon as it reports the lost transfer. The broker keeps
+the original worker's resources reserved until it finishes or its lease
+expires. Only the current attempt can deliver the result.
 
 `--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
@@ -2376,6 +2514,11 @@ together when every eligible route has been measured and that worker can
 finish the batch before any other could deliver one member. It checks the
 granted worker and endpoint before sending the member IDs. New arrivals can
 still receive single-member probes.
+When several destinations have enough RAM to receive independently, the
+owner can reserve a measured batch on a fast worker while another destination
+tries a new helper. The other destinations can submit work as soon as the
+broker grants the batch. If the worker leaves or the receive budget shrinks,
+the owner can send the original members individually.
 The broker reports a common batch width and the number of slots that can
 stream each independent batch size within the workers' CPU and memory budgets.
 The GPU generates and sorts the next member while the worker encodes the
@@ -2405,6 +2548,12 @@ contributions, `pinned output wait` measures how long the preceding consumer
 holds the buffer before the device-to-host copy. Packed GPU generation
 can overlap its output callback, so its generation time includes backpressure
 from the receiver.
+The Workers tab shows each worker's failed assignments and the latest
+reason alongside its validated deliveries. With phase timing enabled,
+the owner identifies failed assignments
+by worker instance, sequence and attempt. The worker logs the reason for
+a failure after it accepts the lease. These fields let you match failures
+to retries across the two machines.
 
 An optional remote encoding probe uses recent broker timings and available
 CPU and task slots to decide whether it can finish within the local encoding
@@ -2757,7 +2906,7 @@ On Windows with the HIP backend, direct single-GPU plotting and its memory
 watchdog use the driver's reading for the plotting process. When sharing the
 Radeon with another application, `POS2GPU_MAX_VRAM_MB` can bound a direct
 plot's memory use. A compute worker with an automatic GPU limit also reads
-Windows' adapter-wide usage and process budget when it starts.
+Windows' adapter-wide usage and process budget as it updates its offer.
 
 Integrated Intel GPUs share host memory. Admission uses the driver's free
 host-memory reading, bounded by physical host RAM and the runtime's allocation
@@ -3038,7 +3187,7 @@ common commands and options; use this reference for the complete command guide.
 | `POS2GPU_ASSERT_VRAM=1` | Fail when the sampled decrease in free VRAM exceeds the declared budget, including its margin. The Windows HIP reading covers the plotting process. On a backend with device-wide readings, repeat on an idle GPU before attributing a failure to the model. Enabled by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
-| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr. The [group construction engine](#construction-and-recovery) also reports output transfers, host CPU time and controller waits. Diagnostic synchronization can change overlap; these are not kernel-busy measurements. |
+| `POS2GPU_PHASE_TIMING=1`      | Writes phase timings for Xs, sort and T1–T3 to stderr. Group construction also reports controller waits and the target, collection and member range for hashing, fresh payload writes, file commit and durable publication. Per-target counters include time in codec, write and sync calls. Diagnostic synchronization can affect overlap. |
 | `ACPP_GFX=gfxXXXX` | AMD container AOT target; Cargo detects the GPU separately. See [AMD target selection](INSTALL.md#amd-target-selection). |
 | `ACPP_TARGETS=...` | Override Cargo target selection, such as `generic` or `hip:gfx1031`. For direct CMake use `-DACPP_TARGETS=...`. |
 | `CUDA_ARCHITECTURES=89`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |

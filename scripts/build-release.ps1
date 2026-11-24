@@ -155,6 +155,7 @@ ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
     -R ('^(' + ($hostTests -join '|') + ')$')
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
     -R '^compute_(membership|worker)_network_test$'
+ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 -R '^compute_worker_gpu_(recovery|capacity)_test$'
 cmake --build $BuildDir --parallel 2
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test)$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

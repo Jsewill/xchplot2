@@ -249,7 +249,7 @@ public:
                                         unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0,
                                         size_t parallel_roots = 1, size_t open_slots = SIZE_MAX,
                                         std::function<uint64_t(ExternalConfig&)> const& configure_stripes = {},
-                                        bool preview = false, bool spare_spindle = false)
+                                        bool preview = false, bool spare_spindle = false, long double successor_rate = 0)
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -318,7 +318,7 @@ public:
         {
             uint64_t const extent = std::min(segment_bytes, read_buffer_bytes ? std::max(uint64_t(1), read_buffer_bytes / 8) : segment_bytes);
             size_t const width = spare_spindle ? 1 : std::min<uint64_t>(parallel_roots, std::max<uint64_t>(1, desired / extent));
-            for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots))
+            for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots, successor_rate))
             {
                 auto const& root = roots_[i]; root.value.check();
                 selected.push_back(i); seen.push_back(root.filesystem);
@@ -559,7 +559,7 @@ private:
     // Reserve the spindles needed by simultaneous output writers and balance
     // the remaining drives by throughput before splitting a capacity grant.
     std::vector<std::pair<size_t, uint64_t>> rotating_shares(uint64_t owner, StorageDevice const& destination,
-        std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots) const
+        std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots, long double successor_rate) const
     {
         struct Candidate { size_t root; uint64_t room; long double rate; };
         std::vector<Candidate> disks;
@@ -699,6 +699,31 @@ private:
                 { return overlap(*successor, roots_[disk.root].value.device); });
                 if (replacement != disks.end()) *end++ = *replacement;
                 selected = end - disks.begin();
+            }
+        }
+        // A qualified same-output successor can receive on different HDDs while this
+        // stripe packs. Split only this owner's share, with enough measured service
+        // and complete capacity on both sides. Unknown rates keep the ordinary grant.
+        if (successor_rate > 0 && selected > 1 && bandwidth_)
+        {
+            auto stripe = std::span(disks).first(selected);
+            long double total = 0;
+            for (auto const& disk : stripe)
+            {
+                if (overlap(destination, roots_[disk.root].value.device) ||
+                    !bandwidth_->bandwidth(roots_[disk.root].value.device)) { total = 0; break; }
+                total += disk.rate;
+            }
+            long double rate = 0;
+            uint64_t room = 0;
+            for (size_t i = 0; total && i + 1 < selected; ++i)
+            {
+                rate += disks[i].rate; room += std::min(desired - room, disks[i].room);
+                if (room < desired || rate < std::max(successor_rate, total / 2) || total - rate < successor_rate) continue;
+                uint64_t spare = 0;
+                for (auto const& disk : stripe.subspan(i + 1)) spare += std::min(desired - spare, disk.room);
+                if (spare == desired) selected = i + 1;
+                break;
             }
         }
         disks.resize(selected);

@@ -2,6 +2,7 @@
 // private ownership without adding a production cache-testing interface.
 #include "host/ComputeWorker.cpp"
 #include "host/ComputeSession.hpp"
+#include "host/GroupStorage.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
 #include "compute_pool_fixture.hpp"
@@ -601,6 +602,37 @@ void planning_feedback()
     auto roster = std::make_shared<pool::GenerationRoster>();
     for (auto const& worker : {fast_packed, slow_packed})
         roster->routes.push_back({worker.worker_identity, worker.worker_instance, route, {}, {}, 0, 1});
+    {
+        auto& pair = new_planner();
+        pair.capacity(18, 2, roster, 0, now);
+        auto quick = fast_packed, helper = slow_packed;
+        quick.execution_ns = 300; quick.transfer_ns = 100;
+        helper.execution_ns = 4000; helper.transfer_ns = 4000;
+        helper.generation = {4000, 4000, 4000, 0};
+        train(pair, quick, route); train(pair, helper, route);
+        auto ordinary = [&](unsigned paid)
+        {
+            WorkerPackedRoute target;
+            auto const active = pair.selected(quick, route, now);
+            auto const n = pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &target, true);
+            pair.released(quick.worker_identity, active);
+            require(n == 3 && target.route.identity == quick.worker_identity && target.paid_width == paid,
+                "the slower singleton route inherited a batch sized for the earlier release");
+        };
+        ordinary(0);
+        auto whole = quick; whole.work_units = 3; whole.execution_ns = 750;
+        observe(pair, whole, route); ordinary(3);
+        auto hybrid = std::make_shared<pool::GenerationRoster>(*roster); hybrid->routes.back().cpu_slots = 1;
+        pair.capacity(18, 2, hybrid, pair.selections(), now);
+        WorkerPackedRoute unpriced;
+        require(pair.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 3, 2, 3, 1, now, 0, &unpriced, true) == 3 &&
+            unpriced.route.identity.empty(), "a measured GPU priced the unmeasured CPU backend on the same worker");
+        pair.capacity(18, 2, roster, pair.selections(), now);
+        helper.execution_ns = 200; helper.transfer_ns = 200; observe(pair, helper, route);
+        WorkerPackedRoute open;
+        require(pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &open, true) == 3 &&
+            open.route.identity.empty(), "a competitive measured singleton was pinned behind the incumbent");
+    }
     receiving.capacity(18, 2, roster, 0, now); train(receiving, fast_packed, route);
     auto selected = receiving.selected(slow_packed, route, now);
     pool::Lease first; first.worker_identity = slow_packed.worker_identity;
@@ -641,6 +673,65 @@ void planning_feedback()
     require(width_after(6000) == 1, "a stale member prelude from the old route occupied its replacement");
     receiving.released(slow_packed.worker_identity, replaced);
 
+    {
+        auto& joining = new_planner();
+        auto extra = slow_packed; extra.worker_identity = "arriving-packed-worker";
+        auto mixed = std::make_shared<pool::GenerationRoster>(*roster);
+        mixed->routes.push_back({extra.worker_identity, extra.worker_instance, route, {}, {}, 0, 1});
+        joining.capacity(18, 2, mixed, 0, now);
+        train(joining, fast_packed, route);
+        auto slower = slow_packed; slower.generation = {8000, 1000, 1000, 0};
+        train(joining, slower, route);
+        auto trial = joining.selected(extra, route, now);
+        pool::Lease probe = first; probe.worker_identity = extra.worker_identity;
+        joining.receiving_packed(probe, trial, now);
+        auto width = [&](unsigned ns)
+        { return joining.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Packed, 3, 3, 3, 3, 1,
+            now + std::chrono::nanoseconds(ns), 0, &planned); };
+        require(width(100) == 1 && width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a second measured helper kept a fast route on singletons during another worker's long first transfer");
+        auto active_fast = joining.selected(fast_packed, route, now + std::chrono::nanoseconds(9700));
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a wide batch stopped following the earlier measured release when an unpriced slot was occupied");
+        auto prior_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(4000));
+        auto next_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(5960));
+        joining.observed(slower, route, prior_slow, now + std::chrono::nanoseconds(6000));
+        joining.released(slower.worker_identity, prior_slow);
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "an overlapped receipt on a slower measured worker broke a batch that beats its next singleton");
+        require(width(12000) == 1, "an overdue fast worker borrowed another worker's release estimate");
+        joining.released(slower.worker_identity, next_slow);
+        joining.released(fast_packed.worker_identity, active_fast);
+        auto changed = std::make_shared<pool::GenerationRoster>(*mixed); changed->routes.back().endpoint = relocated;
+        joining.capacity(18, 2, changed, joining.selections(), now);
+        require(width(10000) == 1, "a replaced worker inherited its predecessor's occupied first transfer");
+    }
+
+    {
+        auto& costs = new_planner();
+        auto routes = std::make_shared<pool::GenerationRoster>(*roster);
+        auto third = slow_packed; third.worker_identity = "wireless";
+        routes->routes.push_back({third.worker_identity, third.worker_instance, route, {}, {}, 0, 1});
+        costs.capacity(18, 2, routes, 0, now);
+        auto quick = fast_packed, medium = slow_packed, whole = quick;
+        quick.elapsed_ns = 3'500'000'000; medium.elapsed_ns = 25'000'000'000; third.elapsed_ns = 111'000'000'000;
+        whole.work_units = 3; whole.elapsed_ns = 8'000'000'000;
+        whole.generation = {}; // Older workers still deliver the measured owner receipt.
+        auto wave = [&](unsigned width, WorkerPackedRoute const& target = {}, unsigned receivers = 3)
+        { return costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, width, 3,
+            receivers, *routes, target, now); };
+        observe(costs, quick, route); observe(costs, whole, route);
+        WorkerPackedRoute target{routes->routes.front(), pool::Kind::GenerateGpu};
+        require(!wave(1) && wave(3, target) == whole.elapsed_ns && !wave(2, target),
+            "a fast worker priced unmeasured singleton peers or an unobserved split");
+        observe(costs, medium, route); observe(costs, third, route);
+        require(wave(1) == third.elapsed_ns && wave(1, {}, 1) == 3.L * third.elapsed_ns && !wave(3),
+            "a fast fleet rate concealed the slowest receipt or an unpriced whole-group route");
+        auto changed = std::make_shared<pool::GenerationRoster>(*routes); changed->routes.back().endpoint = relocated;
+        costs.capacity(18, 2, changed, costs.selections(), now);
+        require(!wave(1) && !costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, 1, 3, 3, *changed, {}, now),
+            "a replacement route inherited an earlier publication trial price");
+    }
     auto& final_group = new_planner();
     final_group.capacity(18, 2, roster, 0, now);
     auto triple = fast_packed; triple.work_units = 3; triple.generation = {1200, 600, 600, 0};
@@ -652,6 +743,32 @@ void planning_feedback()
     require(earlier(now) && planned.route.identity == triple.worker_identity,
         "a final measured batch was split although it beats a singleton on every alternative");
     require(!earlier(now + std::chrono::nanoseconds(2000)), "an overdue worker kept the final batch");
+    auto packed_pair = triple; packed_pair.work_units = 2; packed_pair.generation = {750, 450, 450, 0};
+    train(final_group, packed_pair, route);
+    final_group.released(triple.worker_identity, running);
+    running = final_group.selected(triple, route, now);
+    std::shared_ptr<void> assigned_singleton;
+    auto spare_fits = [&](unsigned ns) { return final_group.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2,
+        now, now + std::chrono::nanoseconds(ns), assigned_singleton); };
+    require(!spare_fits(0) && !spare_fits(7000) && spare_fits(12000) && !spare_fits(12000),
+        "packed work did not preserve the final fast batch or use the measured spare over a fitting independent horizon");
+    assigned_singleton.reset();
+    auto lost = std::make_shared<pool::GenerationRoster>(*roster); lost->routes.pop_back();
+    final_group.capacity(18, 2, lost, final_group.selections(), now);
+    require(!spare_fits(12000), "a withdrawn packed worker still supplied an idle singleton");
+    final_group.capacity(18, 2, roster, final_group.selections(), now);
+    {
+        auto& shared_link = new_planner();
+        shared_link.capacity(18, 2, roster, 0, now);
+        auto full = triple, shorter = packed_pair, helper = alternate;
+        full.generation = {1, 1800, 1800, 0}; shorter.generation = {1, 1200, 1200, 0};
+        helper.generation = {1, 8000, 8000, 0};
+        full.ingress_interface = shorter.ingress_interface = helper.ingress_interface = 7;
+        train(shared_link, full, route); train(shared_link, shorter, route); train(shared_link, helper, route);
+        shared_link.selected(full, route, now);
+        require(!shared_link.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2, now,
+            now + std::chrono::nanoseconds(12000), assigned_singleton), "a saturated shared ingress funded another packed receiver");
+    }
     final_group.released(triple.worker_identity, running);
     auto dual = std::make_shared<pool::GenerationRoster>(*roster); dual->routes.back().cpu_slots = 1;
     final_group.capacity(18, 2, dual, final_group.selections(), now);
@@ -1202,12 +1319,17 @@ void assigned_local_and_fencing()
     WorkerService scratch_limited(bounded); scratch_limited.start();
     config.broker = bounded.broker; config.owner_id = "batch-refusal-owner";
     config.local_service = nullptr; config.task_timeout_ms = 10000;
+    std::string failed_instance, failed_reason;
+    config.generation_failed = [&](auto const& task, std::string_view reason)
+        { failed_instance = task.worker_instance; failed_reason = reason; };
     WorkerClient refused(config);
     bool unsupported = false, emitted = false;
     try { refused.contributions(18, 2, ids, [&](auto, auto, auto) { emitted = true; }); }
     catch (pool::UnsupportedResources const&) { unsupported = true; }
     require(unsupported && !emitted,
         "refused contribution batch retried its excluded shape instead of returning before output");
+    require(failed_instance == scratch_limited.status().instance && failed_reason.find("scratch") != std::string::npos,
+        "failed generation lost its authenticated worker or resource diagnostic");
     chunks = 0;
     refused.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, auto bytes, uint16_t members)
     { require(ordinal == chunks++ && members == 1 && !bytes.empty(), "singleton split failed after a typed batch refusal"); });
@@ -1234,6 +1356,77 @@ void temporary_worker_refusal()
     auto expected = codec.encode(0, {}, 0, {&region, 1});
     pool::BrokerClient worker_control(offer.broker, tls);
     auto const instance = service.status().instance;
+    {
+        bool moved = false, pressure_at_grant = false;
+        std::shared_ptr<DiskIoGovernor> io;
+        WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
+        config.owner_id = "terminal-grant-fence";
+        config.generation_path = [&](auto const&, auto const&, uint32_t) { return std::string(64, moved ? 'b' : 'a'); };
+        config.selected = [&](auto const&) { if (std::exchange(pressure_at_grant, false)) io->observe_pressure(true); };
+        WorkerClient client(config); auto const competing = worker_control.open_owner("contending-writer");
+        pool::Task blocker; blocker.compatibility = worker_compatibility(); blocker.k = 18; blocker.strength = 2;
+        blocker.kind = pool::Kind::GenerateCpu; blocker.resources.host_bytes = 1;
+        auto reserve = [&]
+        {
+            blocker.task_id = pool::random_token(); ++blocker.sequence;
+            require(bool(worker_control.acquire(competing, blocker)), "contender did not occupy the idle signed lane");
+        };
+        auto release = [&] { worker_control.cancel(competing, blocker.task_id, blocker.attempt); };
+        auto const before = service.status().accepted_tasks;
+        enum class Change { queued, pressure, path };
+        for (bool fresh : {false, true}) for (auto change : {Change::queued, Change::pressure, Change::path})
+        {
+            moved = false; auto publication = client.publication_route(18, 2, {&id, 1});
+            require(bool(publication), "a registered single-slot worker did not quote its normal generation path");
+            io = std::make_shared<DiskIoGovernor>(); auto const sampled = io->pressure_deadline();
+            publication->pressure_unchanged = [io, sampled] { return io->pressure_deadline() == sampled; };
+            publication->selected_fresh = fresh; publication->promoted.store(true);
+            std::atomic<bool> returned{false}; std::future<void> released;
+            if (change == Change::queued)
+            {
+                reserve();
+                released = std::async(std::launch::async, [&]
+                {
+                    auto const until = Clock::now() + std::chrono::seconds(2);
+                    while (!returned.load() && Clock::now() < until && !worker_control.status().queued)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    release();
+                });
+            }
+            else if (change == Change::pressure) pressure_at_grant = true;
+            else moved = true;
+            bool declined = false, received = false;
+            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::seconds(3);
+            try
+            {
+                if (fresh) client.contributions(18, 2, {&id, 1}, [&](auto, auto, auto) { received = true; },
+                    cancel, {}, {}, [&](auto, auto, auto const&) { received = true; });
+                else client.generate_packed(18, 2, {&id, 1}, [&](auto const&, uint64_t) { received = true; }, cancel);
+            }
+            catch (WorkerPublicationChanged const&) { declined = true; }
+            returned = true; if (released.valid()) released.get();
+            require(declined && !received && !client.stats().input_bytes && service.status().accepted_tasks == before,
+                "a changed terminal queue, pressure or path failed to return to the incumbent before Work");
+        }
+        reserve();
+        auto ordinary = std::async(std::launch::async, [&]
+        {
+            bool delivered = false; client.generate(18, 2, id, [&](auto const&, uint64_t) { delivered = true; }); return delivered;
+        });
+        auto until = Clock::now() + std::chrono::seconds(2); bool waited = false;
+        while (Clock::now() < until && !(waited = worker_control.status().queued != 0))
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        release();
+        auto const delivered = ordinary.get();
+        require(waited && delivered && client.stats().completed_generation == 1,
+            "discarding terminal evidence changed the ordinary lease's queue or completion");
+        // The TLS End can reach the owner before the worker's signed release and acceptance guard finish.
+        until = Clock::now() + std::chrono::seconds(2);
+        while (Clock::now() < until && service.status().accepted_tasks != before)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(service.status().accepted_tasks == before, "completed ordinary work retained its worker acceptance");
+
+    }
     for (bool local : {false, true})
     {
         bool refuse = false, delayed_pause = false;
@@ -1917,7 +2110,7 @@ void local_only_parallel()
             auto const affinity = pos2gpu::current_thread_cpus(); bool rejected = false;
             WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
             try { client.generate(18, 2, id, [](auto const&, auto) {}, cancel); }
-            catch (worker_detail::TaskCancelled const&) { rejected = true; }
+            catch (WorkerTaskTimeout const&) { rejected = true; }
             return rejected && pos2gpu::current_thread_cpus() == affinity;
         });
         completed = cancelled.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
@@ -2035,6 +2228,16 @@ void status_inspection()
     auto accepting = inspect(); auto after = control.status();
     require(accepting.status == "compatible-workers-observed" && accepting.accepting_generation == 1 && accepting.accepting_codec == 1 &&
         !after.owners && !after.jobs, "status inspection created owner sessions/tasks or failed to report compatible admission");
+    control.unregister_worker(offer.instance);
+    offer.admission = pool::WorkerAdmission::Accepting;
+    offer.capabilities |= pool::capability(pool::Kind::GenerateGpu);
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, {1, 1, 1, 1}, 1, 1}};
+    offer.gpu_recovery = "ZE_RESULT_ERROR_DEVICE_LOST";
+    control.register_worker(offer);
+    auto recovering = inspect();
+    require(recovering.accepting_generation == 1 && recovering.accepting_codec == 1 &&
+        recovering.worker_resources.size() == 1 && recovering.worker_resources.front().gpu_recovery == offer.gpu_recovery,
+        "live status dropped the GPU recovery cause or withdrew accepting CPU work");
     args.pool_broker = "localhost:" + std::to_string(broker.server.endpoint().port);
     auto hostname = inspect();
     require(!hostname.complete && !hostname.checked && !hostname.issues.empty() && hostname.issues.front().reason.find("numeric") != std::string::npos,

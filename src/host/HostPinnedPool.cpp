@@ -1,6 +1,7 @@
 // HostPinnedPool.cpp — see header for design.
 
 #include "host/HostPinnedPool.hpp"
+#include "host/GpuCleanup.hpp"
 
 #include "host/GpuBufferPool.hpp"   // host_pinned_reserve_check
 
@@ -13,7 +14,7 @@ HostPinnedPool::~HostPinnedPool()
 {
     for (auto& [name, s] : slots_) {
         if (s.ptr && s.alloc_q) {
-            sycl::free(s.ptr, *s.alloc_q);
+            release_gpu_memory(name.c_str(), s.bytes, &GpuCleanupCharges::host, [&] { sycl::free(s.ptr, *s.alloc_q); });
         }
     }
 }
@@ -31,9 +32,9 @@ void* HostPinnedPool::acquire(std::string_view name, std::size_t bytes,
         return it->second.ptr;
     }
     if (it != slots_.end() && it->second.ptr && it->second.alloc_q) {
-        sycl::free(it->second.ptr, *it->second.alloc_q);
-        it->second.ptr = nullptr;
-        it->second.bytes = 0;
+        auto* owned = std::exchange(it->second.ptr, nullptr);
+        checked_gpu_free(std::exchange(it->second.bytes, 0), &GpuCleanupCharges::host,
+            [&] { sycl::free(owned, *it->second.alloc_q); });
     }
     // After the free above, so a grown slot is charged only its delta against
     // what the host actually has left.

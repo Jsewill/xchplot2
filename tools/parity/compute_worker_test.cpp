@@ -297,8 +297,21 @@ void multiple_brokers(char const* ca, char const* cert, char const* key)
     if (!started) { release.set_value(); held.get(); throw std::runtime_error("first broker made no progress"); }
     auto queued = std::async(std::launch::async, [&] { return collect(b); });
     bool const bounded = queued.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    WorkerGenerationCapacity busy;
+    auto const until = Clock::now() + std::chrono::seconds(3);
+    do
+    {
+        busy = a.generation_capacity(18, 2);
+        if (busy.availability.admission && !busy.availability.admission->available_slots) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (Clock::now() < until);
     release.set_value();
-    require(held.get() == expected && queued.get() == expected, "independent brokers changed worker output");
+    auto const first_result = held.get();
+    auto const idle = a.generation_capacity(18, 2);
+    require(busy.slots == 1 && busy.availability.admission && !busy.availability.admission->available_slots &&
+        !busy.availability.admission->other_owner_tasks && idle.availability.admission && idle.availability.admission->available_slots == 1,
+        "completed packed receipt retained the owner's occupied slot");
+    require(first_result == expected && queued.get() == expected, "independent brokers changed worker output");
     require(bounded, "independent brokers exceeded the worker's one shared task slot");
 
     client.local_service = nullptr; WorkerClient remote(client);
@@ -701,7 +714,7 @@ void network(char const* ca, char const* cert, char const* key)
         for (size_t i = 0; i < incoming.size(); ++i)
             require(unpack(incoming[i]->finish(checked)) == reference[i], "packed lease changed member order or content");
         auto const reference_digest = members_digest(18, Members(reference), nullptr, [] {});
-        auto collect_fresh = [&](WorkerClient& source)
+        auto collect_fresh = [&](WorkerClient& source, bool ahead = true)
         {
             size_t ordinal = 0, largest_window = 0;
             uint64_t size = 0, peak = 0, budget = 0, largest = 0;
@@ -724,6 +737,7 @@ void network(char const* ca, char const* cert, char const* key)
             auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> batch, uint16_t count)
             {
                 require(!batch.empty() && batch.size() <= fresh_group_window_chunks, "fresh group receive window exceeds admission");
+                require(caller == std::this_thread::get_id(), "fresh read-ahead changed the contribution sink thread");
                 // A shared scheduler must accept owner validation after the
                 // worker releases its codec permits, including in-process.
                 if (!largest_window) client_options.cpu_scheduler->submit([] {}).get();
@@ -735,7 +749,7 @@ void network(char const* ca, char const* cert, char const* key)
                 {
                     require(!budget && digest == reference_digest, "fresh lease changed the recovery digest");
                     budget = payload; largest = max_chunk;
-                });
+                }, false, true, {}, ahead);
             require(ordinal == PlotGroupFile::getChunkCountForK(18) && largest_window > 1 && size <= budget && peak <= largest,
                 "fresh lease lost window batching, chunks or storage bounds");
             return std::array{budget, largest, size};
@@ -745,7 +759,22 @@ void network(char const* ca, char const* cert, char const* key)
         WorkerTaskObservation observation;
         local_options.observe = [&](auto const& value) { observation = value; };
         WorkerClient local(local_options);
+        bool accepted = false, stopped = false;
+        try
+        {
+            client.contributions(18, 2, ids, [](auto, auto, auto) {}, {}, {},
+                [&](auto, auto, auto) { require(accepted, "fresh window preceded manifest"); throw WorkerTaskDeclined(); },
+                [&](auto, auto, auto const&) { accepted = true; });
+        }
+        catch (WorkerTaskDeclined const&) { stopped = true; }
+        require(accepted && stopped, "fresh read-ahead lost the sink decline");
+        auto const before_serial = client.stats().generation;
+        auto const serial_manifest = collect_fresh(client, false);
+        auto const serial = client.stats().generation;
+        require(serial.frame_wait_ns - before_serial.frame_wait_ns == serial.frame_read_ns - before_serial.frame_read_ns,
+            "one-frame fresh receive prefetched without an owner grant");
         auto const remote_manifest = collect_fresh(client);
+        require(serial_manifest == remote_manifest, "fresh read-ahead changed the serial reference");
         require(collect_fresh(local) == remote_manifest, "direct and TLS fresh leases differ in bounds or size");
         auto const completed = local.stats();
         require(completed.completed_contributions == 1 && completed.local_tasks == 1 &&
@@ -957,8 +986,24 @@ void offered_cpus()
     require(cancelled_waiter, "worker CPU queue ignored cancellation");
     CpuWork reused(offered, &shared, cancel, 2);
 }
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "compute_worker_gpu_fixture.hpp"
+#endif
 int main(int argc, char** argv)
 {
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (argc == 2 && std::string_view(argv[1]) == "--shared-capacity") {
+        try { worker_gpu_test::shared_capacity(); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    if (argc == 8 && std::string_view(argv[5]) == "--gpu-recovery-worker")
+    { worker_gpu_test::child = true; return run_worker_gpu_child(argv[6], argv[7]); }
+    if (argc == 2 && (std::string_view(argv[1]) == "--gpu-recovery" || std::string_view(argv[1]) == "--gpu-recovery-network"))
+    {
+        try { worker_gpu_test::recovery(std::string_view(argv[1]) == "--gpu-recovery-network"); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+#endif
     try { scoped_threads(); packed_word_validation(); budget(); fitted_broker_budget(); retained_budget(); chunk_headers(); renewal_errors(); offered_cpus(); generation(); if (argc == 4) network(argv[1], argv[2], argv[3]);
         else if (argc == 2 && std::string_view(argv[1]) == "--network")
         { pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "worker-ca");
