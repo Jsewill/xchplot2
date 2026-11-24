@@ -124,9 +124,10 @@ python3 contrib/pos2-pr118/group.py \
 
 `--pool-pk` is supported instead of `--pool-ph`. The default device is CPU;
 GPU selection is explicit and never falls back to CPU. Key generation uses
-released chia-protocol/chia-bls 0.52 for BLS and identity hashing, with
-the V2 taproot hash SHA-256 of `(local_pk + farmer_pk) || farmer_pk` for both
-pool-public-key and pool-contract modes. It generates one seed and memo per group, exposes the group
+`chia-bls` for BLS operations. Tests compare group and member IDs with
+`chia-protocol`. Both pool-public-key and pool-contract modes use the V2
+taproot hash SHA-256 of `(local_pk + farmer_pk) || farmer_pk`.
+The plotter generates one seed and memo per group, exposes the group
 hash, and derives each member ID as SHA-256 of the group ID, big-endian u16
 index, and u8 meta group. New jobs generate fresh random keys by default, so
 repeating the same plotting parameters produces distinct group and member IDs.
