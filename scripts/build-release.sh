@@ -11,6 +11,10 @@ architectures='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;8
 if [[ $arch == aarch64 ]]; then
     # NVCC 12.9 needs these NEON headers. Host C++ uses the system libstdc++.
     cuda_host_cxx=/usr/bin/g++-11
+    # NVCC's GCC directory also contains its older libstdc++. Keep it out of C++ links.
+    cuda_libgcc=$("$cuda_host_cxx" -print-libgcc-file-name)
+    excluded_dirs=${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES_EXCLUDE:-}
+    export CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES_EXCLUDE="${excluded_dirs:+$excluded_dirs;}${cuda_libgcc%/*}"
     components+=,ocl
     architectures=$(nvcc --list-gpu-arch | awk '
         /^compute_[0-9]+$/ {
