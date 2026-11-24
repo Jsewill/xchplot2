@@ -2948,6 +2948,69 @@ void destination_admission()
         "successor singleton fallback bypassed actual workspace admission");
 }
 
+void independent_terminal_dispatch()
+{
+    // Seven independent writers exceed the small exact-search ceiling.
+    // The longest write is already first, but the last, three-member batch
+    // determines when the complete farm becomes durable.
+    std::array<unsigned, 7> generation{3, 3, 3, 3, 3, 6, 9}, disk{24, 12, 12, 12, 12, 12, 21};
+    std::array<ExecutionReady, 7> ready;
+    std::array<ExecutionLane, 7> lanes;
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = generation[i]; work.cpu = 5; work.destination = disk[i];
+        work.known = work.io_overlap = true; work.batches = 1; lanes[i].destination = i;
+        ready[i] = {i, 0, work.cpu + work.destination, true, uint16_t(generation[i] / 3), false, work.generation};
+    }
+    std::array<size_t, 7> order{0, 1, 2, 3, 4, 5, 6};
+    auto completion = [&]
+    {
+        unsigned released = 0, last = 0;
+        for (auto i : order) { released += generation[i]; last = std::max(last, released + disk[i]); }
+        return last;
+    };
+    unsigned const ordinary = completion();
+    auto optimum = ordinary;
+    while (std::next_permutation(order.begin(), order.end())) optimum = std::min(optimum, completion());
+    auto const chosen = execution_terminal_first(ready, lanes, 7, 1);
+    require(chosen == 6 && ordinary == 51 && optimum == 42, "the ordinary critical writer was never promoted");
+    std::rotate(order.begin(), order.begin() + *chosen, order.begin() + *chosen + 1);
+    require(completion() == optimum && execution_terminal_first(ready, lanes, 2, 1) == chosen,
+        "the first grant missed the independently attainable durable lower bound");
+    require(!execution_terminal_first(ready, lanes, 1, 1), "the independent ordering overrode scarce packing CPU");
+    ready[0].deferrals = ready.size();
+    require(!execution_terminal_first(ready, lanes, 7, 1), "the critical writer overtook an aged grant");
+    ready[0].deferrals = 0; lanes[0].work.scratch_write = 1;
+    require(!execution_terminal_first(ready, lanes, 7, 1), "unattributed scratch service acquired an independent tail");
+    lanes[0].work.scratch_write = 0; lanes[0].work.destination = 39; ready[0].remaining = 44;
+    require(!execution_terminal_first(ready, lanes, 7, 1), "an equal completion changed ordinary terminal priority");
+
+    // The stable sorted suffix would price [1, 3, 2, 0] at 40, but its
+    // third grant is aged. The real rotating owner issues [1, 3, 0, 2]
+    // and finishes at 42, slower than the ordinary 41.
+    std::array<unsigned, 4> p{3, 2, 3, 1}, q{30, 38, 33, 23};
+    for (size_t i = 0; i < p.size(); ++i)
+    {
+        lanes[i].work.generation = p[i]; lanes[i].work.cpu = 1; lanes[i].work.destination = q[i];
+        ready[i] = {i, 0, static_cast<long double>(q[i] + 1), true, uint16_t(p[i]), false,
+            static_cast<long double>(p[i])};
+    }
+    std::array<size_t, 4> feasible{};
+    require(execution_terminal_first(std::span(ready).first(4), std::span(lanes).first(4), 4, 1, feasible) == 1 &&
+        feasible == std::array<size_t, 4>{1, 2, 3, 0}, "a saved terminal order priced work beyond the age fence");
+    for (size_t i = 0; i < 3; ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = std::array{2, 2, 1}[i]; work.destination = std::array{36, 20, 35}[i];
+        ready[i] = {i, size_t(std::array{2, 2, 1}[i]), work.cpu + work.destination, true,
+            uint16_t(work.generation), false, work.generation};
+    }
+    require(!execution_terminal_first(std::span(ready).first(3), std::span(lanes).first(3), 3, 1),
+        "an early fairness release turned ordinary 39 into a projected win but actual 40");
+
+}
+
 void execution_planning()
 {
     using namespace grow_controller_test;
@@ -3051,6 +3114,7 @@ void execution_planning()
     lanes.back().work.known = true; lanes.back().scratch.clear();
     require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
         "unknown scratch attribution acquired an execution estimate");
+    independent_terminal_dispatch();
     std::array<ExecutionReady, 3> ready{{{7, 0, 100, true}, {8, 0, 300, true}, {9, 0, 200, true}}};
     require(execution_generation_order(ready) == 8, "generation did not start the longest measured downstream tail");
     ready.back().known = false;
@@ -3106,7 +3170,9 @@ void execution_planning()
         "the final ordinary grant lost its planned member range");
     accepted.grant(final[1].index, inputs[1].count); require(!accepted.count, "completed terminal grants kept an order");
     inputs[2].plot[0] = 1; require(!plan.next(remaining, pending, supply, 2), "changed member kept the saved terminal order");
-    inputs[2].plot[0] = 0; final[2].deferrals = pending.size();
+    inputs[2].plot[0] = 0; inputs[2].time_to_write = 10;
+    require(!plan.next(remaining, pending, supply, 2), "changed ordinary priority kept an earlier terminal forecast");
+    inputs[2].time_to_write = 0; final[2].deferrals = pending.size();
     require(!plan.next(remaining, pending, supply, 2), "a saved terminal order bypassed an aged grant");
     final[2].deferrals = 0; auto replacement = std::make_shared<int>(1);
     require(!plan.next(remaining, pending, {1, replacement}, 2) && !plan.next(remaining, pending, supply, 100),
