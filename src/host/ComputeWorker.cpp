@@ -3268,12 +3268,7 @@ public:
             if (end < finish) { finish = end; batch = &item; }
         }
         if (!batch) return false;
-        unsigned offered = 0, measured = 1;
-        for (auto const& route : roster_->routes)
-        {
-            offered += bool(route.cpu_slots && kind != pool::Kind::GenerateGpu);
-            offered += bool(route.gpu_slots && kind != pool::Kind::GenerateCpu);
-        }
+        unsigned measured = 1;
         // Even if every other eligible backend were idle now, each would
         // deliver its first member after this measured whole batch.
         for (auto const& item : std::span(histories_).first(count_))
@@ -3284,13 +3279,13 @@ public:
                 if (!singleton || singleton <= finish) return false;
                 ++measured;
             }
-        if (measured != offered && !independent) return false;
+        if (!independent && measured != offered_backends(kind)) return false;
         batch_route = {*offered_route(batch->peer.worker), batch->kind};
         return true;
     }
     unsigned dispatch_width(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, unsigned ready, unsigned destinations,
                             unsigned offered, unsigned limit, unsigned fallback, Clock::time_point now = Clock::now(),
-                            unsigned independent_width = 0, WorkerPackedRoute* batch_route = nullptr)
+                            unsigned independent_width = 0, WorkerPackedRoute* batch_route = nullptr, bool independent_packed = false)
     {
         retire(now);
         bool const packed = output == GenerationOutput::Packed;
@@ -3384,6 +3379,25 @@ public:
             static_cast<long double>(ready) * std::max(1u, destinations) / throughput);
         auto const width = std::clamp(unsigned(std::ceil(horizon / available)), 1u, std::min(ready, limit));
         if (width > 1 && occupied_first) *batch_route = {*offered_route(selected->peer.worker), selected->kind};
+        else if (independent_packed && width > 1 && batch_route && selected && selected->slots == 1 && count > 1 &&
+            roster_ && roster_->complete && roster_k_ == k && roster_strength_ == strength)
+        {
+            auto const single = selected->packed_delivery_ns[1], whole = selected->packed_delivery_ns[width];
+            auto const service = whole ? whole : width * single;
+            auto const finish = service + (queue ? next_finish - next_rate : 0);
+            // Keep a batch on the route used to size it when even its ordinary
+            // singletons can finish before a competing worker's first member.
+            unsigned measured = 0;
+            for (auto const& other : std::span(histories_).first(count_))
+                if (other.matches(k, strength, kind, output) && (&other == selected || other.packed_delivery_ns[1] > finish)) ++measured;
+            if (service && measured == offered_backends(kind))
+            {
+                *batch_route = {*offered_route(selected->peer.worker), selected->kind};
+                // A first trial keeps the independent horizon. Only an actual
+                // exact-width receipt can take the broker's finite preference.
+                if (whole && (!single || whole < width * single)) batch_route->paid_width = width;
+            }
+        }
         return width;
     }
     Plan suggested(uint8_t k, uint8_t strength, pool::Kind kind, GenerationOutput output, Clock::time_point now = Clock::now())
@@ -3636,6 +3650,16 @@ private:
     static Peer key(WorkerTaskObservation const& value, pool::Endpoint const& route)
     { return {text<64>(value.worker_identity), text<64>(value.worker_instance), text<253>(route.host),
         text<253>(route.server_name), route.port, value.local_direct}; }
+    unsigned offered_backends(pool::Kind kind) const
+    {
+        unsigned count = 0;
+        for (auto const& route : roster_->routes)
+        {
+            count += bool(route.cpu_slots && kind != pool::Kind::GenerateGpu);
+            count += bool(route.gpu_slots && kind != pool::Kind::GenerateCpu);
+        }
+        return count;
+    }
     pool::GenerationRoute const* offered_route(std::array<char, 64> const& worker) const
     {
         for (auto const& route : roster_->routes) if (text<64>(route.identity) == worker) return &route;
@@ -4980,10 +5004,11 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     if (destinations <= hint.slots && batch_route &&
         impl_->planning.packed_before_singletons(k, strength, impl_->config.generation_kind, width, *batch_route)) return width;
     // First preserve the ordinary measured split, including ready newcomers.
+    bool const independent = priced && singleton_limit && destinations >= 2 && impl_->config.max_active_generation >= 2;
     auto const ordinary = destinations < std::min(hint.slots, impl_->config.max_active_generation) ? 1 :
         impl_->planning.dispatch_width(k, strength, impl_->config.generation_kind, GenerationOutput::Packed,
-            ready, destinations, hint.slots, width, 1, Clock::now(), 0, batch_route);
-    if (ordinary != 1 || !priced || !singleton_limit || destinations < 2 || impl_->config.max_active_generation < 2) return ordinary;
+            ready, destinations, hint.slots, width, 1, Clock::now(), 0, batch_route, independent);
+    if (ordinary != 1 || !independent) return ordinary;
     if (auto pending = impl_->independent_packed.lock())
     {
         // Let the incumbent claim its priced grant before a sibling singleton
