@@ -1,0 +1,45 @@
+name: Repository lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Workflows, spelling and documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        id: checkout
+      - name: List tracked Markdown
+        id: docs
+        run: |
+          {
+            echo 'files<<EOF'
+            git ls-files '*.md'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - uses: DavidAnson/markdownlint-cli2-action@v25
+        with:
+          globs: ${{ steps.docs.outputs.files }}
+      - name: Check local documentation links
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          python3 scripts/test/docs.py --self-test
+          python3 scripts/test/docs.py
+      - uses: crate-ci/typos@v1.52.2
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+      - uses: reviewdog/action-actionlint@v1
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        with:
+          fail_level: error

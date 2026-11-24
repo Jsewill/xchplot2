@@ -146,19 +146,21 @@ Keep each workflow focused on its own checks:
 
 | Workflow | Purpose |
 | --- | --- |
-| `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
+| `Repository lint` | Workflow syntax, spelling, Markdown, and local documentation links |
+| `CI` | Shell and container lint, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
 | `arch-matrix` | Compile sm_86 and sm_89 together with CUDA 13 and sm_120 with CUDA 12.9. The installation containers cover sm_61 and sm_75. |
 | `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
 | `Binary release` | Package and test Linux and Windows archives on both host architectures |
 | `GPU hardware` | Execute correctness and memory suites on the trusted GPU fleet |
 
-Build workflows filter changes to their inputs. CI starts on every PR and
-`main` push so spelling checks cover all tracked text, then selects lint and
-test jobs by their inputs. Documentation checks also run for deletions and
-renames that could break local links. Release PRs select Linux and Windows
-builds separately. Manual dispatch runs all checks for the selected
-workflow, subject to its platform, architecture or suite inputs. Scheduled
-installation checks and tag release builds retain their full matrices.
+Repository lint checks every PR and `main` push, including deletions and
+renames that could break local links. Dependabot groups its spelling,
+Markdown, and workflow linter updates in one weekly PR per target branch
+when updates are available. Build workflows select jobs by their inputs.
+Release PRs select Linux and Windows builds separately. Manual dispatch runs
+all checks for the selected workflow, subject to its platform, architecture
+or suite inputs. Scheduled installation checks and tag release builds run
+their full matrices.
 CI and installation workflows keep each push run because their job filters
 cover only that push. Their PR and manual runs, and architecture workflow
 runs, cancel older runs for the same event and ref. Release builds cancel
@@ -460,8 +462,8 @@ sessions, test counts and run-by-run validation results in local records or CI
 artifacts. User guides should explain supported behavior, limitations and the
 actions readers need to take.
 
-The existing Markdown job lints tracked documentation, including section
-fragments. Local links are checked without contacting external websites:
+Repository lint checks tracked Markdown and links to local files and section
+headings. Run the link check locally with
 
 ```bash
 python3 scripts/test/docs.py
