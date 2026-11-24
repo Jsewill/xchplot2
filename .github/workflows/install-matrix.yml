@@ -32,6 +32,7 @@ on:
       - 'scripts/test/**'
       - 'scripts/test-multi-gpu.sh'
       - 'scripts/build-container.sh'
+      - 'scripts/build-release.*'
       - 'scripts/install-container-deps.sh'
       # Sibling CI workflows — editing arch-matrix or the lint
       # workflow shouldn't drag in the install matrix.
@@ -39,6 +40,7 @@ on:
       - '.github/workflows/gpu*.yml'
       - '.github/workflows/lint.yml'
       - '.github/workflows/release.yml'
+      - 'ci/release/**'
       - '.github/actionlint.*'
       - '_typos.toml'
       - '.github/workflows/arch-matrix.yml'

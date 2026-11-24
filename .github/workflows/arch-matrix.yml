@@ -37,6 +37,7 @@ on:
       - 'scripts/test/**'
       - 'scripts/test-multi-gpu.sh'
       - 'scripts/build-container.sh'
+      - 'scripts/build-release.*'
       - 'scripts/install-container-deps.sh'
       # Sibling CI workflows + install-matrix-only containerfiles.
       - '.github/workflows/ci.yml'
@@ -47,6 +48,7 @@ on:
       - '_typos.toml'
       - '.github/workflows/install-matrix.yml'
       - 'ci/install-matrix/**'
+      - 'ci/release/**'
   push:
     branches: [cuda-only]
     paths-ignore: *ignored-paths

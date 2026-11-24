@@ -8,6 +8,8 @@ on:
       - '.github/workflows/install-matrix.yml'
       - '.github/workflows/lint.yml'
       - '.github/workflows/release.yml'
+      - 'ci/install-matrix/**'
+      - 'ci/release/**'
       - '.github/actionlint.*'
       - '.github/dependabot.yml'
       - '**/*.md'
