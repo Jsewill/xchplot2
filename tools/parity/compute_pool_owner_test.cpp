@@ -989,9 +989,19 @@ void private_local_delegation(std::optional<fs::path> retained = {})
     require(!model.choose(shape, now, 100).possible, "idle persistent GPU RAM was spent a second time");
     fast.offer.standing_host_bytes = 10; slow.offer.demand.host_bytes = 20;
     fast.offer.demand.slots = 0; fast.held = {0, 0, 0, 0};
+    fast.offer.gpu_headroom_limited = true;
     choice = model.choose(shape, now, 100);
     require(choice.device == 1 && choice.grant.cpu_threads == 3, "sole eligible slow CPU did not receive the available grant");
     require(model.choose(shape, now, 30).device == SIZE_MAX, "physical host pressure was ignored");
+    slow.offer.demand.slots = 0;
+    choice = model.choose(shape, now, 100);
+    require(choice.device == SIZE_MAX && choice.possible, "temporary GPU memory pressure ended private acquisition");
+    fast.offer.demand.host_bytes = 81;
+    require(!model.choose(shape, now, 100).possible, "waiting for GPU memory ignored the permanent shared host limit");
+    fast.offer.demand.host_bytes = 55;
+    fast.offer.gpu_headroom_limited = false;
+    require(!model.choose(shape, now, 100).possible, "permanently unsupported private shape waited for GPU memory");
+    slow.offer.demand.slots = 1;
     fast.offer.demand = {3, 1, 55, 0};
     choice = model.choose(shape, now, 100);
     require(choice.device == 0 && choice.grant.cpu_threads == 2, "one CPU service occupied every permit despite a fitting peer");
@@ -1099,6 +1109,21 @@ int run_dashboard_reader(FarmingOwnerHealth const& owner, fs::path const& marker
 void owner_dashboard_feed()
 {
     DashboardJob progress;
+    auto gpu_status = [&](std::string const& cause, bool waiting) {
+        progress.local_gpu_health("gpu0", cause, waiting);
+        DashboardFrame frame; progress.fill(frame, false);
+        auto const& workers = frame.rows[DashboardFrame::workers];
+        auto const row = std::find_if(workers.begin(), workers.end(), [](auto const& entry)
+            { return entry.value.starts_with("Local gpu0   "); });
+        return row == workers.end() ? DashboardFrame::Row{} : *row;
+    };
+    auto waiting = gpu_status({}, true);
+    require(waiting.value == "Local gpu0   Waiting for GPU memory" && waiting.detail.empty(),
+        "private GPU memory pressure was missing from the worker view");
+    auto recovering = gpu_status("device lost", false);
+    require(recovering.value == "Local gpu0   GPU recovering" && recovering.detail == "device lost",
+        "private GPU recovery lost its driver cause after waiting for memory");
+    require(gpu_status({}, false).value.empty(), "available GPU retained its previous worker status");
     progress.roster(18, 2, 1, true, true, true, {{"id", "process", "helper", "GPU", "endpoint", 1}});
     progress.failed_delivery("id", "process", "insufficient memory");
     DashboardFrame snapshot;

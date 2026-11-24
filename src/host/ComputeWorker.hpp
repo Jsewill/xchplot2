@@ -252,6 +252,7 @@ struct WorkerLocalOffer
     uint64_t standing_host_bytes = 0, member_host_bytes = 0;
     unsigned max_batch_members = 0;
     std::string gpu_recovery;
+    bool gpu_headroom_limited = false;
 };
 class WorkerAdmissionRejected : public std::runtime_error
 {

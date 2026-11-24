@@ -38,8 +38,12 @@ inline std::optional<unsigned> windows_hip_worker_node(std::uint32_t mask, unsig
 // Windows HIP reports allocations by the current process. A worker also has to
 // fit its WDDM process budget and the remaining dedicated memory on this adapter.
 inline std::uint64_t windows_hip_worker_headroom(std::uint64_t hip_free,
-    std::uint64_t budget, std::uint64_t process_used, std::uint64_t dedicated, std::uint64_t adapter_used)
+    std::uint64_t budget, std::uint64_t process_used, std::uint64_t dedicated, std::uint64_t adapter_used, std::uint64_t resident = 0)
 {
+    // Only usage attributable to this process can be subtracted from the
+    // whole adapter. WDDM residency can be below logical USM allocations.
+    resident = std::min({resident, process_used, adapter_used});
+    process_used -= resident; adapter_used -= resident;
     if (process_used >= budget || adapter_used >= dedicated) return 0;
     return std::min({hip_free, budget - process_used, dedicated - adapter_used});
 }

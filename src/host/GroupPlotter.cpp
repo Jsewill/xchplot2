@@ -746,12 +746,13 @@ public:
         }
     };
     std::vector<Device> devices;
-    std::function<void(int,std::string const&)> gpu_health_changed;
+    std::function<void(int, group_grow::WorkerLocalOffer const&)> gpu_health_changed;
     void refresh(Device& lane, uint8_t k, uint8_t strength, unsigned members)
     {
         auto offer = lane.service->local_generation_offer(k, strength, members);
-        if (gpu_health_changed && offer.gpu_recovery != lane.offer.gpu_recovery)
-            gpu_health_changed(lane.selector, offer.gpu_recovery);
+        if (gpu_health_changed && (offer.gpu_recovery != lane.offer.gpu_recovery ||
+            offer.gpu_headroom_limited != lane.offer.gpu_headroom_limited))
+            gpu_health_changed(lane.selector, offer);
         lane.offer = std::move(offer);
     }
     unsigned cpus;
@@ -844,7 +845,10 @@ public:
         {
             auto const& lane = devices[i];
             auto demand = lane.offer.demand;
-            if (!demand.slots || !demand.cpu_threads || standing > host_bytes || demand.host_bytes > host_bytes - standing) continue;
+            if (standing > host_bytes || demand.host_bytes > host_bytes - standing) continue;
+            // Another process can release VRAM while acquire() waits for this shape.
+            if (lane.offer.gpu_headroom_limited) best.possible = true;
+            if (!demand.slots || !demand.cpu_threads) continue;
             best.possible = true;
             if (demand.host_bytes > lane.offer.capacity.host_bytes || demand.host_bytes > limit) continue;
             auto const device_ready = ready(lane);
@@ -1188,13 +1192,18 @@ struct Backend
         require(cpu_scheduler && args.pool_offer_ram && args.pool_offer_cpus,
             "selected local producers have no shared CPU and RAM allowance");
         auto schedule = std::make_shared<PrivateLocalSchedule>(unsigned(args.pool_offer_cpus), args.pool_offer_ram);
-        schedule->gpu_health_changed = [job=args.dashboard_job, display=args.dashboard, progress=args.progress](int selector, std::string const& cause)
+        schedule->gpu_health_changed = [job=args.dashboard_job, display=args.dashboard, progress=args.progress](
+            int selector, group_grow::WorkerLocalOffer const& offer)
         {
             auto const name = pos2gpu::device_label(selector);
-            if (job) job->local_gpu_health(name, cause);
-            if (progress && (!display || !display->active()))
-                std::osyncstream(std::cerr) << name << (cause.empty() ? " GPU generation is available again" :
-                    " GPU recovering: " + group_grow::DashboardTerminal::label(cause)) << '\n';
+            if (job) job->local_gpu_health(name, offer.gpu_recovery, offer.gpu_headroom_limited);
+            if (!progress || (display && display->active())) return;
+            if (!offer.gpu_recovery.empty())
+                std::osyncstream(std::cerr) << name << " GPU recovering: " << group_grow::DashboardTerminal::label(offer.gpu_recovery) << '\n';
+            else if (offer.gpu_headroom_limited)
+                std::osyncstream(std::cerr) << name << " is waiting for GPU memory\n";
+            else if (offer.demand.slots)
+                std::osyncstream(std::cerr) << name << " GPU generation is available again\n";
         };
         schedule->devices.reserve(args.local_devices.size());
         uint64_t standing = 0;
