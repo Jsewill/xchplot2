@@ -2346,7 +2346,13 @@ def check(binary, root, reference=None):
         run("pause", relocated, "--destination", relocated, "--quiet")
         copied = farm / ("copied native destination " + str(index))
         source = farm / ("offline copy source " + str(index))
-        shutil.copytree(relocated, copied)
+        if os.name == "nt":
+            # Relocated job records retain their owner and protected ACLs.
+            result = subprocess.run(["robocopy", relocated, copied, "/E", "/COPY:DATSO", "/R:0", "/W:0"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert result.returncode == 1, (result.returncode, result.stdout)
+        else:
+            shutil.copytree(relocated, copied)
         assert copied.stat().st_ino != relocated.stat().st_ino
         relocated.rename(source)
         source_snapshot = snapshot(source)
