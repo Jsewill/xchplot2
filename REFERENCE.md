@@ -732,6 +732,8 @@ that path without rewriting its saved policy. A running `fill` also rescans its
 requested discovery roots for missing members and reconnects matching identities.
 A copied directory has a different identity and needs explicit relocation.
 Drain a destination before copying it so its started files can finish.
+On Windows, preserve file ownership and permissions when copying the job
+directory with `robocopy OLD NEW /E /COPY:DATSO`.
 Unfinished construction still requires its original files and scratch
 directories; copying them changes their checked identities.
 For an intentional copy or move to a new directory, keep the output and saved

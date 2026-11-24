@@ -108,6 +108,19 @@ void failed_successor_publication(grow_controller_test::Arguments args, fs::path
         }
         ++before_publication;
         original.control(WorkerControl::Pause); survivor.start();
+        // A local pause reaches the broker on the worker's next heartbeat.
+        // Finish the handoff before allowing the foreground lease request.
+        pool::BrokerClient broker(replacement.broker, replacement.tls);
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        for (;;)
+        {
+            auto const page = broker.status({});
+            if (std::ranges::any_of(page.worker_records, [&](auto const& row) {
+                return row.identity == worker && row.admission == pool::WorkerAdmission::Paused;
+            })) break;
+            require(std::chrono::steady_clock::now() < until, "broker did not observe the original worker's pause");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         throw WorkerAdmissionRejected("declined provisional executor");
     };
     require(run_farming(args) == 0 && before_publication <= 1 && after_publication == 1 &&
@@ -364,7 +377,9 @@ void repartition_and_global_admission()
     WorkerService worker(offered); worker.start();
     Arguments args; args.backend = "cpu"; args.workers = 2; args.pool_inflight = 1;
     args.max_ram = uint64_t(1) << 30; args.window = uint64_t(1) << 20;
-    args.pool_frame_bytes = tls.max_frame_bytes; args.pool_timeout_ms = 10000; args.pool_socket_timeout_ms = tls.timeout_ms;
+    // Both writers share one slot. A refused batch and its singleton retries share
+    // the original task deadline, so use the normal owner budget for this byte-parity test.
+    args.pool_frame_bytes = tls.max_frame_bytes; args.pool_socket_timeout_ms = tls.timeout_ms;
     args.pool_broker = "127.0.0.1:" + std::to_string(offered.broker.port);
     args.pool_owner = "owner-repartition"; args.pool_ca = tls.ca_file; args.pool_cert = tls.cert_file; args.pool_key = tls.key_file;
     Backend backend; backend.cpu_scheduler = std::make_shared<CodecScheduler>(2);
