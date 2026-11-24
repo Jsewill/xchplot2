@@ -74,6 +74,9 @@ int main() try
     pos2gpu::GroupOptions args; args.backend = "cpu"; args.construction = "reference"; args.workers = 1; args.max_ram = 16 * mib; args.batch = 65535; args.compute_mode = "off";
     ReplotSupervision supervision{mib, 8 * mib, 1, 100000}; supervision.source_roots = {directory}; native.source_resources = {disk};
     auto request = replot_native_request(args, profile, state, {}, 0, 16 * mib, supervision);
+    auto filtered = args; filtered.destination_temp = device.rotating ? "ssd" : "hdd";
+    require(replot_native_request(filtered, profile, state, {}, 0, 16 * mib, supervision).scratch_resources.empty(),
+        "migration reserved scratch on a destination excluded by its media policy");
     {
         auto automatic = profile; automatic.native.compute_owner_identity = "enrolled-owner";
         auto resolved = args; resolved.pool_codec_auto = true; resolved.pool_codec_ram = 96 * mib;

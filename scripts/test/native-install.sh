@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-gpu=${1:?usage: native-install.sh nvidia|amd|intel [--smoke] [--no-acpp]}
+gpu=${1:?usage: native-install.sh nvidia|amd|intel [--smoke|--full-cmake] [--no-acpp]}
 shift
 case "$gpu" in
     nvidia) backend=cuda; export XCHPLOT2_BUILD_CUDA=ON ;;
@@ -12,11 +12,13 @@ case "$gpu" in
     *) echo "Unknown GPU vendor: $gpu" >&2; exit 1 ;;
 esac
 
-suite=full
-if [[ ${1:-} == --smoke ]]; then
-    suite=smoke
-    shift
-fi
+cargo_binary=build-native-install/cargo/bin/xchplot2
+cmake_binary=build-native-install/cmake/tools/xchplot2/xchplot2
+full_binary=$cargo_binary
+case ${1:-} in
+    --smoke) full_binary=; shift ;;
+    --full-cmake) full_binary=$cmake_binary; shift ;;
+esac
 if [[ "${1:-}" == --no-acpp ]]; then
     export ACPP_PREFIX="$HOME/.local"
 fi
@@ -36,7 +38,7 @@ rm -rf build-native-install/cargo-target
 # Runtime checks are CPU-only. Vendor backend files and tools are checked
 # below; probing their drivers on a hosted runner is not a hardware test.
 export ACPP_VISIBILITY_MASK=omp
-build-native-install/cargo/bin/xchplot2 --help
+"$cargo_binary" --help
 
 test -f "$acpp_prefix/lib/hipSYCL/librt-backend-$backend.so"
 if [[ "$gpu" == intel ]]; then
@@ -50,15 +52,15 @@ cmake -S . -B build-native-install/cmake -G Ninja \
     -DACPP_TARGETS="$ACPP_TARGETS"
 cmake --build build-native-install/cmake --parallel "$CARGO_BUILD_JOBS" \
     --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
-build-native-install/cmake/tools/xchplot2/xchplot2 --help
+"$cmake_binary" --help
 ctest --test-dir build-native-install/cmake \
     --output-on-failure --no-tests=error \
     -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
 
-for binary in build-native-install/cargo/bin/xchplot2 build-native-install/cmake/tools/xchplot2/xchplot2; do
+for binary in "$cargo_binary" "$cmake_binary"; do
     echo "Testing plot recovery and proofs with $binary"
     python3 scripts/test/recovery.py "$binary"
-    if [[ $suite == full ]]; then
+    if [[ $binary == "$full_binary" ]]; then
         echo "Testing grouped plotting and automatic compute with $binary"
         python3 scripts/test/group-cli.py "$binary" --automatic-compute
         echo "Testing compute management with $binary"

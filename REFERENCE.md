@@ -1724,6 +1724,11 @@ commitments before claiming any source. An inadequate `--temp-capacity-bytes` or
 unavailable scratch root refuses the deletion; credit cannot stand in for a
 complete scratch grant.
 
+When none of the selected filesystems supplies a durable directory identity,
+use the `fill` command printed when saving a migration plan to carry its
+scratch selection into execution. The private job remembers a destination-only
+scratch policy. Repeat any separate `--temp-dir` paths when resuming.
+
 Each batch must fit conservative output, construction, recovery and headroom
 allowances. Execution checks actual available space again. A rename or
 quarantine frees no capacity; open handles, snapshots or filesystem behavior

@@ -135,7 +135,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full-native == 'true' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
-    # Clean toolchain builds plus both installed-binary suites can exceed 90 minutes.
+    # Leave room for a clean toolchain build and the installed CLI suites.
     timeout-minutes: 150
     container:
       image: ${{ matrix.image }}
@@ -177,7 +177,6 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full-native == 'true'
     runs-on: windows-2025
-    # The representative WSL install runs both complete CLI suites too.
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -202,7 +201,7 @@ jobs:
           source_dir=$(mktemp -d -p "$HOME" xchplot2-ci-XXXXXX)
           cp -a . "$source_dir/"
           cd "$source_dir"
-          bash scripts/test/native-install.sh '${{ matrix.gpu }}' ${{ matrix.gpu != 'nvidia' && '--smoke' || '' }} 2>&1 | tee "$log"
+          bash scripts/test/native-install.sh '${{ matrix.gpu }}' ${{ matrix.gpu == 'nvidia' && '--full-cmake' || '--smoke' }} 2>&1 | tee "$log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -209,9 +209,10 @@ install. Containerfile and container-only test changes run the container matrix.
 Weekly and manual runs cover all installs and containers. The
 [binary release job](#binary-releases) checks native Windows separately.
 
-The Ubuntu NVIDIA install and its WSL counterpart also run
-`scripts/test/group-cli.py --automatic-compute` and `scripts/test/compute-cli.py`
-against both binaries. Other installs use `native-install.sh VENDOR --smoke`
+The native Ubuntu NVIDIA install runs `scripts/test/group-cli.py --automatic-compute`
+and `scripts/test/compute-cli.py` with the Cargo binary. Its WSL counterpart
+uses `--full-cmake` to run those suites with the CMake binary. Other installs
+use `native-install.sh VENDOR --smoke`
 to check the backend, parity, interrupted plots, recovery and full proofs.
 The grouped suite covers read-only plans, all construction engines' crash
 recovery, saved enrollment, several brokers sharing a worker, worker

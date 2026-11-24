@@ -132,6 +132,7 @@ struct GroupOptions : GroupComputeOptions
     bool farming_detect_local = false;
     std::shared_ptr<group_grow::FarmingProfile const> farming_profile;
     std::shared_ptr<std::string const> replot_local_profile;
+    std::string replot_local_destination_temp;
     // Explicit connection choices survive local profile/job continuation.
     // The snapshot precedes enrollment/default resolution and RAM partitioning.
     std::map<std::string, std::string> compute_settings;

@@ -400,15 +400,6 @@ void report_output(Arguments const& args, fs::path const& path, uint16_t members
     else print();
 }
 
-void add_destination_temporary(std::vector<fs::path>& roots, std::string_view policy,
-                               fs::path const& directory, group_grow::StorageDevice const& device)
-{
-    bool const enabled = policy == "on" || (!device.drives.empty() &&
-        ((policy == "ssd" && device.nonrotating) || (policy == "hdd" && device.rotating)));
-    if (!enabled) return;
-    if (std::find(roots.begin(), roots.end(), directory) == roots.end()) roots.push_back(directory);
-}
-
 group_grow::Identity initial_identity(Identity const& requested)
 {
     validate(requested);
@@ -12781,11 +12772,14 @@ Arguments replot_review_options(Arguments const& supplied, group_grow::ReplotRev
     same_limit(args.max_total_members_set, args.max_total_members, review.farm.max_total_members, "--max-total-members");
     args.k = review.farm.config.k; args.strength = review.farm.config.strength; args.headroom = review.farm.headroom;
     if (review.farm.config.fixed_meta) args.meta = review.farm.config.meta_group_override;
-    if (args.temporary.empty() && !args.destination_temp_set)
+    if (!args.from_plan.empty() && args.temporary.empty() && !args.destination_temp_set)
     {
         if (!review.owned_roots.empty())
+        {
             for (auto const& path : review.scratch_directories) args.temporary.push_back(file_io::native_path(path));
-        args.destination_temp = "off";
+            args.destination_temp = "off";
+        }
+        else args.destination_temp = args.replot_local_destination_temp.empty() ? "off" : args.replot_local_destination_temp;
     }
     return args;
 }
@@ -20295,6 +20289,7 @@ void apply_replot_local_bindings(Arguments& args, group_grow::ReplotLocalBinding
     if (!args.chia_executable_set && args.chia_executable.empty()) args.chia_executable = file_io::native_path(local.executable);
     if (!args.farming_profile_set && args.farming_profile_path.empty() && local.policy_digest == policy_digest)
         args.farming_profile_path = file_io::native_path(local.profile);
+    if (local.policy_digest == policy_digest) args.replot_local_destination_temp = local.destination_temp;
     if (!local.compute_settings.empty())
     {
         auto const document = group_grow::profile_detail::JsonReader(local.compute_settings, args.max_ram / 8).read();
@@ -20305,6 +20300,13 @@ std::string replot_local_compute_settings(Arguments const& args)
 {
     if (args.compute_settings.empty()) return {};
     std::ostringstream out; out << "{\"compute_settings\":"; pos2gpu::write_group_compute_settings(out, args); out << '}'; return out.str();
+}
+std::string replot_local_destination_temp(Arguments const& args, group_grow::ReplotReview const& review)
+{
+    // A job without a portable scratch scope can recover a destination-only policy
+    // using the identities already recorded for those destinations.
+    if (!review.owned_roots.empty() || !args.temporary.empty() || args.destination_temp == "off") return {};
+    return args.destination_temp;
 }
 void apply_replot_job(Arguments& args, ReplotInputs const& inputs)
 {
@@ -21204,7 +21206,7 @@ int execute_replot(Arguments const& supplied, ReplotInputs inputs)
     auto local_path = [&](fs::path const& path) { return path.empty() ? std::string{} : file_io::path_text(fs::absolute(path).lexically_normal()); };
     ReplotLocalBindings selected_local{inputs.digest, inputs.review.farm.job_id, profile_detail::host_name(), replot_local_user(),
         args.farm_adapter, local_path(args.chia_root), local_path(args.chia_executable), local_path(args.farming_profile_path), inputs.policy_digest,
-        replot_local_compute_settings(args)};
+        replot_local_compute_settings(args), replot_local_destination_temp(args, inputs.review)};
     auto const local_body = replot_local_bindings_text(selected_local);
     require(inputs.stamp && !args.from_plan.empty(), "execution requires the original saved migration review");
     std::vector<fs::path> reviewed_destinations;
@@ -24472,7 +24474,8 @@ int start_replot(Arguments args, ReplotInputs inputs)
     auto const options = replot_adapter(args);
     job.review = replot_review_text(inputs.review);
     job.bindings = {stream_state::digest(job.review), inputs.review.farm.job_id, profile_detail::host_name(), replot_local_user(),
-        args.farm_adapter, file_io::path_text(options.root), file_io::path_text(options.executable), {}, {}, replot_local_compute_settings(args)};
+        args.farm_adapter, file_io::path_text(options.root), file_io::path_text(options.executable), {}, {}, replot_local_compute_settings(args),
+        replot_local_destination_temp(args, inputs.review)};
     auto const initial_bytes = sum(replot_job_text(job).size(), 65536 + 65);
     std::map<std::string, uint64_t> reserves;
     for (auto const& directory : inputs.review.farm.directories)

@@ -5029,6 +5029,17 @@ void replot_status_protocol(fs::path const& root)
     require(with_compute.starts_with("ordinary-group-replot-local-v2\n") &&
         replot_local_bindings_text(parse_replot_local_bindings(with_compute)) == with_compute,
         "private compute selection roundtrip changed bytes");
+    auto selected_scratch = local;
+    selected_scratch.destination_temp = "on";
+    for (bool with_pool : {true, false})
+    {
+        if (!with_pool) selected_scratch.compute_settings.clear();
+        auto const text = replot_local_bindings_text(selected_scratch);
+        auto const restored = parse_replot_local_bindings(text);
+        require(text.starts_with("ordinary-group-replot-local-v3\n") && restored.destination_temp == "on" &&
+            restored.compute_settings == selected_scratch.compute_settings && replot_local_bindings_text(restored) == text,
+            "private recovery lost its selected destination scratch or compute policy");
+    }
     auto const tight_allowance = replot_journal_allocation(4096, 4096, 4096);
     require(!replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance) &&
         replot_local_bindings_fit(4096, 4096, local_text.size(), 4096, tight_allowance + 65536),
@@ -5533,12 +5544,21 @@ void replot_review_options(fs::path const& directory)
     require(!saved.farming_profile, "saved migration did not reuse resource-only profile semantics");
     {
         ReplotReview review; review.memory_limit_bytes = saved.max_ram;
+        auto fresh = saved; fresh.from_plan.clear();
+        require(grow_controller_test::replot_review_options(fresh, review).destination_temp == "on",
+            "fresh migration discarded its selected default destination scratch");
         auto restored = grow_controller_test::replot_review_options(saved, review);
         require(restored.destination_temp == "off" && restored.temporary.empty(),
             "new scratch default widened a legacy migration review");
+        auto local = saved; local.replot_local_destination_temp = "hdd";
+        require(grow_controller_test::replot_review_options(local, review).destination_temp == "hdd",
+            "private migration recovery lost its selected destination policy");
+        auto disabled = local; disabled.destination_temp = "off"; disabled.destination_temp_set = true;
+        require(grow_controller_test::replot_review_options(disabled, review).destination_temp == "off",
+            "private recovery overrode an explicit destination scratch selection");
         review.owned_roots.push_back({directory.string()});
         review.scratch_directories.push_back((directory / "reviewed-scratch").string());
-        restored = grow_controller_test::replot_review_options(saved, review);
+        restored = grow_controller_test::replot_review_options(local, review);
         require(restored.destination_temp == "off" && restored.temporary == std::vector<fs::path>{directory / "reviewed-scratch"},
             "new scratch default replaced the migration's reviewed temporary directories");
         auto explicit_policy = saved; explicit_policy.destination_temp = "on"; explicit_policy.destination_temp_set = true;

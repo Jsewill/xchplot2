@@ -680,13 +680,13 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     second.mkdir()
     options = [first, second, "-k", 18, "--strength", 4, "--group-members", 8, "--max-groups", 1,
                "--max-total-members", 8, "--leave-free", 0, "--destination-temp", "off"]
-    forecast = json.loads(run("plan", *options, "--capacity-bytes", "8M", "--json").stdout)
+    forecast = json.loads(run("plan", *options, *runtime, "--capacity-bytes", "8M", "--json").stdout)
     # This deterministic strength/meta cohort packs below the next forecast
     # boundary. Keep the independently reserved metadata outside its tested
     # plot-byte budget, including when a platform rounds that metadata up.
     for _ in range(3):
         capacity = 10212432 + 2 * forecast["manifest_reserved_bytes"]
-        assessed = json.loads(run("plan", *options, "--capacity-bytes", capacity, "--json").stdout)
+        assessed = json.loads(run("plan", *options, *runtime, "--capacity-bytes", capacity, "--json").stdout)
         if assessed["manifest_reserved_bytes"] == forecast["manifest_reserved_bytes"]:
             forecast = assessed
             break
@@ -694,17 +694,18 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     else:
         raise AssertionError("beyond-forecast fixture metadata reservation did not settle")
     options += ["--capacity-bytes", capacity]
-    initial = forecast["destinations"][1]
-    assert 0 < initial["members"] < 8 and initial["allocation_grant_members"] > initial["members"]
     run("fill", *options, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
         "--quiet", point="initialized", code=86)
     original = private_record(first, "grow-farm.plan").read_bytes()
+    prepared = json.loads(run("plan", "--metadata-only", "--manifest", private_record(first, "grow-farm.plan"), "--json").stdout)
+    initial = next(item for item in prepared["destinations"] if item["directory"] == str(second))
+    assert 0 < initial["forecast_members"] < initial["allocation_grant_members"] <= 8, initial
     offline_outputs = {path.name: digest(path) for path in [*first.glob("*.gplot"), *first.glob("*.gplot.partial")]}
     first.rename(offline)
     try:
         run("fill", "--resume", "--allow-missing", second, *runtime, "--quiet", code=4)
         completed = sum(header(path)[3] for path in second.glob("*.gplot"))
-        assert completed > initial["members"] and completed <= initial["allocation_grant_members"]
+        assert initial["forecast_members"] < completed <= initial["allocation_grant_members"], (initial, completed)
         assert private_record(second, "grow-farm.plan").read_bytes() == original
         assert private_record(offline, "grow-farm.plan").read_bytes() == original
         status = json.loads(run("status", second, "--inspect", "--json", code=2).stdout)
@@ -718,14 +719,17 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     for path in [*first.glob("*.gplot"), *second.glob("*.gplot")]:
         verify(path)
     progress_review = root / "beyond forecast saved progress.plan"
-    run("plan", second, "--save-plan", progress_review)
+    current = json.loads(run("plan", second, "--save-plan", progress_review, "--json").stdout)
     saved_progress = json.loads(run("plan", "--metadata-only", progress_review, "--json").stdout)
     assert saved_progress["recovery"]["saved_unsealed_members"] == 0
     admitted = sum(item["admitted_members"] for item in saved_progress["destinations"])
     actual = sum(header(path)[3] for destination in (first, second) for path in destination.glob("*.gplot"))
     assert admitted == actual
     saved_available = next(item for item in saved_progress["destinations"] if item["directory"] == str(second))
-    assert saved_available["count_scope"] == "layout-forecast" and saved_available["admitted_members"] > saved_available["forecast_members"]
+    current_available = next(item for item in current["destinations"] if item["directory"] == str(second))
+    assert saved_available["count_scope"] == current_available["count_scope"] == "layout-forecast"
+    assert saved_available["forecast_members"] == current_available["forecast_members"], (saved_available, current_available)
+    assert saved_available["admitted_members"] == sum(header(path)[3] for path in second.glob("*.gplot")) >= completed
 
     retired = root / "retired member returns"
     retired.mkdir()
@@ -2539,14 +2543,15 @@ def check_replot(binary, root, reference=None):
             identities = dict(zip(("verified_stage", "published", "ready"), rows[8:11]))
             identity = identities[phase]
         else:
-            assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n", b"ordinary-group-replot-receipt-v3\n")
+            assert rows[0] in (b"ordinary-group-replot-receipt-v1\n", b"ordinary-group-replot-receipt-v2\n",
+                               b"ordinary-group-replot-receipt-v3\n", b"ordinary-group-replot-receipt-v4\n")
             if rows[0] == b"ordinary-group-replot-receipt-v1\n":
                 return "stamp"
-            identity = rows[-2] if rows[0] == b"ordinary-group-replot-receipt-v3\n" else rows[-1]
+            identity = rows[3]
         scheme, filesystem, handle_type, object_id = shlex.split(identity.decode("utf-8"))
         assert scheme in ("0", "1", "2")
         if phase is None:
-            assert scheme != "0", "native receipt omitted its replacement owner"
+            assert (scheme != "0") == durable_root, "receipt does not match the fixture filesystem's identity support"
         return "stamp" if scheme == "0" else "owner"
 
     farm = directory / "old and new plots"
@@ -2577,6 +2582,8 @@ def check_replot(binary, root, reference=None):
     inventory_file = directory / "inventory.plan"
     catalog = json.loads(run("plan", "--inventory", farm, *adapter, "--save-plan", inventory_file, "--json").stdout)
     assert catalog["network"]["available"] and len(catalog["plots"]) == 1
+    # The test creates all source, destination and scratch directories on the same filesystem.
+    durable_root = "durable_identity" in catalog["roots"][0]
     assert catalog["plots"][0]["header_validated"] and catalog["plots"][0]["plot_id"] == plot_id.hex()
     inventory_before = snapshot(farm)
     run("plan", "--inventory", farm, *adapter, "--farm-adapter-timeout-ms", 1, "--json", code=2)
@@ -3113,15 +3120,17 @@ def check_replot(binary, root, reference=None):
     assert any("cannot inspect scratch/destination directory" in reason for reason in imported["infeasibility_reasons"])
     run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options, "--temp-dir", invalid_temp, *keys, code=2)
     assert snapshot(farm) == guarded, "invalid temporary root changed the farm before predelete admission"
-    if temporary_review.read_bytes().startswith((b"ordinary-group-replot-review-v2\n", b"ordinary-group-replot-review-v3\n", b"ordinary-group-replot-review-v4\n")):
-        temporary_before = snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)
-        unreviewed = json.loads(run("plan", temporary_review, "--harvester", temporary_file, *adapter, *options,
-                                   "--temp-dir", external_scratch, "--json", code=2).stdout)
+    temporary_before = snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)
+    unreviewed = json.loads(run("plan", temporary_review, "--harvester", temporary_file, *adapter, *options,
+                               "--temp-dir", external_scratch, "--json", code=2 if durable_root else 0).stdout)
+    if durable_root:
         assert any("keep the reviewed scratch scope" in reason for reason in unreviewed["infeasibility_reasons"])
         run("fill", temporary_review, "--harvester", temporary_file, *adapter, *options,
             "--temp-dir", external_scratch, *keys, code=2)
-        assert snapshot(farm) == guarded and not private_record(farm, "grow-replot.plan").exists()
-        assert (snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)) == temporary_before
+    else:
+        assert unreviewed["feasible"] and unreviewed["native_request"]["scratch_resources"] == disks
+    assert snapshot(farm) == guarded and not private_record(farm, "grow-replot.plan").exists()
+    assert (snapshot(valid_temp), snapshot(external_scratch), digest(temporary_review)) == temporary_before
     protected_root = directory / "protected old plots"
     protected_root.mkdir()
     protected_source = protected_root / "protected.plot"
@@ -3173,7 +3182,12 @@ def check_replot(binary, root, reference=None):
     legacy_review = directory / "legacy strict migration.plan"
     legacy_rows = farming_plan_rows(review_file.read_bytes()[:-65])
     assert legacy_rows[0] == b"ordinary-group-replot-review-v3\n"
-    legacy_rows[0] = b"ordinary-group-replot-review-v2\n"
+    if durable_root:
+        legacy_rows[0] = b"ordinary-group-replot-review-v2\n"
+    else:
+        assert legacy_rows[-3:-1] == [b"0\n", b"0\n"]
+        del legacy_rows[-3:-1]  # v1 has no scratch or owner rows.
+        legacy_rows[0] = b"ordinary-group-replot-review-v1\n"
     legacy_body = b"".join(legacy_rows[:-1])
     legacy_review.write_bytes(legacy_body + hashlib.sha256(legacy_body).hexdigest().encode() + b"\n")
     legacy_metadata = json.loads(run("plan", "--from-plan", legacy_review, "--json").stdout)
@@ -4247,14 +4261,19 @@ def check_replot(binary, root, reference=None):
     unrelated = private_record(compute_farm, "unrelated")
     unrelated.write_text("preserve unrelated bookkeeping", encoding="utf-8")
     stopped = snapshot(compute_farm)
-    refusal = run("fill", compute_review, *keys, code=2)
-    assert "unrelated bookkeeping" in refusal.stdout + refusal.stderr and snapshot(compute_farm) == stopped
+    resume_compute = ["fill", compute_review]
+    if not durable_root:
+        # Without export handles the portable review cannot restore its scratch paths.
+        resume_compute += ["--temp-dir", external_scratch, "--destination-temp", "on"]
+    refusal = run(*resume_compute, *keys, code=2)
+    assert "unrelated bookkeeping" in refusal.stdout + refusal.stderr, refusal.stdout + refusal.stderr
+    assert snapshot(compute_farm) == stopped
     unrelated.unlink()
-    run("fill", compute_review, *keys, point="replot-journal-all-staged", code=86)
+    run(*resume_compute, *keys, point="replot-journal-all-staged", code=86)
     # Resume from the private local binding with neither the reusable profile
     # nor any compute flags, even though enrollment is outside the default path.
-    run("fill", compute_review, "--devices", cpu_node, point="replot-replacement-verified", code=86)
-    run("fill", compute_review)
+    run(*resume_compute, "--devices", cpu_node, point="replot-replacement-verified", code=86)
+    run(*resume_compute)
     compute_final = Path(reviewed_compute["batches"][0]["path"])
     assert not compute_source.exists() and header(compute_final)[3] == 2
     proof = run("verify", compute_final, "--full", "--trials", 100)
