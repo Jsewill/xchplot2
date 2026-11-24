@@ -8616,8 +8616,10 @@ void farming_active_audit(fs::path const& root, Members input, Config cfg)
     // writer durably advances it and deletes a consumed segment. Recreate
     // that reader view without depending on thread or disk timing.
     std::optional<fs::path> segment;
+    // The first append writes contribution run 0 and a separate summary run.
+    // Directory enumeration order varies across runner filesystems.
     for (auto const& entry : fs::recursive_directory_iterator(scratch))
-        if (entry.path().filename().string().starts_with("run-")) { segment = entry.path(); break; }
+        if (entry.path().filename() == "run-0-0") { segment = entry.path(); break; }
     require(segment && fs::remove(*segment), "farming audit fixture has no external segment");
     farm.check(active);
     bool rejected = false;

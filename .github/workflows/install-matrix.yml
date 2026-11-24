@@ -5,7 +5,7 @@ name: install-matrix
 
 on:
   pull_request:
-    paths:
+    paths: &build-paths
       - .github/workflows/install-matrix.yml
       - .dockerignore
       - Containerfile
@@ -40,39 +40,7 @@ on:
       - '!tools/xchplot2/compute_service_windows.cpp'
   push:
     branches: [main]
-    paths:
-      - .github/workflows/install-matrix.yml
-      - .dockerignore
-      - Containerfile
-      - CMakeLists.txt
-      - Cargo.toml
-      - Cargo.lock
-      - build.rs
-      - cmake/**
-      - keygen-rs/Cargo.*
-      - keygen-rs/src/**
-      - keygen-rs/include/**
-      - src/**
-      - tools/xchplot2/**
-      - tools/parity/plot_file_parity.cpp
-      - tools/parity/solver_filter_parity.cpp
-      - tools/parity/sycl_twophase_budget_test.cpp
-      - tools/parity/sycl_sort_parity.cpp
-      - tools/parity/sycl_bucket_offsets_parity.cpp
-      - tools/parity/sycl_g_x_parity.cpp
-      - contrib/pos2-plotter-output-move.patch
-      - contrib/pos2-solver-*.patch
-      - contrib/pos2-worker-thread-limit.patch
-      - contrib/cccl-arch-list.patch
-      - ci/release/adaptivecpp-level-zero-*.patch
-      - scripts/install-deps.sh
-      - scripts/test/native-install.sh
-      - scripts/test/recovery.py
-      - scripts/test/group-cli.py
-      - scripts/test/compute-cli.py
-      - scripts/test/group-pool-test.py
-      - '!tools/xchplot2/windows.manifest'
-      - '!tools/xchplot2/compute_service_windows.cpp'
+    paths: *build-paths
   workflow_dispatch:
   schedule:
     # Package repositories can break a fresh install without source changes.
@@ -95,11 +63,13 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      shared: ${{ steps.filter.outputs.shared }}
+      full-native: ${{ steps.matrix.outputs.full }}
+      native-matrix: ${{ steps.matrix.outputs.native }}
       native: ${{ steps.filter.outputs.native }}
-      container: ${{ steps.filter.outputs.container }}
+      container: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.filter.outputs.build == 'true' || steps.filter.outputs.container == 'true' }}
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'push'
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -107,75 +77,70 @@ jobs:
           base: ${{ github.ref }}
           predicate-quantifier: some-with-excludes
           filters: |
-            shared:
+            build:
               - '.github/workflows/install-matrix.yml'
               - '{CMakeLists.txt,Cargo.toml,Cargo.lock,build.rs}'
               - 'cmake/**'
-              - 'keygen-rs/{Cargo.toml,Cargo.lock,src/**,include/**}'
-              - 'src/**'
-              - 'tools/xchplot2/*.{cpp,h,hpp,cu}'
-              - '!tools/xchplot2/compute_service_windows.cpp'
-              - 'tools/parity/plot_file_parity.cpp'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock}'
               - 'contrib/pos2-{plotter-output-move,solver-*,worker-thread-limit}.patch'
               - 'contrib/cccl-arch-list.patch'
               - 'ci/release/adaptivecpp-level-zero-*.patch'
-            native:
+            installer:
               - 'scripts/install-deps.sh'
               - 'scripts/test/native-install.sh'
+            native:
+              - 'keygen-rs/{src,include}/**'
+              - 'src/**'
+              - 'tools/xchplot2/*.{cpp,h,hpp,cu}'
+              - '!tools/xchplot2/compute_service_windows.cpp'
               - 'scripts/test/{recovery,group-cli,compute-cli,group-pool-test}.py'
-              - 'tools/parity/{solver_filter_parity,sycl_twophase_budget_test}.cpp'
+              - 'tools/parity/{plot_file_parity,solver_filter_parity,sycl_twophase_budget_test}.cpp'
             container:
               - '{Containerfile,.dockerignore}'
-              - 'tools/parity/{sycl_sort_parity,sycl_bucket_offsets_parity,sycl_g_x_parity}.cpp'
+              - 'src/gpu/**'
+              - 'tools/parity/{plot_file_parity,sycl_sort_parity,sycl_bucket_offsets_parity,sycl_g_x_parity}.cpp'
+      - name: Select clean installs
+        id: matrix
+        shell: python
+        env:
+          FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || steps.filter.outputs.build == 'true' || steps.filter.outputs.installer == 'true' }}
+        run: |
+          import json
+          import os
+
+          full = os.environ['FULL']
+          vendors = ['nvidia', 'amd', 'intel']
+          platforms = [
+              ('ubuntu-24.04', 'ubuntu:24.04', vendors),
+              ('debian-13', 'debian:13', ['nvidia', 'amd']),  # no compute-runtime package
+              ('fedora-44', 'fedora:44', vendors),
+              ('arch', 'archlinux:base-devel', vendors),
+              ('fedora-44-fetch', 'fedora:44', ['amd']),
+              ('ubuntu-24.04-fetch', 'ubuntu:24.04', ['nvidia', 'intel']),
+          ]
+          rows = []
+          for name, image, gpus in platforms:
+              for gpu in gpus:
+                  primary = name == 'ubuntu-24.04' and gpu == 'nvidia'
+                  if primary or full == 'true':
+                      rows.append(dict(os=name, image=image, gpu=gpu, fetch=name.endswith('-fetch'), smoke=not primary))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('full=' + full, file=output)
+              print('native=' + json.dumps(rows), file=output)
 
   native:
-    name: native / ${{ matrix.os.name }} / ${{ matrix.gpu }}
+    name: native / ${{ matrix.os }} / ${{ matrix.gpu }}
     needs: changes
-    if: >-
-      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
-      needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.full-native == 'true' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     # Clean toolchain builds plus both installed-binary suites can exceed 90 minutes.
     timeout-minutes: 150
     container:
-      image: ${{ matrix.os.image }}
+      image: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - name: ubuntu-24.04
-            image: ubuntu:24.04
-          - name: debian-13
-            image: debian:13
-          - name: fedora-44
-            image: fedora:44
-          - name: arch
-            image: archlinux:base-devel
-        gpu: [nvidia, amd, intel]
-        exclude:
-          # Debian 13 has no Intel compute-runtime package, even in backports.
-          # Intel native installs are covered on Ubuntu, Fedora, Arch, and WSL2.
-          - os:
-              name: debian-13
-              image: debian:13
-            gpu: intel
-        include:
-          # Cargo must also build AdaptiveCpp when only system packages exist.
-          - os:
-              name: fedora-44-fetch
-              image: fedora:44
-            gpu: amd
-            fetch: true
-          - os:
-              name: ubuntu-24.04-fetch
-              image: ubuntu:24.04
-            gpu: nvidia
-            fetch: true
-          - os:
-              name: ubuntu-24.04-fetch
-              image: ubuntu:24.04
-            gpu: intel
-            fetch: true
+        include: ${{ fromJSON(needs.changes.outputs.native-matrix) }}
     steps:
       - name: Bootstrap checkout and sudo
         shell: bash
@@ -192,24 +157,25 @@ jobs:
             arch) ;;
           esac
       - uses: actions/checkout@v7
-      - name: Install dependencies, Cargo binary, and CMake binary
+      - name: Install, build and test both binaries
         shell: bash
-        run: bash scripts/test/native-install.sh '${{ matrix.gpu }}' ${{ matrix.fetch && '--no-acpp' || '' }} 2>&1 | tee native-install.log
+        run: |
+          bash scripts/test/native-install.sh '${{ matrix.gpu }}' \
+            ${{ matrix.smoke && '--smoke' || '' }} \
+            ${{ matrix.fetch && '--no-acpp' || '' }} 2>&1 | tee native-install.log
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: native-${{ matrix.os.name }}-${{ matrix.gpu }}
+          name: native-${{ matrix.os }}-${{ matrix.gpu }}
           path: native-install.log
           retention-days: 14
 
   wsl:
     name: WSL2 / ubuntu-24.04 / ${{ matrix.gpu }}
     needs: changes
-    if: >-
-      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
-      needs.changes.outputs.shared == 'true' || needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.full-native == 'true'
     runs-on: windows-2025
-    # Run the same complete Cargo and CMake checks as the native installs.
+    # The representative WSL install runs both complete CLI suites too.
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -224,7 +190,7 @@ jobs:
           distribution: Ubuntu-24.04
           wsl-version: 2
           use-cache: 'false'
-      - name: Install and build in a fresh WSL2 filesystem
+      - name: Install, build and test both binaries on WSL2
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
@@ -234,7 +200,7 @@ jobs:
           source_dir=$(mktemp -d -p "$HOME" xchplot2-ci-XXXXXX)
           cp -a . "$source_dir/"
           cd "$source_dir"
-          bash scripts/test/native-install.sh '${{ matrix.gpu }}' 2>&1 | tee "$log"
+          bash scripts/test/native-install.sh '${{ matrix.gpu }}' ${{ matrix.gpu != 'nvidia' && '--smoke' || '' }} 2>&1 | tee "$log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -245,9 +211,7 @@ jobs:
   build:
     name: build / ${{ matrix.target.name }}
     needs: changes
-    if: >-
-      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' ||
-      needs.changes.outputs.shared == 'true' || needs.changes.outputs.container == 'true'
+    if: needs.changes.outputs.container == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:

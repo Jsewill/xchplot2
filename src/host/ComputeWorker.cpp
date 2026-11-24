@@ -182,6 +182,10 @@ class TaskCancelled : public std::runtime_error
 public:
     using std::runtime_error::runtime_error;
 };
+struct WorkerServiceStopped : pool::TransientTransport
+{
+    WorkerServiceStopped() : pool::TransientTransport("worker service stopped") {}
+};
 struct PackedRouteChanged : WorkerTaskDeclined {};
 struct FailedGpuGeneration : WorkerGenerationFailed
 {
@@ -197,6 +201,7 @@ std::exception_ptr task_failure(std::exception_ptr original, std::exception_ptr 
 {
     if (renewal) try { std::rethrow_exception(original); }
     catch (TaskCancelled const&) { return renewal; }
+    catch (WorkerServiceStopped const&) { return renewal; }
     catch (WorkerTaskTimeout const&) { return renewal; }
     catch (...) {}
     return original;
@@ -640,7 +645,7 @@ void WorkerCancellation::check() const
 {
     if ((stop && stop->load(std::memory_order_acquire)) ||
         (upstream_stop && upstream_stop->load(std::memory_order_acquire))) throw TaskCancelled("worker task cancelled");
-    if (service_stop && service_stop->load(std::memory_order_acquire)) throw TaskCancelled("worker service stopped");
+    if (service_stop && service_stop->load(std::memory_order_acquire)) throw WorkerServiceStopped();
     if (Clock::now() >= deadline) throw WorkerTaskTimeout("worker task deadline expired");
 }
 uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
@@ -1888,7 +1893,11 @@ struct WorkerService::Impl
     void on_gpu(std::function<void()> operation)
     {
         std::packaged_task<void()> task(std::move(operation)); auto done = task.get_future();
-        { std::lock_guard lock(jobs_mutex); require(!stopping.load(), "worker service stopped"); gpu_jobs.push_back(std::move(task)); }
+        {
+            std::lock_guard lock(jobs_mutex);
+            if (stopping.load()) throw WorkerServiceStopped();
+            gpu_jobs.push_back(std::move(task));
+        }
         jobs_ready.notify_one(); done.get();
     }
 

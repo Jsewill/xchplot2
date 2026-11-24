@@ -239,9 +239,10 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
                        check=True, timeout=720)
         assert (package / "licenses/mdns.txt").stat().st_size > 0
         assert (package / ("licenses/openssl.txt" if os.name == "nt" else "licenses/libssl-dev.txt")).stat().st_size > 0
-        # This process runs ordinary, migration and automatic-compute suites.
+        # Successful grouped CLI suites take over half an hour on some hosted runners.
+        # Each CLI operation still has its own timeout inside the harness.
         subprocess.run([sys.executable, pathlib.Path(__file__).with_name("group-cli.py"), binary,
-                        "--automatic-compute", "--scratch", work], check=True, timeout=1800)
+                        "--automatic-compute", "--scratch", work], check=True, timeout=60 * 60)
         subprocess.run([sys.executable, pathlib.Path(__file__).with_name("compute-cli.py"), binary,
                         "--scratch", work, *(["--service-manager"] if os.name == "nt" else [])],
                        check=True, timeout=420)

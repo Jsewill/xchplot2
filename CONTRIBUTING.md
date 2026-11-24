@@ -147,7 +147,7 @@ Keep each workflow focused on its own checks:
 | Workflow | Purpose |
 | --- | --- |
 | `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
-| `arch-matrix` | Compile CUDA objects for sm_86, sm_89 and sm_120; the installation containers cover sm_61 and sm_75 |
+| `arch-matrix` | Compile sm_86 and sm_89 together with CUDA 13 and sm_120 with CUDA 12.9. The installation containers cover sm_61 and sm_75. |
 | `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
 | `Binary release` | Package and test Linux and Windows archives on both host architectures |
 | `GPU hardware` | Execute correctness and memory suites on the trusted GPU fleet |
@@ -155,9 +155,8 @@ Keep each workflow focused on its own checks:
 Build workflows filter changes to their inputs. CI starts on every PR and
 `main` push so spelling checks cover all tracked text, then selects lint and
 test jobs by their inputs. Documentation checks also run for deletions and
-renames that could break local links. The installation matrix selects native
-and WSL checks separately from container builds; release PRs select Linux and
-Windows builds separately. Manual dispatch runs all checks for the selected
+renames that could break local links. Release PRs select Linux and Windows
+builds separately. Manual dispatch runs all checks for the selected
 workflow, subject to its platform, architecture or suite inputs. Scheduled
 installation checks and tag release builds retain their full matrices.
 CI and installation workflows keep each push run because their job filters
@@ -196,14 +195,21 @@ Both the installed Cargo executable and the CMake executable run
 SIGTERM, saved manifest and completed-file preservation on resume, forced
 publication failure, partial cleanup, and full proofs. Windows uses the same
 harness with Ctrl-Break and keeps its Unicode benchmark checks.
-CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
-repository changes. The existing container and CUDA architecture matrices
-remain separate coverage. The [binary release job](#binary-releases) checks
-native Windows separately.
 
-Linux installs also run `scripts/test/group-cli.py --automatic-compute` and
-`scripts/test/compute-cli.py` against both installed binaries. The grouped
-suite covers full proofs, read-only plans, all construction engines' crash
+On PRs and `main` pushes, ordinary application and CLI test changes run one
+clean Ubuntu 24.04 NVIDIA install. Installer changes exercise every native and
+WSL install in the table, including the three Cargo toolchain bootstrap cases.
+Build-system and dependency changes also rebuild the five production containers.
+GPU source changes exercise those containers alongside the representative
+install. Containerfile and container-only test changes run the container matrix.
+Weekly and manual runs cover all installs and containers. The
+[binary release job](#binary-releases) checks native Windows separately.
+
+The Ubuntu NVIDIA install and its WSL counterpart also run
+`scripts/test/group-cli.py --automatic-compute` and `scripts/test/compute-cli.py`
+against both binaries. Other installs use `native-install.sh VENDOR --smoke`
+to check the backend, parity, interrupted plots, recovery and full proofs.
+The grouped suite covers read-only plans, all construction engines' crash
 recovery, saved enrollment, several brokers sharing a worker, worker
 replacement and broker outages. The compute suite checks authenticated status,
 pause/drain/resume, renewal, revocation and background service commands.

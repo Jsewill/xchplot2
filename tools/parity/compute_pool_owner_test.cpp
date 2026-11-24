@@ -49,17 +49,19 @@ struct Directory
 std::vector<uint8_t> contents(fs::path const& path)
 { auto in = group_tools::input(path.string()); return {std::istreambuf_iterator<char>(in), {}}; }
 
-// Queue one real successor generation at the encoder boundary, after source
-// preparation has joined. Policy, measured local time, deadlines and all
-// remote validation remain the production provider's responsibility.
+// Queue one real successor after source preparation. The standalone timing
+// run uses its measured cost. CTest supplies a busy-owner cost so a faster
+// runner still exercises remote publication and canonical byte validation.
 struct PrefetchEncoder final : RemoteEncoder
 {
     std::shared_ptr<PoolRemoteEncoder> remote;
     std::function<std::future<void>()> prefetch;
     std::future<void> pending;
     bool queued = false;
-    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider, std::function<std::future<void>()> start)
-        : remote(std::move(provider)), prefetch(std::move(start)) {}
+    uint64_t local_queue_ns;
+    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider, std::function<std::future<void>()> start,
+        uint64_t queue_ns)
+        : remote(std::move(provider)), prefetch(std::move(start)), local_queue_ns(queue_ns) {}
     ~PrefetchEncoder() { if (pending.valid()) pending.wait(); }
     std::optional<RemoteEncodedWindow> encode(uint8_t k, std::span<ChunkInput const> chunks, bool summaries) override
     {
@@ -70,7 +72,7 @@ struct PrefetchEncoder final : RemoteEncoder
     }
     void observe_local(uint8_t k, std::span<ChunkInput const> chunks,
         std::span<uint64_t const> sizes, std::span<EncodedBlock const> blocks, uint64_t elapsed) override
-    { remote->observe_local(k, chunks, sizes, blocks, elapsed); }
+    { remote->observe_local(k, chunks, sizes, blocks, std::max(elapsed, local_queue_ns)); }
     void join() { if (pending.valid()) pending.get(); }
 };
 
@@ -281,7 +283,7 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return scheduler->submit(generate_successor);
-    });
+    }, retained ? 0 : 1'000'000'000);
     backend->test_remote = encoder;
     std::vector<std::vector<uint64_t>> raw;
     {

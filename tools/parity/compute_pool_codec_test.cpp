@@ -198,6 +198,8 @@ void integration(uint8_t k)
     RunningBroker broker(broker_options);
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(256) << 20, 0}; offered.max_task_bytes = uint64_t(1) << 20;
+    // Both windows must fit at once, even when other jobs are using the CI runner.
+    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
     WorkerService service(offered); service.start();
     auto scheduler = std::make_shared<CodecScheduler>(1);
     WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;
@@ -290,7 +292,9 @@ void integration(uint8_t k)
         auto a = first_window.get(), b = second_window.get();
         { std::lock_guard lock(selection_mutex); parallel = false; }
         require(a && b && a->bytes == expected && b->bytes == expected && waiting == 2,
-            "independent remote codec windows did not run concurrently");
+            "independent remote codec windows did not run concurrently (k=" + std::to_string(k) +
+            ", selected=" + std::to_string(waiting) + ", returned=" + std::to_string(bool(a) + bool(b)) +
+            ", " + remote->last_failure() + ")");
     }
 
     unsigned initialized = 0;

@@ -966,6 +966,17 @@ void renewal_errors()
     auto const permanent = std::make_exception_ptr(std::runtime_error("invalid content or TLS identity"));
     auto kind = [](std::exception_ptr error)
     { try { std::rethrow_exception(error); } catch (std::exception const& value) { return error_kind(value); } };
+    // An automatic worker can exit with its owner while another plot still uses it.
+    std::atomic<bool> stopped{true};
+    WorkerCancellation cancel;
+    cancel.service_stop = &stopped;
+    std::exception_ptr shutdown;
+    try { cancel.check(); } catch (pool::TransientTransport const&) { shutdown = std::current_exception(); }
+    require(shutdown && kind(shutdown) == WorkerError::Transport && kind(task_failure(shutdown, permanent)) == WorkerError::Permanent,
+        "service shutdown blocked a retry or masked a renewal failure");
+    cancel.stop = &stopped;
+    try { cancel.check(); throw std::logic_error("worker ignored task cancellation"); }
+    catch (TaskCancelled const&) {}
     require(kind(task_failure(cancelled, transport)) == WorkerError::Transport &&
         kind(task_failure(cancelled, stale)) == WorkerError::Stale &&
         kind(task_failure(cancelled, permanent)) == WorkerError::Permanent &&

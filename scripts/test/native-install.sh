@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-gpu=${1:?usage: native-install.sh nvidia|amd|intel}
+gpu=${1:?usage: native-install.sh nvidia|amd|intel [--smoke] [--no-acpp]}
 shift
 case "$gpu" in
     nvidia) backend=cuda; export XCHPLOT2_BUILD_CUDA=ON ;;
@@ -12,6 +12,11 @@ case "$gpu" in
     *) echo "Unknown GPU vendor: $gpu" >&2; exit 1 ;;
 esac
 
+suite=full
+if [[ ${1:-} == --smoke ]]; then
+    suite=smoke
+    shift
+fi
 if [[ "${1:-}" == --no-acpp ]]; then
     export ACPP_PREFIX="$HOME/.local"
 fi
@@ -51,8 +56,12 @@ ctest --test-dir build-native-install/cmake \
     -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
 
 for binary in build-native-install/cargo/bin/xchplot2 build-native-install/cmake/tools/xchplot2/xchplot2; do
-    echo "Checking installed binary: $binary"
+    echo "Testing plot recovery and proofs with $binary"
     python3 scripts/test/recovery.py "$binary"
-    python3 scripts/test/group-cli.py "$binary" --automatic-compute
-    python3 scripts/test/compute-cli.py "$binary"
+    if [[ $suite == full ]]; then
+        echo "Testing grouped plotting and automatic compute with $binary"
+        python3 scripts/test/group-cli.py "$binary" --automatic-compute
+        echo "Testing compute management with $binary"
+        python3 scripts/test/compute-cli.py "$binary"
+    fi
 done

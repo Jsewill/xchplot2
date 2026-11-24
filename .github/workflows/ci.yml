@@ -36,6 +36,7 @@ jobs:
       installer-smoke: ${{ steps.filter.outputs.installer-smoke }}
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'push'
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name != 'workflow_dispatch'
@@ -58,16 +59,16 @@ jobs:
               - 'CMakeLists.txt'
               - 'cmake/{BuildVersion,HostTests,RegisterTests}.cmake'
               - 'scripts/test/host-tests.sh'
-              - 'src/host/{Batch*,BenchStats,BoundedProofSampling,Cancel,ConfigFile,GpuBufferPool,GpuPipeline,GpuPlotter}.hpp'
+              - 'src/host/{Batch*,BenchStats,BoundedProofSampling,Cancel,ConfigFile,GpuBufferPool,GpuCleanup,GpuPipeline,GpuPlotter}.hpp'
               - 'src/host/{ComputeNetwork,ComputePool,ComputeSession,ComputeWorker}.hpp'
               - 'src/host/{GroupCalibrationProcess,GroupComputeSettings,GroupFarmComputeResources,GroupFarmFile,GroupFarmMetadata,GroupFarmResources}.hpp'
               - 'src/host/{GroupFarming,GroupFile,GroupHarvesterProfile,GroupNativeIdentity,GroupOptions,GroupPacked,GroupPlotter,GroupPublication}.hpp'
-              - 'src/host/{HostGuard,HostRamPolicy,Json,MultiGpuPipelineParallel,MultiGpuShardBufferPool,NumaTopology,PlotFileWriterParallel,PoolSizing,Random,Spill*,TempFile,Utf8,Vram*}.hpp'
-              - 'src/host/{BatchManifest,Cancel,ConfigFile,HostRamPolicy,MultiGpuPipelineParallel,NumaTopology,TempFile}.cpp'
-              - 'src/gpu/{DeviceIds,SpillTileReader,SyclDeviceList}.hpp'
+              - 'src/host/{HostGuard,HostPinnedPool,HostRamPolicy,Json,MultiGpuPipelineParallel,MultiGpuShardBufferPool,NumaTopology,PlotFileWriterParallel,PoolSizing,Random,Spill*,TempFile,Utf8,Vram*}.hpp'
+              - 'src/host/{BatchManifest,Cancel,ConfigFile,HostPinnedPool,HostRamPolicy,MultiGpuPipelineParallel,NumaTopology,TempFile}.cpp'
+              - 'src/gpu/{DeviceIds,SpillTileReader,SyclDeviceList,TwoPhaseScratch}.hpp'
               - 'keygen-rs/include/**'
               - 'tools/xchplot2/{cli,group_commands,group_options}.cpp'
-              - 'tools/xchplot2/{cli,device_options,group_commands}.hpp'
+              - 'tools/xchplot2/{device_options,group_commands}.hpp'
               - 'tools/parity/{bench_stats,bounded_proof_sampling,cli_host,group_calibration_process,group_compute_resources,group_farm_metadata,group_farm_resources,group_file,group_harvester_profile,host_guard,host_spill_policy,numa_topology,pipeline_control,spill_coverage,spill_engine,temp_file,vram_budget,vram_probe}_test.cpp'
               - 'tools/parity/pipeline_control_test/**'
             python:
@@ -81,9 +82,9 @@ jobs:
               - 'contrib/pos2-pr118/{CMakeLists.txt,*.cpp,plot-index-base.patch}'
               - 'contrib/pos2-{plotter-output-move,solver-*,worker-thread-limit}.patch'
               - 'keygen-rs/{Cargo.toml,Cargo.lock,src/**,include/**}'
-              - 'src/host/{Group*,Compute*,BatchPlotter,BenchStats,GpuPipeline,GpuPlotter,Json,MultiGpuPipelineParallel,NumaTopology,PoolSizing,Random,Utf8,VramBudget,WindowsFile}.hpp'
+              - 'src/host/{Group*,Compute*,BatchPlotter,BenchStats,CpuPlotMemory,CpuTables,GpuBufferPool,GpuCleanup,GpuPipeline,GpuPlotter,Json,MultiGpuPipelineParallel,NumaTopology,PoolSizing,Random,Utf8,VramBudget,WindowsFile,WorkerGpuProcess}.hpp'
               - 'src/host/{Compute*,GroupPlotter,NumaTopology}.cpp'
-              - 'src/gpu/DeviceIds.hpp'
+              - 'src/gpu/{AsyncErrorLog,DeviceIds,SyclDeviceList}.hpp'
               - 'tools/xchplot2/{compute_broker,compute_worker,group_options,group_commands,group_reference}.cpp'
               - 'tools/xchplot2/{compute_output,device_options,group_commands}.hpp'
               - 'tools/parity/compute_*'
@@ -155,11 +156,8 @@ jobs:
           workspaces: keygen-rs
       - name: cargo fmt --check
         run: cargo fmt --all --check
-      - name: cargo check
-        run: cargo check --all-targets --locked
-      - name: cargo clippy (advisory)
+      - name: cargo clippy (warnings advisory)
         run: cargo clippy --all-targets --locked -- -W clippy::all
-        continue-on-error: true
       - name: cargo test
         run: cargo test --all-targets --locked
 
