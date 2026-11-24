@@ -196,10 +196,12 @@ SIGTERM, saved manifest and completed-file preservation on resume, forced
 publication failure, partial cleanup, and full proofs. Windows uses the same
 harness with Ctrl-Break and keeps its Unicode benchmark checks.
 
-On PRs and `main` pushes, ordinary application and CLI test changes run one
-clean Ubuntu 24.04 NVIDIA install. Installer changes exercise every native and
-WSL install in the table, including the three Cargo toolchain bootstrap cases.
-Build-system and dependency changes also rebuild the five production containers.
+On PRs and `main` pushes, application changes, including `keygen-rs` dependency
+updates, run one clean Ubuntu 24.04 NVIDIA install. A keygen dependency PR
+also runs Rust tests and checks the Linux and Windows release archives on
+x86-64 and Arm64. Installer changes exercise every native and WSL install in
+the table, including the three Cargo toolchain bootstrap cases. Changes to
+the build system or its toolchains also rebuild the five production containers.
 GPU source changes exercise those containers alongside the representative
 install. Containerfile and container-only test changes run the container matrix.
 Weekly and manual runs cover all installs and containers. The

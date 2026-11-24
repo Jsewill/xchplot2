@@ -81,7 +81,6 @@ jobs:
               - '.github/workflows/install-matrix.yml'
               - '{CMakeLists.txt,Cargo.toml,Cargo.lock,build.rs}'
               - 'cmake/**'
-              - 'keygen-rs/{Cargo.toml,Cargo.lock}'
               - 'contrib/pos2-{plotter-output-move,solver-*,worker-thread-limit}.patch'
               - 'contrib/cccl-arch-list.patch'
               - 'ci/release/adaptivecpp-level-zero-*.patch'
@@ -89,7 +88,7 @@ jobs:
               - 'scripts/install-deps.sh'
               - 'scripts/test/native-install.sh'
             native:
-              - 'keygen-rs/{src,include}/**'
+              - 'keygen-rs/{Cargo.toml,Cargo.lock,src/**,include/**}'
               - 'src/**'
               - 'tools/xchplot2/*.{cpp,h,hpp,cu}'
               - '!tools/xchplot2/compute_service_windows.cpp'
