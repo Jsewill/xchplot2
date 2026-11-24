@@ -547,13 +547,16 @@ inline void shared_capacity()
     generate(18);
     require(setups == old_setups, "owned resident buffers caused needless rebuild");
     require(fast_buffers, "fully available pool did not use faster optional output");
+    // Local sampling precedes the heartbeat that publishes the new budget.
+    // Request a lease against each budget once both sides have observed it.
+    auto published_budget = [&](uint64_t bytes)
+    {
+        if (worker.local_generation_offer(18, 2, 1).demand.gpu_bytes != bytes) return false;
+        auto const page = control.status({});
+        return !page.worker_records.empty() && page.worker_records.front().capacity.gpu_bytes == bytes;
+    };
     usable_mib = 59;
-    require(eventually(
-                [&]
-                {
-                    auto available = worker.local_generation_offer(18, 2, 1);
-                    return available.demand.gpu_bytes == (59ull << 20);
-                }),
+    require(eventually([&] { return published_budget(59ull << 20); }),
             "same-tier loss of optional buffers did not reach admission");
     generate(18);
     require(active_tier == "pool" && !fast_buffers && scratch_limit <= (19ull << 20),
@@ -562,12 +565,7 @@ inline void shared_capacity()
     auto smaller = grant(smaller_task, true);
     require(smaller->task.resources.gpu_bytes == (59ull << 20), "broker missed the smaller signed GPU envelope");
     usable_mib = 64;
-    require(eventually(
-                [&]
-                {
-                    auto offer = worker.local_generation_offer(18, 2, 1);
-                    return offer.demand.gpu_bytes == (64ull << 20);
-                }),
+    require(eventually([&] { return published_budget(64ull << 20); }),
             "same-tier optional buffers never became available again");
     generate(18);
     require(fast_buffers, "recovered memory did not restore optional buffers");
