@@ -30,7 +30,7 @@ std::uint64_t run_one_plot_cpu(BatchEntry const& entry, BatchOptions const& opts
     if (opts.verbose)
         std::fprintf(stderr, "[batch:cpu] generating k=%d with %u CPU lanes\n", int(entry.k), layout.lanes);
     auto fragments = native_cpu_fragments(entry.plot_id.data(), uint8_t(entry.k), uint8_t(entry.strength),
-        layout.lanes, layout.peak_bytes(), [] {
+        layout.lanes, layout.peak_bytes(entry.strength), [] {
             if (cancel_requested()) throw std::runtime_error("CPU plotting cancelled");
         });
     const auto path = std::filesystem::path(entry.out_dir) / entry.out_name;

@@ -1786,7 +1786,7 @@ extern "C" int xchplot2_main(int argc, char* argv[])
         }
         opts.progress = resolve_progress(progress_tri, opts.quiet);
 
-        std::size_t const worker_count = pos2gpu::batch_worker_count(opts, k);
+        std::size_t const worker_count = pos2gpu::batch_worker_count(opts, k, strength);
         // Per worker, not a global total: each worker has its own cold-start
         // plot to exclude. The queue size is still sized off the worker count.
         std::size_t const warmup_per_worker = static_cast<std::size_t>(warmup);

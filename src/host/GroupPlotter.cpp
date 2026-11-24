@@ -529,7 +529,7 @@ Fixtures fixtures(fs::path const& path, uint64_t budget)
 
 uint64_t cpu_peak(PlotGroupParams const& group, unsigned threads)
 {
-    return pos2gpu::cpu::worker_peak(group.get_k(), threads);
+    return pos2gpu::cpu::worker_peak(group.get_k(), threads, group.get_strength());
 }
 uint64_t fragment_bound(PlotGroupParams const& group)
 {

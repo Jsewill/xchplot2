@@ -3484,7 +3484,7 @@ int cpu_target_for_gpu_rate(double s_gpu_seconds)
 //
 // Never throws: batch_worker_count() calls this from outside the CLI's try block
 // (cli.cpp), so a throw here would terminate instead of printing.
-int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
+int cpu_workers_that_fit(int asked, int k, int strength, std::size_t gpu_count,
                          std::vector<NumaNode> const& nodes,
                          std::string* note)
 {
@@ -3536,7 +3536,7 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
         return n > 0 ? n : 0;
     }
 
-    std::uint64_t const per_worker = cpu_worker_peak_bytes(k);
+    std::uint64_t const per_worker = cpu_worker_peak_bytes(k, strength);
     std::uint64_t const free_now   = host_free_bytes_once();
     if (free_now == 0 || per_worker == 0) {
         // The probe failed (no /proc/meminfo? a kernel older than 3.14?). Do not
@@ -3637,9 +3637,9 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
 
 }  // namespace
 
-std::uint64_t cpu_worker_peak_bytes(int k)
+std::uint64_t cpu_worker_peak_bytes(int k, int strength)
 {
-    if (k < 18 || k > 28 || k % 2) return 0;
+    if (k < 18 || k > 28 || k % 2 || strength < 2 || strength > std::min(17, k - 3)) return 0;
     // On a multi-node host a worker may be rebound to any selected node.
     // A single-node worker keeps the enclosing process's affinity.
     const auto affinity = current_thread_cpus();
@@ -3649,7 +3649,7 @@ std::uint64_t cpu_worker_peak_bytes(int k)
         if (nodes.size() > 1)
             for (const auto& node : nodes) threads = std::max(threads, unsigned(node.cpus.size()));
     }
-    return cpu::worker_peak(unsigned(k), threads);
+    return cpu::worker_peak(unsigned(k), threads, unsigned(strength));
 }
 
 std::vector<std::string> worker_labels(std::vector<int> const& device_ids)
@@ -3678,6 +3678,7 @@ std::vector<std::string> worker_labels(std::vector<int> const& device_ids)
 
 std::vector<int> resolve_batch_devices(BatchOptions const& opts,
                                        int                 k,
+                                       int                 strength,
                                        std::string*        gate_note)
 {
     std::vector<int> device_ids;
@@ -3745,7 +3746,7 @@ std::vector<int> resolve_batch_devices(BatchOptions const& opts,
     // memory bandwidth) is not something it arbitrates. Resolved per node
     // (auto/max/exact) and RAM-trimmed host-wide.
     int const cpu_count =
-        cpu_workers_that_fit(opts.cpu_workers, k, gpu_count, cpu_nodes, gate_note);
+        cpu_workers_that_fit(opts.cpu_workers, k, strength, gpu_count, cpu_nodes, gate_note);
 
     // Materialise the default GPU whenever CPU plotting is in play and one
     // exists — EVEN IF the count trimmed to zero. That way a run that wanted CPU
@@ -3850,9 +3851,9 @@ BatchStrategy resolve_batch_strategy(BatchOptions const& opts,
     return select_strategy(inputs, reason_out);
 }
 
-std::size_t batch_worker_count(BatchOptions const& opts, int k)
+std::size_t batch_worker_count(BatchOptions const& opts, int k, int strength)
 {
-    auto const device_ids = resolve_batch_devices(opts, k);
+    auto const device_ids = resolve_batch_devices(opts, k, strength);
     auto const strategy   = resolve_batch_strategy(opts, device_ids, k);
     if (strategy == BatchStrategy::ShardPlot && device_ids.size() > 1) {
         return 1;  // devices form one team; one plot in flight
@@ -3967,7 +3968,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
     //                      The count is capped at what host RAM holds.
     std::string gate_note;
     std::vector<int> device_ids =
-        resolve_batch_devices(opts, pool_k, &gate_note);
+        resolve_batch_devices(opts, pool_k, pool_strength, &gate_note);
     std::set<int> gpu_ids;
     for (int id : device_ids)
         if (!is_cpu_device(id) && !gpu_ids.insert(id).second)
@@ -4104,7 +4105,7 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
             return nullptr;
         }
         return std::make_unique<CpuMemoryGate>(
-            cpu_worker_peak_bytes(pool_k),
+            cpu_worker_peak_bytes(pool_k, pool_strength),
             cpu_budget_bytes(pool_k, gpu_count));
     };
 

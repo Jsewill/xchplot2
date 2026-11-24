@@ -2715,7 +2715,9 @@ do not establish support in a released farmer or network activation.
 `xchplot2 devices` lists the IDs accepted by `--devices`. Without an enrolled
 compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses xchplot2's native C++ member generator.
 A CPU worker generates and sorts the member in RAM, then hands the fragments to
-the plot writer. Its memory grant covers the table layout for its CPU allowance.
+the plot writer. The RAM estimate accounts for k, strength and the number of CPU
+threads. When all match targets for a key fit in one bucket, threads share a read-only
+index and can skip the temporary query table.
 The SYCL and CUDA-only builds use the same generator. When CPU and GPU workers
 share a batch, the scheduler starts with estimates for the selected k and
 strength. It uses observed completion times to decide whether another member

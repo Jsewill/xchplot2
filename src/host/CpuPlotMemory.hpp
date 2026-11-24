@@ -48,42 +48,44 @@ struct Layout {
              + uint64_t(lanes) * bins * 3 * sizeof(uint32_t);
     }
 
-    uint64_t peak_bytes() const
+    uint64_t peak_bytes(unsigned strength = 2) const
     {
+        if (strength < 2 || strength > std::min(17u, k - 3)) throw std::invalid_argument("unsupported CPU match strength");
         // Xs/T1/T2 carry 8/12/16 bytes. T3 emits an 8-byte fragment.
-        // Up to a quarter of the bins belong to a section and a quarter
-        // of those belong to one right key (all supported strengths >= 2).
-        const uint32_t query_bins = std::max(1u, buckets / 16);
-        const auto join = [&](unsigned input, unsigned output) {
-            return table_bytes(bound, buckets, input) + table_bytes(bound, buckets, output)
-                + table_bytes(query_rows, query_bins, input)
-                + uint64_t(lanes) * (uint64_t(right_tile) * input
-                                     + uint64_t(heads) * sizeof(uint32_t));
+        // All supported sizes have four sections. T1 has four match keys,
+        // and T2/T3 use the requested strength.
+        const auto join = [&](unsigned input, unsigned output, unsigned key_bits) {
+            const uint32_t bins = std::max(1u, (buckets / 4) >> key_bits);
+            const uint32_t targets = (n / 4) >> key_bits;
+            const auto tables = table_bytes(bound, buckets, input) + table_bytes(bound, buckets, output);
+            if (bins == 1) return tables + uint64_t(targets) * (2 * input + sizeof(uint32_t));
+            return tables + table_bytes(query_rows, bins, input)
+                + uint64_t(std::min(lanes, bins)) * (uint64_t(right_tile) * input + uint64_t(heads) * sizeof(uint32_t));
         };
         // The left block directory contains at most one span per block.
         // Each final fragment can coexist with its bucket and its sort scratch.
         const uint64_t directories = uint64_t(blocks(bound, buckets)) * 32;
         const uint64_t sort = table_bytes(bound, buckets, 8) + uint64_t(bound) * 16;
-        return std::max({join(8, 12), join(12, 16), join(16, 8), sort}) + directories
+        return std::max({join(8, 12, 2), join(12, 16, strength), join(16, 8, strength), sort}) + directories
             + uint64_t(lanes) * 65536 + (uint64_t{2} << 20);
     }
 };
 
 // A worker can receive fewer permits than it offered. Block sizes change at
 // powers of two, so the largest allocation need not use the most lanes.
-inline uint64_t member_peak(unsigned k, unsigned threads = 0)
+inline uint64_t member_peak(unsigned k, unsigned threads = 0, unsigned strength = 2)
 {
     const auto max_lanes = Layout(k, threads ? threads : std::numeric_limits<unsigned>::max()).lanes;
     uint64_t peak = 0;
     for (unsigned n = 1; n <= max_lanes; ++n)
-        peak = std::max(peak, Layout(k, n).peak_bytes());
+        peak = std::max(peak, Layout(k, n).peak_bytes(strength));
     return peak;
 }
 
 // The worker also needs its thread runtime and writer/codec bookkeeping.
-inline uint64_t worker_peak(unsigned k, unsigned threads = 0)
+inline uint64_t worker_peak(unsigned k, unsigned threads = 0, unsigned strength = 2)
 {
-    return member_peak(k, threads) + (uint64_t{128} << 20);
+    return member_peak(k, threads, strength) + (uint64_t{128} << 20);
 }
 
 } // namespace pos2gpu::cpu

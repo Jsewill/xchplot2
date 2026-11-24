@@ -68,7 +68,7 @@ std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
 std::string plot_to_file(GpuPlotOptions const& options, std::string const&)
 { last_test_options = options; return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
-size_t batch_worker_count(BatchOptions const&, int) { return 1; }
+size_t batch_worker_count(BatchOptions const&, int, int) { return 1; }
 BatchResult run_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts)
 {
     ++batch_calls; last_options = opts; last_entries = entries;

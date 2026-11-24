@@ -616,7 +616,7 @@ uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
 uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength, unsigned threads)
 {
     (void)parameters(k, strength);
-    return pos2gpu::cpu::worker_peak(k, threads);
+    return pos2gpu::cpu::worker_peak(k, threads, strength);
 }
 uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes, unsigned threads)
 {

@@ -1,4 +1,4 @@
-// Native C++20 CPU producer. Only the proof-format primitives come from pos2-chip.
+// Native C++20 CPU producer using pos2-chip's AES rounds, parameters and fragment codec.
 // Keep the implementation with the callers that already include those headers.
 #pragma once
 
@@ -147,30 +147,165 @@ inline uint64_t meta(Xs row) { return row.x; }
 inline uint64_t meta(First row) { return row.lo | (uint64_t(row.hi) << 32); }
 inline uint64_t meta(Second row) { return row.lo | (uint64_t(row.hi) << 32); }
 
-template<class Left, class Right, class F>
-void pair(ProofCore& proof, Left l, Right r, F&& emit)
-{
-    if constexpr (std::is_same_v<Left, Xs>) {
-        if (auto hit = proof.pairing_t1(l.x, r.x))
-            emit(First{hit->match_info, hit->meta_lo, hit->meta_hi}, hit->match_info);
-    } else if constexpr (std::is_same_v<Left, First>) {
-        if (auto hit = proof.pairing_t2(meta(l), meta(r)))
-            emit(Second{hit->match_info, uint32_t(hit->meta), uint32_t(hit->meta >> 32), hit->x_bits}, hit->match_info);
-    } else {
-        if (auto hit = proof.pairing_t3(meta(l), meta(r), l.xbits, r.xbits))
-            emit(hit->proof_fragment, hit->proof_fragment);
+// Independent AES states can occupy the CPU's round pipelines together. Use
+// the proof implementation's round primitive on every supported architecture.
+class HashBatch {
+public:
+    static constexpr unsigned width = 8;
+    using States = rx_vec_i128[width];
+
+    explicit HashBatch(PlotId const& id) : first_(key(id.bytes())), second_(key(id.bytes() + 16)) {}
+
+    void hash(States& states, unsigned rounds) const
+    {
+        hash(states, rounds, std::make_index_sequence<width>{});
     }
-}
+
+    template<unsigned Stage, class Row, class F>
+    void targets(std::span<const Row> rows, ProofCore& proof, unsigned match_key,
+                 unsigned rounds, uint32_t mask, F&& emit) const
+    {
+        while (rows.size() >= width) {
+            States states;
+            for (unsigned i = 0; i < width; ++i) {
+                const uint64_t value = meta(rows[i]);
+                states[i] = rx_set_int_vec_i128(int32_t(value >> 32), int32_t(value), int32_t(match_key), Stage);
+            }
+            hash(states, rounds);
+            for (unsigned i = 0; i < width; ++i)
+                emit(rows[i], uint32_t(rx_vec_i128_x(states[i])) & mask);
+            rows = rows.subspan(width);
+        }
+        for (auto row : rows) emit(row, proof.matching_target(Stage, meta(row), match_key));
+    }
+
+private:
+    // Expand the eight independent states at compile time. Release builds
+    // using -O2 otherwise reload the states from memory between AES rounds.
+    template<size_t... I>
+    void hash(States& states, unsigned rounds, std::index_sequence<I...>) const
+    {
+        const auto first = first_, second = second_;
+        for (unsigned round = 0; round < rounds; ++round) {
+            ((states[I] = aesenc<!HAVE_AES>(states[I], first)), ...);
+            ((states[I] = aesenc<!HAVE_AES>(states[I], second)), ...);
+        }
+    }
+
+    static rx_vec_i128 key(const uint8_t* bytes)
+    {
+        return rx_set_int_vec_i128(int32_t(load32(bytes + 12)), int32_t(load32(bytes + 8)),
+                                   int32_t(load32(bytes + 4)), int32_t(load32(bytes)));
+    }
+    rx_vec_i128 first_, second_;
+};
+
+// Each lane owns its pending pairs. Only a full batch or the final partial
+// batch performs the rounds, and only passing pairs create an output row.
+template<unsigned Stage, class Row>
+struct alignas(64) PairBatch {
+    Row left[HashBatch::width], right[HashBatch::width];
+    unsigned count = 0;
+
+    template<class F>
+    void flush(HashBatch const& hashes, unsigned k, uint32_t filter,
+               unsigned rounds, F&& emit)
+    {
+        HashBatch::States states{};
+        for (unsigned i = 0; i < count; ++i) {
+            const uint64_t l = meta(left[i]), r = meta(right[i]);
+            states[i] = rx_set_int_vec_i128(int32_t(r >> 32), int32_t(r), int32_t(l >> 32), int32_t(l));
+        }
+        hashes.hash(states, rounds);
+        for (unsigned i = 0; i < count; ++i) {
+            const auto state = states[i];
+            if (uint32_t(rx_vec_i128_w(state)) & filter) continue;
+            if constexpr (Stage == 3) {
+                emit((uint64_t(left[i].xbits) << k) | right[i].xbits);
+            } else {
+                const uint32_t info = uint32_t(rx_vec_i128_x(state)) & ((uint32_t{1} << k) - 1);
+                const uint64_t l = meta(left[i]), r = meta(right[i]);
+                if constexpr (Stage == 1) {
+                    const uint64_t xs = (l << k) | r;
+                    emit(First{info, uint32_t(xs), uint32_t(xs >> 32)});
+                } else {
+                    const unsigned half = k / 2;
+                    const uint32_t xs = (uint32_t(l >> (k + half)) << half) | uint32_t(r >> (k + half));
+                    const uint32_t hi_mask = (uint32_t{1} << (2 * k - 32)) - 1;
+                    emit(Second{info, uint32_t(rx_vec_i128_y(state)), uint32_t(rx_vec_i128_z(state)) & hi_mask, xs});
+                }
+            }
+        }
+        count = 0;
+    }
+};
+
+// Encode consecutive successful T3 pairs together before scattering the
+// resulting fragments to their sort buckets.
+struct alignas(64) FragmentBatch {
+    static constexpr unsigned width = 16;
+    uint64_t values[width];
+    unsigned count = 0;
+
+    void flush(ProofFragmentCodec const& codec, Table<uint64_t>& output, unsigned lane, unsigned shift)
+    {
+        for (unsigned i = 0; i < count; ++i) values[i] = codec.encode(values[i]);
+        for (unsigned i = 0; i < count; ++i) output.append(lane, unsigned(values[i] >> shift), values[i]);
+        count = 0;
+    }
+};
 
 template<class Row>
-struct RightIndex {
-    std::unique_ptr<Row[]> nodes;
-    std::vector<uint32_t> heads;
+class RightIndex {
+public:
+    // Each tile retains all rows with the same target, including duplicates.
+    template<class F>
+    void tiles(Table<Row> const& input, unsigned bin, uint32_t base, uint32_t target_mask,
+               uint32_t heads, uint32_t capacity, Work& work, F&& consume)
+    {
+        heads_.assign(heads, 0);
+        if (capacity > capacity_) {
+            nodes_ = std::make_unique_for_overwrite<Row[]>(capacity);
+            capacity_ = capacity;
+        }
+        uint32_t filled = 0;
+        unsigned blocks_seen = 0;
+        input.visit(bin, [&](auto block) {
+            if (!(blocks_seen++ % 16)) work.poll();
+            for (auto row : block) {
+                if ((row.info & ~target_mask) != base) continue;
+                if (filled == capacity) {
+                    consume();
+                    std::fill(heads_.begin(), heads_.end(), 0);
+                    filled = 0;
+                }
+                auto& head = heads_[row.info & (heads - 1)];
+                row.info = head;
+                nodes_[filled++] = row;
+                head = filled;
+            }
+        });
+        if (filled) consume();
+    }
+
+    template<class F>
+    void visit(uint32_t target, F&& emit) const
+    {
+        for (auto id = heads_[target & (heads_.size() - 1)]; id; ) {
+            const auto& row = nodes_[id - 1];
+            emit(row);
+            id = row.info;
+        }
+    }
+private:
+    uint32_t capacity_ = 0;
+    std::unique_ptr<Row[]> nodes_;
+    std::vector<uint32_t> heads_;
 };
 
 template<unsigned Stage, class Row, class Output>
-void match(Layout const& layout, PlotProofParams const& params, ProofCore& proof, Work& work,
-           Table<Row> const& input, Table<Output>& output)
+void match(Layout const& layout, PlotProofParams const& params, HashBatch const& hashes,
+           ProofCore& proof, Work& work, Table<Row> const& input, Table<Output>& output)
 {
     const unsigned shift = layout.k - layout.bucket_bits;
     const unsigned output_shift = (Stage == 3 ? 2 * layout.k : layout.k) - layout.bucket_bits;
@@ -180,75 +315,90 @@ void match(Layout const& layout, PlotProofParams const& params, ProofCore& proof
     const uint32_t mask = (uint32_t{1} << target_bits) - 1;
     const unsigned query_bins = std::max(1u, section_bins / keys);
     const unsigned head_count = std::min(layout.heads, mask + 1);
-    Table<Row> queries(layout, layout.query_rows, query_bins);
+    const unsigned extra = Stage == 1 ? params.get_strength() - 2 : 0;
+    const unsigned target_rounds = AES_MATCHING_TARGET_ROUNDS << extra;
+    const unsigned pair_rounds = AES_PAIRING_ROUNDS << extra;
     std::vector<RightIndex<Row>> scratch(layout.lanes);
+    std::vector<PairBatch<Stage, Row>> pairs(layout.lanes);
+    std::vector<FragmentBatch> fragments;
+    if constexpr (Stage == 3) fragments.resize(layout.lanes);
+    auto flush = [&](unsigned lane) {
+        pairs[lane].flush(hashes, layout.k, keys - 1, pair_rounds, [&](Output result) {
+            if constexpr (Stage == 3) {
+                auto& packed = fragments[lane];
+                packed.values[packed.count++] = result;
+                if (packed.count == FragmentBatch::width)
+                    packed.flush(proof.fragment_codec, output, lane, output_shift);
+            } else {
+                output.append(lane, result.info >> output_shift, result);
+            }
+        });
+    };
+    auto add_pair = [&](unsigned lane, Row left, Row right) {
+        auto& batch = pairs[lane];
+        batch.left[batch.count] = left;
+        batch.right[batch.count++] = right;
+        if (batch.count == HashBatch::width) flush(lane);
+    };
 
+    std::unique_ptr<Table<Row>> queries;
+    if (query_bins > 1) queries = std::make_unique<Table<Row>>(layout, layout.query_rows, query_bins);
     for (unsigned section = 0; section < params.get_num_sections(); ++section) {
         std::vector<std::span<const Row>> left;
         for (unsigned i = 0; i < section_bins; ++i)
             input.visit(section * section_bins + i, [&](auto block) { left.push_back(block); });
+        auto targets = [&](size_t first, size_t count, unsigned key, auto&& emit) {
+            constexpr unsigned blocks_per_task = 8;
+            work.parallel((count + blocks_per_task - 1) / blocks_per_task, [&](unsigned lane, size_t task) {
+                const auto start = task * blocks_per_task;
+                for (size_t i = start; i < std::min(count, start + blocks_per_task); ++i) {
+                    if (i == start || (Stage == 1 && params.get_strength() > 8)) work.poll();
+                    hashes.targets<Stage>(left[first + i], proof, key, target_rounds, mask,
+                                          [&](Row row, uint32_t target) { emit(lane, row, target); });
+                }
+            });
+        };
         const unsigned right_section = proof.matching_section(section);
         for (unsigned key = 0; key < keys; ++key) {
             const uint32_t base = (right_section * keys + key) << target_bits;
             const unsigned first_bin = base >> shift;
-            // A section can be larger than its expected occupancy. Work in
-            // bounded groups of blocks while retaining every row and duplicate.
+            if (!queries) {
+                // All targets fit one index. Share it read-only while lanes probe
+                // their own left blocks. The grant holds two rows per target.
+                // A larger bucket is processed in successive tiles.
+                auto& index = scratch.front();
+                index.tiles(input, first_bin, base, mask, head_count, 2 * head_count, work, [&] {
+                    targets(0, left.size(), key, [&](unsigned lane, Row row, uint32_t target) {
+                        index.visit(target, [&](Row right) { add_pair(lane, row, right); });
+                    });
+                });
+                continue;
+            }
+            // Bound the left batch even when a section exceeds its expected size.
             const size_t batch = layout.query_rows / layout.block;
             for (size_t first = 0; first < left.size(); first += batch) {
-                queries.reset();
-                const size_t count = std::min(batch, left.size() - first);
-                constexpr unsigned blocks_per_task = 8;
-                work.parallel((count + blocks_per_task - 1) / blocks_per_task, [&](unsigned lane, size_t task) {
-                    for (size_t i = task * blocks_per_task; i < std::min(count, (task + 1) * blocks_per_task); ++i) {
-                        if (i == task * blocks_per_task || (Stage == 1 && params.get_strength() > 8)) work.poll();
-                        for (auto row : left[first + i]) {
-                            row.info = proof.matching_target(Stage, meta(row), key);
-                            queries.append(lane, row.info >> shift, row);
-                        }
-                    }
+                queries->reset();
+                targets(first, std::min(batch, left.size() - first), key, [&](unsigned lane, Row row, uint32_t target) {
+                    row.info = target;
+                    queries->append(lane, target >> shift, row);
                 });
                 work.parallel(query_bins, [&](unsigned lane, size_t bin) {
                     auto& index = scratch[lane];
-                    index.heads.assign(head_count, 0);
-                    if (!index.nodes) index.nodes = std::make_unique_for_overwrite<Row[]>(layout.right_tile);
-                    uint32_t filled = 0;
-                    unsigned blocks_seen = 0;
-                    auto join = [&] {
-                        if (!filled) return;
-                        queries.visit(unsigned(bin), [&](auto block) {
+                    index.tiles(input, first_bin + unsigned(bin), base, mask, head_count, layout.right_tile, work, [&] {
+                        unsigned blocks_seen = 0;
+                        queries->visit(unsigned(bin), [&](auto block) {
                             if (!(blocks_seen++ % 16)) work.poll();
-                            for (const auto l : block) {
-                                // The bucket fixes the high target bits. The head index
-                                // fixes every remaining bit, including for duplicate rows.
-                                for (auto j = index.heads[l.info & (head_count - 1)]; j; ) {
-                                    const auto& r = index.nodes[j - 1];
-                                    pair(proof, l, r, [&](Output result, auto sort_key) {
-                                        output.append(lane, unsigned(sort_key >> output_shift), result);
-                                    });
-                                    j = r.info;
-                                }
-                            }
+                            for (auto row : block)
+                                index.visit(row.info, [&](Row right) { add_pair(lane, row, right); });
                         });
-                    };
-                    input.visit(first_bin + unsigned(bin), [&](auto block) {
-                        if (!(blocks_seen++ % 16)) work.poll();
-                        for (auto r : block) {
-                            if ((r.info & ~mask) != base) continue;
-                            if (filled == layout.right_tile) {
-                                join();
-                                std::fill(index.heads.begin(), index.heads.end(), 0);
-                                filled = 0;
-                            }
-                            auto& head = index.heads[r.info & (head_count - 1)];
-                            r.info = head;
-                            index.nodes[filled++] = r;
-                            head = filled;
-                        }
                     });
-                    join();
                 });
             }
         }
+    }
+    for (unsigned lane = 0; lane < layout.lanes; ++lane) {
+        if (pairs[lane].count) flush(lane);
+        if constexpr (Stage == 3) fragments[lane].flush(proof.fragment_codec, output, lane, output_shift);
     }
     output.size();
 }
@@ -276,11 +426,13 @@ inline std::vector<uint64_t> generate(PlotProofParams const& params, unsigned th
                                       std::function<void()> const& check = {})
 {
     const Layout layout(unsigned(params.get_k()), threads);
-    if (layout.peak_bytes() > ram_bytes) throw std::length_error("CPU plotting exceeds the available RAM grant");
+    if (layout.peak_bytes(params.get_strength()) > ram_bytes)
+        throw std::length_error("CPU plotting exceeds the available RAM grant");
     detail::Work work(layout.lanes, check);
     work.poll();
     ProofCore proof(params);
     using namespace detail;
+    const HashBatch hashes(params.get_plot_id());
     auto xs = std::make_unique<Table<Xs>>(layout, layout.n, layout.buckets);
     constexpr unsigned tile = 8192;
     work.parallel(layout.n / tile, [&](unsigned lane, size_t part) {
@@ -291,13 +443,13 @@ inline std::vector<uint64_t> generate(PlotProofParams const& params, unsigned th
         }
     });
     auto t1 = std::make_unique<Table<First>>(layout, layout.bound, layout.buckets);
-    match<1>(layout, params, proof, work, *xs, *t1);
+    match<1>(layout, params, hashes, proof, work, *xs, *t1);
     xs.reset();
     auto t2 = std::make_unique<Table<Second>>(layout, layout.bound, layout.buckets);
-    match<2>(layout, params, proof, work, *t1, *t2);
+    match<2>(layout, params, hashes, proof, work, *t1, *t2);
     t1.reset();
     Table<uint64_t> fragments(layout, layout.bound, layout.buckets);
-    match<3>(layout, params, proof, work, *t2, fragments);
+    match<3>(layout, params, hashes, proof, work, *t2, fragments);
     t2.reset();
 
     std::vector<uint64_t> result;

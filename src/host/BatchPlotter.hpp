@@ -367,7 +367,7 @@ BatchStrategy select_strategy(
 std::vector<std::string> worker_labels(std::vector<int> const& device_ids);
 
 // Host allocation bound, including the per-worker runtime allowance.
-std::uint64_t cpu_worker_peak_bytes(int k);
+std::uint64_t cpu_worker_peak_bytes(int k, int strength);
 
 // Resolve BatchOptions' device selection to the concrete id list
 // run_batch will use (use_all_devices → enumerate, device_ids →
@@ -386,6 +386,7 @@ std::uint64_t cpu_worker_peak_bytes(int k);
 // every caller printing it.
 std::vector<int> resolve_batch_devices(BatchOptions const& opts,
                                        int                 k,
+                                       int                 strength,
                                        std::string*        gate_note = nullptr);
 
 // Filter a resolved device list down to the devices that can actually run a
@@ -407,6 +408,6 @@ BatchStrategy resolve_batch_strategy(BatchOptions const& opts,
 
 // Number of concurrently-plotting workers run_batch will spawn for
 // these options (shard-plot and pipeline-plot act as one team = 1).
-std::size_t batch_worker_count(BatchOptions const& opts, int k);
+std::size_t batch_worker_count(BatchOptions const& opts, int k, int strength);
 
 } // namespace pos2gpu

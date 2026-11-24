@@ -1,7 +1,8 @@
 # Benchmarks
 
 The September GPU measurements use the pre-1.0 cipher and raw format.
-Current `.gplot` measurements cover [native Windows grouped plotting](#native-windows-grouped-plotting)
+Current `.gplot` measurements cover [native CPU plotting](#native-cpu-plotting),
+[native Windows grouped plotting](#native-windows-grouped-plotting)
 and [grouped plots on HDDs](#grouped-plots-on-hdds). See also the
 [CPU plotting memory experiment](#cpu-plotting-memory-experiment).
 Use [`xchplot2 bench`](REFERENCE.md#benchmarking) to measure your system.
@@ -185,6 +186,35 @@ member. The published file matched the reference and passed 84 full-proof
 checks. Plot construction used RAM throughout.
 
 ## Native CPU plotting
+
+### Batched CPU matching
+
+Both versions plotted the same k=28, strength-2 members on four pinned
+E-cores of a shared Core Ultra 7 270K Plus. Timings include compression,
+writing and publication, from process launch through successful exit.
+
+| Completed job | Original native generator | Batched CPU matching | Peak RAM with batched matching |
+|---|---:|---:|---:|
+| One member | 36.93 s/member | 28.52 s/member | 7.85 GiB |
+| Two members in one group | 40.41 s/member | 33.60 s/member | 8.96 GiB |
+
+The single-member times are medians of three runs per version. Individual
+runs took 36.91–37.75 seconds before and 28.29–29.81 seconds after. Each
+two-member group used automatic construction, a 12 GiB limit and one
+destination. Whole-group times were 80.83 and 67.19 seconds. Both groups
+matched the independent pos2-chip file byte for byte.
+
+In a separate k=28 run, generation took 27.21 seconds before the writer.
+Building and probing the match indexes, evaluating candidate pairs and
+writing their output rows accounted for 19.62 seconds. Exporting and
+sorting the final fragments took 1.49 seconds.
+
+On a shared Ryzen 9 5950X running Windows, two k=28 runs per version took
+61.25–62.05 seconds before and 47.85–47.93 seconds after. These times
+include the SSH invocation. Both versions used four threads at below-normal
+priority, published the same file and used zero scratch bytes.
+
+### Initial native CPU measurements
 
 On November 24, 2026, four pinned E-cores on a shared Core Ultra 7 270K Plus
 published a k=28, strength-2 member through the ordinary batch writer.
