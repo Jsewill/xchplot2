@@ -457,6 +457,39 @@ void repartition_and_global_admission()
         "single-owner packed pipeline prefetch changed canonical publication");
 }
 
+void retained_terminal_grants(WorkerGenerationCapacity const& capacity)
+{
+    // No first grant with an ordinary continuation can reach the 40-unit
+    // physical bound. Permit the exact, revalidated continuation on seven
+    // writers only when the complete input roster is available.
+    std::array<unsigned, 7> packed{3, 1, 1, 2, 3, 3, 1}, write{27, 21, 29, 26, 36, 31, 37};
+    std::array<ExecutionReady, 7> ready;
+    std::array<ExecutionLane, 7> lanes;
+    std::array<TerminalGenerationBatch, 7> inputs{};
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = packed[i]; work.cpu = 1; work.destination = write[i];
+        work.batches = 1; work.known = work.io_overlap = true; lanes[i].destination = i;
+        ready[i] = {i, 0, work.cpu + work.destination, true, uint16_t(packed[i]), false, work.generation};
+        inputs[i] = {i, i, 1, 0, uint16_t(packed[i]), {}, {work.generation, work.cpu, 0, work.destination},
+            ready[i].time_to_write};
+    }
+    require(capacity.slots == 1 && capacity.roster && capacity.roster->complete,
+        "the authenticated terminal fixture lost its sole worker");
+    GenerationSupply supply{capacity.slots, capacity.roster}; TerminalGenerationPlan saved;
+    require(saved.choose(ready, lanes, {}, 7, 7, 1, supply, true, 1, 100) == 4 && !saved.count,
+        "the single-grant fallback claimed an unvalidated terminal continuation");
+    require(saved.choose(ready, lanes, inputs, 7, 7, 1, supply, true, 1, 100) == 6 && saved.count == 7,
+        "the seven-writer plan did not attain the shorter durable bound");
+    saved.grant(6, inputs[6].count);
+    require(saved.next(std::span(inputs).first(6), std::span(ready).first(6), supply, 2) == 4,
+        "the second necessary grant lost its qualified writer");
+    inputs[3].writer = 99;
+    require(!saved.next(std::span(inputs).first(6), std::span(ready).first(6), supply, 2),
+        "a changed large cohort kept its old continuation");
+}
+
 void late_packed_capacity()
 {
     using namespace grow_controller_test;
@@ -495,6 +528,7 @@ void late_packed_capacity()
     require(filling.get() == 3 && members.size() == 3 && hash.size() == 3 && receipts.size() == 2 &&
         hash.digest_for(Members(members)) == members_digest(18, Members(members), nullptr, [] {}),
         "newly available packed capacity did not batch and hash the unsent pair");
+    retained_terminal_grants(client->generation_capacity(18, 2));
     auto const canonical_packed = members_digest(18, Members(members), nullptr, [] {});
     worker_detail::CpuLimit cpu(1);
     for (unsigned i = 0; i < 3; ++i)

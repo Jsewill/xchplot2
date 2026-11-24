@@ -2,6 +2,7 @@
 // exact memory, codec, space and recovery admission before changing any bytes.
 #pragma once
 #include "host/GroupMerge.hpp"
+#include <bit>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -854,6 +855,7 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
     result.known = !result.unmeasured && result.completion > 0;
     return result;
 }
+inline constexpr size_t execution_forecast_lanes = std::numeric_limits<uint64_t>::digits;
 inline constexpr size_t exact_terminal_batches = 6;
 
 struct TerminalGenerationBatch
@@ -863,6 +865,7 @@ struct TerminalGenerationBatch
     uint16_t first = 0, count = 0;
     std::array<uint8_t, 32> plot{};
     std::array<long double, 4> service{};
+    long double time_to_write = 0;
     bool operator==(TerminalGenerationBatch const&) const = default;
 };
 
@@ -870,7 +873,7 @@ struct TerminalGenerationBatch
 // still checks the current receive, CPU, writer and worker availability.
 struct TerminalGenerationPlan
 {
-    std::array<TerminalGenerationBatch, exact_terminal_batches> batches{};
+    std::vector<TerminalGenerationBatch> batches;
     size_t count = 0, issued = 0;
     GenerationSupply supply;
     uint64_t deadline = 0;
@@ -895,33 +898,138 @@ struct TerminalGenerationPlan
     }
 };
 
-// Enumerate small cohorts in ordinary priority order to retain that priority
-// on equal completion. Larger cohorts compare one alternative first grant.
+// Price only dispatch orders the owner can issue before and after its age fence.
+// Equal completion retains ordinary priority.
 inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady const> ready,
     std::span<ExecutionLane const> lanes, unsigned workers, unsigned grant, std::span<size_t> exact_order = {})
 {
-    if (ready.size() < 2 || ready.size() != lanes.size() || !workers || !grant) return {};
+    if (ready.size() < 2 || ready.size() > execution_forecast_lanes || ready.size() != lanes.size() || !workers || !grant) return {};
     std::vector<size_t> order(lanes.size());
     std::vector<long double> tail(lanes.size());
     std::set<size_t> writers;
+    long double max_cpu = 0, min_generation = std::numeric_limits<long double>::max();
     for (size_t i = 0; i < lanes.size(); ++i)
     {
         auto const& work = lanes[i].work;
         if (!ready[i].known || !work.known || work.generation <= 0 || work.destination <= 0 || work.batches != 1 ||
-            ready[i].tight_capacity || ready[i].deferrals >= ready.size() || !lanes[i].scratch.empty() ||
+            ready[i].tight_capacity || ready[i].deferrals >= ready.size() || lanes[i].committed || lanes[i].ready_after ||
+            !lanes[i].scratch.empty() || work.scratch_read || work.scratch_write || work.scratch_bytes ||
             !writers.insert(lanes[i].destination).second) return {};
         auto const cpu = work.cpu / std::min(workers, grant) + work.serial;
         tail[i] = work.io_overlap ? std::max(cpu, work.destination) : cpu + work.destination;
-        order[i] = i;
+        max_cpu = std::max(max_cpu, cpu); min_generation = std::min(min_generation, work.generation);
+        if (!(cpu >= 0 && std::isfinite(tail[i]) && std::isfinite(work.generation))) return {};
     }
-    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], true); });
+    // Each mask holds equal-priority destinations in physical visiting order.
+    // Ranks only advance as grants remove work, so replaying a complete owner
+    // continuation visits at most one rank per destination for each rule.
+    auto ranks = [&](auto precedes)
+    {
+        std::array<uint64_t, execution_forecast_lanes> groups{};
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), precedes);
+        size_t group = 0;
+        for (size_t i = 0; i < order.size(); ++i)
+        {
+            if (i && precedes(order[i - 1], order[i])) ++group;
+            groups[group] |= uint64_t(1) << order[i];
+        }
+        return groups;
+    };
+    auto const ages = ranks([&](auto a, auto b) { return ready[a].deferrals > ready[b].deferrals; });
+    auto priority = [&](bool timed)
+    { return ranks([&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], timed); }); };
+    uint64_t untimed = 0;
+    for (size_t i = 0; i < ready.size(); ++i)
+        if (ready[i].members_to_pack != UINT16_MAX && !(ready[i].time_to_write > 0)) untimed |= uint64_t(1) << i;
+    auto const warm = priority(true), cold = untimed ? priority(false) : warm;
+    std::vector<size_t> projected(order.size());
+    auto follow = [&](std::span<size_t const> preferred, bool require_order = false)
+    {
+        uint64_t pending = UINT64_MAX >> (execution_forecast_lanes - order.size());
+        size_t next = 0, age = 0, known = 0, unknown = 0;
+        bool retained = true;
+        auto head = [&](auto const& groups, size_t& rank)
+        {
+            while (!(groups[rank] & pending)) ++rank;
+            return groups[rank] & pending;
+        };
+        for (size_t step = 0; step < projected.size(); ++step)
+        {
+            auto group = head(ages, age);
+            bool const aged = ready[std::countr_zero(group)].deferrals + step >= order.size() - step;
+            if (aged || step >= preferred.size()) retained = false;
+            if (!retained && !aged) group = pending & untimed ? head(cold, unknown) : head(warm, known);
+            auto const later = group & (UINT64_MAX << next);
+            size_t const index = retained ? preferred[step] : size_t(std::countr_zero(later ? later : group));
+            if (require_order && preferred[step] != index) return false;
+            projected[step] = index; pending &= ~(uint64_t(1) << index);
+            next = index + 1 == ready.size() ? 0 : index + 1;
+        }
+        return true;
+    };
+    follow({});
+    order = projected;
+    auto const codecs = std::max(1u, workers / grant);
+    if (order.size() > exact_terminal_batches && (codecs >= order.size() || max_cpu <= codecs * min_generation))
+    {
+        // Every release has a free codec grant, including reuse after at
+        // least one generation interval per grant. Each writer is independent.
+        auto finish = [&](std::span<size_t const> sequence, size_t first = SIZE_MAX)
+        {
+            long double released = 0, end = 0;
+            auto append = [&](size_t i)
+            {
+                released += lanes[i].work.generation;
+                end = std::max(end, released + tail[i]);
+            };
+            if (first != SIZE_MAX) append(first);
+            for (auto i : sequence) if (i != first) append(i);
+            return end;
+        };
+        auto longest_first = order;
+        std::stable_sort(longest_first.begin(), longest_first.end(), [&](auto a, auto b) { return tail[a] > tail[b]; });
+        // Among jobs with a tail at least q, the last generation must precede
+        // that much downstream service. Descending tails attain this bound.
+        auto const lower = finish(longest_first);
+        auto best = finish(order);
+        std::optional<size_t> first;
+        for (auto i : order)
+        {
+            if (best <= lower) break;
+            if (i == order.front() || finish(longest_first, i) >= best) continue;
+            follow(std::span(&i, 1));
+            auto const candidate = finish(projected);
+            if (candidate < best) { best = candidate; first = ready[i].index; }
+        }
+        if (exact_order.size() >= order.size() && lower < best)
+        {
+            // Accept a longer plan only when the rotating owner can actually
+            // attain the physical bound. Releasing the plan early at any
+            // unchanged prefix must remain at least as good as the last one.
+            auto previous = finish(order);
+            for (size_t prefix = 1; prefix <= order.size(); ++prefix)
+            {
+                follow(std::span(longest_first).first(prefix));
+                auto const candidate = finish(projected);
+                if (candidate > previous) break;
+                if (candidate == lower)
+                {
+                    std::copy(projected.begin(), projected.end(), exact_order.begin());
+                    return ready[projected.front()].index;
+                }
+                previous = candidate;
+            }
+        }
+        return first;
+    }
     auto const longest = std::max_element(order.begin(), order.end(), [&](auto a, auto b) { return tail[a] < tail[b]; });
     bool const enumerate_orders = order.size() <= exact_terminal_batches;
     if (!enumerate_orders && longest == order.begin()) return {};
     std::vector<ExecutionLane> schedule(lanes.size());
     auto estimate = [&]
     {
-        for (size_t i = 0; i < order.size(); ++i) schedule[i] = {lanes[order[i]].work, order[i]};
+        for (size_t i = 0; i < projected.size(); ++i) schedule[i] = {lanes[projected[i]].work, projected[i]};
         return pipeline_execution_estimate(schedule, schedule.size(), workers, grant, schedule.size(), true);
     };
     auto const ordinary = estimate();
@@ -929,13 +1037,14 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
     if (enumerate_orders)
     {
         // Ranks preserve rotating priority even when two distinct batches have
-        // equal timing keys. Every permutation must remain distinguishable.
+        // equal timing keys. Only physically attainable orders enter the model.
         std::array<size_t, exact_terminal_batches> rank{};
         for (size_t i = 0; i < order.size(); ++i) rank[order[i]] = i;
         long double best = ordinary.completion;
         std::optional<size_t> first;
         while (std::next_permutation(order.begin(), order.end(), [&](auto a, auto b) { return rank[a] < rank[b]; }))
         {
+            if (!follow(order, true)) continue;
             auto const candidate = estimate();
             if (!candidate.known) return {};
             if (candidate.completion >= best) continue;
@@ -944,9 +1053,9 @@ inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady c
         }
         return first;
     }
-    std::rotate(order.begin(), longest, longest + 1);
+    follow(std::span(&*longest, 1));
     auto const changed = estimate();
-    if (changed.known && changed.completion < ordinary.completion) return ready[order.front()].index;
+    if (changed.known && changed.completion < ordinary.completion) return ready[*longest].index;
     return {};
 }
 
@@ -959,13 +1068,16 @@ inline std::optional<size_t> TerminalGenerationPlan::choose(std::span<ExecutionR
         if (prefix) if (auto saved = next(inputs, ready, current, now)) return saved;
         clear(); return {};
     }
-    if (ready.size() != active || (active <= batches.size() && inputs.size() != active)) return {};
-    std::array<size_t, exact_terminal_batches> order{};
-    auto first = execution_terminal_first(ready, lanes, workers, grant, order);
-    if (first && active <= batches.size())
+    if (ready.size() != active || active > execution_forecast_lanes ||
+        (active <= exact_terminal_batches && inputs.size() != active)) return {};
+    std::array<size_t, execution_forecast_lanes> order{};
+    order.front() = SIZE_MAX;
+    auto const saved = inputs.size() == active ? std::span(order).first(active) : std::span<size_t>{};
+    auto first = execution_terminal_first(ready, lanes, workers, grant, saved);
+    if (first && order.front() != SIZE_MAX)
     {
         long double generation = 0;
-        count = active; issued = 0; supply = current;
+        batches.resize(active); count = active; issued = 0; supply = current;
         for (size_t i = 0; i < count; ++i) { batches[i] = inputs[order[i]]; generation += lanes[i].work.generation; }
         auto duration = std::min(timeout, UINT64_MAX - now);
         if (generation < duration) duration = uint64_t(generation);
