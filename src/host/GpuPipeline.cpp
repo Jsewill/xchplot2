@@ -101,10 +101,10 @@ struct StreamingStats {
     ~StreamingStats() {
         for (auto const& [ptr, bytes] : sizes)
             release_gpu_memory("streaming device allocation", bytes, &GpuCleanupCharges::device,
-                [&] { sycl::free(ptr, sycl_backend::queue()); });
+                [owned = ptr] { sycl::free(owned, sycl_backend::queue()); });
         for (auto const& [ptr, bytes] : host_ptrs)
             release_gpu_memory("streaming pinned allocation", bytes, &GpuCleanupCharges::host,
-                [&] { sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), sycl_backend::queue()); });
+                [owned = ptr] { sycl::free(pos2gpu::host_guard_disarm(owned, "~StreamingStats"), sycl_backend::queue()); });
     }
 };
 

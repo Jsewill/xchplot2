@@ -14,7 +14,8 @@ HostPinnedPool::~HostPinnedPool()
 {
     for (auto& [name, s] : slots_) {
         if (s.ptr && s.alloc_q) {
-            release_gpu_memory(name.c_str(), s.bytes, &GpuCleanupCharges::host, [&] { sycl::free(s.ptr, *s.alloc_q); });
+            release_gpu_memory(name.c_str(), s.bytes, &GpuCleanupCharges::host,
+                [ptr = s.ptr, queue = s.alloc_q] { sycl::free(ptr, *queue); });
         }
     }
 }
