@@ -1131,7 +1131,7 @@ def check_farm_updates(run, command, verify, root):
                                                "--group-members", 8, "--max-groups", 2, "--max-total-members", 11,
                                                "--capacity-bytes", "128M", "--headroom-bytes", 0,
                                                "--farming-max-eligible-groups", 4, "--seed", SEED,
-                                               "-f", FARMER, "--pool-ph", POOL, "--quiet"),
+                                               "-f", FARMER, "--pool-ph", POOL, "--json"),
                                        stdout=output, stderr=subprocess.STDOUT)
             try:
                 stopped = False
@@ -1177,7 +1177,16 @@ def check_farm_updates(run, command, verify, root):
                 if stopped:
                     process.send_signal(signal.SIGCONT)
                     stopped = False
-                assert process.wait(timeout=180) == 0, live_log.read_text(encoding="utf-8")
+                writer_code = process.wait(timeout=180)
+                if writer_code:
+                    # The updater can acquire the writer lock at the handoff. The
+                    # original fill then observes a policy revision being published.
+                    report = live_log.read_text(encoding="utf-8")
+                    assert writer_code == 2, report
+                    observation = json.loads(report.splitlines()[-1])
+                    assert observation.get("farming_status") and observation["read_only"] and not observation["inspection_complete"], report
+                    assert observation["diagnosis"]["status"] == "inspection-incomplete" and (
+                        observation["diagnosis"]["condition"] == "farming job changed while acquiring its directories"), report
             finally:
                 if stopped and process.poll() is None:
                     process.send_signal(signal.SIGCONT)
@@ -1193,9 +1202,8 @@ def check_farm_updates(run, command, verify, root):
         assert any(record["status"] == ("refused" if refused_update else "applied") for record in status["updates"])
         if refused_update:
             assert status["update_reason"]
-        else:
-            verify(paths[0])
-            verify(paths[-1])
+        verify(paths[0])
+        verify(paths[-1])
     print("PASS resizing, future parameter cohorts, live updates, refusal/cancellation, read-only status and revision recovery", flush=True)
 
 
