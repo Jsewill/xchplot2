@@ -3,6 +3,14 @@ name: GPU hardware
 on:
   push:
     branches: [cuda-only]
+    paths-ignore:
+      - '.github/workflows/lint.yml'
+      - '.github/actionlint.*'
+      - '.github/dependabot.yml'
+      - '**/*.md'
+      - '.markdownlint*'
+      - '_typos.toml'
+      - 'scripts/test/docs.py'
   workflow_dispatch:
     inputs:
       suite:

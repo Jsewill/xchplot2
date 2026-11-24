@@ -2,8 +2,17 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore: &lint-paths
+      - '.github/workflows/lint.yml'
+      - '.github/actionlint.*'
+      - '.github/dependabot.yml'
+      - '**/*.md'
+      - '.markdownlint*'
+      - '_typos.toml'
+      - 'scripts/test/docs.py'
   push:
     branches: [cuda-only]
+    paths-ignore: *lint-paths
 
 permissions:
   contents: read
@@ -20,15 +29,6 @@ jobs:
         # Recurse so scripts/test/install-container-deps/run.sh and any
         # future helpers under scripts/ stay covered.
         run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck
-
-  actions:
-    name: actionlint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: reviewdog/action-actionlint@v1
-        with:
-          fail_level: error
 
   rust:
     name: Rust (keygen-rs)
@@ -154,31 +154,3 @@ jobs:
         # Catches typos in service names / build-arg keys / unresolvable
         # ${VAR} placeholders without ever pulling a base image. ~5s.
         run: docker compose -f compose.yaml config --quiet
-
-  typos:
-    name: typos
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: crate-ci/typos@master
-
-  markdownlint:
-    name: Markdown documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: List tracked Markdown
-        id: docs
-        run: |
-          {
-            echo 'files<<EOF'
-            git ls-files '*.md'
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-      - uses: DavidAnson/markdownlint-cli2-action@v25
-        with:
-          globs: ${{ steps.docs.outputs.files }}
-      - name: Check local documentation links
-        run: |
-          python3 scripts/test/docs.py --self-test
-          python3 scripts/test/docs.py

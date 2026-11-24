@@ -213,8 +213,10 @@ memory budgets and spill support. Record GPU, source revision, sample count,
 warmup, units, and measurement date with new results. Label older results
 whose provenance is incomplete.
 
-The existing Markdown job lints tracked documentation, including section
-fragments. Local links are checked without contacting external websites:
+Repository lint checks workflow syntax, spelling, tracked Markdown, and links
+to local files and section headings. Dependabot groups updates to the three
+lint actions in one weekly PR per target branch when updates are available.
+Run the link check locally with
 
 ```bash
 python3 scripts/test/docs.py

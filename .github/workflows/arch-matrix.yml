@@ -17,7 +17,7 @@ name: arch-matrix
 
 on:
   pull_request:
-    paths-ignore:
+    paths-ignore: &ignored-paths
       # Docs & metadata
       - '**.md'
       - 'docs/**'
@@ -37,28 +37,14 @@ on:
       - 'scripts/install-container-deps.sh'
       # Sibling CI workflows + install-matrix-only containerfiles.
       - '.github/workflows/ci.yml'
+      - '.github/workflows/lint.yml'
+      - '.github/actionlint.*'
+      - '_typos.toml'
       - '.github/workflows/install-matrix.yml'
       - 'ci/install-matrix/**'
   push:
     branches: [cuda-only]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      - 'scripts/test/**'
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/install-matrix.yml'
-      - 'ci/install-matrix/**'
+    paths-ignore: *ignored-paths
 
 permissions:
   contents: read

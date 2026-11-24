@@ -14,7 +14,7 @@ name: install-matrix
 
 on:
   pull_request:
-    paths-ignore:
+    paths-ignore: &ignored-paths
       # Docs & metadata
       - '**.md'
       - 'docs/**'
@@ -36,26 +36,13 @@ on:
       # Sibling CI workflows — editing arch-matrix or the lint
       # workflow shouldn't drag in the install matrix.
       - '.github/workflows/ci.yml'
+      - '.github/workflows/lint.yml'
+      - '.github/actionlint.*'
+      - '_typos.toml'
       - '.github/workflows/arch-matrix.yml'
   push:
     branches: [cuda-only]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.markdownlint*'
-      - '.github/dependabot.yml'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE*'
-      - 'scripts/test/**'
-      - 'scripts/test-multi-gpu.sh'
-      - 'scripts/build-container.sh'
-      - 'scripts/install-container-deps.sh'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/arch-matrix.yml'
+    paths-ignore: *ignored-paths
 
 permissions:
   contents: read
