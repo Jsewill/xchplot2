@@ -2,6 +2,7 @@
 // private ownership without adding a production cache-testing interface.
 #include "host/ComputeWorker.cpp"
 #include "host/ComputeSession.hpp"
+#include "host/GroupStorage.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
 #include "compute_pool_fixture.hpp"
@@ -1356,33 +1357,75 @@ void temporary_worker_refusal()
     pool::BrokerClient worker_control(offer.broker, tls);
     auto const instance = service.status().instance;
     {
-        bool moved = false;
+        bool moved = false, pressure_at_grant = false;
+        std::shared_ptr<DiskIoGovernor> io;
         WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
         config.owner_id = "terminal-grant-fence";
         config.generation_path = [&](auto const&, auto const&, uint32_t) { return std::string(64, moved ? 'b' : 'a'); };
-        WorkerClient client(config);
+        config.selected = [&](auto const&) { if (std::exchange(pressure_at_grant, false)) io->observe_pressure(true); };
+        WorkerClient client(config); auto const competing = worker_control.open_owner("contending-writer");
+        pool::Task blocker; blocker.compatibility = worker_compatibility(); blocker.k = 18; blocker.strength = 2;
+        blocker.kind = pool::Kind::GenerateCpu; blocker.resources.host_bytes = 1;
+        auto reserve = [&]
+        {
+            blocker.task_id = pool::random_token(); ++blocker.sequence;
+            require(bool(worker_control.acquire(competing, blocker)), "contender did not occupy the idle signed lane");
+        };
+        auto release = [&] { worker_control.cancel(competing, blocker.task_id, blocker.attempt); };
         auto const before = service.status().accepted_tasks;
-        for (bool fresh : {false, true})
+        enum class Change { queued, pressure, path };
+        for (bool fresh : {false, true}) for (auto change : {Change::queued, Change::pressure, Change::path})
         {
             moved = false; auto publication = client.publication_route(18, 2, {&id, 1});
             require(bool(publication), "a registered single-slot worker did not quote its normal generation path");
+            io = std::make_shared<DiskIoGovernor>(); auto const sampled = io->pressure_deadline();
+            publication->pressure_unchanged = [io, sampled] { return io->pressure_deadline() == sampled; };
             publication->selected_fresh = fresh; publication->promoted.store(true);
-            // Both grants are genuine. Change the measured path between the quote and the authenticated data connection.
-            moved = true; bool declined = false, received = false;
+            std::atomic<bool> returned{false}; std::future<void> released;
+            if (change == Change::queued)
+            {
+                reserve();
+                released = std::async(std::launch::async, [&]
+                {
+                    auto const until = Clock::now() + std::chrono::seconds(2);
+                    while (!returned.load() && Clock::now() < until && !worker_control.status().queued)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    release();
+                });
+            }
+            else if (change == Change::pressure) pressure_at_grant = true;
+            else moved = true;
+            bool declined = false, received = false;
+            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::seconds(3);
             try
             {
                 if (fresh) client.contributions(18, 2, {&id, 1}, [&](auto, auto, auto) { received = true; },
-                    {}, {}, {}, [&](auto, auto, auto const&) { received = true; });
-                else client.generate_packed(18, 2, {&id, 1}, [&](auto const&, uint64_t) { received = true; });
+                    cancel, {}, {}, [&](auto, auto, auto const&) { received = true; });
+                else client.generate_packed(18, 2, {&id, 1}, [&](auto const&, uint64_t) { received = true; }, cancel);
             }
             catch (WorkerPublicationChanged const&) { declined = true; }
+            returned = true; if (released.valid()) released.get();
             require(declined && !received && !client.stats().input_bytes && service.status().accepted_tasks == before,
-                "a changed terminal path began paid worker processing");
+                "a changed terminal queue, pressure or path failed to return to the incumbent before Work");
         }
-        bool delivered = false;
-        client.generate(18, 2, id, [&](auto const&, uint64_t) { delivered = true; });
-        require(delivered && client.stats().completed_generation == 1 && service.status().accepted_tasks == before,
-            "discarding terminal evidence prevented the following ordinary lease from finishing");
+        reserve();
+        auto ordinary = std::async(std::launch::async, [&]
+        {
+            bool delivered = false; client.generate(18, 2, id, [&](auto const&, uint64_t) { delivered = true; }); return delivered;
+        });
+        auto until = Clock::now() + std::chrono::seconds(2); bool waited = false;
+        while (Clock::now() < until && !(waited = worker_control.status().queued != 0))
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        release();
+        auto const delivered = ordinary.get();
+        require(waited && delivered && client.stats().completed_generation == 1,
+            "discarding terminal evidence changed the ordinary lease's queue or completion");
+        // The TLS End can reach the owner before the worker's signed release and acceptance guard finish.
+        until = Clock::now() + std::chrono::seconds(2);
+        while (Clock::now() < until && service.status().accepted_tasks != before)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(service.status().accepted_tasks == before, "completed ordinary work retained its worker acceptance");
+
     }
     for (bool local : {false, true})
     {

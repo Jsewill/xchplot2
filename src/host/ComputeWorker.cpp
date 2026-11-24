@@ -4192,6 +4192,26 @@ struct WorkerClient::Impl
         for (auto const& id : ids) if (std::find(paid->ids.begin(), paid->ids.end(), id) != paid->ids.end()) throw WorkerPublicationChanged();
         return {};
     }
+    std::optional<WorkerPackedRoute> priced_packed_route(uint8_t k, uint8_t strength, unsigned width,
+        pool::GenerationRoster const& roster, WorkerCancellation cancel)
+    {
+        try
+        {
+            cancel.deadline = std::min(cancel.deadline, Clock::now() + std::chrono::milliseconds(std::min(250u, config.task_timeout_ms)));
+            cancel.check();
+            auto control = broker.with_deadline(cancel.deadline);
+            pool::OwnerSession session; pool::Task shape; shape.compatibility = config.compatibility;
+            shape.kind = config.generation_kind; shape.k = k; shape.strength = strength; shape.work_units = width;
+            shape.resources.cpu_threads = config.generation_threads;
+            { auto lock = sequence_lock(cancel); prepare_session_locked(control, session, false); }
+            auto const best = bind_generation_paths(control, session) ? control.finite_packed_route(session, shape) : std::nullopt;
+            if (best)
+                for (auto const& route : roster.routes)
+                    if (route.identity == best->first) return WorkerPackedRoute{route, best->second};
+        }
+        catch (std::exception const&) {} // Advisory placement does not own the real lease.
+        return {};
+    }
     bool bind_generation_paths(pool::BrokerClient& control, pool::OwnerSession const& session)
     {
         if (!config.generation_path) return true;
@@ -4469,6 +4489,8 @@ struct WorkerClient::Impl
             auto next_hint = Clock::now();
             while (!lease)
             {
+                // The publication was priced on an immediately available lane.
+                if (options.publication) { declined = true; throw WorkerPublicationChanged(); }
                 if (operation != Operation::Encode && Clock::now() >= next_hint)
                 {
                     auto const current = capacity(k, strength, cancel.deadline);
@@ -4564,7 +4586,8 @@ struct WorkerClient::Impl
             {
                 auto const local = connection->channel.local_address();
                 same_path = !local.empty() && config.generation_path({lease->worker_identity, lease->worker_instance, lease->endpoint},
-                    local, connection->ingress) == options.publication->path;
+                    local, connection->ingress) == options.publication->path &&
+                    (!options.publication->pressure_unchanged || options.publication->pressure_unchanged());
             }
             catch (...) {}
             if (!same_path) { connection->declined = true; throw WorkerPublicationChanged(); }
@@ -4970,8 +4993,9 @@ bool WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32>
 { return generate_packed(k, strength, {&id, 1}, sink, cancel, std::move(identity), other_work_until); }
 bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerPackedSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity, Clock::time_point other_work_until,
-    WorkerPackedRoute const* batch_route)
+    WorkerPackedRoute const* batch_route, bool* reprice_unstarted)
 {
+    if (reprice_unstarted) *reprice_unstarted = false;
     cancel = impl_->cancellation(cancel);
     WorkerTaskOptions options; options.other_work_until = other_work_until;
     options.publication = impl_->publication_for(ids, false);
@@ -5001,9 +5025,19 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
             std::lock_guard lock(impl_->planning_mutex);
             if (impl_->independent_packed.lock() == batch_route->placement) impl_->independent_packed.reset();
         }
+        cancel.check();
+        if (reprice_unstarted && options.packed_route && options.packed_route->paid_width == ids.size())
+        { *reprice_unstarted = true; return false; }
+        // A caller with one ordered sink can retry its suffix after delivering
+        // the first member. The withdrawn price never authorizes another width.
         bool checked = true;
-        for (auto const& id : ids)
-            checked = generate(k, strength, id, sink, cancel, {}, other_work_until) && checked;
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            if (i && ids.size() - i > 1)
+                if (auto route = priced_packed_route(k, strength, unsigned(ids.size() - i), cancel))
+                    return generate_packed(k, strength, ids.subspan(i), sink, cancel, {}, other_work_until, &*route) && checked;
+            checked = generate(k, strength, ids[i], sink, cancel, {}, other_work_until) && checked;
+        }
         return checked;
     }
     auto first = generate(k, strength, ids.front(), sink, cancel, {}, other_work_until);
@@ -5273,6 +5307,18 @@ WorkerGenerationCapacity WorkerClient::Impl::capacity(uint8_t k, uint8_t strengt
         try { config.generation_capacity_changed(k, strength, result); } catch (...) {}
     return result;
 }
+std::optional<WorkerPackedRoute> WorkerClient::priced_packed_route(uint8_t k, uint8_t strength, unsigned width,
+    WorkerCancellation cancel) const
+{
+    cancel.check();
+    if (impl_->config.local_only || width < 2) return {};
+    auto const hint = impl_->capacity(k, strength, cancel.deadline);
+    if (!hint.roster || !hint.roster->complete) return {};
+    auto next = impl_->priced_packed_route(k, strength, width, *hint.roster, cancel);
+    cancel.check();
+    if (next) next->paid_width = width;
+    return next;
+}
 unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
                                               WorkerPackedRoute* batch_route, unsigned* singleton_limit, Clock::time_point other_work_until) const
 {
@@ -5301,22 +5347,9 @@ unsigned WorkerClient::packed_generation_width(uint8_t k, uint8_t strength, unsi
     bool const priced = batch_route && hint.roster && hint.roster->complete && !impl_->config.local_only;
     auto broker_route = [&]
     {
-        try
-        {
-            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(std::min(250u, impl_->config.task_timeout_ms));
-            auto control = impl_->broker.with_deadline(cancel.deadline);
-            pool::OwnerSession session; pool::Task shape; shape.compatibility = impl_->config.compatibility;
-            shape.kind = impl_->config.generation_kind; shape.k = k; shape.strength = strength; shape.work_units = width;
-            shape.resources.cpu_threads = impl_->config.generation_threads;
-            { auto lock = impl_->sequence_lock(cancel); impl_->prepare_session_locked(control, session, false); }
-            auto const best = impl_->bind_generation_paths(control, session) ? control.finite_packed_route(session, shape) : std::nullopt;
-            if (best)
-                for (auto const& route : hint.roster->routes)
-                    if (route.identity == best->first)
-                    { *batch_route = {route, best->second}; return true; }
-        }
-        catch (std::exception const&) {} // Advisory placement does not own the real lease.
-        return false;
+        auto route = impl_->priced_packed_route(k, strength, width, *hint.roster, {});
+        if (route) *batch_route = std::move(*route);
+        return bool(route);
     };
     if (priced && destinations == 1 && other_work_until != Clock::time_point{} && other_work_until <= Clock::now() &&
         broker_route()) return width;

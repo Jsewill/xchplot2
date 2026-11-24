@@ -1980,6 +1980,15 @@ struct BrokerServer::Impl
                 if (!single) continue;
                 lanes += capacity.parallel_tasks(single->resources);
                 if (lanes > 1) break;
+                if (t.kind == Kind::GenerateAny && single->kind == Kind::GenerateGpu && capacity.slots > 1)
+                {
+                    // The default GPU profile can exhaust VRAM while another CPU lane still fits.
+                    if (auto cpu = eligible(job, id, worker, capacity, Kind::GenerateCpu))
+                    {
+                        auto residual = capacity; subtract(residual, cpu->resources);
+                        if (eligible(job, id, worker, residual)) { ++lanes; break; }
+                    }
+                }
                 if (room.at(id) != capacity) continue;
                 t.work_units = members;
                 auto const packed = eligible(job, id, worker, capacity);
