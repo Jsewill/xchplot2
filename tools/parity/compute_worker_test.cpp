@@ -992,6 +992,10 @@ void offered_cpus()
 int main(int argc, char** argv)
 {
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (argc == 2 && std::string_view(argv[1]) == "--shared-capacity") {
+        try { worker_gpu_test::shared_capacity(); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
     if (argc == 8 && std::string_view(argv[5]) == "--gpu-recovery-worker")
     { worker_gpu_test::child = true; return run_worker_gpu_child(argv[6], argv[7]); }
     if (argc == 2 && (std::string_view(argv[1]) == "--gpu-recovery" || std::string_view(argv[1]) == "--gpu-recovery-network"))

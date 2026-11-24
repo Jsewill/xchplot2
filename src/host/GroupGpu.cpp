@@ -150,6 +150,35 @@ uint64_t host_peak(int k, std::string const& tier)
     if (tier == "minimal") return pos2gpu::streaming_minimal_host_bytes(k);
     return pos2gpu::streaming_tiny_host_bytes(k);
 }
+// The mandatory floor includes lazy tables and the same margin as preflight.
+// Candidate scratch can also use smaller runtime allocations below its full
+// threshold. apply_device_budget always bounds that allocation exactly.
+enum DeviceMode : unsigned { overlap_output = 1, compact_output = 2, full_match = 4 };
+unsigned device_modes(int k, int strength, uint64_t capacity, bool pool, uint64_t floor, uint64_t room,
+    bool overlap, bool compact, bool preserve)
+{
+    if (room < floor) return 0;
+    auto spare = room - floor;
+    auto const buckets = uint64_t(1) << ((k < 28 ? 2 : k - 26) + strength);
+    auto const match = pos2gpu::twophase_scratch_bytes(capacity, buckets, uint64_t(1) << strength);
+    auto fits = [&](uint64_t bytes) {
+        return bytes <= spare && (!preserve || detail::preserves_match_scratch(spare, spare - bytes, match));
+    };
+    unsigned modes = 0;
+    if (pool && overlap && fits(capacity * sizeof(uint64_t)))
+    {
+        modes |= overlap_output; spare -= capacity * sizeof(uint64_t);
+        if (compact && capacity <= UINT32_MAX)
+        {
+            auto const window = std::min(capacity, transfer_window_bytes / sizeof(uint64_t));
+            auto const packed = ((window + 1) / 2) * sizeof(uint64_t);
+            if (packed && detail::PackedTransferLayout(k, capacity).metadata_words <= window / 2 && fits(packed))
+            { modes |= compact_output; spare -= packed; }
+        }
+    }
+    if (spare >= match) modes |= full_match;
+    return modes;
+}
 } // namespace
 
 struct GpuProducer::Impl
@@ -157,7 +186,8 @@ struct GpuProducer::Impl
     int k, strength;
     GpuProducerOptions options;
     uint64_t capacity;
-    uint64_t twophase_budget_bytes = 0;
+    uint64_t twophase_budget_bytes = 0, base_device_floor = 0;
+    unsigned initial_device_modes = 0;
     bool profile = false;
     bool locked_output = false;
     bool prepared_borrowed_output = false;
@@ -220,12 +250,10 @@ struct GpuProducer::Impl
                     memory_before_pool.free_bytes, required, margin);
                 auto const overlap_budget = pos2gpu::vram_scratch_budget(
                     memory_before_pool.free_bytes, required + capacity * sizeof(uint64_t), margin);
-                auto const buckets = uint64_t(1) << ((k < 28 ? 2 : k - 26) + strength);
-                auto const match_scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets, uint64_t(1) << strength);
-                if (options.member_overlap && pos2gpu::vram_fits(memory_before_pool.free_bytes,
-                        required + capacity * sizeof(uint64_t), margin) &&
-                    (!options.preserve_match_scratch || detail::preserves_match_scratch(
-                        twophase_budget_bytes, overlap_budget, match_scratch)))
+                base_device_floor = required + margin;
+                initial_device_modes = device_modes(k, strength, capacity, true, base_device_floor,
+                    memory_before_pool.free_bytes, options.member_overlap, options.compact_transfer, options.preserve_match_scratch);
+                if (initial_device_modes & overlap_output)
                 {
                     // This optional allocation must not turn an otherwise
                     // admitted pooled run into CPU/streaming fallback when a
@@ -264,29 +292,20 @@ struct GpuProducer::Impl
                             // member overlap fits. Reserve its complete tile
                             // beside the lazy pool and independent output;
                             // preserve an already admitted fast match path.
-                            if (options.compact_transfer && capacity <= UINT32_MAX)
+                            if (initial_device_modes & compact_output)
                             {
-                                detail::PackedTransferLayout const layout(k, capacity);
                                 uint64_t const words = (transfer_capacity() + 1) / 2;
-                                uint64_t const packed_peak = required + capacity * sizeof(uint64_t) + words * sizeof(uint64_t);
-                                uint64_t const packed_budget = pos2gpu::vram_scratch_budget(
-                                    memory_before_pool.free_bytes, packed_peak, margin);
-                                if (words && layout.metadata_words <= transfer_capacity() / 2 &&
-                                    pos2gpu::vram_fits(memory_before_pool.free_bytes, packed_peak, margin) &&
-                                    (!options.preserve_match_scratch || detail::preserves_match_scratch(
-                                        overlap_budget, packed_budget, match_scratch)))
+                                uint64_t const packed_budget = overlap_budget - words * sizeof(uint64_t);
+                                try
                                 {
-                                    try
+                                    device_packed = sycl::malloc_device<uint64_t>(words, *queue);
+                                    if (device_packed)
                                     {
-                                        device_packed = sycl::malloc_device<uint64_t>(words, *queue);
-                                        if (device_packed)
-                                        {
-                                            packed_scratch_words = words;
-                                            twophase_budget_bytes = packed_budget;
-                                        }
+                                        packed_scratch_words = words;
+                                        twophase_budget_bytes = packed_budget;
                                     }
-                                    catch (std::exception const&) {}
                                 }
+                                catch (std::exception const&) {}
                             }
                         }
                     }
@@ -315,6 +334,7 @@ struct GpuProducer::Impl
         auto const required = device_peak(k, selected);
         if (!pos2gpu::vram_fits(memory.free_bytes, required, margin))
             throw pos2gpu::InsufficientVramError("GPU growth tier peak plus VRAM buffer exceeds free device memory");
+        base_device_floor = required + margin;
         twophase_budget_bytes = pos2gpu::vram_scratch_budget(memory.free_bytes, required, margin);
     }
 
@@ -480,7 +500,8 @@ GpuProducer::GpuProducer(int k, int strength, GpuProducerOptions options)
     : impl_(std::make_unique<Impl>(k, strength, std::move(options))) {}
 GpuProducer::~GpuProducer() = default;
 
-GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOptions const& options)
+std::vector<GpuProducerPreflight> GpuProducer::preflight_profiles(int k, int strength,
+    GpuProducerOptions const& options, bool current)
 {
     if (k < 18 || k > 28 || (k & 1) || strength < 2 || strength > k - 3)
         throw std::invalid_argument("GPU producer requires even k in [18, 28] and strength in [2, k-3]");
@@ -492,42 +513,77 @@ GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOpti
     if (char const* v = std::getenv("XCHPLOT2_SPILL_T1META"); v && v[0] == '1')
         throw std::invalid_argument("same-file GPU growth does not permit XCHPLOT2_SPILL_T1META disk offload");
     pos2gpu::bind_current_device(options.device_id);
-    auto memory = pos2gpu::query_device_memory();
-    if (options.max_vram_bytes) memory.free_bytes = std::min(memory.free_bytes, options.max_vram_bytes);
-    auto const margin = pos2gpu::vram_safety_margin();
+    auto const adapter_host_bytes = runtime_host_bytes + sizeof(Impl);
+    uint64_t room = UINT64_MAX;
+    if (current)
+    {
+        room = pos2gpu::query_device_memory().free_bytes;
+        if (options.max_vram_bytes) room = std::min(room, options.max_vram_bytes);
+    }
     auto const capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
-    GpuProducerPreflight result;
-    result.physical_identity = pos2gpu::gpu_physical_identity(options.device_id);
-    result.tier = options.tier;
-    if (result.tier == "auto" || result.tier == "pool")
+    auto const margin = pos2gpu::vram_safety_margin();
+    auto const identity = pos2gpu::gpu_physical_identity(options.device_id);
+    std::vector<GpuProducerPreflight> result;
+    auto append = [&](char const* tier, uint64_t device, uint64_t host)
+    {
+        if (!pos2gpu::vram_fits(room, device, margin)) return;
+        // A less-preferred mode with the same or a greater floor can never
+        // become the automatic choice at any amount of free memory.
+        if (!result.empty() && device + margin >= result.back().device_bytes) return;
+        result.push_back({tier, host, host + capacity * sizeof(uint64_t), device + margin, identity});
+    };
+    if (options.tier == "auto" || options.tier == "pool")
     {
         auto const sizing = pos2gpu::GpuBufferPool::sizing(k);
-        if (pos2gpu::vram_fits(memory.free_bytes, sizing.device_bytes(), margin))
+        append("pool", sizing.device_bytes(), adapter_host_bytes + sizing.pinned_bytes);
+        if (current && !result.empty()) return result;
+    }
+    for (auto tier : {"plain", "compact", "minimal", "tiny", "pinned"})
+        if (options.tier == tier || (options.tier == "auto" && std::string_view(tier) != "pinned"))
         {
-            result.tier = "pool";
-            result.device_bytes = sizing.device_bytes() + margin;
-            result.borrowed_host_bytes = runtime_host_bytes + sizeof(Impl) + sizing.pinned_bytes;
+            append(tier, device_peak(k, tier), std::max(host_peak(k, tier), adapter_host_bytes + capacity * sizeof(uint64_t)));
+            if (current && !result.empty()) break;
         }
-        else if (result.tier == "pool")
-            throw pos2gpu::InsufficientVramError("GPU growth pool exceeds offered device memory");
-    }
-    if (!result.device_bytes)
-    {
-        if (result.tier == "auto")
-            for (char const* tier : {"plain", "compact", "minimal", "tiny"})
-            {
-                result.tier = tier;
-                if (pos2gpu::vram_fits(memory.free_bytes, device_peak(k, result.tier), margin)) break;
-            }
-        auto const required = device_peak(k, result.tier);
-        if (!pos2gpu::vram_fits(memory.free_bytes, required, margin))
-            throw pos2gpu::InsufficientVramError("GPU growth tier exceeds offered device memory");
-        result.device_bytes = required + margin;
-        result.borrowed_host_bytes = std::max(host_peak(k, result.tier),
-            runtime_host_bytes + sizeof(Impl) + capacity * sizeof(uint64_t));
-    }
-    result.owning_host_bytes = result.borrowed_host_bytes + capacity * sizeof(uint64_t);
     return result;
+}
+
+std::vector<GpuProducerPreflight> GpuProducer::preflight_tiers(int k, int strength, GpuProducerOptions const& options)
+{
+    return preflight_profiles(k, strength, options, false);
+}
+
+GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOptions const& options)
+{
+    auto result = preflight_profiles(k, strength, options, true);
+    if (!result.empty()) return std::move(result.front());
+    if (options.tier == "pool") throw pos2gpu::InsufficientVramError("GPU growth pool exceeds offered device memory");
+    throw pos2gpu::InsufficientVramError("GPU growth tier exceeds offered device memory");
+}
+
+unsigned GpuProducer::worker_budget_class(int k, int strength, GpuProducerPreflight const& profile, uint64_t room)
+{
+    auto const capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
+    return device_modes(k, strength, capacity, profile.tier == "pool", profile.device_bytes, room, true, true, true);
+}
+
+bool GpuProducer::apply_device_budget(uint64_t room)
+{
+    auto& p = *impl_;
+    if (room < p.base_device_floor) return false;
+    auto const modes = device_modes(p.k, p.strength, p.capacity, bool(p.pool), p.base_device_floor, room,
+        p.options.member_overlap, p.options.compact_transfer, p.options.preserve_match_scratch);
+    if ((modes ^ p.initial_device_modes) & (overlap_output | compact_output)) return false;
+    uint64_t fixed = p.base_device_floor;
+    if (p.device_output) fixed += p.capacity * sizeof(uint64_t);
+    if (p.device_packed) fixed += p.packed_scratch_words * sizeof(uint64_t);
+    if (fixed > room) return false;
+    auto const scratch = room - fixed;
+    if (scratch != p.twophase_budget_bytes)
+    {
+        pos2gpu::sycl_backend::set_twophase_budget(*p.queue, scratch);
+        p.twophase_budget_bytes = scratch;
+    }
+    return true;
 }
 
 uint64_t GpuProducer::host_generation_peak_bytes() const

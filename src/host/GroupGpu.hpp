@@ -135,6 +135,14 @@ public:
     // Uses the production backend's sizing queries and current free memory.
     // Initializes the device runtime, but allocates no generation tables.
     static GpuProducerPreflight preflight(int k, int strength, GpuProducerOptions const& = {});
+    // Ordered modes that can become the first fit as available VRAM changes.
+    static std::vector<GpuProducerPreflight> preflight_tiers(int k, int strength, GpuProducerOptions const&);
+    // Discrete optional paths available under a worker grant, including full
+    // match scratch and the raw/compact output slots. No driver sizing queries.
+    static unsigned worker_budget_class(int k, int strength, GpuProducerPreflight const&, uint64_t room);
+    // Rebind cached and future scratch to this grant. False requires a new
+    // producer because persistent device buffers must be dropped or acquired.
+    bool apply_device_budget(uint64_t room);
     ~GpuProducer();
     GpuProducer(GpuProducer const&) = delete;
     GpuProducer& operator=(GpuProducer const&) = delete;
@@ -210,6 +218,8 @@ private:
     std::shared_future<uint64_t> generate_output_async(std::array<uint8_t, 32> const& plot_id,
         std::function<void(std::span<uint64_t const>, uint64_t)> consume,
         std::function<void(PackedFragmentTile const&, uint64_t)> consume_packed);
+    static std::vector<GpuProducerPreflight> preflight_profiles(int k, int strength,
+        GpuProducerOptions const& options, bool current);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

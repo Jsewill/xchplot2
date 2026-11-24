@@ -17,7 +17,8 @@
 namespace group_grow::worker_gpu
 {
 using calibration_process::check;
-struct Profile { uint64_t borrowed = 0, owning = 0, device = 0; char tier[16]{}; };
+enum Probe : uint32_t { generation, canary, budget_only };
+struct Profile { uint64_t borrowed = 0, owning = 0, device = 0, minimum_owning = 0; char tier[16]{}; };
 struct ResourcesUnavailable : std::runtime_error
 {
     uint64_t host_bytes;
@@ -28,7 +29,7 @@ struct Request
 {
     static constexpr uint64_t identity = 0x5843484750553031ULL;
     uint64_t format = identity, mapping_bytes = 0, host_bytes = 0, gpu_bytes = 0, parent = 0;
-    uint64_t count = 0, safe_gpu_bytes = 0, original_total = 0;
+    uint64_t count = 0, safe_gpu_bytes = 0, original_total = 0, measured_room = UINT64_MAX, next_upgrade = UINT64_MAX;
     uint32_t k = 18, strength = 2, threads = 1, probe = 0;
     // Read only after the child exits successfully. Bounds are canonical
     // fragments; the parent never publishes a partial child result.
@@ -213,12 +214,12 @@ public:
         if (result.lost) throw DeviceLost(result.error);
         if (result.unavailable)
         {
-            auto const native = result.probe ? result.profiles.front().owning : 0;
+            auto const native = result.probe == canary ? result.profiles.front().owning : 0;
             throw ResourcesUnavailable(result.error, native && native <= UINT64_MAX - output().size_bytes() ?
                 native + output().size_bytes() : 0);
         }
         if (result.error[0]) throw std::runtime_error(result.error);
-        check(result.complete == 1 && result.count && result.count <= output().size(), "incomplete isolated GPU generation");
+        check(result.complete == 1 && (result.probe == budget_only ? result.count == 0 : result.count && result.count <= output().size()), "incomplete isolated GPU generation");
     }
 };
 }

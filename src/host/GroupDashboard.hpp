@@ -91,7 +91,7 @@ class DashboardJob
     std::deque<DashboardFrame::Row> decisions_;
     std::vector<DashboardFrame::Row> roster_;
     std::vector<DashboardFrame::Row> admission_rows_;
-    std::map<std::string,std::string> recovering_local_gpus_;
+    std::map<std::string, DashboardFrame::Row> local_gpu_status_;
     std::optional<unsigned> registered_;
     std::string roster_state_;
     struct Grant
@@ -301,11 +301,12 @@ class DashboardJob
         ++record.failures;
         record.last_failure = cause;
     }
-    void local_gpu_health(std::string const& device, std::string const& cause)
+    void local_gpu_health(std::string const& device, std::string const& cause, bool waiting_for_memory)
     {
         std::lock_guard lock(mutex_);
-        if (cause.empty()) recovering_local_gpus_.erase(device);
-        else recovering_local_gpus_[device] = cause;
+        if (!cause.empty()) local_gpu_status_[device] = {"GPU recovering", cause};
+        else if (waiting_for_memory) local_gpu_status_[device] = {"Waiting for GPU memory", {}};
+        else local_gpu_status_.erase(device);
     }
     void decision(std::string chosen, std::string why)
     {
@@ -410,8 +411,8 @@ class DashboardJob
                                         : roster_state_);
         for (auto const& row : admission_rows_)
             frame.add(DashboardFrame::workers, row.value, row.detail);
-        for (auto const& [device, cause] : recovering_local_gpus_)
-            frame.add(DashboardFrame::workers, "Local " + device + "   GPU recovering", cause);
+        for (auto const& [device, status] : local_gpu_status_)
+            frame.add(DashboardFrame::workers, "Local " + device + "   " + status.value, status.detail);
         auto delivered = [&](Delivery const& d, std::string const& name) {
             if (d.failures)
                 frame.add(DashboardFrame::workers, name + "   " + std::to_string(d.failures) +

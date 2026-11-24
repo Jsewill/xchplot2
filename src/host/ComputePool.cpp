@@ -48,6 +48,7 @@ enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3,
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
 enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute, RegisterGpuRecovery, StatusGpuRecovery, GenerationRoutesGpuRecovery, AcquireFiniteGeneration, FinitePackedRoute, GenerationPaths, DeliveredOnPath };
 class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
+class UnsupportedProfiles : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
 constexpr uint8_t independent_flag = 0x80;
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
@@ -89,14 +90,14 @@ OwnerSession read_session(Reader& reader)
     OwnerSession result; result.owner_id = reader.string(256); result.token = reader.string(64);
     result.epoch = reader.string(64); result.generation = reader.u64(); return result;
 }
-void write_profiles(Writer& writer, std::vector<GenerationProfile> const& profiles)
+void write_profiles(Writer& writer, std::vector<GenerationProfile> const& profiles, bool extended)
 {
     require(profiles.size() <= max_generation_profiles, "too many generation profiles");
     writer.u32(uint32_t(profiles.size()));
     for (auto const& profile : profiles)
     {
-        writer.u8(uint8_t(profile.kind)); writer.u8(profile.k); writer.u8(profile.strength); writer.u32(profile.cpu_threads);
-        write_resources(writer, profile.resources); writer.u64(profile.member_host_bytes); writer.u32(profile.max_batch_members);
+        writer.u8(uint8_t(profile.kind) | (extended && profile.independent_unavailable ? independent_flag : 0)); writer.u8(profile.k); writer.u8(profile.strength); writer.u32(profile.cpu_threads);
+        write_resources(writer, profile.resources); writer.u64(profile.member_host_bytes); writer.u32(!extended && profile.independent_unavailable ? 1 : profile.max_batch_members);
     }
 }
 std::vector<GenerationProfile> read_profiles(Reader& reader)
@@ -105,18 +106,19 @@ std::vector<GenerationProfile> read_profiles(Reader& reader)
     std::vector<GenerationProfile> profiles; profiles.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
     {
-        GenerationProfile profile; profile.kind = Kind(reader.u8()); profile.k = reader.u8(); profile.strength = reader.u8();
+        GenerationProfile profile; auto const kind = reader.u8(); profile.kind = Kind(kind & ~independent_flag);
+        profile.independent_unavailable = kind & independent_flag; profile.k = reader.u8(); profile.strength = reader.u8();
         profile.cpu_threads = reader.u32(); profile.resources = read_resources(reader);
         profile.member_host_bytes = reader.u64(); profile.max_batch_members = reader.u32(); profiles.push_back(profile);
     }
     return profiles;
 }
-void write_offer(Writer& writer, WorkerOffer const& offer)
+void write_offer(Writer& writer, WorkerOffer const& offer, bool extended)
 {
     writer.string(offer.instance); writer.string(offer.compatibility); writer.string(offer.codec_compatibility);
     writer.string(offer.producer_build); write_endpoint(writer, offer.endpoint);
     write_resources(writer, offer.capacity); writer.u64(offer.capacity_revision); writer.u32(offer.generation_threads); writer.u32(offer.capabilities); writer.u8(offer.min_k); writer.u8(offer.max_k);
-    write_profiles(writer, offer.generation_profiles);
+    write_profiles(writer, offer.generation_profiles, extended);
     writer.u32(offer.codec_limits.max_chunks); writer.u64(offer.codec_limits.max_task_bytes); writer.u8(uint8_t(offer.admission));
     write_worker_hardware(writer, offer.hardware); writer.u32(offer.independent_k_mask);
 }
@@ -130,13 +132,13 @@ WorkerOffer read_offer(Reader& reader)
     result.admission = WorkerAdmission(reader.u8()); result.hardware = read_worker_hardware(reader);
     result.independent_k_mask = reader.u32(); return result;
 }
-void write_update(Writer& writer, std::optional<CapacityUpdate> const& update)
+void write_update(Writer& writer, std::optional<CapacityUpdate> const& update, bool extended)
 {
     writer.u8(bool(update)); if (update)
     {
         writer.u64(update->revision); write_resources(writer, update->capacity);
         writer.u8(bool(update->generation_profiles));
-        if (update->generation_profiles) write_profiles(writer, *update->generation_profiles);
+        if (update->generation_profiles) write_profiles(writer, *update->generation_profiles, extended);
     }
 }
 std::optional<CapacityUpdate> read_update(Reader& reader)
@@ -204,7 +206,7 @@ struct BrokerClient::Connections
     // An older reply in flight must not disable them on the replacement.
     struct GenerationApi
     {
-        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true};
+        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true}, tier_profiles{true};
     };
     std::atomic<std::shared_ptr<GenerationApi>> generation_api{std::make_shared<GenerationApi>()};
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
@@ -296,6 +298,9 @@ std::vector<uint8_t> BrokerClient::call(Writer const& writer, std::string* peer_
         if (code == ErrorCode::StaleDelivery) throw StaleDelivery("compute broker: " + message);
         if (code == ErrorCode::StaleLease) throw StaleLease("compute broker: " + message);
         if (message == "unknown broker operation") throw UnknownOperation("compute broker: " + message);
+        if (message == "broker resource accounting underflow") throw CapacityReserved("compute broker: " + message);
+        if (message == "invalid generation resource profile" || message == "independent members require a GPU profile")
+            throw UnsupportedProfiles("compute broker: " + message);
         if (message == "invalid generation backlog") throw UnsupportedBacklog("compute broker: " + message);
         throw std::runtime_error("compute broker: " + message);
     }
@@ -480,17 +485,32 @@ void BrokerClient::cancel(OwnerSession const& owner, std::string const& task, ui
 }
 void BrokerClient::renew(Lease const& lease)
 { auto writer = request(Operation::Renew); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
+std::vector<uint8_t> BrokerClient::call_profiles(std::span<GenerationProfile const> profiles,
+    std::function<Writer(bool)> const& encode, std::string* peer_identity, std::string* peer_node_id)
+{
+    auto const api = connections_->generation_api.load();
+    if (api->tier_profiles.load() && std::ranges::any_of(profiles, &GenerationProfile::independent_unavailable))
+    {
+        try { return call(encode(true), peer_identity, peer_node_id); }
+        catch (UnsupportedProfiles const&) { api->tier_profiles.store(false); }
+    }
+    // An older V8 broker rejects flagged profile kinds before applying the
+    // registration or releasing the lease. Its single width applies to both
+    // output modes, so it can safely accept singletons on these streaming ks.
+    return call(encode(false), peer_identity, peer_node_id);
+}
 std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recovering_gpu(WorkerOffer const& offer,
     bool retain_route, std::string* peer_identity, std::string* peer_node_id)
 {
     if (offer.gpu_recovery.empty()) return {};
     auto const api = connections_->generation_api.load();
     if (!api->gpu_recovery.load()) return {};
-    auto writer = request(Operation::RegisterGpuRecovery); write_offer(writer, offer);
-    writer.u8(retain_route); writer.string(offer.gpu_recovery);
     try
     {
-        auto bytes = call(writer, peer_identity, peer_node_id);
+        auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+            auto writer = request(Operation::RegisterGpuRecovery); write_offer(writer, offer, extended);
+            writer.u8(retain_route); writer.string(offer.gpu_recovery); return writer;
+        }, peer_identity, peer_node_id);
         Reader in(bytes); auto epoch = in.string(64); auto endpoint = read_endpoint(in); in.finish();
         require(!epoch.empty() && endpoint.port, "invalid GPU recovery registration");
         return std::pair{std::move(epoch), std::move(endpoint)};
@@ -500,8 +520,9 @@ std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recoverin
 std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string* peer_identity, std::string* peer_node_id)
 {
     if (auto received = register_recovering_gpu(offer, false, peer_identity, peer_node_id)) return received->first;
-    auto writer = request(Operation::Register); write_offer(writer, offer);
-    auto bytes = call(writer, peer_identity, peer_node_id);
+    auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+        auto writer = request(Operation::Register); write_offer(writer, offer, extended); return writer;
+    }, peer_identity, peer_node_id);
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
     require(!epoch.empty(), "broker registration omitted its epoch"); return epoch;
 }
@@ -509,10 +530,11 @@ std::string BrokerClient::register_worker_route(WorkerOffer& offer, std::string*
 {
     if (auto received = register_recovering_gpu(offer, true, peer_identity, peer_node_id))
     { offer.endpoint = std::move(received->second); return received->first; }
-    auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer);
     try
     {
-        auto bytes = call(writer, peer_identity, peer_node_id);
+        auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+            auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer, extended); return writer;
+        }, peer_identity, peer_node_id);
         Reader reader(bytes); auto epoch = reader.string(64); auto endpoint = read_endpoint(reader); reader.finish();
         require(!epoch.empty() && !endpoint.host.empty() && endpoint.port, "broker route registration omitted its endpoint or epoch");
         offer.endpoint = std::move(endpoint); return epoch;
@@ -558,8 +580,12 @@ bool BrokerClient::begin(Lease const& lease, std::string const& owner, bool* awa
 }
 void BrokerClient::finish(Lease const& lease, std::optional<CapacityUpdate> const& update)
 {
-    auto writer = request(Operation::Finish); write_lease(writer, lease); write_update(writer, update);
-    auto bytes = call(writer); Reader(bytes).finish();
+    std::span<GenerationProfile const> profiles;
+    if (update && update->generation_profiles) profiles = *update->generation_profiles;
+    auto bytes = call_profiles(profiles, [&](bool extended) {
+        auto writer = request(Operation::Finish); write_lease(writer, lease); write_update(writer, update, extended); return writer;
+    });
+    Reader(bytes).finish();
 }
 void BrokerClient::delivered(Lease const& lease, DeliveryObservation const& observation, std::string const& generation_path)
 {
@@ -578,8 +604,12 @@ void BrokerClient::delivered(Lease const& lease, DeliveryObservation const& obse
 
 void BrokerClient::reject(Lease const& lease, FailureCode reason, std::optional<CapacityUpdate> const& update)
 {
-    auto writer = request(Operation::Reject); write_lease(writer, lease); writer.u8(uint8_t(reason)); write_update(writer, update);
-    auto bytes = call(writer); Reader(bytes).finish();
+    std::span<GenerationProfile const> profiles;
+    if (update && update->generation_profiles) profiles = *update->generation_profiles;
+    auto bytes = call_profiles(profiles, [&](bool extended) {
+        auto writer = request(Operation::Reject); write_lease(writer, lease); writer.u8(uint8_t(reason)); write_update(writer, update, extended); return writer;
+    });
+    Reader(bytes).finish();
 }
 void BrokerClient::abandon(Lease const& lease)
 { auto writer = request(Operation::Abandon); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
@@ -926,6 +956,7 @@ struct BrokerServer::Impl
                         value.cpu_threads == offer.generation_threads; });
                 if (profile != offer.generation_profiles.end())
                 {
+                    if (task.independent_members && task.work_units > 1 && profile->independent_unavailable) return reject(WaitReason::UnsupportedKind);
                     if (task.work_units > profile->max_batch_members) return reject(WaitReason::UnsupportedParameters);
                     auto const extra = task.independent_members ? 0 : task.work_units - 1;
                     if (profile->member_host_bytes && extra > (UINT64_MAX - profile->resources.host_bytes) / profile->member_host_bytes) return reject(WaitReason::HostCapacity);
@@ -1379,7 +1410,7 @@ struct BrokerServer::Impl
                 (offer.capabilities & capability(value.kind)) && value.k >= offer.min_k && value.k <= offer.max_k &&
                 !(value.k & 1) && value.strength <= 32 && value.cpu_threads == (threads ? threads : offer.generation_threads) &&
                 value.resources.cpu_threads == value.cpu_threads && value.resources.slots == 1 && value.resources.host_bytes &&
-                (value.kind == Kind::GenerateGpu || !value.resources.gpu_bytes) &&
+                (value.kind == Kind::GenerateGpu || (!value.resources.gpu_bytes && !value.independent_unavailable)) &&
                 value.max_batch_members && value.max_batch_members <= max_generation_batch_members,
                 "invalid generation resource profile");
             require(std::none_of(profiles.begin(), it, [&](GenerationProfile const& old)

@@ -22,6 +22,7 @@ inline constexpr uint64_t default_codec_task_bytes = uint64_t(64) << 20;
 // ordinal, old membership/blob length and contribution/new-member counts.
 inline constexpr uint32_t codec_window_header_bytes = 4, codec_chunk_header_bytes = 18;
 enum class FailureCode : uint8_t { UnsupportedResources = 1, RefusedBeforeBegin };
+class CapacityReserved : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedResources : public std::runtime_error
 {
 public:
@@ -80,6 +81,9 @@ struct GenerationProfile
     Resources resources;
     uint64_t member_host_bytes = 0;
     uint32_t max_batch_members = 1;
+    // A worker can retain its V8 pooled-k capability while this generation
+    // profile temporarily requires a streaming tier.
+    bool independent_unavailable = false;
     bool operator==(GenerationProfile const&) const = default;
 };
 struct CodecLimits
@@ -369,6 +373,8 @@ private:
     std::optional<std::pair<std::string, Endpoint>> register_recovering_gpu(WorkerOffer const&, bool retain_route,
         std::string* peer_identity, std::string* peer_node_id);
     struct Connections;
+    std::vector<uint8_t> call_profiles(std::span<GenerationProfile const>, std::function<Writer(bool)> const&,
+        std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     std::vector<uint8_t> call(Writer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     Endpoint endpoint_;
     TlsOptions tls_;

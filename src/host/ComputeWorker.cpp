@@ -14,6 +14,7 @@
 #include "host/GpuCleanup.hpp"
 #include "host/GroupGpu.hpp"
 #include "host/GpuBufferPool.hpp"
+#include "host/VramBudget.hpp"
 #include "host/GpuPipeline.hpp"
 #endif
 
@@ -180,6 +181,9 @@ public:
     using std::runtime_error::runtime_error;
 };
 struct PackedRouteChanged : WorkerTaskDeclined {};
+// The signed shape was valid when issued. The same logical job can retry
+// this worker after its refreshed profile has reached the broker.
+struct GenerationCapacityChanged : pool::UnsupportedResources { using UnsupportedResources::UnsupportedResources; };
 std::exception_ptr task_failure(std::exception_ptr original, std::exception_ptr renewal)
 {
     if (renewal) try { std::rethrow_exception(original); }
@@ -659,10 +663,10 @@ int run_worker_gpu_child(char const* handle, char const* bytes)
     try
     {
         require(r.k >= 18 && r.k <= 28 && !(r.k % 2) && r.strength >= 2 && r.strength <= r.k - 3 &&
-                r.threads && r.threads <= 1024 && r.gpu_bytes && r.host_bytes && r.probe <= 1 &&
+                r.threads && r.threads <= 1024 && r.gpu_bytes && r.host_bytes && r.probe <= worker_gpu::budget_only &&
                 !r.tier[sizeof(r.tier)-1] && !r.physical[sizeof(r.physical)-1] &&
                 !r.backend[sizeof(r.backend)-1] && !r.name[sizeof(r.name)-1] &&
-                mapping->output().size() == fragment_count_bound(r.k, r.strength), "invalid isolated GPU request");
+                mapping->output().size() == (r.probe == worker_gpu::budget_only ? 1 : fragment_count_bound(r.k, r.strength)), "invalid isolated GPU request");
         require(!r.probe || (r.k == 18 && r.strength == 2), "invalid GPU recovery canary");
         auto const devices = pos2gpu::list_gpu_devices();
         int device = -1;
@@ -673,9 +677,16 @@ int run_worker_gpu_child(char const* handle, char const* bytes)
             device = int(info.id);
         }
         if (device < 0) throw worker_gpu::DeviceLost("original GPU is unavailable");
-        uint64_t const live = pos2gpu::worker_gpu_available_bytes(device);
-        if (!live && r.live_budget_required) throw pool::UnsupportedResources("cannot verify the original GPU memory budget");
-        r.safe_gpu_bytes = live ? std::min(live, r.gpu_bytes) : r.gpu_bytes;
+        auto const live = pos2gpu::worker_gpu_headroom(device, 0, !r.live_budget_required);
+        r.measured_room = live.value_or(UINT64_MAX);
+        if (r.probe == worker_gpu::budget_only)
+        {
+            r.complete = 1;
+            return 0;
+        }
+        if (!live) throw pool::UnsupportedResources("cannot verify the original GPU memory budget");
+        r.safe_gpu_bytes = std::min<uint64_t>(*live, r.gpu_bytes);
+        if (!r.safe_gpu_bytes) throw pool::UnsupportedResources("GPU adapter has no current memory headroom");
         GpuProducerOptions options;
         options.device_id = device; options.host_threads = r.threads; options.tier = r.tier;
         options.max_vram_bytes = r.safe_gpu_bytes;
@@ -684,15 +695,25 @@ int run_worker_gpu_child(char const* handle, char const* bytes)
         auto const output_bytes = mapping->output().size_bytes();
         if (output_bytes > r.host_bytes || preflight.owning_host_bytes > r.host_bytes - output_bytes)
             throw pool::UnsupportedResources("isolated GPU generation exceeds its host grant");
-        if (r.probe)
-            for (unsigned k = 18; k <= 28; k += 2) try
+        if (r.probe == worker_gpu::canary)
+            for (unsigned k = 18; k <= 28; k += 2)
             {
-                auto const profile = GpuProducer::preflight(k, 2, options);
                 auto& target = r.profiles[(k-18)/2];
-                target.borrowed = profile.borrowed_host_bytes; target.owning = profile.owning_host_bytes;
-                target.device = profile.device_bytes; gpu_text(target.tier, profile.tier);
+                for (auto const& profile : GpuProducer::preflight_tiers(k, 2, options))
+                {
+                    if (profile.device_bytes > r.gpu_bytes) continue;
+                    if (!target.minimum_owning || profile.owning_host_bytes < target.minimum_owning)
+                        target.minimum_owning = profile.owning_host_bytes;
+                    if (target.device) continue;
+                    if (profile.device_bytes > r.safe_gpu_bytes)
+                    {
+                        r.next_upgrade = std::min(r.next_upgrade, profile.device_bytes);
+                        continue;
+                    }
+                    target.borrowed = profile.borrowed_host_bytes; target.owning = profile.owning_host_bytes;
+                    target.device = profile.device_bytes; gpu_text(target.tier, profile.tier);
+                }
             }
-            catch (pos2gpu::InsufficientVramError const&) {}
         {
             GpuProducer producer(r.k, r.strength, options);
             auto const tiled = producer.host_tiled_generation_peak_bytes();
@@ -784,8 +805,14 @@ void default_worker_resources(WorkerConfig& config)
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     if (config.backend != "cpu" && !config.capacity.gpu_bytes)
     {
-        config.capacity.gpu_bytes = pos2gpu::worker_gpu_available_bytes(config.device);
-        config.gpu_capacity_measured = config.capacity.gpu_bytes != 0;
+        if (auto reading = pos2gpu::worker_gpu_headroom(config.device))
+        {
+            // The current sample establishes availability. The adapter bounds
+            // the automatic partition when another process later frees memory.
+            for (auto const& device : pos2gpu::list_gpu_devices()) if (device.id == size_t(config.device))
+            { config.capacity.gpu_bytes = device.vram_bytes ? device.vram_bytes : *reading; break; }
+            config.gpu_capacity_measured = true;
+        }
         require(config.backend != "gpu" || config.capacity.gpu_bytes,
             "cannot determine worker GPU memory; set --gpu-bytes");
     }
@@ -847,7 +874,7 @@ struct WorkerService::Impl
     pool::WorkerAdmission admission = pool::WorkerAdmission::Accepting;
     std::optional<pool::PoolIdentity> control_identity;
     uint64_t accepted_tasks = 0;
-    std::atomic<bool> gpu_active{false};
+    std::atomic<uint64_t> gpu_active{0};
     std::mutex jobs_mutex, heartbeat_mutex;
     std::condition_variable jobs_ready, heartbeat_ready;
     std::deque<std::packaged_task<void()>> gpu_jobs;
@@ -861,11 +888,18 @@ struct WorkerService::Impl
     pool::WorkerHardware physical;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     using GpuProfiles = std::unordered_map<unsigned, GpuProducerPreflight>;
-    GpuProfiles gpu_profiles; // initial in-process profiles, immutable after startup
+    GpuProfiles gpu_profiles; // possible original profiles, immutable after startup
+    std::unordered_map<unsigned, std::vector<GpuProducerPreflight>> gpu_tiers;
+    struct NativeGpuOffer { uint64_t bytes = 0; GpuProfiles profiles; };
+    std::atomic<std::shared_ptr<NativeGpuOffer const>> native_gpu;
+    bool sample_gpu = false; // jobs_mutex
+    Clock::time_point next_gpu_sample{}; // jobs_mutex
     struct Recovery {
         std::string cause;
         uint64_t gpu_bytes = 0;
         GpuProfiles profiles;
+        uint64_t next_upgrade = UINT64_MAX;
+        std::array<uint64_t,6> minimum_owning{};
     };
     std::atomic<std::shared_ptr<Recovery const>> gpu_recovery;
     pos2gpu::GpuDeviceInfo gpu_identity;
@@ -876,7 +910,9 @@ struct WorkerService::Impl
     std::optional<GpuProducerPreflight> gpu_profile(unsigned k) const
     {
         auto state = gpu_recovery.load();
-        auto const& profiles = state ? state->profiles : gpu_profiles;
+        auto native = native_gpu.load();
+        if (!state && !native) return {};
+        auto const& profiles = state ? state->profiles : native->profiles;
         auto at = profiles.find(k);
         if (at == profiles.end()) return {};
         return at->second;
@@ -972,6 +1008,10 @@ struct WorkerService::Impl
             auto const devices = pos2gpu::list_gpu_devices();
             for (auto const& device : devices) if (device.id == size_t(config.device))
             {
+                if (device.vram_bytes) config.capacity.gpu_bytes = std::min(config.capacity.gpu_bytes, uint64_t(device.vram_bytes));
+                if (char const* cap = std::getenv("POS2GPU_MAX_VRAM_MB"); cap && cap[0])
+                    config.capacity.gpu_bytes = std::min<uint64_t>(config.capacity.gpu_bytes, pos2gpu::vram_mib_bytes(cap, "POS2GPU_MAX_VRAM_MB"));
+                physical.partition.gpu_bytes = config.capacity.gpu_bytes;
                 gpu_identity = device; physical.gpu_identity = device.physical_identity; physical.total_gpu_bytes = device.vram_bytes;
                 distinct_gpu = std::count_if(devices.begin(), devices.end(), [&](auto const& other)
                     { return same_gpu(other, device.backend, device.physical_identity, device.name, device.vram_bytes); }) == 1;
@@ -993,7 +1033,10 @@ struct WorkerService::Impl
                     options.member_overlap = options.compact_transfer = options.preserve_match_scratch = true;
                     try
                     {
-                        gpu_profiles.emplace(k, GpuProducer::preflight(k, 2, options));
+                        auto tiers = GpuProducer::preflight_tiers(k, 2, options);
+                        std::erase_if(tiers, [&](auto const& tier) { return tier.device_bytes > config.capacity.gpu_bytes; });
+                        if (!tiers.empty())
+                        { gpu_profiles.emplace(k, tiers.front()); gpu_tiers.emplace(k, std::move(tiers)); }
                         if (auto cause = pos2gpu::async_device_loss(gpu_identity.backend); !cause.empty())
                         { lost_gpu(std::move(cause)); break; }
                     }
@@ -1004,6 +1047,7 @@ struct WorkerService::Impl
                         try { throw; } catch (pos2gpu::InsufficientVramError const&) {}
                     }
                 }
+                if (!gpu_recovery.load()) refresh_native_gpu();
                 if (!gpu_recovery.load() && gpu_profiles.empty())
                 {
                     require(config.backend != "gpu", "GPU offer cannot fit any supported generation tier");
@@ -1061,7 +1105,7 @@ struct WorkerService::Impl
         if (auto state = gpu_recovery.load(); state && !state->gpu_bytes) value.gpu_recovery = state->cause;
 #endif
         auto const memory = budget->active(); auto const cpu = offered_cpu.active();
-        value.active = {cpu.first, memory.second, memory.first, gpu_active.load() ? offered_gpu_bytes() : 0};
+        value.active = {cpu.first, memory.second, memory.first, gpu_active.load()};
         value.waiting_cpu = cpu.second; value.baseline_host_bytes = budget->baseline();
         { std::lock_guard lock(admission_mutex); value.admission = admission; value.accepted_tasks = accepted_tasks; }
         { std::lock_guard lock(brokers_mutex); value.known_brokers = brokers.size(); value.deferred_brokers = deferred_brokers;
@@ -1101,13 +1145,14 @@ struct WorkerService::Impl
         if (!gpu_enabled) return 0;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (auto state = gpu_recovery.load()) return state->gpu_bytes;
+        if (auto native = native_gpu.load()) return native->bytes;
 #endif
-        return config.capacity.gpu_bytes;
+        return 0;
     }
     pool::Resources current_capacity(uint64_t* standing = nullptr) const
     {
         auto capacity = config.capacity;
-        capacity.gpu_bytes = offered_gpu_bytes();
+        capacity.gpu_bytes = std::max(offered_gpu_bytes(), gpu_active.load());
         auto const active = offered_cpu.active().first;
         auto const available = available_resources(active);
         capacity.cpu_threads = std::min(capacity.cpu_threads, std::max(active, std::max(uint32_t(1), available.cpu_threads)));
@@ -1257,6 +1302,9 @@ struct WorkerService::Impl
                 refresh_cursor = (refresh_cursor + std::max<size_t>(1, snapshot.size())) % brokers.size();
             }
         }
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+        if (!snapshot.empty()) request_gpu_sample();
+#endif
         capacity_update();
         std::vector<std::future<void>> requests;
         for (auto const& broker : snapshot) requests.push_back(std::async(std::launch::async, [this, broker]
@@ -1293,7 +1341,17 @@ struct WorkerService::Impl
                     auto route = value.endpoint; value = offer(); value.endpoint = std::move(route);
                 }
                 std::string peer, node;
-                auto epoch = !revision && routed ? client.register_worker_route(value, &peer, &node) : client.register_worker(value, &peer, &node);
+                std::string epoch;
+                try { epoch = !revision && routed ? client.register_worker_route(value, &peer, &node) : client.register_worker(value, &peer, &node); }
+                catch (pool::CapacityReserved const&)
+                {
+                    // An unstarted lease is invisible to this worker. Its
+                    // broker keeps the previous revision until release. Keep
+                    // the remaining CPU and codec lanes discoverable meanwhile.
+                    if (!revision || !client.heartbeat(instance, revision, value.admission)) throw;
+                    std::lock_guard lock(brokers_mutex); broker->seen = Clock::now(); broker->healthy = true;
+                    return;
+                }
                 std::lock_guard lock(brokers_mutex);
                 auto same = std::find_if(brokers.begin(), brokers.end(), [&](auto const& registered)
                 { return registered != broker && !registered->epoch.empty() && registered->epoch == epoch && registered->identity == peer; });
@@ -1376,17 +1434,121 @@ struct WorkerService::Impl
     }
 
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    void request_gpu_sample()
+    {
+        auto const state = gpu_recovery.load();
+        if (!gpu_enabled || (state && (!state->gpu_bytes || state->next_upgrade == UINT64_MAX))) return;
+        { std::lock_guard lock(admission_mutex); if (admission != pool::WorkerAdmission::Accepting) return; }
+        {
+            std::lock_guard lock(jobs_mutex);
+            auto const now = Clock::now();
+            if (now < next_gpu_sample) return;
+            next_gpu_sample = now + std::chrono::seconds(1);
+            sample_gpu = true;
+            check_idle_output = true;
+        }
+        jobs_ready.notify_one();
+    }
+    uint64_t native_headroom(uint64_t resident) const
+    {
+        auto const reading = pos2gpu::worker_gpu_headroom(config.device, resident, !config.gpu_capacity_measured);
+        return std::min<uint64_t>(reading.value_or(0), config.capacity.gpu_bytes);
+    }
+    GpuProducerPreflight const* native_tier(unsigned k, uint64_t room) const
+    {
+        auto const found = gpu_tiers.find(k);
+        if (found != gpu_tiers.end()) for (auto const& tier : found->second)
+            if (tier.device_bytes <= room) return &tier;
+        return nullptr;
+    }
+    uint64_t refresh_native_gpu(bool recycle = true)
+    {
+        // Only the GPU thread owns these allocations. Sample between jobs so
+        // another task's temporary tables can never be credited as reusable.
+        auto room = native_headroom(gpu ? gpu->device_resident_bytes() : 0);
+        if (gpu && recycle)
+        {
+            auto const* next = native_tier(gpu_k, room);
+            if (!next || next->tier != gpu->tier() || !gpu->apply_device_budget(room))
+            {
+                discard_gpu();
+                if (gpu_recovery.load()) return 0;
+                room = native_headroom(0);
+            }
+        }
+        auto previous = native_gpu.load();
+        bool changed = !previous;
+        for (auto const& [k, tiers] : gpu_tiers)
+        {
+            if (changed || room == previous->bytes) break;
+            auto const* selected = native_tier(k, room);
+            auto const old = previous->profiles.find(k);
+            if ((old != previous->profiles.end()) != bool(selected)) { changed = true; break; }
+            if (!selected) continue;
+            if (old->second.tier != selected->tier) { changed = true; break; }
+            auto const maximum = std::min<unsigned>(STRENGTH_MAX, k - PlotProofParams::num_section_bits_for_k(k) - 1);
+            for (unsigned strength = STRENGTH_MIN; strength <= maximum; ++strength)
+                if (GpuProducer::worker_budget_class(k, strength, *selected, room) !=
+                    GpuProducer::worker_budget_class(k, strength, *selected, previous->bytes))
+                { changed = true; break; }
+        }
+        if (changed)
+        {
+            auto value = std::make_shared<NativeGpuOffer>();
+            for (auto const& [k, tiers] : gpu_tiers)
+                if (auto const* selected = native_tier(k, room)) value->profiles.emplace(k, *selected);
+            // The grant serializes one device. Keep it stable while the same
+            // tiers, output buffers and match paths fit. Each native job also
+            // checks its exact signed envelope against the current headroom.
+            if (!value->profiles.empty()) value->bytes = room;
+            { std::lock_guard lock(advertisement_mutex); native_gpu.store(std::move(value)); generation_profiles_changed = true; }
+            heartbeat_ready.notify_all();
+        }
+        return room;
+    }
     uint64_t gpu_singleton_bytes(GpuProducerPreflight const& profile, uint8_t k, uint64_t retained) const
     {
         auto const indexes = boundary_bytes(k);
         auto const peak = add(add(profile.borrowed_host_bytes, indexes), config.max_task_bytes);
         return peak > retained ? peak - retained : indexes;
     }
+    uint64_t gpu_generation_host_bytes(GpuProducerPreflight const& profile, uint8_t k, uint8_t strength,
+        size_t members, uint64_t retained, bool isolated) const
+    {
+        if (isolated) {
+            auto const raw = multiply(fragment_count_bound(k,strength), sizeof(uint64_t));
+            return add(add(add(child_host_bytes(profile,k,strength), multiply(raw,members-1)),
+                multiply(add(boundary_bytes(k), worker_gpu::header_bytes), members)), config.max_task_bytes);
+        }
+        if (members == 1) return gpu_singleton_bytes(profile, k, retained);
+        auto const indexes = multiply(boundary_bytes(k), members);
+        auto const raw = multiply(fragment_count_bound(k, strength), sizeof(uint64_t));
+        auto const peak = add(add(add(profile.borrowed_host_bytes, multiply(raw, members - 1)), indexes), config.max_task_bytes);
+        return peak > retained ? peak - retained : indexes;
+    }
+    uint64_t minimum_gpu_host_bytes(uint8_t k, uint8_t strength, size_t members, uint64_t retained) const
+    {
+        if (auto state = gpu_recovery.load())
+        {
+            if (k < 18 || k > 28 || k % 2 || !state->minimum_owning[(k-18)/2]) return 0;
+            GpuProducerPreflight profile;
+            profile.owning_host_bytes = state->minimum_owning[(k-18)/2];
+            return gpu_generation_host_bytes(profile,k,strength,members,0,true);
+        }
+        auto at = gpu_tiers.find(k);
+        if (at == gpu_tiers.end()) return 0;
+        uint64_t minimum = UINT64_MAX;
+        for (auto const& profile : at->second)
+            minimum = std::min(minimum,gpu_generation_host_bytes(profile,k,strength,members,retained,false));
+        return minimum;
+    }
     void update_idle_gpu_output()
     {
         if (!gpu) return;
         resource_sampler.locked_output(gpu->locked_host_output_bytes());
-        auto const minimum = gpu_singleton_bytes(gpu_profiles.at(gpu_k), gpu_k, gpu_retained.bytes);
+        auto selected = gpu_profile(gpu_k);
+        if (!selected || selected->tier != gpu->tier()) { discard_gpu(); return; }
+        auto const minimum = gpu_singleton_bytes(*selected, gpu_k, gpu_retained.bytes);
         if (budget->task_capacity() >= minimum) { idle_generation_bytes.store(minimum); return; }
         resource_sampler.locked_output(0);
         gpu->release_host_output();
@@ -1419,17 +1581,12 @@ struct WorkerService::Impl
         if (use_gpu)
         {
             auto const selected = gpu_profile(k);
-            if (!selected) throw pool::UnsupportedResources("GPU task has no admitted generation profile");
-            if (gpu_recovery.load()) {
-                auto const raw = multiply(fragment_count_bound(k,strength), sizeof(uint64_t));
-                return add(add(add(child_host_bytes(*selected,k,strength), multiply(raw,members-1)),
-                    multiply(add(boundary_bytes(k), worker_gpu::header_bytes), members)), config.max_task_bytes);
+            if (!selected)
+            {
+                if (minimum_gpu_host_bytes(k,strength,members,retained)) throw GenerationCapacityChanged("GPU adapter headroom changed");
+                throw pool::UnsupportedResources("GPU task has no admitted generation profile");
             }
-            if (members == 1) return gpu_singleton_bytes(*selected, k, retained);
-            auto const indexes = multiply(boundary_bytes(k), members);
-            auto const raw = multiply(fragment_count_bound(k, strength), sizeof(uint64_t));
-            auto const peak = add(add(add(selected->borrowed_host_bytes, multiply(raw, members - 1)), indexes), config.max_task_bytes);
-            return peak > retained ? peak - retained : indexes;
+            return gpu_generation_host_bytes(*selected,k,strength,members,retained,bool(gpu_recovery.load()));
         }
 #endif
         return worker_cpu_task_bytes(k, strength, members, config.max_task_bytes);
@@ -1460,8 +1617,13 @@ struct WorkerService::Impl
                         gpu.resources.host_bytes = add(add(child_host_bytes(*selected,k,strength),
                             add(boundary_bytes(k),worker_gpu::header_bytes)),config.max_task_bytes);
                         gpu.member_host_bytes = add(gpu.member_host_bytes,worker_gpu::header_bytes);
-                    } else if (original != gpu_profiles.end())
+                    } else if (selected)
+                        gpu.resources.host_bytes = gpu_singleton_bytes(*selected, k, retained);
+                    else if (original != gpu_profiles.end())
                         gpu.resources.host_bytes = gpu_singleton_bytes(original->second, k, retained);
+                    // Preserve the immutable physical capability; eligibility follows this tier revision.
+                    if (!gpu_recovery.load() && selected && selected->tier != "pool" && original != gpu_profiles.end() && original->second.tier == "pool")
+                        gpu.independent_unavailable = true;
                     // V8 instances have immutable GPU capability and pooled-k masks. Keep their
                     // shapes on re-registration. A withdrawn shape cannot fit the live capacity.
                     gpu.resources.gpu_bytes = selected ? capacity.gpu_bytes :
@@ -1481,17 +1643,38 @@ struct WorkerService::Impl
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     std::unique_ptr<worker_gpu::Mapping> mapped_gpu_member(unsigned k,unsigned strength,
         std::array<uint8_t,32> const& id, unsigned threads, std::string const& tier,
-        uint64_t host_bytes, uint64_t gpu_bytes, WorkerCancellation const& cancel, bool probe = false)
+        uint64_t host_bytes, uint64_t gpu_bytes, WorkerCancellation const& cancel,
+        worker_gpu::Probe probe = worker_gpu::generation)
     {
-        auto mapping = worker_gpu::Mapping::open(worker_gpu::mapping_size(fragment_count_bound(k,strength)));
+        auto mapping = worker_gpu::Mapping::open(worker_gpu::mapping_size(
+            probe == worker_gpu::budget_only ? 1 : fragment_count_bound(k,strength)));
         auto& r = mapping->request(); r.k = k; r.strength = strength; r.threads = threads; r.id = id;
         r.probe = probe; r.host_bytes = host_bytes; r.gpu_bytes = gpu_bytes; r.original_total = gpu_identity.vram_bytes;
         r.live_budget_required = config.gpu_capacity_measured; gpu_text(r.tier,tier);
         gpu_text(r.name,gpu_identity.name); gpu_text(r.physical,gpu_identity.physical_identity);
         gpu_text(r.backend,gpu_identity.backend);
+        auto changed_room = [&](bool unavailable)
+        {
+            auto state = gpu_recovery.load();
+            if (probe || !state || !state->gpu_bytes) return;
+            auto const ceiling = config.capacity.gpu_bytes - std::min(config.capacity.gpu_bytes, unconfirmed_gpu_frees.device);
+            auto const room = r.measured_room == UINT64_MAX ? 0 : std::min(ceiling, r.measured_room);
+            auto current = state->profiles.find(k);
+            bool changed = unavailable && current != state->profiles.end() && room < current->second.device_bytes;
+            changed = changed || room >= state->next_upgrade;
+            // Fresh processes own recovered work. Renew their independently
+            // verified profiles only after an observed change in feasibility.
+            if (changed) lost_gpu(state->cause);
+        };
         try { mapping->run([&] { cancel.check(); }); }
         catch (worker_gpu::ResourcesUnavailable const& error)
-        { if (probe) throw; throw pool::UnsupportedResources(error.what()); }
+        {
+            if (probe) throw;
+            auto previous = gpu_recovery.load(); changed_room(true);
+            if (gpu_recovery.load() != previous) throw GenerationCapacityChanged(error.what());
+            throw pool::UnsupportedResources(error.what());
+        }
+        changed_room(false);
         return mapping;
     }
     void lost_gpu(std::string cause)
@@ -1507,7 +1690,8 @@ struct WorkerService::Impl
     void probe_gpu()
     {
         auto state = gpu_recovery.load();
-        if (!state || state->gpu_bytes) return;
+        bool const sample = state && state->gpu_bytes;
+        if (!state || (sample && state->next_upgrade == UINT64_MAX)) return;
         auto const begin = Clock::now();
         next_gpu_probe = begin + gpu_probe_delay;
         gpu_probe_delay = std::min(gpu_probe_delay*2, std::chrono::seconds(60));
@@ -1522,7 +1706,8 @@ struct WorkerService::Impl
             add(GpuProducer::runtime_host_allowance_bytes(), worker_cpu_generation_bytes(18,2));
         auto const child_bytes = std::max(initial_bytes, probe_host_bytes);
         auto const raw = multiply(fragment_count_bound(18,2), sizeof(uint64_t));
-        auto const peak = add(worker_gpu::header_bytes, std::max(child_bytes, add(raw,worker_cpu_generation_bytes(18,2))));
+        auto const peak = sample ? add(worker_gpu::mapping_size(1), GpuProducer::runtime_host_allowance_bytes()) :
+            add(worker_gpu::header_bytes, std::max(child_bytes, add(raw,worker_cpu_generation_bytes(18,2))));
         WorkerCancellation reserve = cancel;
         reserve.deadline = std::min(reserve.deadline, begin + std::chrono::milliseconds(200));
         try {
@@ -1532,8 +1717,17 @@ struct WorkerService::Impl
             CpuWork cpu(offered_cpu,scheduler.get(),reserve,1);
             cancel.deadline = std::min(cancel.deadline, Clock::now()+std::chrono::seconds(60));
             std::array<uint8_t,32> id{};
-            auto mapping = mapped_gpu_member(18,2,id,1,config.tier,child_bytes,device_room,cancel,true);
+            auto mapping = mapped_gpu_member(18,2,id,1,config.tier,sample ? peak : child_bytes,device_room,cancel,
+                sample ? worker_gpu::budget_only : worker_gpu::canary);
             auto const& r = mapping->request();
+            if (sample)
+            {
+                auto const room = r.measured_room == UINT64_MAX ? 0 : std::min(device_room,r.measured_room);
+                if (room >= state->next_upgrade || std::ranges::any_of(state->profiles,
+                    [&](auto const& entry) { return entry.second.device_bytes > room; }))
+                    lost_gpu(state->cause);
+                return;
+            }
             // The child and original parent runtime are independent. A successful
             // enumeration or driver call cannot prove that fresh output is usable.
             WorkerReferencePlotter::Options options{}; options.validate = false; options.verbose = false;
@@ -1544,8 +1738,10 @@ struct WorkerService::Impl
             require(std::ranges::equal(expected,result), "fresh GPU canary differs from the CPU reference");
             auto recovered = std::make_shared<Recovery>();
             recovered->cause = state->cause; recovered->gpu_bytes = std::min(device_room,r.safe_gpu_bytes);
+            recovered->next_upgrade = r.next_upgrade;
             for (unsigned k=18; k<=28; k+=2) {
                 auto const& profile = r.profiles[(k-18)/2];
+                recovered->minimum_owning[(k-18)/2] = profile.minimum_owning;
                 if (!profile.device || !profile.borrowed || !profile.owning || profile.tier[sizeof(profile.tier)-1]) continue;
                 recovered->profiles.emplace(k,GpuProducerPreflight{profile.tier,profile.borrowed,profile.owning,
                     profile.device,gpu_identity.physical_identity});
@@ -1555,8 +1751,10 @@ struct WorkerService::Impl
             // The isolated executor needs a different host grant even if the
             // same total GPU and host capacity is available after its canary.
             { std::lock_guard lock(advertisement_mutex); gpu_recovery.store(std::move(recovered)); generation_profiles_changed = true; }
+            gpu_probe_delay = std::chrono::seconds(1);
             heartbeat_ready.notify_all();
         }
+        catch (worker_gpu::DeviceLost const&) { if (sample) lost_gpu(state->cause); }
         catch (worker_gpu::ResourcesUnavailable const& error)
         { probe_host_bytes = std::max(probe_host_bytes, error.host_bytes); }
         catch (std::exception const&) { /* Keep the GPU withdrawn until a complete canary succeeds. */ }
@@ -1584,6 +1782,9 @@ struct WorkerService::Impl
         for (;;)
         {
             std::packaged_task<void()> job;
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+            bool sample = false;
+#endif
             {
                 std::unique_lock lock(jobs_mutex);
                 auto ready = [&] { return stopping.load() || !gpu_jobs.empty() || check_idle_output; };
@@ -1593,6 +1794,9 @@ struct WorkerService::Impl
                 else
 #endif
                     jobs_ready.wait(lock, ready);
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+                sample = std::exchange(sample_gpu, false);
+#endif
                 check_idle_output = false;
                 if (!gpu_jobs.empty()) { job = std::move(gpu_jobs.front()); gpu_jobs.pop_front(); }
                 else if (stopping.load()) break;
@@ -1600,10 +1804,19 @@ struct WorkerService::Impl
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
             if (!gpu_recovery.load()) if (auto loss = pos2gpu::async_device_loss(); !loss.empty())
             { lost_gpu(std::move(loss)); discard_gpu(); }
+            if (sample && !gpu_recovery.load()) try { refresh_native_gpu(); }
+            catch (...)
+            {
+                if (auto cause = gpu_failure(std::current_exception(), gpu_identity.backend); !cause.empty()) lost_gpu(std::move(cause));
+                discard_gpu();
+            }
+            if (!gpu_recovery.load()) if (auto cause = pos2gpu::async_device_loss(); !cause.empty())
+            { lost_gpu(std::move(cause)); discard_gpu(); }
 #endif
             if (job.valid()) job();
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-            else if (auto state = gpu_recovery.load(); state && !state->gpu_bytes) { if (Clock::now() >= next_gpu_probe) probe_gpu(); }
+            else if (auto state = gpu_recovery.load(); state && (!state->gpu_bytes || sample))
+            { if (Clock::now() >= next_gpu_probe) probe_gpu(); }
             else try { update_idle_gpu_output(); } catch (...) { discard_gpu(); }
 #endif
         }
@@ -1686,6 +1899,9 @@ struct WorkerService::Impl
         require(!ids.empty() && ids.size() <= config.max_batch_members &&
             (bool(packed_sink) != bool(contribution_sink)), "worker generation batch exceeds configured limit");
         require(!independent || (use_gpu && contribution_sink && !manifest), "invalid independent contribution task");
+        // A singleton has the same framing and resource contract on every
+        // tier, including an older broker's one-member independent request.
+        if (ids.size() == 1) independent = false;
         size_t const retained_members = independent ? 1 : ids.size();
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         auto const admitted_context = use_gpu ? gpu_recovery.load() : nullptr;
@@ -1703,7 +1919,11 @@ struct WorkerService::Impl
         require(threads && threads <= config.capacity.cpu_threads, "generation CPU allowance exceeds worker offer");
         uint64_t const dynamic_peak = generation_host_bytes(k, strength, retained_members, use_gpu, prior_retained);
         if (grant && dynamic_peak > grant->host_bytes)
+        {
+            if (use_gpu)
+                throw GenerationCapacityChanged("current GPU tier exceeds the original host grant");
             throw pool::UnsupportedResources("generation model exceeds leased host memory");
+        }
         if (admit)
         {
             WorkerTaskAdmission value; value.worker = status(); value.local_fallback = true;
@@ -1894,7 +2114,7 @@ struct WorkerService::Impl
             std::vector<std::unique_ptr<worker_gpu::Mapping>> mappings;
             if (use_gpu && admitted_context) {
                 auto const at = admitted_context->profiles.find(k);
-                if (at == admitted_context->profiles.end()) throw pool::UnsupportedResources("GPU generation profile changed");
+                if (at == admitted_context->profiles.end()) throw GenerationCapacityChanged("GPU generation profile changed");
                 auto const host = child_host_bytes(at->second,k,strength);
                 uint64_t const bytes = grant ? std::min(grant->gpu_bytes, admitted_context->gpu_bytes) : admitted_context->gpu_bytes;
                 for (size_t i=0; i<ids.size(); ++i) {
@@ -1913,7 +2133,11 @@ struct WorkerService::Impl
             {
                 if (!gpu_retained.budget)
                     gpu_retained = budget->acquire(GpuProducer::runtime_host_allowance_bytes(), false, cancel, true);
-                if (!gpu || gpu_k != k || gpu_strength != strength || gpu_threads != threads)
+                auto const live = refresh_native_gpu(false);
+                auto const allowed = grant ? std::min(live, grant->gpu_bytes) : live;
+                auto const* selected = native_tier(k, allowed);
+                if (!selected) throw GenerationCapacityChanged("GPU tier no longer fits available device memory");
+                if (!gpu || gpu_k != k || gpu_strength != strength || gpu_threads != threads || gpu->tier() != selected->tier || !gpu->apply_device_budget(allowed))
                 {
                     // Keep the old persistent reservation charged while
                     // rebuilding. Its bytes fund the new producer inside the
@@ -1922,8 +2146,15 @@ struct WorkerService::Impl
                     gpu.reset();
                     if (unconfirmed_gpu_frees.host || unconfirmed_gpu_frees.device)
                         throw worker_gpu::DeviceLost("GPU driver could not confirm allocation cleanup");
-                    GpuProducerOptions options; options.device_id = config.device; options.tier = gpu_profiles.at(k).tier;
-                    options.max_vram_bytes = grant ? grant->gpu_bytes : config.capacity.gpu_bytes;
+                    auto const room = std::min(allowed, native_headroom(0));
+                    selected = native_tier(k, room);
+                    if (!selected) throw GenerationCapacityChanged("GPU tier no longer fits available device memory");
+                    auto const need = add(add(selected->borrowed_host_bytes, multiply(raw_bytes, retained_members - 1)),
+                        add(indexes, config.max_task_bytes));
+                    if (grant && need > add(grant->host_bytes, prior_retained))
+                        throw GenerationCapacityChanged("GPU tier exceeds leased host memory");
+                    GpuProducerOptions options; options.device_id = config.device; options.tier = selected->tier;
+                    options.max_vram_bytes = room;
                     options.host_threads = std::max(1u, threads - 1);
                     options.member_overlap = options.compact_transfer = options.preserve_match_scratch = true;
                     CpuWork compute(offered_cpu, scheduler.get(), cancel, threads);
@@ -1944,8 +2175,8 @@ struct WorkerService::Impl
                 task_retained = gpu_retained.bytes;
                 if (independent)
                 {
-                    if (threads < 2 || gpu->tier() != "pool")
-                        throw pool::UnsupportedResources("independent contributions require a pooled GPU and a codec thread");
+                    if (threads < 2) throw pool::UnsupportedResources("independent contributions require a codec thread");
+                    if (gpu->tier() != "pool") throw GenerationCapacityChanged("the current GPU tier cannot overlap independent members");
                     generated_retained = gpu->host_borrowed_generation_peak_bytes();
                     try
                     {
@@ -2058,15 +2289,15 @@ struct WorkerService::Impl
         };
         if (use_gpu) on_gpu([&]
         {
-            struct ActiveGpu { std::atomic<bool>& value; ~ActiveGpu() { value.store(false); } } active{gpu_active};
-            gpu_active.store(true);
+            struct ActiveGpu { std::atomic<uint64_t>& value; ~ActiveGpu() { value.store(0); } } active{gpu_active};
+            gpu_active.store(grant ? grant->gpu_bytes : offered_gpu_bytes());
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
             struct NativeGeneration {
                 pos2gpu::AsyncErrorLog& log;
                 ~NativeGeneration() { log.generating.store(false); }
             } native{pos2gpu::async_errors()};
             native.log.generating.store(!admitted_context);
-            if (gpu_recovery.load() != admitted_context) throw pool::UnsupportedResources("GPU generation profile changed while waiting");
+            if (gpu_recovery.load() != admitted_context) throw GenerationCapacityChanged("GPU generation profile changed while waiting");
             // A previously admitted request may have been waiting for this
             // thread when another task returned its cached host allocation.
             if (gpu_retained.bytes < prior_retained)
@@ -2258,7 +2489,14 @@ struct WorkerService::Impl
                 std::vector<uint8_t>().swap(frame.payload);
                 { std::lock_guard lock(output_mutex); keepalive_enabled = true; }
                 bool const use_gpu = lease->task.kind == pool::Kind::GenerateGpu || (lease->task.kind == pool::Kind::GenerateAny && offered_gpu_bytes());
-                if (use_gpu && !offered_gpu_bytes()) throw pool::UnsupportedResources("GPU generation is unavailable");
+                if (use_gpu && !offered_gpu_bytes())
+                {
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+                    if (gpu_enabled && (gpu_recovery.load() || gpu_profiles.contains(k)))
+                        throw GenerationCapacityChanged("GPU generation is temporarily unavailable");
+#endif
+                    throw pool::UnsupportedResources("GPU generation is unavailable");
+                }
                 auto packed_sink = [&](PackedFragmentTile const& tile, uint64_t total)
                 {
                     output_started = true;
@@ -2397,13 +2635,14 @@ struct WorkerService::Impl
         }
         catch (std::exception const&)
         {
-            WorkerError kind = WorkerError::Permanent; std::string message;
+            WorkerError kind = WorkerError::Permanent; std::string message; bool repriced = false;
             try { std::rethrow_exception(task_failure(std::current_exception(), renewal_failure)); }
-            catch (std::exception const& error) { kind = error_kind(error); message = error.what(); }
+            catch (std::exception const& error)
+            { kind = error_kind(error); message = error.what(); repriced = dynamic_cast<GenerationCapacityChanged const*>(&error); }
             bool const unsupported = !output_started && kind == WorkerError::Unsupported;
             if (begun) trace_task_failure(*lease, "worker", message.c_str());
             if (kind == WorkerError::Unsupported && !unsupported) kind = WorkerError::Permanent;
-            if (unsupported && begun) try
+            if (unsupported && begun && !repriced) try
             { auto cleanup = worker_detail::cleanup_control(*broker, config.tls);
               cleanup.reject(*lease, pool::FailureCode::UnsupportedResources, capacity_update(registered_revision)); }
             catch (...)
@@ -2656,15 +2895,27 @@ unsigned WorkerService::generate_assigned(pool::Lease const& lease,
         {
             auto update = impl_->capacity_update(registered_revision);
             auto cleanup = worker_detail::cleanup_control(control, impl_->config.tls);
-            if (dynamic_cast<pool::UnsupportedResources const*>(&error))
+            if (dynamic_cast<pool::UnsupportedResources const*>(&error) && !dynamic_cast<GenerationCapacityChanged const*>(&error))
                 cleanup.reject(lease, pool::FailureCode::UnsupportedResources, update);
             else cleanup.finish(lease, update);
         }
-        catch (...) { /* The next heartbeat publishes the current capacity. */ }
+        catch (...)
+        {
+            try
+            {
+                auto cleanup = worker_detail::cleanup_control(control, impl_->config.tls);
+                if (dynamic_cast<pool::UnsupportedResources const*>(&error) && !dynamic_cast<GenerationCapacityChanged const*>(&error)) cleanup.reject(lease, pool::FailureCode::UnsupportedResources);
+                else cleanup.finish(lease);
+            }
+            catch (...) {}
+        }
         std::rethrow_exception(task_failure(failure, renewal_failure));
     }
     try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease, impl_->capacity_update(registered_revision)); }
-    catch (...) { /* The next heartbeat publishes the current capacity. */ }
+    catch (...)
+    {
+        try { worker_detail::cleanup_control(control, impl_->config.tls).finish(lease); } catch (...) {}
+    }
     return impl_->generation_slots(lease.task);
 }
 void WorkerService::encode_assigned(pool::Lease const& lease, std::span<uint8_t const> payload,
@@ -2704,12 +2955,21 @@ void WorkerService::generate_local(uint8_t k, uint8_t strength, std::array<uint8
 WorkerLocalOffer WorkerService::local_generation_offer(uint8_t k, uint8_t strength, unsigned members) const
 {
     WorkerLocalOffer result;
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    impl_->request_gpu_sample();
+#endif
+    std::lock_guard lock(impl_->advertisement_mutex);
     result.capacity = impl_->current_capacity(&result.standing_host_bytes);
     if (!members || members > impl_->config.max_batch_members) return result;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
     if (auto state = impl_->gpu_recovery.load(); state && !state->gpu_bytes)
     { result.gpu_recovery = state->cause; return result; }
-    if (impl_->gpu_enabled && (!result.capacity.gpu_bytes || !impl_->gpu_profile(k))) return result;
+    if (impl_->gpu_enabled && (!result.capacity.gpu_bytes || !impl_->gpu_profile(k)))
+    {
+        result.demand.host_bytes = impl_->minimum_gpu_host_bytes(k,strength,members,result.standing_host_bytes - impl_->service_baseline);
+        result.gpu_headroom_limited = result.demand.host_bytes != 0;
+        return result;
+    }
 #endif
     result.demand = {std::min(impl_->config.generation_threads, result.capacity.cpu_threads), 1,
         impl_->generation_host_bytes(k, strength, members, bool(impl_->offered_gpu_bytes()), result.standing_host_bytes - impl_->service_baseline),

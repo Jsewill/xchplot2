@@ -411,7 +411,7 @@ bool cuda_query_device_memory(int device_ordinal,
 #endif
 
 #ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
-size_t windows_hip_worker_budget(HMODULE runtime, int ordinal, size_t hip_free, size_t hip_total);
+std::optional<size_t> windows_hip_worker_budget(HMODULE runtime, int ordinal, size_t hip_free, size_t hip_total, size_t resident);
 #endif
 
 // AMD free-VRAM probe. Resolved at runtime rather than linked, deliberately:
@@ -1004,21 +1004,27 @@ bool device_memory_probe(int device_ordinal,
     return false;
 }
 
-size_t worker_gpu_available_bytes(int device_ordinal)
+std::optional<size_t> worker_gpu_headroom(int device_ordinal, size_t resident, [[maybe_unused]] bool permit_runtime_only)
 {
     size_t free = 0, total = 0;
-    if (!device_memory_probe(device_ordinal, free, total)) return 0;
+    if (!device_memory_probe(device_ordinal, free, total)) return {};
+    free = std::min(free, total);
+    free += std::min(resident, total - free);
 #ifdef _WIN32
     auto const target = probe_target_for(device_ordinal);
     if (target.runtime == ProbeRuntime::Hip) {
 #ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
-        return windows_hip_worker_budget(retained_hip_runtime(), target.ordinal, std::min(free, total), total);
+        auto const reading = windows_hip_worker_budget(retained_hip_runtime(), target.ordinal, free, total, resident);
+        if (reading) free = *reading;
+        else if (!permit_runtime_only) return {};
 #else
-        return 0;
+        if (!permit_runtime_only) return {};
 #endif
     }
 #endif
-    return std::min(free, total);
+    if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0])
+        free = std::min(free, vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB"));
+    return free;
 }
 
 size_t vram_safety_margin()
