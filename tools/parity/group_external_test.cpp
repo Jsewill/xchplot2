@@ -11,7 +11,7 @@ std::atomic<unsigned> writes_before_failure{0};
 std::atomic<bool> reject_retired_receipt{false};
 std::atomic<bool> reject_atomic_retirement{false};
 std::atomic<unsigned> retirement_flags{0};
-std::atomic<bool> slow_checkpoint_writes{false};
+std::atomic<bool> slow_checkpoint_writes{false}, slow_next_sync{false};
 std::atomic<bool> observe_oversized_partial{false};
 std::atomic<uint64_t> oversized_partial_reads{0};
 std::atomic<bool> observe_index_writes{false};
@@ -71,6 +71,7 @@ struct TargetPipelineBarrier
 } target_pipeline_barrier;
 struct SharedStorageBarrier
 {
+    static constexpr auto timeout = std::chrono::seconds(30);
     std::mutex mutex;
     std::condition_variable ready;
     std::string path;
@@ -84,7 +85,7 @@ void hold_shared_storage(int fd, bool sync)
     auto const size = ::readlink(descriptor.c_str(), path.data(), path.size());
     if (size <= 0 || std::string_view(path.data(), size_t(size)) != state.path) return;
     state.blocked = true; state.ready.notify_all();
-    if (!state.ready.wait_for(lock, std::chrono::seconds(10), [&] { return state.released; })) state.timed_out = true;
+    if (!state.ready.wait_for(lock, state.timeout, [&] { return state.released; })) state.timed_out = true;
 }
 extern "C" size_t __real_POS2_FSE_compress_usingCTable(void*, size_t, void const*, size_t, FSE_CTable const*);
 extern "C" size_t __wrap_POS2_FSE_compress_usingCTable(void* dst, size_t capacity, void const* src, size_t size, FSE_CTable const* table)
@@ -169,6 +170,7 @@ extern "C" int __real_fsync(int);
 extern "C" int __wrap_fsync(int fd)
 {
     hold_shared_storage(fd, true);
+    if (slow_next_sync.exchange(false)) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     {
         std::lock_guard lock(segment_sync_failure.mutex); auto& state = segment_sync_failure;
         if (state.armed && (!state.after_payload || state.payload))
@@ -1116,6 +1118,48 @@ void packing_index(fs::path const& root, ExternalConfig const& ext)
     catch (std::runtime_error const&) { rejected = true; }
     require(rejected, "external index buffer bypassed workspace admission");
 }
+void fresh_checkpoint_forecast(fs::path const& root)
+{
+#ifdef GROW_TEST_WRAP_PWRITE
+    auto raw = members(1, 8, 22);
+    std::vector<uint8_t> reference;
+    for (bool intermediate : {false, true})
+    {
+        auto cfg = config(); cfg.checkpoint_bytes = intermediate ? 1 : (uint64_t(64) << 20);
+        auto const path = root / (intermediate ? "refresh-durable-forecast" : "terminal-durable-forecast");
+        Engine engine(path.string(), cfg, false, initial_identity(22)); engine.confirm_identity();
+        unsigned observations = 0;
+        uint64_t first_sync = 0, measured_sync = 0;
+        long double revised = 0;
+        engine.fresh_write([&](uint64_t peak, long double remaining)
+        {
+            require(peak && remaining > 0, "fresh output offered an empty service forecast");
+            if (!observations++)
+            {
+                first_sync = engine.stats().sync_ns;
+                slow_next_sync = intermediate;
+            }
+            else
+            {
+                measured_sync = engine.stats().sync_ns - first_sync;
+                revised = remaining;
+            }
+        });
+        require(engine.append(Members(raw)).accepted, "fresh checkpoint forecast input was refused");
+        if (intermediate)
+            require(observations == 2 && measured_sync >= 10000000 && revised >= measured_sync &&
+                contents(path) == reference, "fresh output lost a measured future sync or changed ordinary bytes");
+        else
+        {
+            require(observations == 1, "the terminal checkpoint advertised a successor after the payload was complete");
+            reference = contents(path);
+        }
+    }
+#else
+    (void)root;
+#endif
+}
+
 void packing_checkpoints(fs::path const& root, Members input, ExternalConfig const& ext,
                          std::vector<uint8_t> const& reference)
 {
@@ -1182,6 +1226,23 @@ void packing_checkpoints(fs::path const& root, Members input, ExternalConfig con
     confidence.add({established, 1000, 240});
     require(confidence.select(established, ceiling, 64 * ceiling) == trial,
         "sustained current-size evidence did not qualify a material checkpoint trial");
+
+    PackingCheckpointHistory ordinary;
+    ordinary.add({current, 1000, 50});
+    auto const candidate = ordinary.select(current, 16 * mib, 32 * mib, true);
+    require(candidate == 16 * mib, "fresh output missed the lowest predicted time within its admitted ceiling");
+    ordinary.add({candidate, 8000, 1500}); ordinary.select(candidate, ceiling, candidate, true);
+    ordinary.add({candidate, 8000, 1500});
+    require(ordinary.select(candidate, ceiling, candidate, true) == current,
+        "fresh output retained a slower measured interval");
+
+    PackingCheckpointHistory terminal;
+    terminal.add({256 * mib, 1000, 400, 0, 256 * mib});
+    require(terminal.select(256 * mib, ceiling, 3 * established, true) == ceiling,
+        "fresh output excluded a faster interval that could finish the group");
+    terminal.add({3 * established, 9000, 400, 0, ceiling, true});
+    require(terminal.fastest_completed_interval() == ceiling,
+        "matching fresh groups could not reuse the faster completed terminal interval");
 
     auto const directory = root / "packing-checkpoints"; fs::create_directory(directory);
     auto cfg = config(); cfg.checkpoint_bytes = 4096;
@@ -1466,6 +1527,28 @@ void pipeline_barriers(fs::path const& root, ExternalConfig const& ext)
       require(engine.append(input).accepted, "barrier reference did not fit"); }
     auto const expected = contents(root / "barrier-reference");
     auto cfg = config(); cfg.workers = 1; cfg.io_overlap = true;
+    {
+        auto odd = cfg; ++odd.window_bytes; odd.checkpoint_bytes = odd.window_bytes + 73;
+        auto const path = root / "partial-writeback-window";
+        complete(path, input, ext, false, odd);
+        require(expected.size() > 2 * odd.checkpoint_bytes && contents(path) == expected,
+            "packing across unaligned window and checkpoint boundaries changed canonical bytes");
+    }
+    {
+        auto single = ext; single.scratch.resize(1);
+        auto const source = storage_device(single.scratch.front().directory), target = storage_device(root);
+        bool const independent = source.rotating && target.rotating && external_detail::independent_packing_io(target, {&source, 1});
+        for (uint64_t window : {cfg.window_bytes, uint64_t(8 * 1024 * 1024)})
+        {
+            auto options = cfg; options.window_bytes = window;
+            single.bandwidth = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+            auto const path = root / ("single-scratch-" + std::to_string(window));
+            auto const stats = complete(path, input, single, false, options);
+            require(stats.merge_inputs == 2 && contents(path) == expected &&
+                (single.bandwidth->bandwidth(source) > 0) == (independent && window > cfg.window_bytes),
+                "single HDD read-ahead exceeded its cache or changed the packed output");
+        }
+    }
     std::vector<FragmentRegion> regions;
     for (size_t member = 0; member < input.size(); ++member) regions.push_back(input[member].region(0));
     ChunkCodec codec(18, cfg.codec_bytes);
@@ -1805,7 +1888,7 @@ void shared_storage_cpu(fs::path const& root, Members input)
         bool observed;
         {
             std::unique_lock lock(shared_storage_barrier.mutex); auto& state = shared_storage_barrier;
-            observed = state.ready.wait_for(lock, std::chrono::seconds(5), [&] { return state.blocked; });
+            observed = state.ready.wait_for(lock, state.timeout, [&] { return state.blocked; });
         }
         auto other = std::async(std::launch::async, [&]
         {
@@ -1814,7 +1897,9 @@ void shared_storage_cpu(fs::path const& root, Members input)
             require(second.append(input).accepted, "independent shared CPU contribution rejected");
             return second.finish();
         });
-        bool const progressed = other.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        // The held syscall has its own deadlock timeout. Wait for the second
+        // output to finish so the assertion checks the order of completion.
+        other.wait();
         bool const outstanding = blocked.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
         bool timed_out;
         {
@@ -1823,8 +1908,9 @@ void shared_storage_cpu(fs::path const& root, Members input)
         }
         shared_storage_barrier.ready.notify_all();
         auto const appended = blocked.get(); auto const finished = other.get();
-        require(observed && progressed && outstanding && !timed_out && appended.accepted && finished.members == input.size(),
-            "blocked output storage retained shared compute admission");
+        require(observed, "first output did not reach the shared storage barrier");
+        require(outstanding && !timed_out, "blocked output storage retained shared compute admission");
+        require(appended.accepted && finished.members == input.size(), "shared compute did not finish both outputs");
         require(contents(blocked_path) == contents(other_path), "shared compute changed ordinary/external v2 bytes");
     }
 #else
@@ -1876,7 +1962,9 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
     {
         auto cfg = config(); cfg.io_overlap = overlap;
         auto const path = root / (std::string("prepared-") + (packed ? "packed" : "raw") + (overlap ? "-overlap" : "-serial"));
-        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+        auto scratch = ext;
+        if (packed && overlap) for (auto& grant : scratch.scratch) grant.capacity_bytes = 2ull << 20;
+        ExternalEngine engine(path.string(), cfg, scratch, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "prepared input reservation rejected");
         require(input->reserved_bytes() >= input->written_bytes(), "prepared input reservation undercounts payload");
         feed(*input, packed); require(input->sealed(), "prepared input did not seal");
@@ -2069,9 +2157,11 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
         input.reset(); engine.finish();
     }
 #endif
-    for (auto const* point : {"external-input-sealed", "external-contribution-flushed", "external-run-after-checkpoint"})
+    for (auto const* point : {"external-input-sealed", "external-contribution-flushed", "external-run-after-checkpoint",
+        "external-pack-initialized-before-checkpoint", "external-pack-initialized-after-checkpoint"})
     {
         auto const path = root / (std::string("prepared-crash-") + point);
+        bool const packing = std::string_view(point).starts_with("external-pack-initialized");
         auto const child = ::fork(); require(child >= 0, "cannot fork prepared input crash test");
         if (!child)
         {
@@ -2080,13 +2170,19 @@ void prepared_inputs(fs::path const& root, std::vector<std::vector<uint64_t>> co
                 ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
                 auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "crash reservation rejected");
                 require(!::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1), "cannot set prepared input failpoint");
-                feed(*input, false); engine.append(*input); std::_Exit(0);
+                feed(*input, false); engine.append(*input, 0, packing); std::_Exit(0);
             }
             catch (...) { std::_Exit(1); }
         }
         int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
             "prepared input failpoint did not interrupt");
         ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
+        if (packing)
+        {
+            bool const committed = std::string_view(point).ends_with("after-checkpoint");
+            require(engine.can_append() != committed && engine.committed_member_count() == (committed ? raw.size() : 0) &&
+                !engine.pending_members(), "final prepared input recovered the wrong packing frontier");
+        }
         if (!engine.committed_member_count())
         {
             auto input = engine.prepare_input(uint16_t(raw.size()), raw.front().size()); require(bool(input), "resumed prepared reservation rejected");
@@ -2119,12 +2215,19 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         bool rejected = false; try { action(); } catch (std::runtime_error const&) { rejected = true; }
         require(rejected, "invalid contribution input was accepted");
     };
-    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset)
+    auto write_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width)
     {
-        for (uint64_t chunk = 0; chunk < chunks; ++chunk)
-            input.append_chunk(member, chunk, encoded[offset + member][size_t(chunk)]);
-        input.finish_member(member);
+        for (uint64_t chunk = 0; chunk < chunks;)
+        {
+            std::array<std::span<uint8_t const>, 128> window;
+            require(width && width <= window.size(), "invalid contribution test window");
+            size_t const count = size_t(std::min<uint64_t>(width, chunks - chunk));
+            for (size_t i = 0; i < count; ++i) window[i] = encoded[offset + member][size_t(chunk) + i];
+            input.append_chunks(member, chunk, {window.data(), count}); chunk += count;
+        }
     };
+    auto feed_member = [&](ExternalEngine::ContributionInput& input, uint16_t member, size_t offset, size_t width = 17)
+    { write_member(input, member, offset, width); input.finish_member(member); };
     auto feed = [&](ExternalEngine::ContributionInput& input, size_t offset, bool concurrent)
     {
         std::vector<std::future<void>> pending;
@@ -2176,8 +2279,80 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
         feed_groups(*input, prior, concurrent);
         require(input->reserved_bytes() <= reserved && input->written_bytes() <= input->reserved_bytes(),
             "grouped contribution exceeded its original reservation");
-        require(engine.append(*input).accepted, "grouped contribution append rejected");
+        auto const reads = engine.stats().phases[size_t(WorkPhase::plan)].read_bytes;
+        require(engine.append(*input, 0, true).accepted && engine.can_append(),
+            "final contribution skipped staging beyond its packing reader limit");
+        if (!concurrent) require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
+            "ordered validated contributions were reread during conservative sizing");
         input.reset(); engine.finish(); require(contents(path) == reference, "grouped contributions changed canonical bytes");
+    }
+    for (std::string_view mode : {"interleave", "overtake", "exact"})
+    {
+        auto const path = root / ("contribution-chunk-" + std::string(mode));
+        auto grant = ext; grant.packing_inputs = unsigned(raw.size());
+        auto cfg = config();
+        if (mode == "exact") cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, grant);
+        {
+            ExternalEngine engine(path.string(), cfg, grant, false, initial_identity()); engine.confirm_identity();
+            auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
+            require(bool(input), "interleaved contribution reservation rejected");
+            for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+            {
+                bool const ahead = mode != "interleave" && chunk == chunks / 2;
+                if (ahead) input->append_chunk(1, chunk, encoded[1][chunk]);
+                for (uint16_t member = 0; member < input->size(); ++member)
+                    if (member != 1 || !ahead) input->append_chunk(member, chunk, encoded[member][chunk]);
+            }
+            for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
+            input->seal(); auto const before = engine.stats();
+            require(engine.append(*input, 0, true).accepted && !engine.can_append(), "interleaved final contribution did not start packing");
+            auto const plan = size_t(WorkPhase::plan), encode = size_t(WorkPhase::encode);
+            auto const reads = engine.stats().phases[plan].read_bytes - before.phases[plan].read_bytes;
+            require(mode == "exact" ? reads && engine.stats().sized_chunks == chunks : !reads,
+                "final contribution chose the wrong sizing pass");
+            require(engine.stats().phases[encode].written_bytes == before.phases[encode].written_bytes,
+                "final contribution wrote an intermediate staging summary");
+        }
+        ExternalEngine resumed(path.string(), cfg, grant, true); resumed.confirm_identity(); resumed.finish();
+        require(contents(path) == reference, "resumed final contributions changed canonical bytes");
+    }
+    uint64_t ordered_bound = 0;
+    for (bool retry : {false, true})
+    {
+        auto const path = root / (retry ? "contribution-ordered-lease-retry" : "contribution-ordered-lease");
+        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
+        require(bool(input), "ordered lease reservation rejected");
+        // Start the retry with a shorter first member so reusing the stale
+        // summary would give a different capacity bound.
+        if (retry) for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            uint64_t const first = chunk * range + 7;
+            std::array<uint64_t, 4> const values{first, first + range / 4, first + range / 2, first + 3 * range / 4};
+            FragmentRegion const region{std::span(values)};
+            input->append_chunk(0, chunk, codec.encode(chunk, {}, 0, {&region, 1}));
+        }
+        for (uint16_t member = retry ? 1 : 0; member < input->size(); ++member)
+            write_member(*input, member, 0, 17);
+        rejects([&] { input->seal(); });
+        if (retry)
+        {
+            input->reset_member(0);
+            write_member(*input, 0, 0, 17);
+        }
+        for (uint16_t member = 0; member < input->size(); ++member) input->finish_member(member);
+        input->seal();
+        auto const reads = engine.stats().phases[size_t(WorkPhase::plan)].read_bytes;
+        auto const result = engine.append(*input);
+        require(result.accepted, "ordered lease append rejected");
+        if (retry) require(result.attempted_final_bytes == ordered_bound, "ordered lease retry used a stale capacity bound");
+        else
+        {
+            ordered_bound = result.attempted_final_bytes;
+            require(engine.stats().phases[size_t(WorkPhase::plan)].read_bytes == reads,
+                "ordered lease members were reread after deferred writer completion");
+        }
+        engine.finish(); require(contents(path) == reference, "ordered lease changed canonical bytes");
     }
     for (bool split : {false, true})
     {
@@ -2246,31 +2421,97 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
     {
         auto const path = root / "contribution-member-retry";
-        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        std::array<std::span<uint8_t const>, 128> window;
+        for (size_t i = 0; i < window.size(); ++i) window[i] = encoded[0][i];
+        std::vector<uint64_t> dense(300);
+        for (size_t i = 0; i < dense.size(); ++i) dense[i] = i * (range / dense.size());
+        uint16_t const peers = uint16_t(raw.size() - 1);
+        std::vector<FragmentRegion> regions(peers, FragmentRegion{std::span<uint64_t const>(dense)});
+        auto const large = codec.encode(0, {}, 0, regions);
+        auto cfg = config(); cfg.io_overlap = true; cfg.cpu_scheduler = std::make_shared<CodecScheduler>(cfg.workers);
+        cfg.codec_bytes = ChunkCodec::estimate_work(18, large.size(), 0);
+        auto const input_bytes = ExternalEngine::contribution_input_memory_bytes(cfg, uint16_t(raw.size()));
+        cfg.workers = 1;
+        require(ExternalEngine::contribution_input_memory_bytes(cfg, uint16_t(raw.size())) > input_bytes,
+            "a single-writer destination did not budget for borrowed validation workers");
+        require(ChunkCodec::estimate_work(18, window.front().size(), 0) <= cfg.codec_bytes / 4,
+            "mixed-width contribution fixture cannot use two validation workers");
+        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size());
         require(bool(input), "contribution retry reservation rejected");
         uint64_t const reserved = input->reserved_bytes();
+        // One large packet from the other stream needs the full codec grant.
+        require(input->append_chunks(0, 0, window) && input->append_chunk(1, 0, large, peers),
+            "contribution validator could not return its worker scratch to a large chunk");
+        input->reset_member(1, peers); input->reset_member(0);
+        // A peer finishing its run returns unused scratch. Check this reset
+        // before launching the peers that overlap the next failed attempt.
+        require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
         std::vector<std::future<void>> pending;
         for (uint16_t member = 1; member < input->size(); ++member)
             pending.push_back(std::async(std::launch::async, [&, member] { feed_member(*input, member, 0); }));
-        for (uint64_t chunk = 0; chunk < 7; ++chunk) input->append_chunk(0, chunk, encoded[0][size_t(chunk)]);
-        input->reset_member(0);
-        require(input->reserved_bytes() == reserved, "partial contribution retry changed its scratch reservation");
-        auto invalid = encoded[0][0]; invalid.push_back(0);
-        rejects([&] { input->append_chunk(0, 0, invalid); });
-        input->reset_member(0); feed_member(*input, 0, 0);
+        auto invalid = encoded[0][window.size() - 1]; invalid.push_back(0); window.back() = invalid;
+        rejects([&] { input->append_chunks(0, 0, window); });
+        rejects([&] { input->append_chunk(0, 0, encoded[0][0]); });
+        input->reset_member(0); feed_member(*input, 0, 0, window.size());
         for (auto& future : pending) future.get();
         input->seal(); rejects([&] { input->reset_member(0); });
         require(engine.append(*input).accepted, "restarted contribution input rejected");
         engine.finish(); require(contents(path) == reference, "member retry disturbed another contribution");
     }
     {
+        auto const path = root / "contribution-changed-source";
+        ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+        auto input = engine.prepare_contributions(1, raw.front().size());
+        require(bool(input), "changed contribution fixture reservation rejected");
+        feed_member(*input, 0, 0); input->seal();
+        auto const segments = summary_segments(path, ext, 0);
+        require(!segments.empty(), "completed contribution has no scratch segment");
+        fs::last_write_time(segments.front(), fs::last_write_time(segments.front()) + std::chrono::seconds(2));
+        rejects([&] { (void)engine.append(*input); });
+        require(!engine.committed_member_count(), "changed contribution advanced the cached summary");
+    }
+    {
         auto const path = root / "contribution-exact"; auto cfg = config();
-        cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, ext);
-        ExternalEngine engine(path.string(), cfg, ext, false, initial_identity()); engine.confirm_identity();
+        auto tight = ext; for (auto& grant : tight.scratch) grant.capacity_bytes = 2ull << 20;
+        cfg.capacity_bytes = reference.size() + ExternalEngine::metadata_bytes(18, tight);
+        ExternalEngine engine(path.string(), cfg, tight, false, initial_identity()); engine.confirm_identity();
         auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "exact contribution preflight rejected");
         feed(*input, 0, false); require(engine.append(*input).accepted, "exact contribution capacity rejected");
         engine.finish(); require(contents(path) == reference, "exact contribution output differs");
+    }
+    {
+        auto const path = root / "contribution-capacity-probe";
+        uint16_t const prior = uint16_t(raw.size() - 1);
+        {
+            ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
+            auto const reserved = engine.scratch_reserved_bytes();
+            auto input = engine.prepare_contributions(1, raw.front().size(), reference.size() / (raw.size() * 2));
+            require(bool(input), "capacity probe reservation rejected");
+            uint64_t chunk = 0;
+            while (chunk < chunks && input->append_chunk(0, chunk, encoded[0][size_t(chunk)])) ++chunk;
+            require(chunk && chunk + 1 < chunks && input->rejected_final_bytes() > reference.size() / (raw.size() * 2),
+                "oversized member was not stopped during transfer");
+            input.reset();
+            require(!engine.committed_member_count() && engine.scratch_reserved_bytes() == reserved,
+                "partial capacity probe changed the durable frontier or retained scratch");
+            require(engine.append(Members(raw).subspan(0, prior)).accepted, "capacity probe prefix rejected");
+        }
+        ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
+        {
+            auto input = engine.prepare_contributions(1, raw.back().size(), reference.size() - 1);
+            require(bool(input), "near-fit probe reservation rejected");
+            feed_member(*input, 0, prior); input->seal();
+            require(!engine.append(*input).accepted && input->rejected_final_bytes() == reference.size() &&
+                engine.committed_member_count() == prior, "exact-capacity refusal lost its proven final size");
+        }
+        auto input = engine.prepare_contributions(1, raw.back().size(), reference.size());
+        require(input && engine.committed_member_count() == prior, "capacity probe did not restore its prefix");
+        for (uint64_t chunk = 0; chunk < chunks / 2; ++chunk)
+            require(input->append_chunk(0, chunk, encoded.back()[size_t(chunk)]), "fitting partial member rejected");
+        input->reset_member(0); feed_member(*input, 0, prior); input->seal();
+        require(!input->rejected_final_bytes() && engine.append(*input).accepted, "exact-fit restarted probe rejected");
+        engine.finish(); require(contents(path) == reference, "capacity probe changed the exact-fit publication");
     }
     {
         auto const prefix_path = root / "contribution-prefix-reference";
@@ -2339,30 +2580,42 @@ void contribution_inputs(fs::path const& root, std::vector<std::vector<uint64_t>
     }
 #endif
     for (bool grouped : {false, true})
-    for (auto const* point : {"external-contribution-input-sealed", "external-run-before-checkpoint", "external-run-after-checkpoint"})
+    for (auto const* point : {"external-contribution-input-sealed", "external-run-before-checkpoint", "external-run-after-checkpoint",
+        "external-pack-initialized-before-checkpoint", "external-pack-initialized-after-checkpoint"})
     {
         auto const path = root / (std::string(grouped ? "contribution-grouped-crash-" : "contribution-crash-") + point);
+        bool const packing = std::string_view(point).starts_with("external-pack-initialized");
+        uint16_t const prior = packing && grouped ? 2 : 0;
+        auto grant = ext;
+        if (packing) grant.packing_inputs = unsigned(raw.size());
         auto const child = ::fork(); require(child >= 0, "cannot fork contribution recovery test");
         if (!child)
         {
             try
             {
-                ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity();
-                auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "crash contribution preflight rejected");
+                ExternalEngine engine(path.string(), config(), grant, false, initial_identity()); engine.confirm_identity();
+                if (prior) require(engine.append(Members(raw).subspan(0, prior)).accepted, "crash fixture lost its prefix");
+                auto input = engine.prepare_contributions(uint16_t(raw.size() - prior), raw.front().size()); require(bool(input), "crash contribution preflight rejected");
                 require(!::setenv("XCHPLOT2_GROW_FAILPOINT", point, 1), "cannot set contribution recovery failpoint");
-                if (grouped) feed_groups(*input, 0, false); else feed(*input, 0, false);
-                engine.append(*input); std::_Exit(0);
+                if (grouped) feed_groups(*input, prior, false); else feed(*input, prior, false);
+                engine.append(*input, 0, packing); std::_Exit(0);
             }
             catch (...) { std::_Exit(1); }
         }
         int status = 0; require(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 86,
             "contribution failpoint did not interrupt");
-        ExternalEngine engine(path.string(), config(), ext, true); engine.confirm_identity();
-        if (!engine.committed_member_count())
+        ExternalEngine engine(path.string(), config(), grant, true); engine.confirm_identity();
+        if (packing)
         {
-            auto input = engine.prepare_contributions(uint16_t(raw.size()), raw.front().size()); require(bool(input), "resumed contribution preflight rejected");
-            if (grouped) feed_groups(*input, 0, true); else feed(*input, 0, false);
-            require(engine.append(*input).accepted, "resumed contribution append rejected");
+            bool const committed = std::string_view(point).ends_with("after-checkpoint");
+            require(engine.can_append() != committed && engine.committed_member_count() == (committed ? raw.size() : prior) &&
+                !engine.pending_members(), "final contribution recovered the wrong packing frontier");
+        }
+        if (engine.committed_member_count() < raw.size())
+        {
+            auto input = engine.prepare_contributions(uint16_t(raw.size() - prior), raw.front().size()); require(bool(input), "resumed contribution preflight rejected");
+            if (grouped) feed_groups(*input, prior, true); else feed(*input, prior, true);
+            require(engine.append(*input, 0, packing).accepted, "resumed contribution append rejected");
         }
         engine.finish(); require(contents(path) == reference, "contribution recovery changed ordinary bytes");
     }
@@ -2733,7 +2986,11 @@ try
     if (argc == 1 || bulk_only) bulk_checkpoints(root, input, ext);
     if (bulk_only)
     { fs::remove_all(root); std::cout << "external bulk checkpoint tests passed\n"; return 0; }
-    if (argc == 1 || checkpoints_only) packing_index(root, ext);
+    if (argc == 1 || checkpoints_only)
+    {
+        fresh_checkpoint_forecast(root);
+        packing_index(root, ext);
+    }
     packing_transition(root, input, ext, reference);
     if (retirement_only)
     {
@@ -2804,7 +3061,8 @@ try
     {
         ExternalEngine engine((root / "buffered").string(), config(), ext, false, initial_identity()); engine.confirm_identity();
         require(engine.append(input).accepted, "buffered fixture rejected"); uint64_t segments = 0;
-        for (auto const& grant : ext.scratch) for (auto const& entry : fs::recursive_directory_iterator(grant.directory))
+        auto const directory = ".xchplot2-external-" + ownership_token(root / "buffered");
+        for (auto const& grant : ext.scratch) for (auto const& entry : fs::directory_iterator(fs::path(grant.directory) / directory))
             if (entry.is_regular_file() && entry.path().filename().string().starts_with("run-")) ++segments;
         engine.finish(); auto const& stats = engine.stats(); uint64_t const window = config().window_bytes;
         require(stats.read_calls <= (stats.read_bytes + window - 1) / window + segments + 2,
@@ -2930,7 +3188,8 @@ try
         auto const path = root / "missing";
         { ExternalEngine engine(path.string(), config(), ext, false, initial_identity()); engine.confirm_identity(); require(engine.append(input.subspan(0, 1)).accepted, "missing-input fixture rejected"); }
         fs::path segment;
-        for (auto const& grant : ext.scratch) for (auto const& entry : fs::recursive_directory_iterator(grant.directory))
+        auto const directory = ".xchplot2-external-" + ownership_token(path);
+        for (auto const& grant : ext.scratch) for (auto const& entry : fs::directory_iterator(fs::path(grant.directory) / directory))
             if (entry.is_regular_file() && entry.path().filename().string().starts_with("run-")) segment = entry.path();
         require(!segment.empty(), "missing-input fixture has no segment"); fs::rename(segment, segment.string() + ".held");
         { std::ofstream tail(path, std::ios::binary | std::ios::app); tail << "uncommitted tail"; }

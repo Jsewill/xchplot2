@@ -622,16 +622,22 @@ if(XCHPLOT2_HIP_RUNTIME_H)
     # without this explicit link, ROCm silently fails to initialise
     # and AdaptiveCpp's default selector falls through to its OpenMP
     # host device. The fall-through makes hellosycl / sycl_t1_parity
-    # report "ALL OK" while having executed entirely on CPU. Mirrors
-    # build.rs:631 (cargo:rustc-link-lib=amdhip64) for the cargo
-    # build path.
+    # report "ALL OK" while having executed entirely on CPU. Mirrors the
+    # HIP runtime link in build.rs for the cargo build path.
     # It is also what puts the HIP runtime on the link line for targets that
     # merely consume libpos2_gpu.a rather than compiling SYCL themselves: with
     # a hip:gfx* AOT target those objects carry hipLaunchKernel /
     # __hipRegisterFatBinary, and tools/xchplot2 failed to link outright when
     # this was skipped.
     if(XCHPLOT2_AMDHIP64)
-        link_libraries("${XCHPLOT2_AMDHIP64}")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # SSCP has no host-side HIP references, so --as-needed can drop
+            # even a full library path. Keep the runtime in DT_NEEDED, as
+            # Cargo does, before AdaptiveCpp loads its backend plugins.
+            link_libraries("-Wl,--no-as-needed" "${XCHPLOT2_AMDHIP64}" "-Wl,--as-needed")
+        else()
+            link_libraries("${XCHPLOT2_AMDHIP64}")
+        endif()
         message(STATUS "xchplot2: link_libraries(${XCHPLOT2_AMDHIP64}) — "
                        "AdaptiveCpp HIP backend will find ROCm at runtime")
     else()
@@ -663,7 +669,7 @@ endif()
 # pin. The `if(NOT DEFINED ...)` guard lets a plain edit take effect on
 # reconfigure while still honouring user -D overrides.
 if(NOT DEFINED POS2_CHIP_GIT_TAG)
-    set(POS2_CHIP_GIT_TAG "ff89d3e61f4315311a7f975409a6433e67f699ff")
+    set(POS2_CHIP_GIT_TAG "077c692b51a32cde748e6a8f1ccefe5354c81fa8")
 endif()
 
 if(NOT DEFINED POS2_CHIP_DIR)
@@ -912,6 +918,19 @@ target_include_directories(pos2_gpu PUBLIC
 )
 target_link_libraries(pos2_gpu PUBLIC pos2_chip_headers)
 target_compile_features(pos2_gpu PUBLIC cxx_std_20)
+if(WIN32)
+    find_path(XCHPLOT2_WINDOWS_HIP_INCLUDE hip/hip_runtime_api.h HINTS ENV HIP_PATH PATH_SUFFIXES include)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("#include <dxcore_interface.h>
+        int main() { return int(DXCoreAdapterState::AdapterMemoryUsageBytes); }" XCHPLOT2_DXCORE_MEMORY)
+    if(XCHPLOT2_WINDOWS_HIP_INCLUDE AND XCHPLOT2_DXCORE_MEMORY)
+        target_sources(pos2_gpu PRIVATE src/host/WindowsHipBudget.cpp)
+        # The versioned HIP properties type is used in this host-only source, away from CUDA headers.
+        set_source_files_properties(src/host/WindowsHipBudget.cpp PROPERTIES
+            INCLUDE_DIRECTORIES "${XCHPLOT2_WINDOWS_HIP_INCLUDE}" COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__=1")
+        target_compile_definitions(pos2_gpu PRIVATE XCHPLOT2_WINDOWS_HIP_BUDGET=1)
+    endif()
+endif()
 if(XCHPLOT2_INSTRUMENT_MATCH)
     target_compile_definitions(pos2_gpu PUBLIC XCHPLOT2_INSTRUMENT_MATCH=1)
 endif()
@@ -1184,7 +1203,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
     target_compile_features(xchplot2_group_gpu PRIVATE cxx_std_20)
     target_link_libraries(xchplot2_group_gpu PRIVATE pos2_gpu_host)
     target_compile_definitions(pos2_pr118_grow_worker_host PRIVATE GROW_GPU_BACKEND=1)
-    target_link_libraries(pos2_pr118_grow_worker_host PRIVATE pos2_gpu_host)
+    target_link_libraries(pos2_pr118_grow_worker_host PRIVATE pos2_gpu_host pos2_keygen)
 
     add_library(xchplot2_groups STATIC src/host/GroupPlotter.cpp src/host/ComputeSession.cpp
         $<TARGET_OBJECTS:xchplot2_group_gpu>)

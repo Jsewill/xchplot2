@@ -1,6 +1,8 @@
 // Broker control plane. Bulk results travel directly from worker to owner.
 #pragma once
 #include "host/ComputeNetwork.hpp"
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -9,7 +11,7 @@
 
 namespace group_grow::pool
 {
-inline constexpr uint32_t protocol_version = 6;
+inline constexpr uint32_t protocol_version = 8;
 inline constexpr size_t max_retry_failures = 16;
 inline constexpr uint32_t max_generation_batch_members = 8;
 inline constexpr size_t max_generation_profiles = 512;
@@ -19,7 +21,8 @@ inline constexpr uint64_t default_codec_task_bytes = uint64_t(64) << 20;
 // A serialized codec window begins with its count. Each chunk then carries
 // ordinal, old membership/blob length and contribution/new-member counts.
 inline constexpr uint32_t codec_window_header_bytes = 4, codec_chunk_header_bytes = 18;
-enum class FailureCode : uint8_t { UnsupportedResources = 1 };
+enum class FailureCode : uint8_t { UnsupportedResources = 1, RefusedBeforeBegin };
+class CapacityReserved : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedResources : public std::runtime_error
 {
 public:
@@ -29,6 +32,11 @@ class StaleOwnerSession : public std::runtime_error
 {
 public:
     using std::runtime_error::runtime_error;
+};
+class BrokerRestarted : public StaleOwnerSession
+{
+public:
+    using StaleOwnerSession::StaleOwnerSession;
 };
 class StaleDelivery : public std::runtime_error
 {
@@ -42,6 +50,7 @@ public:
 };
 enum class Kind : uint8_t { GenerateCpu = 1, GenerateGpu = 2, Pack = 3, GenerateAny = 4 };
 inline constexpr uint32_t capability(Kind kind) { return 1u << uint8_t(kind); }
+enum class GenerationOutput : uint8_t { Packed, Contributions, Fresh };
 struct Resources
 {
     // Generation requests may use zero for the selected worker's configured
@@ -52,6 +61,14 @@ struct Resources
     // profiles refine the selected worker's exact conservative task demand.
     uint64_t host_bytes = 0, gpu_bytes = 0;
     bool operator==(Resources const&) const = default;
+    uint32_t parallel_tasks(Resources const& demand) const
+    {
+        auto const lanes = slots / std::max(1u, demand.slots);
+        auto count = std::min(lanes, cpu_threads / std::max(1u, demand.cpu_threads));
+        if (demand.host_bytes) count = uint32_t(std::min<uint64_t>(count, host_bytes / demand.host_bytes));
+        if (demand.gpu_bytes) count = uint32_t(std::min<uint64_t>(count, gpu_bytes / demand.gpu_bytes));
+        return count;
+    }
 };
 struct GenerationProfile
 {
@@ -64,6 +81,9 @@ struct GenerationProfile
     Resources resources;
     uint64_t member_host_bytes = 0;
     uint32_t max_batch_members = 1;
+    // A worker can retain its V8 pooled-k capability while this generation
+    // profile temporarily requires a streaming tier.
+    bool independent_unavailable = false;
     bool operator==(GenerationProfile const&) const = default;
 };
 struct CodecLimits
@@ -84,6 +104,7 @@ struct WorkerHardware
     uint64_t total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, standing_host_bytes = 0, observed_at_unix_ms = 0;
     bool operator==(WorkerHardware const&) const = default;
 };
+std::string worker_diagnostic(std::string);
 void write_worker_hardware(Writer&, WorkerHardware const&);
 WorkerHardware read_worker_hardware(Reader&);
 struct WorkerOffer
@@ -101,6 +122,8 @@ struct WorkerOffer
     CodecLimits codec_limits;
     WorkerAdmission admission = WorkerAdmission::Accepting;
     WorkerHardware hardware;
+    uint32_t independent_k_mask = 0;
+    std::string gpu_recovery; // bounded authenticated device-loss diagnostic, optional on V8
 };
 struct Task
 {
@@ -116,6 +139,10 @@ struct Task
     // Generation tasks leave both zero. Retries preserve these fields.
     uint32_t chunk_count = 0;
     uint64_t max_output_bytes = 0;
+    GenerationOutput generation_output = GenerationOutput::Packed;
+    // Independently framed members share one generation slot and reuse its
+    // singleton working set. This output contract is bound to the lease.
+    bool independent_members = false;
     bool operator==(Task const&) const = default;
 };
 struct OwnerSession
@@ -141,9 +168,17 @@ struct CapacityUpdate
     Resources capacity;
     uint64_t revision = 0;
     std::optional<std::vector<GenerationProfile>> generation_profiles = {};
+    // A full worker snapshot can omit the profiles once this broker has
+    // acknowledged the same revision for this worker instance.
+    CapacityUpdate for_broker(uint64_t registered_revision) const
+    {
+        if (revision == registered_revision) return {capacity, revision, {}};
+        return *this;
+    }
 };
 struct DeliveryObservation
 {
+    // Owner time from worker selection to validated delivery.
     uint64_t elapsed_ns = 0, input_bytes = 0, output_bytes = 0;
 };
 void write_lease(Writer&, Lease const&);
@@ -183,6 +218,7 @@ struct BrokerWorkerStatus
     WorkerAdmission admission = WorkerAdmission::Accepting;
     uint64_t seen_ms = 0;
     WorkerHardware hardware;
+    std::string gpu_recovery;
 };
 struct BrokerOwnerStatus
 {
@@ -212,6 +248,46 @@ struct BrokerStatusPage
     std::vector<BrokerOwnerStatus> owner_records;
     std::vector<BrokerJobStatus> job_records;
 };
+// Eligible singleton generation routes for this owner request. CPU and GPU
+// figures on the same worker draw from the same partition. Like a capacity
+// hint, this snapshot does not reserve any worker or change its admission.
+struct GenerationRoute
+{
+    std::string identity, instance;
+    Endpoint endpoint;
+    std::string host, gpu_identity;
+    uint32_t cpu_slots = 0, gpu_slots = 0;
+    bool operator==(GenerationRoute const&) const = default;
+};
+struct PublicationRoute
+{
+    std::string identity, instance;
+    Endpoint endpoint;
+    Kind kind = Kind::GenerateAny;
+    Resources resources;
+};
+struct GenerationRoster
+{
+    // At most one ordinary status page. Aggregate slot counts still cover
+    // the whole registry when additional rows do not fit this observation.
+    std::vector<GenerationRoute> routes;
+    bool complete = true;
+    struct RecoveringGpu
+    {
+        std::string host, cause;
+        bool operator==(RecoveringGpu const&) const = default;
+    };
+    std::vector<RecoveringGpu> recovering_gpus;
+    bool operator==(GenerationRoster const&) const = default;
+};
+struct GenerationAdmission
+{
+    uint32_t registered = 0, eligible = 0, available_slots = 0, other_owner_tasks = 0;
+    // Registered workers unable to start this singleton at observation time.
+    // The broker can still defer an available slot for another owner or grant.
+    std::array<uint32_t, size_t(WaitReason::SlotReserved) + 1> waiting{};
+    bool operator==(GenerationAdmission const&) const = default;
+};
 // Bounded persistent TLS channels, shared by copies and per-task deadlines.
 // A channel has one request in flight. A failed request is never replayed.
 // Control frames use a fixed 65536-byte bound independent of bulk-data frames.
@@ -222,6 +298,9 @@ struct BrokerStatusPage
 // increasing sequences. Retry keeps task_id/sequence/body and raises attempt.
 // Queued tasks expire after a lease interval without a matching acquire poll;
 // a later retry needs a newer attempt, as for an expired grant.
+// For deadline-bound codec and generation requests, supporting
+// brokers also expire queued and unclaimed work at the start deadline.
+// Running work follows the usual lease.
 class BrokerClient
 {
 public:
@@ -238,32 +317,58 @@ public:
     void disconnect_idle();
     OwnerSession open_owner(std::string const& owner_id, bool ephemeral = false);
     void close_owner(OwnerSession const&);
-    std::optional<Lease> acquire(OwnerSession const&, Task const&);
+    std::optional<Lease> acquire(OwnerSession const&, Task const&,
+        std::chrono::steady_clock::time_point other_work_until = {});
     // Largest supported batch against each offer's total dynamic capacity,
     // independent of active leases. Advisory only; acquire still queues fairly.
-    uint32_t generation_hint(OwnerSession const&, Task const&);
+    using GenerationPaths = std::vector<std::pair<std::string, std::string>>;
+    bool generation_paths(OwnerSession const&, GenerationPaths const&);
+    std::optional<std::pair<std::string, Kind>> finite_packed_route(OwnerSession const&, Task const&);
+    std::optional<PublicationRoute> publication_route(OwnerSession const&, Task const&);
+    struct GenerationAvailability
+    {
+        // Common width for planning, or the largest eligible width when
+        // checking a task that already requests independent members.
+        uint32_t independent_batch = 0;
+        bool codec_available = true, concurrent_codec = true;
+        // Total eligible slots for an independent request of each width.
+        std::array<uint32_t, max_generation_batch_members + 1> independent_slots{};
+        std::optional<GenerationAdmission> admission;
+        unsigned independent_width(unsigned limit) const
+        {
+            if (limit > max_generation_batch_members) limit = max_generation_batch_members;
+            while (limit && !independent_slots[limit]) --limit;
+            return limit;
+        }
+    };
+    uint32_t generation_hint(OwnerSession const&, Task const&, uint32_t* slots = nullptr,
+        GenerationAvailability* availability = nullptr, std::string const& codec = {},
+        std::shared_ptr<GenerationRoster const>* roster = nullptr);
     void cancel(OwnerSession const&, std::string const& task_id, uint64_t attempt);
     // Only the worker renews Running work; unused grants have a fixed TTL.
     void renew(Lease const&);
     // The authenticated broker epoch selects the correct authority when one
     // executor accepts work from several independent brokers.
     std::string register_worker(WorkerOffer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
+    // On a newly observed broker route, retain the endpoint that this worker
+    // instance already advertises to that authority. Returns it in the offer.
+    std::string register_worker_route(WorkerOffer&, std::string* peer_identity, std::string* peer_node_id);
     void unregister_worker(std::string const& instance);
     // Graceful rotation never releases granted or accepted work. False keeps
     // this authority and its transport reservation until the leases finish.
     bool retire_worker(std::string const& instance);
     // Refresh only a matching live instance/revision. A false response needs
     // full registration; it never revives an expired or replaced process.
-    bool heartbeat(std::string const& instance, uint64_t capacity_revision);
+    bool heartbeat(std::string const& instance, uint64_t capacity_revision, std::optional<WorkerAdmission> admission = {});
     void worker_admission(std::string const& instance, WorkerAdmission);
     BrokerStatusPage status(StatusRequest const& = {});
     // Worker calls begin before admitting work and compares the direct TLS
     // owner's certificate identity. Only that worker can finish running work.
-    bool begin(Lease const&, std::string const& direct_owner_identity);
+    bool begin(Lease const&, std::string const& direct_owner_identity, bool* awaiting_admission = nullptr);
     void finish(Lease const&, std::optional<CapacityUpdate> const& update = {});
     // Owner reports successful receipt and validation, independently of local
     // durable plot commit. Failure to report must not discard accepted data.
-    void delivered(Lease const&, DeliveryObservation const&);
+    void delivered(Lease const&, DeliveryObservation const&, std::string const& generation_path = {});
     // Worker rejects unsupported admission before starting compute or output.
     // A retry of this logical task skips that concrete worker/backend pair.
     void reject(Lease const&, FailureCode, std::optional<CapacityUpdate> const& update = {});
@@ -273,7 +378,11 @@ public:
     ControlMetrics metrics() const;
     static uint64_t memory_bytes(unsigned channels = control_channel_limit);
 private:
+    std::optional<std::pair<std::string, Endpoint>> register_recovering_gpu(WorkerOffer const&, bool retain_route,
+        std::string* peer_identity, std::string* peer_node_id);
     struct Connections;
+    std::vector<uint8_t> call_profiles(std::span<GenerationProfile const>, std::function<Writer(bool)> const&,
+        std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     std::vector<uint8_t> call(Writer const&, std::string* peer_identity = nullptr, std::string* peer_node_id = nullptr);
     Endpoint endpoint_;
     TlsOptions tls_;

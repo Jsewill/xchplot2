@@ -34,7 +34,9 @@ jobs:
     if: >-
       (github.event_name == 'workflow_dispatch' || vars.GPU_RUNNERS_READY == 'true') &&
       (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cuda-only')
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cuda-only') &&
+      (github.event_name != 'push' || inputs.ref == github.sha ||
+       inputs.ref == github.ref || inputs.ref == github.ref_name)
     runs-on: [self-hosted, linux, x64, '${{ inputs.runner }}']
     timeout-minutes: 360
     env:

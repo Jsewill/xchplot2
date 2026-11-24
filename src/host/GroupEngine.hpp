@@ -2,6 +2,7 @@
 // workspace is part of the destination file and is removed before publication.
 #pragma once
 #include "host/GroupCodec.hpp"
+#include "host/GroupCheckpointPolicy.hpp"
 #include "host/GroupFile.hpp"
 #include "host/GroupPublication.hpp"
 #include "host/GroupConstructionIdentity.hpp"
@@ -13,7 +14,10 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <optional>
+#include <syncstream>
 #ifdef __linux__
 #include <sys/ioctl.h>
 #include <linux/falloc.h>
@@ -79,6 +83,7 @@ struct Config
     uint64_t window_bytes = 16ull * 1024 * 1024;
     uint64_t codec_bytes = 256ull * 1024 * 1024;
     uint64_t checkpoint_bytes = 256ull * 1024 * 1024;
+    bool automatic_checkpoints = false;
     bool io_overlap = true;
     bool release_cache = false;
     bool private_output = false;
@@ -207,6 +212,63 @@ struct Stats
     std::array<PhaseStats, size_t(WorkPhase::count)> phases{};
 };
 
+// The pool receipt and controller records use this same monotonic clock. Keep
+// one record per operation, even when the encoder and writer overlap windows.
+class ConstructionTiming
+{
+public:
+    struct Payload
+    {
+        uint64_t first_chunk, chunks, first_offset, end_offset = 0;
+        uint64_t first_write = 0, last_write = 0, first_hint = 0, hints = 0, hinted_bytes = 0;
+    };
+    static bool enabled()
+    {
+        static bool const value = [] { auto p = std::getenv("POS2GPU_PHASE_TIMING"); return p && p[0] == '1'; }();
+        return value;
+    }
+    static uint64_t now() { return enabled() ? WorkProgress::now() : 0; }
+    explicit ConstructionTiming(Stats const* stats = nullptr) : begin_(now()), stats_(stats)
+    {
+        if (begin_ && stats_)
+            before_ = {.write_ns = stats_->write_ns, .sync_ns = stats_->sync_ns, .codec_ns = stats_->codec_ns,
+                       .decode_ns = stats_->decode_ns, .written_bytes = stats_->written_bytes, .syncs = stats_->syncs};
+    }
+    template<class Path>
+    void finish(char const* phase, PlotGroupId const& group, unsigned collection, Path const& target,
+                size_t first, size_t members, Payload const* payload = nullptr) const noexcept
+    {
+        if (!begin_) return;
+        auto const end = WorkProgress::now();
+        int const saved = errno;
+        try
+        {
+            std::osyncstream out(std::cerr);
+            out << "[grow-construction-timing] phase=" << phase << " group_id=" << group_tools::hex(group.span())
+                << " collection=" << collection << " target=" << std::quoted(file_io::path_text(file_io::native_path(target)))
+                << " first_member=" << first << " members=" << members << " begin_ns=" << begin_ << " end_ns=" << end;
+            if (stats_)
+                out << " codec_ns=" << stats_->codec_ns - before_.codec_ns << " decode_ns=" << stats_->decode_ns - before_.decode_ns
+                    << " write_ns=" << stats_->write_ns - before_.write_ns
+                    << " written_bytes=" << stats_->written_bytes - before_.written_bytes
+                    << " sync_ns=" << stats_->sync_ns - before_.sync_ns << " syncs=" << stats_->syncs - before_.syncs;
+            if (payload)
+                out << " first_chunk=" << payload->first_chunk << " chunks=" << payload->chunks
+                    << " first_offset=" << payload->first_offset << " end_offset=" << payload->end_offset
+                    << " first_write_begin_ns=" << payload->first_write << " last_write_end_ns=" << payload->last_write
+                    << " first_writeback_request_ns=" << payload->first_hint << " writeback_requests=" << payload->hints
+                    << " writeback_requested_bytes=" << payload->hinted_bytes;
+            out << '\n';
+        }
+        catch (...) {}
+        errno = saved;
+    }
+private:
+    uint64_t begin_;
+    Stats const* stats_;
+    PhaseStats before_{};
+};
+
 // These measure time inside storage syscalls, including kernel waits. They do
 // not claim physical device traffic: buffered reads may be served from cache.
 inline uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin)
@@ -295,12 +357,26 @@ public:
     std::optional<Plan> plan_fresh(Members members, MemberBatchHash const* hash = nullptr);
     Result apply(Plan& plan, Members members);
     AppendResult append(Members members, MemberBatchHash const* hash = nullptr, bool reject_window = false);
+    template <typename Receive>
+    std::optional<AppendResult> append_fresh_stream(uint16_t members, uint64_t fragment_bound, Receive&& receive);
     Result resume(Members members, MemberBatchHash const* hash = nullptr);
     void confirm_identity();
     Stats const& stats() const { return stats_; }
     // Set between operations. Backward rewriting reports the first durably
     // consumed chunk after its codec readers have stopped borrowing that tail.
     void consumed(std::function<void(uint64_t)> callback) { consumed_ = std::move(callback); }
+    // Called by the writer after a fresh file has an accepted durable plan and
+    // its first payload has been written. The remaining service is a forecast.
+    void fresh_write(std::function<void(uint64_t, long double)> observe) { fresh_write_ = std::move(observe); }
+    // The farm accounts allocated blocks as well as the logical end of the checkpoint.
+    uint64_t fresh_storage_bytes(uint64_t final_bytes, bool allocated = false) const;
+    uint64_t checkpoint_bytes() const { return config_.checkpoint_bytes; }
+    uint64_t fastest_checkpoint() const { return fastest_checkpoint_; }
+    void seed_checkpoint(uint64_t bytes)
+    {
+        if (config_.automatic_checkpoints && !identity_.pending && !identity_.old_members && bytes)
+            config_.checkpoint_bytes = std::min(bytes, PackingCheckpointHistory::maximum_bytes);
+    }
     unsigned encoding_workers() const { return active_workers_; }
     // The owner calls between operations, after joining any borrowed windows.
     // Workers share codec_bytes; task descriptors retain their own small reserve.
@@ -399,7 +475,7 @@ private:
     Identity identity_;
     int fd_ = -1;
     uint64_t device_ = 0, inode_ = 0;
-    uint64_t record_alignment_ = record_bytes;
+    uint64_t record_alignment_ = record_bytes, fastest_checkpoint_ = 0;
     bool created_ = false, finalizing_ = false;
     bool initialization_orphan_ = false, confirmed_ = false;
     std::vector<uint64_t> old_sizes_;
@@ -420,6 +496,7 @@ private:
     unsigned active_workers_ = 0;
     mutable Stats stats_{};
     std::function<void(uint64_t)> consumed_;
+    std::function<void(uint64_t, long double)> fresh_write_;
     // Only immutable, uniquely identified compact members may reuse this digest.
     // Public apply/resume compare the complete identity sequence every time.
     mutable std::unique_ptr<uint64_t[]> digest_ids_;
@@ -429,9 +506,37 @@ private:
     void read_at(uint64_t offset, std::span<uint8_t> bytes) const;
     std::span<uint8_t const> source_window(uint64_t offset, uint64_t bytes, bool reverse);
     void write_at(uint64_t offset, std::span<uint8_t const> bytes) const;
+    static void copy_blocks(std::span<uint8_t> destination, std::span<EncodedBlock const> blocks)
+    {
+        for (auto const& block : blocks)
+        {
+            require(block.bytes.size() <= destination.size(), "encoded output block size mismatch");
+            std::copy(block.bytes.begin(), block.bytes.end(), destination.begin());
+            destination = destination.subspan(block.bytes.size());
+        }
+        require(destination.empty(), "encoded output block size mismatch");
+    }
     void write_blocks(uint64_t offset, std::span<EncodedBlock const> blocks,
                       uint64_t begin, uint64_t length) const;
     void sync() const;
+    void start_fresh_writeback(uint64_t begin, uint64_t end, ConstructionTiming::Payload* trace = nullptr) const
+    {
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+        // Leave the final partial page writable by the next sequential window.
+        uint64_t const aligned = end - end % record_alignment_;
+        if (config_.io_overlap && aligned > begin)
+        {
+            if (trace && ConstructionTiming::enabled())
+            {
+                if (!trace->hints) trace->first_hint = WorkProgress::now();
+                ++trace->hints; trace->hinted_bytes += aligned - begin;
+            }
+            file_io::start_writeback(fd_, begin, aligned - begin);
+        }
+#else
+        (void)begin; (void)end; (void)trace;
+#endif
+    }
     void release_clean(uint64_t begin, uint64_t end) const;
     uint64_t file_bytes() const;
     void check_path() const;
@@ -439,16 +544,21 @@ private:
                   std::array<uint8_t, 32>* authority = nullptr);
     uint64_t preallocate(uint64_t end, uint64_t minimum);
     void checkpoint(Record& record);
+    void tune_checkpoint(PackingCheckpointHistory& history, uint64_t bytes, uint64_t elapsed,
+                         uint64_t checkpoint_ns, uint64_t remaining);
     uint64_t record_offset(uint64_t storage_bytes, unsigned slot) const;
     void replay(Record& record);
     void rewrite(Plan const& plan, Members members, Record& record);
     Result finish(Plan const& plan);
     Result create(Plan& plan, Members members, Record& record);
     Result apply_prepared(Plan& plan, Members members);
+    bool admit_fresh_space(Plan& plan, uint64_t payload_end);
+    void initialize_prepared(Plan& plan);
+    Result finish_fresh(Plan& plan, Record const& record);
     std::unique_ptr<Window> encode_owned(uint64_t first, uint64_t count, uint64_t source_begin, Members members);
     void retain_planned_window(uint64_t first, uint64_t source_begin, std::span<EncodedBlock const> blocks,
                                std::span<uint64_t const> sizes, std::array<uint8_t, 32> const& digest);
-    void load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const;
+    uint64_t load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const;
     void scan_sizes(Header const& header, uint64_t first, uint64_t count, uint64_t begin,
                     uint64_t end, std::vector<uint64_t>& sizes) const;
     void prepare_members(Members members, uint16_t first);
@@ -869,7 +979,7 @@ inline uint64_t Engine::memory_bytes(uint8_t k, Config const& config, uint16_t b
     if (compact_members == batch_members)
         result = grow_add(result, uint64_t(batch_members) * sizeof(uint64_t));
     result = grow_add(result, ParallelEncoder::memory_bytes(config.workers, !config.cpu_scheduler));
-    return grow_add(result, sizeof(Engine) + sizeof(Record) + sizeof(WindowWorker) + record_bytes * 2);
+    return grow_add(result, sizeof(Engine) + sizeof(Record) + sizeof(WindowWorker) + record_bytes * 2 + PackingCheckpointHistory::memory_bytes());
 }
 
 inline uint64_t Engine::memory_bytes(Members members) const
@@ -885,7 +995,7 @@ inline uint64_t Engine::memory_bytes(Members members) const
     return memory_bytes(uint16_t(members.size()), wide, compact);
 }
 
-inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const
+inline uint64_t Engine::load_index(Header const& header, uint64_t bytes, std::vector<uint64_t>& sizes) const
 {
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(header.k);
     require(header.group_size && header.chunk_index_offset >= sizeof(Header) + header.memo_length &&
@@ -927,6 +1037,7 @@ inline void Engine::load_index(Header const& header, uint64_t bytes, std::vector
     auto const index = canonical.asBytes();
     require(index.size() <= packed.size() && std::equal(index.begin(), index.end(), packed.begin()),
             "group index is not canonical");
+    return index.size();
 }
 
 inline void Engine::discover(bool allow_resume, std::optional<Identity> const& initial,
@@ -1059,10 +1170,7 @@ inline void Engine::discover(bool allow_resume, std::optional<Identity> const& i
         finalizing_ = true;
         return;
     }
-    load_index(header, bytes, old_sizes_);
-    BitWriter index;
-    gsz_encode(old_sizes_, header.group_size, index);
-    uint64_t const canonical_bytes = grow_add(header.chunk_index_offset, index.asBytes().size());
+    uint64_t const canonical_bytes = grow_add(header.chunk_index_offset, load_index(header, bytes, old_sizes_));
     require(canonical_bytes == bytes || allow_resume,
             "group has trailing bytes; --resume may discard an interrupted initialization tail");
     if (canonical_bytes != bytes)
@@ -1148,11 +1256,18 @@ inline void Engine::prepare_members(Members members, uint16_t first)
 }
 inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBatchHash const* hash) const
 {
+    ConstructionTiming timing;
+    auto timed = [&](auto const& value)
+    {
+        timing.finish("append_hash", identity_.header.group_id, identity_.header.meta_group, path_,
+            identity_.old_members, members.size());
+        return value;
+    };
     CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
     bool same = digest_count_ != 0 && digest_count_ == members.size();
     for (size_t i = 0; same && i < members.size(); ++i)
         same = members[i].compact() && members[i].immutable_id() == digest_ids_[i];
-    if (same) return digest_;
+    if (same) return timed(digest_);
     auto remember = [&](std::array<uint8_t, 32> const& digest)
     {
         bool immutable = !members.empty();
@@ -1177,7 +1292,7 @@ inline std::array<uint8_t, 32> Engine::digest_members(Members members, MemberBat
         }
         return digest;
     };
-    return remember(members_digest(identity_.header.k, members, hash, [&] { config_.check_running(); }));
+    return timed(remember(members_digest(identity_.header.k, members, hash, [&] { config_.check_running(); })));
 }
 
 inline std::span<EncodedBlock const> Engine::encode_window(uint64_t first, uint64_t count, uint64_t source_begin,
@@ -1373,9 +1488,7 @@ inline Plan Engine::plan(Members members, MemberBatchHash const* hash)
     }
     require(old_offset == identity_.header.chunk_index_offset, "old payload bounds changed");
     result.header.chunk_index_offset = new_offset;
-    BitWriter index;
-    gsz_encode(result.sizes, result.new_members, index);
-    result.final_bytes = grow_add(new_offset, index.asBytes().size());
+    result.final_bytes = grow_add(new_offset, ChunkIndexSize(result.new_members).bytes(result.sizes));
     uint64_t const needed = std::max(grow_add(new_offset, result.largest_chunk_bytes), identity_.bytes);
     uint64_t const first_record = grow_add(needed,
         needed % record_alignment_ ? record_alignment_ - needed % record_alignment_ : 0);
@@ -1440,42 +1553,68 @@ inline std::optional<Plan> Engine::plan_fresh(Members members, MemberBatchHash c
     result.sizes.resize(size_t(chunks));
     std::vector<FragmentRegion> regions(members.size());
     uint64_t offset = sizeof(Header) + identity_.memo.size();
-    for (uint64_t chunk = 0; chunk < chunks; ++chunk)
+    // Size a window under one shared CPU permit, then yield to other producers and writers.
+    for (uint64_t chunk = 0; chunk < chunks;)
     {
-        config_.check_running();
-        uint64_t incoming = 0;
-        for (size_t member = 0; member < members.size(); ++member)
+        CodecScheduler::Lease compute(config_.cpu_scheduler.get(), 1, [&] { config_.check_running(); });
+        uint64_t const begin = offset;
+        do
         {
-            auto const view = members[member];
-            auto const& boundaries = member_boundaries_[member];
-            regions[member] = view.compact() ? view.region(chunk) : view.region(chunk,
-                boundaries[size_t(chunk)], boundaries[size_t(chunk + 1)] - boundaries[size_t(chunk)]);
-            incoming = grow_add(incoming, regions[member].size());
-        }
-        admit_chunk(ChunkCodec::estimate_work(identity_.header.k, 0, incoming));
-        uint64_t const bound = ChunkCodec::fresh_bound(identity_.header.k, chunk, regions, config_.cpu_scheduler.get());
-        if (bound > config_.window_bytes) return std::nullopt;
-        result.sizes[size_t(chunk)] = bound;
-        result.largest_chunk_bytes = std::max(result.largest_chunk_bytes, bound);
-        offset = grow_add(offset, bound);
+            config_.check_running();
+            uint64_t incoming = 0;
+            for (size_t member = 0; member < members.size(); ++member)
+            {
+                auto const view = members[member];
+                auto const& boundaries = member_boundaries_[member];
+                regions[member] = view.compact() ? view.region(chunk) : view.region(chunk,
+                    boundaries[size_t(chunk)], boundaries[size_t(chunk + 1)] - boundaries[size_t(chunk)]);
+                incoming = grow_add(incoming, regions[member].size());
+            }
+            admit_chunk(ChunkCodec::estimate_work(identity_.header.k, 0, incoming));
+            uint64_t const bound = ChunkCodec::fresh_bound(identity_.header.k, chunk, regions);
+            if (bound > config_.window_bytes) return std::nullopt;
+            result.sizes[size_t(chunk)] = bound;
+            result.largest_chunk_bytes = std::max(result.largest_chunk_bytes, bound);
+            offset = grow_add(offset, bound);
+            ++chunk;
+        } while (chunk < chunks && offset - begin < config_.window_bytes);
     }
+    if (!admit_fresh_space(result, offset)) return std::nullopt;
+    return result;
+}
+
+inline uint64_t Engine::fresh_storage_bytes(uint64_t final_bytes, bool allocated) const
+{
+    auto const rem = final_bytes % record_alignment_;
+    auto const aligned = grow_add(final_bytes, rem ? record_alignment_ - rem : 0);
+    return grow_add(grow_add(aligned, record_alignment_), allocated ? record_alignment_ : record_bytes);
+}
+
+inline bool Engine::admit_fresh_space(Plan& result, uint64_t offset)
+{
+    uint64_t const chunks = old_sizes_.size();
     result.header.chunk_index_offset = offset;
     // Every canonical size code is at most a machine word (check_gsz_size).
     result.final_bytes = grow_add(offset, chunks * sizeof(uint64_t));
-    uint64_t const aligned = grow_add(result.final_bytes, result.final_bytes % record_alignment_ ?
-        record_alignment_ - result.final_bytes % record_alignment_ : 0);
-    result.peak_file_bytes = grow_add(grow_add(aligned, record_alignment_), record_bytes);
+    result.peak_file_bytes = fresh_storage_bytes(result.final_bytes);
     result.minimum_peak_file_bytes = result.peak_file_bytes;
     result.workspace_bytes = result.peak_file_bytes - result.final_bytes;
-    if (result.peak_file_bytes > config_.capacity_bytes) return std::nullopt;
+    if (result.peak_file_bytes > config_.capacity_bytes) return false;
     file_io::Space space{};
     require(file_io::space_fd(fd_, &space) == 0 && space.f_frsize, "cannot inspect fresh allocation headroom");
+    uint64_t const reserve = cow_filesystem_ ? 2 * record_alignment_ : 0;
+    uint64_t const available = std::min<uint64_t>(space.f_bavail, UINT64_MAX / space.f_frsize) * space.f_frsize;
+    if (cow_filesystem_ && config_.automatic_checkpoints)
+    {
+        if (available <= grow_add(result.peak_file_bytes, reserve)) return false;
+        config_.checkpoint_bytes = std::min(config_.checkpoint_bytes, available - result.peak_file_bytes - reserve);
+    }
     uint64_t const needed = grow_add(result.peak_file_bytes,
-        cow_filesystem_ ? grow_add(config_.checkpoint_bytes, grow_add(record_alignment_, record_alignment_)) : 0);
+        cow_filesystem_ ? grow_add(config_.checkpoint_bytes, reserve) : 0);
     uint64_t const blocks = needed / space.f_frsize + (needed % space.f_frsize != 0);
-    if (blocks > space.f_bavail) return std::nullopt;
+    if (blocks > space.f_bavail) return false;
     result.accepted = true;
-    return result;
+    return true;
 }
 
 inline uint64_t Engine::preallocate(uint64_t end, uint64_t minimum)
@@ -1620,6 +1759,14 @@ inline Result Engine::apply_prepared(Plan& plan, Members members)
 {
     config_.check_running();
     PhaseTimer timing(stats_, WorkPhase::encode, config_.progress);
+    initialize_prepared(plan);
+    if (plan.fresh_single_pass) return create(plan, members, *record_);
+    rewrite(plan, members, *record_);
+    return finish(plan);
+}
+
+inline void Engine::initialize_prepared(Plan& plan)
+{
     auto saved = std::make_unique<Record>();
     std::memcpy(saved->magic.data(), "XCHPLOT2GROWv1\0\0\0", saved->magic.size());
     saved->original = identity_.header;
@@ -1689,9 +1836,6 @@ inline Result Engine::apply_prepared(Plan& plan, Members members)
         write_at(offsetof(Header, version), std::span<uint8_t const>(&construction_version, 1));
     sync();
     grow_failpoint("marked");
-    if (plan.fresh_single_pass) return create(plan, members, *record_);
-    rewrite(plan, members, *record_);
-    return finish(plan);
 }
 
 inline std::unique_ptr<Engine::Window> Engine::encode_owned(uint64_t first, uint64_t count,
@@ -1709,9 +1853,34 @@ inline std::unique_ptr<Engine::Window> Engine::encode_owned(uint64_t first, uint
     return window;
 }
 
+inline void Engine::tune_checkpoint(PackingCheckpointHistory& history, uint64_t bytes, uint64_t elapsed,
+                                    uint64_t checkpoint_ns, uint64_t remaining)
+{
+    if (!config_.automatic_checkpoints || !bytes) return;
+    // A deliberate terminal interval can finish a group before its nominal
+    // byte threshold. Its entire durable tail is a valid measured interval.
+    bool const terminal_trial = !remaining && history.trial_bytes && bytes > history.trial_from;
+    history.add({bytes, elapsed, checkpoint_ns, 0, config_.checkpoint_bytes, terminal_trial});
+    if (auto best = history.fastest_completed_interval()) fastest_checkpoint_ = best;
+    if (!remaining) return;
+    uint64_t ceiling = PackingCheckpointHistory::maximum_bytes;
+    if (cow_filesystem_)
+    {
+        file_io::Space space{};
+        if (file_io::space_fd(fd_, &space) || !space.f_frsize) return;
+        auto const available = std::min<uint64_t>(space.f_bavail, UINT64_MAX / space.f_frsize) * space.f_frsize;
+        uint64_t const reserve = 2 * record_alignment_;
+        if (available <= reserve) return;
+        ceiling = std::min(ceiling, available - reserve);
+    }
+    config_.checkpoint_bytes = history.select(config_.checkpoint_bytes, ceiling, remaining, true);
+}
+
 inline Result Engine::create(Plan& plan, Members members, Record& record)
 {
+    ConstructionTiming payload(&stats_);
     uint64_t const chunks = old_sizes_.size();
+    ConstructionTiming::Payload writes{chunks - record.remaining, record.remaining, record.new_frontier};
     uint64_t const payload_bound = record.target.chunk_index_offset;
     // Discover the minimum worker count before any output is borrowed. The
     // count never changes while a previous codec block is being written.
@@ -1719,7 +1888,22 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
     std::future<std::unique_ptr<Window>> pending;
     auto worker = overlap_ ? std::make_unique<WindowWorker>(*this, members) : nullptr;
     auto next = record;
-    uint64_t buffered = 0;
+    PackingCheckpointHistory checkpoint_history;
+    auto interval = std::chrono::steady_clock::now();
+    uint64_t buffered = 0, writeback = record.new_frontier;
+    bool observed_write = false, observed_checkpoint = false;
+    auto const initial_write_ns = stats_.write_ns;
+    auto report_write = [&](uint64_t remaining, uint64_t checkpoint_sync_ns)
+    {
+        file_io::Stat file{};
+        if (file_io::inspect_fd(fd_, &file) || file.st_blocks < 0 || uint64_t(file.st_blocks) > UINT64_MAX / 512) return;
+        auto const measured_write = stats_.write_ns - initial_write_ns;
+        auto const remaining_write = static_cast<long double>(measured_write) * remaining / (writes.chunks - remaining);
+        fresh_write_(std::max(record.storage_bytes, uint64_t(file.st_blocks) * 512), remaining_write + checkpoint_sync_ns);
+    };
+#ifdef _WIN32
+    std::unique_ptr<uint8_t[]> output;
+#endif
     while (next.remaining)
     {
         config_.check_running();
@@ -1744,33 +1928,193 @@ inline Result Engine::create(Plan& plan, Members members, Record& record)
             offset += size;
         }
         uint64_t const length = offset - next.new_frontier, partial = length / 2;
+#ifdef _WIN32
+        // Windows writes and waits on each span. Gather a fresh codec window
+        // into the admitted output buffer before the two midpoint writes.
+        if (window->blocks.size() > 1 && length <= config_.window_bytes)
+        {
+            if (!output) output.reset(new uint8_t[size_t(config_.window_bytes)]);
+            std::span<uint8_t> bytes{output.get(), size_t(length)};
+            copy_blocks(bytes, window->blocks);
+            window->blocks.resize(1);
+            window->blocks.front() = {0, size_t(count), bytes};
+        }
+#endif
+        auto const before_write = stats_.write_ns;
+        if (first == writes.first_chunk) writes.first_write = ConstructionTiming::now();
         write_blocks(next.new_frontier, window->blocks, 0, partial);
         grow_failpoint("direct-target-partial");
         write_blocks(next.new_frontier + partial, window->blocks, partial, length - partial);
+        if (fresh_write_ && !observed_write && length && next.remaining > count && stats_.write_ns > before_write)
+        {
+            observed_write = true;
+            report_write(next.remaining - count, 0);
+        }
+        if (next.remaining == count) writes.last_write = ConstructionTiming::now();
         buffered = grow_add(buffered, offset - next.new_frontier);
         next.new_frontier = offset;
         next.remaining -= count;
         if (buffered >= config_.checkpoint_bytes || !next.remaining)
         {
+            auto const flushing = std::chrono::steady_clock::now();
+            auto const before_sync = stats_.sync_ns;
             sync();
             grow_failpoint("direct-target");
             checkpoint(next);
+            if (fresh_write_ && !observed_checkpoint && next.remaining && stats_.sync_ns > before_sync)
+            {
+                // Buffered writes can complete well before their durable checkpoint. At
+                // least one further payload and record sync remains, even after tuning.
+                observed_checkpoint = true;
+                report_write(next.remaining, stats_.sync_ns - before_sync);
+            }
             release_clean(record.new_frontier, next.new_frontier);
+            auto const cost = elapsed_ns(flushing);
+            tune_checkpoint(checkpoint_history, buffered, elapsed_ns(interval), cost, next.remaining ? payload_bound - next.new_frontier : 0);
+            interval = std::chrono::steady_clock::now();
             record = next;
-            buffered = 0;
+            buffered = 0; writeback = next.new_frontier;
             grow_failpoint("direct-committed");
         }
+        else if (config_.io_overlap && next.new_frontier - writeback >= config_.window_bytes)
+        {
+            // Start writing completed pages while the next chunks are encoded.
+            // Only the data sync and checkpoint above advance the durable frontier.
+            start_fresh_writeback(writeback, next.new_frontier, &writes);
+            writeback = next.new_frontier;
+        }
     }
+    writes.end_offset = next.new_frontier;
+    payload.finish("fresh_payload", identity_.header.group_id, identity_.header.meta_group, path_, 0, members.size(), &writes);
+    return finish_fresh(plan, record);
+}
+
+inline Result Engine::finish_fresh(Plan& plan, Record const& record)
+{
     plan.header.chunk_index_offset = record.new_frontier;
-    {
-        BitWriter index;
-        gsz_encode(plan.sizes, plan.new_members, index);
-        plan.final_bytes = grow_add(plan.header.chunk_index_offset, index.asBytes().size());
-    }
+    plan.final_bytes = grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes));
     require(plan.final_bytes <= record.final_bytes, "fresh index exceeded its admitted bound");
     plan.workspace_bytes = plan.peak_file_bytes - plan.final_bytes;
     grow_failpoint("payload");
     return finish(plan);
+}
+
+// A full worker batch has the same canonical member digest and ordinary
+// forward checkpoint as local creation. Recovery can regenerate it with any
+// compatible producer, including after a partial transfer.
+template <typename Receive>
+inline std::optional<AppendResult> Engine::append_fresh_stream(uint16_t members, uint64_t fragment_bound, Receive&& receive)
+{
+    require(confirmed_ && !identity_.pending && !identity_.old_members && members && fragment_bound,
+        "streamed fresh construction requires a confirmed empty group");
+    config_.check_running(); check_path();
+    Plan plan;
+    plan.header = identity_.header; plan.header.group_size = plan.new_members = members;
+    plan.fresh_single_pass = true; plan.sizes.resize(old_sizes_.size());
+    auto const chunks = plan.sizes.size();
+    require(fragment_bound <= (UINT64_MAX - chunks * 1024) / members / sizeof(uint64_t),
+        "fresh group fragment bound exceeds byte accounting");
+    uint64_t const max_symbols = fragment_bound * members;
+    auto const start = sizeof(Header) + identity_.memo.size();
+    uint64_t ordinal = 0, symbols = 0, offset = start;
+    std::vector<uint8_t> output;
+    std::unique_ptr<ParallelEncoder> validator;
+    std::vector<ChunkInput> tasks;
+    std::vector<ChunkSummary> summaries;
+    size_t const page = size_t(std::max(1L, file_io::page_size()));
+    size_t const write_window = std::max<size_t>(1, config_.window_bytes / page) * page;
+    auto const window_limit = std::min<size_t>(write_window, config_.window_bytes);
+    PackingCheckpointHistory history;
+    std::optional<PhaseTimer> timing;
+    std::optional<ConstructionTiming> payload_timing;
+    ConstructionTiming::Payload writes{0, chunks, start};
+    auto interval = std::chrono::steady_clock::now();
+    auto flush = [&]
+    {
+        if (output.empty()) return;
+        if (offset == start) writes.first_write = ConstructionTiming::now();
+        write_at(offset, output);
+        writes.last_write = ConstructionTiming::now();
+        start_fresh_writeback(offset, offset + output.size(), &writes);
+        offset += output.size(); output.clear();
+    };
+    auto begin = [&](uint64_t payload, uint64_t largest, std::array<uint8_t, 32> const& digest)
+    {
+        config_.check_running();
+        require(!record_ && payload && largest && largest <= payload && payload <= chunks * std::min<uint64_t>(largest, UINT64_MAX / chunks),
+            "invalid fresh group manifest");
+        // The public fragment bound and per-chunk coding overhead cap even a
+        // peer's provisional allocation before any destination file is extended.
+        if (largest > config_.window_bytes || payload > max_symbols * sizeof(uint64_t) + chunks * 1024 ||
+            !admit_fresh_space(plan, grow_add(start, payload))) return false;
+        plan.members_digest = digest; plan.largest_chunk_bytes = largest;
+        auto const work = ChunkCodec::estimate_work(plan.header.k, largest, 0);
+        if (work > config_.codec_bytes) return false;
+        unsigned const lanes = unsigned(std::min<uint64_t>(config_.workers, config_.codec_bytes / work));
+        validator = std::make_unique<ParallelEncoder>(plan.header.k, lanes, config_.codec_bytes, config_.cpu_scheduler);
+        output.reserve(size_t(config_.window_bytes));
+        timing.emplace(stats_, WorkPhase::encode, config_.progress);
+        payload_timing.emplace(&stats_);
+        initialize_prepared(plan);
+        interval = std::chrono::steady_clock::now();
+        return true;
+    };
+    auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> batch)
+    {
+        config_.check_running();
+        require(record_ && first == ordinal && !batch.empty() && batch.size() <= chunks - ordinal,
+            "fresh group chunks must arrive once in order");
+        require(batch.size() <= fresh_group_window_chunks, "fresh group receive window exceeds admission");
+        tasks.resize(batch.size()); summaries.resize(batch.size());
+        uint64_t available = plan.header.chunk_index_offset - offset - output.size();
+        for (size_t i = 0; i < batch.size(); ++i)
+        {
+            auto bytes = batch[i];
+            require(bytes.size() > 1 && bytes.size() <= plan.largest_chunk_bytes && bytes.size() <= available,
+                    "fresh group chunk exceeds manifest");
+            available -= bytes.size(); tasks[i] = {first + i, bytes, members, {}};
+        }
+        auto const validating = std::chrono::steady_clock::now();
+        validator->summarize(tasks, summaries); stats_.decode_ns += elapsed_ns(validating);
+        for (size_t i = 0; i < batch.size(); ++i)
+        {
+            symbols = grow_add(symbols, summaries[i].symbols);
+            require(symbols <= max_symbols, "fresh group exceeds admitted fragment count");
+            auto bytes = batch[i]; plan.sizes[ordinal++] = bytes.size();
+            while (!bytes.empty())
+            {
+                auto const room = window_limit - offset % window_limit - output.size();
+                auto part = bytes.first(std::min<size_t>(bytes.size(), room));
+                output.insert(output.end(), part.begin(), part.end()); bytes = bytes.subspan(part.size());
+                if (part.size() == room) flush();
+            }
+        }
+        auto const buffered = offset + output.size() - record_->new_frontier;
+        if (buffered >= config_.checkpoint_bytes || ordinal == chunks)
+        {
+            auto const flushing = std::chrono::steady_clock::now();
+            flush(); sync(); grow_failpoint("direct-target");
+            auto next = *record_; next.new_frontier = offset; next.remaining = chunks - ordinal;
+            // Keep at least the last window replayable until the authenticated
+            // task End has confirmed complete delivery.
+            if (next.remaining)
+            {
+                checkpoint(next); release_clean(record_->new_frontier, offset); *record_ = next;
+                grow_failpoint("direct-committed");
+            }
+            auto const cost = elapsed_ns(flushing);
+            tune_checkpoint(history, buffered, elapsed_ns(interval), cost, next.remaining ? plan.header.chunk_index_offset - offset : 0);
+            interval = std::chrono::steady_clock::now();
+        }
+    };
+    receive(begin, window);
+    if (!record_) return std::nullopt;
+    require(ordinal == chunks && output.empty(), "fresh group stream is incomplete");
+    auto next = *record_; next.remaining = 0; next.new_frontier = offset;
+    checkpoint(next); release_clean(record_->new_frontier, offset); *record_ = next;
+    writes.end_offset = offset;
+    payload_timing->finish("fresh_stream_payload", identity_.header.group_id, identity_.header.meta_group, path_, 0, members, &writes);
+    return AppendResult{true, true, plan.final_bytes, plan.peak_file_bytes, {}, finish_fresh(plan, *record_)};
 }
 
 inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
@@ -1834,25 +2178,25 @@ inline void Engine::rewrite(Plan const& plan, Members members, Record& record)
             flush_output();
         if (!output) output.reset(new uint8_t[size_t(config_.window_bytes)]);
         auto* destination = output.get() + size_t(config_.window_bytes - output_bytes - length);
-        uint64_t copied = 0;
-        for (auto const& block : blocks)
-        {
-            require(block.bytes.size() <= length - copied, "encoded output block size mismatch");
-            std::memcpy(destination + size_t(copied), block.bytes.data(), block.bytes.size());
-            copied += block.bytes.size();
-        }
-        require(copied == length, "encoded output block size mismatch");
+        copy_blocks({destination, size_t(length)}, blocks);
         output_begin = offset; output_bytes += length;
     };
+    PackingCheckpointHistory checkpoint_history;
+    auto interval = std::chrono::steady_clock::now();
     auto commit_direct = [&]
     {
         if (!buffered) return;
+        auto const flushing = std::chrono::steady_clock::now();
         flush_output();
         sync();
         grow_failpoint("direct-target");
         checkpoint(record);
         release_clean(record.old_frontier, durable.old_frontier);
         release_clean(record.new_frontier, durable.new_frontier);
+        auto const cost = elapsed_ns(flushing);
+        tune_checkpoint(checkpoint_history, buffered, elapsed_ns(interval), cost,
+            record.new_frontier - (sizeof(Header) + identity_.memo.size()));
+        interval = std::chrono::steady_clock::now();
         durable = record;
         if (consumed_) consumed_(record.remaining);
         buffered = 0;
@@ -2082,9 +2426,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
         encoder_.reset();
         scan_sizes(plan.header, 0, plan.sizes.size(), sizeof(Header) + identity_.memo.size(),
                    plan.header.chunk_index_offset, plan.sizes);
-        BitWriter index;
-        gsz_encode(plan.sizes, plan.new_members, index);
-        plan.final_bytes = grow_add(plan.header.chunk_index_offset, index.asBytes().size());
+        plan.final_bytes = grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes));
         plan.peak_file_bytes = file_bytes();
         plan.workspace_bytes = plan.peak_file_bytes > plan.final_bytes ? plan.peak_file_bytes - plan.final_bytes : 0;
         require(plan.final_bytes <= file_bytes(), "payload-complete file is shorter than its canonical index");
@@ -2160,9 +2502,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
     }
     require(old_offset == record.old_frontier && new_offset == record.new_frontier,
             "regenerated batch does not reproduce saved frontier");
-    BitWriter index;
-    gsz_encode(plan.sizes, plan.new_members, index);
-    require(grow_add(plan.header.chunk_index_offset, index.asBytes().size()) == plan.final_bytes,
+    require(grow_add(plan.header.chunk_index_offset, ChunkIndexSize(plan.new_members).bytes(plan.sizes)) == plan.final_bytes,
             "reconstructed index length differs from exact plan");
     }
     // Redo replay uses the source-window reservation for its copy buffer.
@@ -2174,6 +2514,7 @@ inline Result Engine::resume(Members members, MemberBatchHash const* hash)
 
 inline Result Engine::finish(Plan const& plan)
 {
+    ConstructionTiming commit(&stats_);
     config_.check_running();
     check_path();
     Header marker = plan.header;
@@ -2217,6 +2558,7 @@ inline Result Engine::finish(Plan const& plan)
     uint8_t const version = PlotGroupFile::FORMAT_VERSION;
     write_at(offsetof(Header, version), {&version, 1});
     sync();
+    commit.finish("file_commit", plan.header.group_id, plan.header.meta_group, path_, 0, plan.new_members);
     grow_failpoint("published");
     identity_.header = plan.header;
     identity_.bytes = plan.final_bytes;

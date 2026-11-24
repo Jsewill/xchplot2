@@ -68,7 +68,7 @@ std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
 std::string plot_to_file(GpuPlotOptions const& options, std::string const&)
 { last_test_options = options; return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
-size_t batch_worker_count(BatchOptions const&, int) { return 1; }
+size_t batch_worker_count(BatchOptions const&, int, int) { return 1; }
 BatchResult run_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts)
 {
     ++batch_calls; last_options = opts; last_entries = entries;
@@ -117,6 +117,8 @@ int run_compute_membership(int argc, char** argv)
 int run_compute_status(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
 int run_compute_service(int argc, char** argv)
+{ last_compute.assign(argv, argv + argc); return 0; }
+int run_compute_firewall(int argc, char** argv)
 { last_compute.assign(argv, argv + argc); return 0; }
 #endif
 VerifyResult verify_plot_file(std::string const&, size_t trials, bool full)
@@ -224,7 +226,7 @@ int main(int argc, char** argv)
         assert(cli({"verify", "unused.gplot", "--config", config.string(), "-n", value}) == 1);
         for (auto const* option : {"--k", "--num", "--strength", "--warmup"})
             assert(cli({"bench", "--config", config.string(), option, value}) == 1);
-        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--meta-group", "--pipeline-depth"})
+        for (auto const* option : {"--k", "--num", "--strength", "--plot-index", "--collection", "--meta-group", "--pipeline-depth"})
             assert(cli({"plot", "--config", config.string(), option, value}) == 1);
         assert(cli({"batch", manifest.string(), "--config", config.string(), "--pipeline-depth", value}) == 1);
         assert(cli({"test", value, std::string(64, 'a'), "--config", config.string()}) == 1);
@@ -491,7 +493,7 @@ int main(int argc, char** argv)
     auto const seeded_entries = last_entries;
     seeded.push_back("--resume");
     assert(capture(seeded).first == 0 && last_entries == seeded_entries);
-    // A fixed seed shares group keys across meta groups, but their files and
+    // A fixed seed shares group keys across collections, but their files and
     // default job manifests must remain distinct.
     auto seeded_meta = args;
     seeded_meta.insert(seeded_meta.end(), {"--seed", std::string(64, 'd')});
@@ -504,6 +506,10 @@ int main(int argc, char** argv)
         assert(last_entries[i].plot_id != meta_zero[i].plot_id);
         assert(last_entries[i].out_name != meta_zero[i].out_name);
     }
+    auto const collection_entries = last_entries;
+    seeded_meta[seeded_meta.size() - 2] = "--collection";
+    seeded_meta.push_back("--resume");
+    assert(capture(seeded_meta).first == 0 && last_entries == collection_entries);
     // Grouped jobs retain membership in durable manifests, including one-member
     // jobs, so an old batch runner cannot silently treat them as ordinary jobs.
     auto grouped_entry = entry; grouped_entry.grouped = true; grouped_entry.group_members = 7;
@@ -542,6 +548,7 @@ int main(int argc, char** argv)
     assert(fill_help.find("--discover-drives") != std::string::npos && fill_help.find("--leave-free") != std::string::npos);
     auto const [fill_all_code, fill_all] = capture({"fill", "--config", config.string(), "--help-all"});
     assert(fill_all_code == 0 && fill_all.find("--paths-from") != std::string::npos && fill_all.size() > fill_help.size());
+    assert(fill_help.find("--collection") != std::string::npos && fill_all.find("--collection") != std::string::npos);
     auto const [grow_help_code, grow_help] = capture({"grow", "--config", config.string(), "--help"});
     assert(grow_help_code == 0 && grow_help.find("always enabled") != std::string::npos);
     assert(grow_help.find("--paths-from") == std::string::npos && grow_help.find("--manifest") == std::string::npos);
@@ -556,7 +563,9 @@ int main(int argc, char** argv)
     assert(last_group_options.destination_temp == "off" && last_group_options.destination_temp_set);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--destination-temp", "on"}) == 0);
     assert(last_group_options.destination_temp == "on" && last_group_options.destination_temp_set);
-    put(config, "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=\"" + dir.string() + "\"\n");
+    std::ostringstream fill_config;
+    fill_config << "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=" << std::quoted(dir.string()) << '\n';
+    put(config, fill_config.str());
     assert(cli({"fill", dir.string(), "--config", config.string()}) == 0);
     assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set &&
         last_group_options.temporary == std::vector<std::filesystem::path>{dir});
@@ -629,6 +638,26 @@ int main(int argc, char** argv)
     }
     assert(cli({"plan", "--config", config.string(), "--replot", "--discover-farm"}) == 0);
     assert(last_group_options.replot && last_group_options.plan_only && last_group_options.discover_farm && last_group_options.target.empty());
+    for (auto const* command : {"plan", "fill"}) {
+        for (bool enabled : {false, true}) {
+            auto const value = enabled ? "true" : "false";
+            put(config, std::string("[defaults]\nreplot=") + value + "\ndiscover-farm=" + value +
+                "\n[" + command + "]\nplan-only=true\n");
+            assert(cli({command, dir.string(), "--config", config.string()}) == 0);
+            assert(last_group_options.replot == enabled && last_group_options.discover_farm == enabled);
+            assert(last_group_options.discover_farm_set && last_group_options.target == dir &&
+                last_group_options.destinations.empty());
+            assert(cli({command, dir.string(), "--config", config.string(),
+                enabled ? "--no-replot" : "--replot", enabled ? "--no-discover-farm" : "--discover-farm"}) == 0);
+            assert(last_group_options.replot != enabled && last_group_options.discover_farm != enabled &&
+                last_group_options.destinations.empty());
+        }
+        put(config, std::string("[defaults]\nreplot=true\ndiscover-farm=true\n[") + command +
+            "]\nplan-only=true\nreplot=false\ndiscover-farm=false\n");
+        assert(cli({command, dir.string(), "--config", config.string()}) == 0);
+        assert(!last_group_options.replot && !last_group_options.discover_farm && last_group_options.destinations.empty());
+    }
+    put(config, "[fill]\nplan-only=true\njson=true\nmax-host-ram=\"512M\"\n");
     for (auto const* option : {"--temp-dirs", "--farm-config", "--exclude-destination"})
         assert(cli({"fill", dir.string(), "--config", config.string(), option, "--json"}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--replot-confirmation", "directory"}) != 0);
@@ -651,6 +680,15 @@ int main(int argc, char** argv)
     assert(cli({"plan", "--config", config.string(), "--paths-from", paths_file.string()}) != 0);
     auto const previous_directory = std::filesystem::current_path();
     std::filesystem::current_path(dir);
+    for (auto const* command : {"plan", "fill"}) {
+        assert(cli({command, "--config", config.string(), "plots-bytes"}) == 0);
+        assert(last_group_options.target == dir / "plots-bytes" && last_group_options.destinations.empty());
+        assert(cli({command, "--config", config.string(), (dir / "plots-bytes").string(), "second-bytes",
+            "--headroom-bytes", "32M"}) == 0);
+        assert(last_group_options.target == dir / "plots-bytes" &&
+            last_group_options.destinations == std::vector{dir / "second-bytes"});
+        assert(last_group_options.headroom_set && last_group_options.headroom == 32ull * 1024 * 1024);
+    }
     assert(cli({"plan", "--config", config.string(), "--temp-dirs", "@scratch", "another scratch-bytes",
                 "--exclude-destination", "@excluded", "--", "@destination"}) == 0);
     assert(last_group_options.target == dir / "@destination" &&
@@ -701,7 +739,7 @@ int main(int argc, char** argv)
     assert(cli({"plan", "--config", config.string(), other.string(), "--group-members", "auto"}) == 0);
     assert(last_group_options.group_auto && last_group_options.group_members_set && !last_group_options.group_members);
     assert(cli({"plan", "--config", config.string(), other.string()}) == 0 && !last_group_options.group_members_set);
-    assert(cli({"plan", "--config", config.string(), other.string(), "-k", "18", "-s", "3", "--meta-group", "7"}) == 0);
+    assert(cli({"plan", "--config", config.string(), other.string(), "-k", "18", "-s", "3", "--collection", "7"}) == 0);
     assert(last_group_options.k_set && last_group_options.strength_set && last_group_options.meta_set);
     assert(cli({"plan", "--config", config.string(), other.string()}) == 0);
     assert(!last_group_options.k_set && !last_group_options.strength_set && !last_group_options.meta_set);
@@ -806,6 +844,16 @@ int main(int argc, char** argv)
     assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
+    auto const forwarded = dir / "forwarded harvester.log", second = other / "reader.log";
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only",
+        "--harvester-log", dir.string(), forwarded.string(), "--harvester-log", other.string(), second.string()}) == 0);
+    assert(last_group_options.harvester_logs == (decltype(last_group_options.harvester_logs){{dir, forwarded}, {other, second}}) &&
+        !last_group_options.farming_profile);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.harvester_logs.size() == 1);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--plan-only", "--harvester", "local",
+        "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.farming_detect_local && last_group_options.harvester_logs.size() == 1);
     auto const argfile = dir / "group.args";
     put(argfile, "--group-members 3\n--max-host-ram 768M\n");
     assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);

@@ -139,6 +139,7 @@ void compute_settings_tests()
     for (auto const& [key, value] : std::vector<std::pair<std::string, std::string>>{
         {"--compute-directory", path}, {"--compute-local", "off"}, {"--compute-broker", "[::1]:18444"},
         {"--compute-owner-id", "farm owner"}, {"--compute-codec-ram", "0"}, {"--compute-inflight", "2"},
+        {"--compute-output", "packed"}, {"--compute-writers", "3"},
         {"--compute-timeout-ms", "120000"}, {"--compute-socket-timeout-ms", "2000"}, {"--compute-frame-bytes", "65536"}})
         check(set_group_compute_setting(original, key, value), "compute option was not captured");
     std::ostringstream saved; saved << "{\"compute_settings\":"; write_group_compute_settings(saved, original); saved << '}';
@@ -146,6 +147,7 @@ void compute_settings_tests()
     GroupOptions resumed;
     check(apply_group_compute_settings(resumed, document) && resumed.pool_directory == path && !resumed.automatic_local_compute &&
         resumed.pool_broker == "[::1]:18444" && resumed.pool_owner == "farm owner" && resumed.pool_owner_explicit &&
+        resumed.pool_output == "packed" && resumed.pool_writers == 3 &&
         !resumed.pool_codec_auto && !resumed.pool_codec_ram && resumed.pool_inflight == 2 && resumed.pool_frame_bytes == 65536 &&
         resumed.pool_timeout_ms == 120000 && resumed.pool_socket_timeout_ms == 2000,
         "local profile continuation lost compute selection");
@@ -205,6 +207,19 @@ void calibration_scope_tests()
     auto mismatch = scoped; mismatch.config.k = 28;
     rejects([&] { std::ostringstream text; write_farming_profile_json(text, mismatch); },
         "calibrated profile was re-exported with mismatched target parameters");
+    auto ranged = profile("{\"reader_calibration\":true,\"sampled_members\":{\"min\":3,\"max\":7},\"farming_profile\":" + out.str() + '}');
+    check(ranged.reader_calibration->coverage(1, 3) == "extrapolated" &&
+        ranged.reader_calibration->coverage(4, 7) == "within-sampled-range" &&
+        ranged.reader_calibration->coverage(7, 8) == "extrapolated" &&
+        copied.reader_calibration->coverage(4, 4) == "unknown-sampled-range",
+        "legacy report membership was discarded or standalone legacy range was invented");
+    std::ostringstream extended; write_farming_profile_json(extended, ranged);
+    check(extended.str().find("\"schema_version\":3") != std::string::npos &&
+        profile(extended.str()).reader_calibration == ranged.reader_calibration, "scoped membership did not survive profile export");
+    rejects([&] { profile("{\"reader_calibration\":true,\"sampled_members\":{\"min\":4,\"max\":7},\"farming_profile\":" + extended.str() + '}'); },
+        "conflicting report/profile membership range was accepted");
+    ranged.reader_calibration->sampled_min_members = 8;
+    rejects([&] { std::ostringstream invalid; write_farming_profile_json(invalid, ranged); }, "inverted calibration membership range was exported");
 }
 void config_tests()
 {

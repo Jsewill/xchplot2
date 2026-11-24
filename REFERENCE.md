@@ -36,12 +36,12 @@ xchplot2 plot -k 28 -n 10 \
 | `-j`, `--workers N` | Shared plotting CPU budget for grouped construction |
 | `-r`, `--resume` | Recover the saved job and skip validated completed files |
 | `-i`, `--plot-index N` | Member index; must be 0 for single-member groups |
-| `-g`, `--meta-group N` | Meta-group field; default 0 |
+| `-g`, `--collection N` | Collection number (default 0). Also accepts `--meta-group`. |
 | `-S`, `--seed HEX` | Optional 64 hex characters for reproducible identities |
 | `-v`, `--verbose` | Print additional worker and plotting details |
 
 Supply the farmer key and one of the pool key, puzzle hash, or contract
-address forms. See [plot indices and meta groups](#plot-indices-and-meta-groups)
+address forms. See [plot indices and collections](#plot-indices-and-collections)
 for the grouping distinction. Full help: `xchplot2 --help`.
 Only k28 is valid for farming. Smaller sizes exercise construction, recovery
 and proof validation in tests; their output is not farmable.
@@ -97,6 +97,84 @@ stderr is redirected it prints one line per plot and defaults to off.
 plots-based (average s/plot × remaining), formatted as
 hours/minutes/seconds when the estimate exceeds one hour.
 
+`--tui` opens a terminal dashboard for `plot`, `batch`, `grow` and `fill`.
+For a directory fill, run `xchplot2 status DIR --tui` in another terminal
+to attach to an active local owner, even if the fill started with
+`--no-progress`. When the owner is remote or offline, status shows saved
+drive observations. Add `--live` to request bounded service and compute
+checks from status. `plan DIR --tui` lets you inspect the proposed layout.
+
+Press `1` through `5` or Tab to switch between Overview, Resources, Workers,
+Decisions and Farm. Use the arrow keys to select a row and Enter to see its
+details. Press `/` to filter the current view by name or detail, then Enter
+to apply the filter. An empty filter shows all rows. Press `a` for the
+commands to add a helper during a fill and `?` for keyboard help. In a
+foreground fill, `q` returns to ordinary progress and Ctrl-C requests a
+cooperative stop. In an attached view either key closes the observer.
+Output paths and JSON still go to stdout. Redirected stderr and terminals
+with `TERM=dumb` use ordinary output. Use `--no-tui` to select it explicitly.
+
+For grouped jobs, Overview divides the time since this invocation started
+by the number of newly published members. The rate includes time spent
+waiting between publications. Members already visible at a final output
+name when the job opens are inherited. Work recovered from a private
+construction file counts when its output becomes visible. The recent rate
+and remaining-time estimates use observed publication intervals. For an open
+fill, Overview shows the remaining destination allowance. The final construction
+JSON includes `new_durable_members`, `inherited_members`,
+`first_new_publication_seconds`, `last_new_publication_seconds`
+and `seconds_per_new_durable_member`. Those publication times are null until
+new work reaches publication. Each construction summary also reports
+`elapsed_seconds` from command start to that report and
+`elapsed_seconds_per_new_durable_member`, which is null for an inherited-only
+run. The final text summary includes shutdown of the invocation's compute
+session. The construction reason and the RAM and scratch forecasts describe
+the last construction choice.
+
+Resources shows owner CPU and resident memory. On Linux it also samples
+physical disks and interfaces and reads GPU activity where the driver
+exposes it. Disk details include the controller's measured bulk service and
+estimated available bandwidth when sampled. Identified PCI storage controllers
+show the combined traffic through the selected disks and their negotiated
+PCIe link. Disk and network rates include other traffic on the same devices.
+[Linux block I/O counters](https://docs.kernel.org/admin-guide/iostats.html)
+
+Workers shows registrations, free and eligible slots, admission waits and
+deliveries validated by the owner. Select a delivery to see its size, worker
+time, send time and owner receive time. These intervals can overlap. Farm
+shows the selected harvester's recent completed lookup times when its log
+is available, including eligible and zero-eligible challenges. A quiet
+window leaves lookup latency unknown.
+
+With `--harvester local`, an ordinary fill can use fresh completions from
+the selected local reader to reduce new HDD work when lookups approach the
+configured deadline. This operates with the dashboard open or closed.
+The Farm view shows when normal disk concurrency is available and when the
+controller is limiting I/O.
+
+When another host farms a disk shared with the fill owner, forward that
+reader's Chia log to a regular file readable on the owner. Bind it to the
+affected fill destination with `--harvester-log DIR FILE`. Repeat the option
+for each destination and reader. Each file must contain one reader's
+messages with timestamps in the owner's local time. The Farm view shows a
+separate 30-second lookup window for each file. A slow reader can defer
+new work on its bound destinations and pace external-construction HDD I/O
+on those filesystems and their known physical aliases.
+Independent readers can continue work on separate drives. Known SSD
+transfers keep their ordinary concurrency.
+
+Combine these bindings with `--harvester local` when the owner also farms.
+The local reader covers fill storage that shares a filesystem or physical
+drive with an accessible plot directory in its Chia configuration. An
+explicit binding can also name its configured log. The owner skips records
+already present at startup or rotation. A quiet or missing log leaves lookup
+pressure unknown. `--harvester PROFILE` supplies planning inputs.
+Use the same bindings for `plan`, `fill --plan-only` and execution, including
+when resuming a job. The fill command printed after saving a plan includes
+the forwarded log bindings. A preview checks the destination declarations
+without opening the logs. If a bound HDD goes offline, other available
+destinations can continue.
+
 Quiet mode suppresses automatic progress and plotting summaries. Explicit
 `--progress` still enables progress; `--no-progress` does not disable verbose
 details. `plot` writes each absolute output path to stdout after that
@@ -115,8 +193,9 @@ Grouped construction keeps its resumable output at `<name>.gplot.partial`
 until the whole group is complete, then renames it without replacing an
 occupied final path. `grow` also removes the final name while extending a file.
 A first `Ctrl-C` asks active work to stop safely; a second aborts immediately.
-The single-member engine finishes its current plot; grouped construction can
-stop at a recovery checkpoint before the file is complete.
+GPU batch workers finish their current plot. A CPU worker can stop during
+member generation and regenerate that member on resume. Grouped construction
+can stop at a recovery checkpoint before the file is complete.
 
 ### Batch manifests
 
@@ -131,12 +210,12 @@ xchplot2 batch /path/to/job.tsv --devices gpu --resume
 Ordinary single-member and raw manifests have nine whitespace-separated fields in this order:
 
 ```text
-k strength plot_index meta_group format group_id_hex memo_hex out_dir out_name
+k strength plot_index collection format group_id_hex memo_hex out_dir out_name
 ```
 
 `format` is `gplot-v2` for a single-member group (index 0), or `raw-v2`
 for a temporary member consumed by the group assembler. `group_id_hex` is
-64 hex characters; the member ID is derived from it, the index, and meta group.
+64 hex characters; the member ID is derived from it, the index, and collection number.
 `memo_hex` encodes up to 255 bytes (`""` represents an empty memo).
 `plot --group-members N` and automatic shared plotting save `gplot-v2-grouped`
 rows with a tenth field, the member count. This explicit format prevents older
@@ -168,18 +247,30 @@ whole-job serialization.
 Ordinary grouped plotting, filling and growth accept the same `--devices`
 selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
 combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
-Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
-CPU budget and `--max-host-ram` budget. Three quarters of that RAM is divided
-equally among the producers; the remainder covers receiving and construction.
-Each producer must fit its share. These explicit local executors need no pool
-enrollment or network listener and cannot be combined with shared compute
-connection/offer options. Repeat the device selection when resuming; it is an
-execution choice, separate from saved plot identities and farming policy.
+Multiple selected devices and explicit CPU NUMA selectors share one local
+`--workers` and `--max-host-ram` budget. With shared compute enabled,
+enrolled helpers can join or leave during the fill. A queued packed or
+encoded member can use a free selected device while helpers are busy. The
+local devices serve this job privately. Use `--compute off` to run them
+without contacting the pool.
+
+By default, the selected devices share three quarters of the RAM remaining
+after any automatic broker/session reservation. Lower saved offer limits
+and explicit CPU, RAM, VRAM and slot caps also apply. Receiving, construction
+and optional remote encoding use the remaining budget. Local devices share
+their partition across active jobs, retained buffers and GPU recovery. If a
+background worker already holds this machine's enrollment, use its offered
+resources or stop that worker before selecting private devices for the job.
+Repeat the device selection when resuming.
 
 Single local CPU/GPU selection and `--backend auto` retain automatic shared
 compute when enrolled; automatic local GPU selection can fall back to CPU.
-Migration still requires its reviewed single-producer resources: select
-`--backend cpu` or `--devices gpuN`. `--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
+Migration uses the backend and authenticated worker reservations in its
+review. CPU generation can use the selected NUMA nodes within the same
+reviewed CPU grant. A GPU list must include the reviewed physical GPU.
+The local executor uses that card and its selected tier. Additional
+reviewed workers can supply remote compute.
+`--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
 and `--max-host-ram min` belong to the single-member batch engine. Use
 `--compute off` to keep that engine for ordinary plotting after enrolling a
 machine in shared compute.
@@ -215,6 +306,35 @@ resource details; `--json` emits the machine-readable report. An infeasible
 layout reports its reason and exits unsuccessfully. `--help` shows the common workflow;
 `--help-all` includes recovery, tuning and shared-compute options.
 
+The construction forecast estimates time through the last durable publication.
+It shows the expected remaining members, sealed commitments and any upper
+member limit. Open fills can finish with a different member count as encoded
+sizes and available capacity become known. When enough completed files of the
+same group size are available, the forecast also shows how many members would
+fit at their observed sizes. An unavailable destination or a pause can leave
+the completion time open.
+
+The preview reads recent completed fills for the selected host, storage
+layout, plot shape and execution settings. One comparable run supplies a point
+estimate. Repeats supply an observed range in seconds per newly durable
+member. For a different job length with the same drive and group layout, the
+projection retains the time to the first file and scales the remaining
+publications. Missing measurements are shown as unmeasured. The current pool
+and its grants are checked during execution. Use `-v` to compare observed
+construction policies or look at `completion_forecast` in JSON.
+For pooled incremental construction, the preview also compares whole fills
+that received only packed members with those that received only complete
+encoded groups on the same layout. If automatic worker output has no matching
+fill of its own, those two measurements supply an observed time range.
+
+During a fill, Overview updates the same forecast from durable publications
+and from a measured schedule covering the remaining work. Its limiting resource
+can identify generation and delivery, owner encoding, a physical disk, shared
+storage bandwidth or previously committed work. A range based on earlier fills
+describes observed variation at the displayed member count. If a predicted
+publication takes longer, Overview keeps the remaining members visible and
+waits for a fresh timing observation.
+
 To execute a reviewed layout, save a plan without private plot keys:
 
 ```bash
@@ -244,9 +364,12 @@ With no directories, `plan` lists candidate mounted data volumes with available
 space and detected media type. It excludes system mounts, RAM filesystems,
 read-only volumes and unsupported filesystems. These are suggestions; select
 the intended directories explicitly before filling them.
-One command accepts up to 1,024 destination directories. Directories on the
-same filesystem share its available capacity; adding another directory there
-does not add disk space.
+Ordinary `plan` and `fill` accept up to 1,024 destination directories in one
+job. Positional paths and nonempty entries from all path lists share that
+limit. Drive and configuration discovery also limit the combined selection
+to 1,024 distinct directories. A plain directory is one destination. Use
+`--discover-drives` to include eligible mounts beneath it. Directories on
+one filesystem share the available capacity.
 
 Use `--paths-from FILE` for one literal path per line, including paths with
 spaces. Blank lines are ignored; paths resolve from the current working
@@ -273,7 +396,7 @@ xchplot2 fill /disk-b/plots
 `fill` always plans a farming layout, including with an explicit
 `--group-members N`. Omit that option or use `auto` to select file membership
 from the farming profile. Files start at index zero; the planner assigns
-shared-ID families and meta groups across physical storage resources.
+shared-ID families and collections across physical storage resources.
 `--max-groups N` limits files per directory, and `--max-total-members N`
 limits membership per directory. Without those limits, the initial layout uses
 available capacity. `--capacity-bytes SIZE` caps aggregate output capacity
@@ -333,7 +456,7 @@ expansions. Joint assessment includes those full promises even for offline
 destinations. It shares the declared CPU, lookup-worker, cache and reader-memory
 budgets, keeps independent jobs' identity families independent, and combines
 known storage sharing conservatively. Duplicate jobs and destination aliases
-are rejected. Harvester service inputs, plot parameters and meta constraints
+are rejected. Harvester service inputs, plot parameters and collection constraints
 must match; saved group-size choices and layout objectives may differ.
 
 This mode reads the supplied summaries and checks their explicit destination
@@ -363,6 +486,10 @@ Compatible changes on different destinations can share a saved revision.
 Replacement copies can be staged concurrently on independent drives; every
 destination must have a durable copy before the revision is published and
 construction relying on it proceeds.
+When an extent fits a destination's existing grant, its local progress
+journal can commit while another destination receives or packs a group.
+The controller waits if the journal shares a physical drive with that
+work's output or scratch, or if it cannot identify the drives.
 Completed files stay unchanged, and resume retains admitted additions and the
 recorded stop reason. Construction methods and configured I/O windows can
 stop filling before the output budget is exhausted, so some unused capacity
@@ -420,6 +547,10 @@ xchplot2 status /disk/plots
 ```
 
 Completed plots and started groups retain their identities and reservations.
+If a destination fills while testing room for another group, an empty
+`.gplot.partial` can remain. Status and resume exclude that file from the
+pending and published group counts. Withdrawing its reservation releases
+the empty private file.
 Parameter changes start with later groups; resizing replaces only the unstarted
 forecast. File and member targets may be lowered below existing work; that
 stops future allocation while started files keep their original reservations.
@@ -619,7 +750,16 @@ xchplot2 grow /plots/example.gplot --max-members 8
 construction before extending it. It reads the file's identity and parameters;
 keys are unnecessary. `--max-members N` is the desired total membership, with
 a maximum of 65535. Capacity and construction limits can stop growth earlier.
+If several additions are ready, request their final membership in one command.
+For example, growing a 72-member file to 74 lets the plotter publish both
+additions in one rewrite when they fit the RAM and capacity budgets.
+Incremental growth reads existing chunks during sizing and encoding. Separate
+requests for 73 and 74 each require a rewrite. `--batch-members` can also
+limit how many additions fit in one rewrite.
 Use `plot` to create a new named job, or `fill` to manage a directory layout.
+On Linux, in-place growth requires private data extents. Use
+`cp --reflink=never` when making a copy to grow on a filesystem that supports
+reflinks.
 
 ### Construction and recovery
 
@@ -627,18 +767,48 @@ Use `plot` to create a new named job, or `fill` to manage a directory layout.
 codec buffers across the job. When omitted, planning and plotting use the
 available host RAM, including process cgroup limits on Linux. This is a ceiling;
 small groups allocate only the buffers they need. Set an explicit cap to leave
-more memory for other applications.
-`-j`/`--workers N` sets the shared plotting CPU budget; zero or omission
-uses the available logical CPU count. The operating system, libraries and
-file cache are outside that buffer model. Separate plotting processes each
+more memory for other applications. The operating system, libraries and file
+cache are outside that buffer model.
+
+`-j`/`--workers N` sets the shared plotting CPU budget for grouped construction.
+Native CPU generation and chunk compression draw from the same budget. Zero or
+omission uses the available logical CPU count. Separate plotting processes each
 have their own construction budget.
 
 Automatic construction chooses among incremental rewriting, staging,
 merging and external contributions according to available RAM and scratch.
-`--construction auto|incremental|staged|merged|external` forces a method when
-needed. `--batch-members N` bounds construction batches independently of the
+`--construction auto` is the default. When RAM and scratch both fit, the
+owner compares feasible grants at the same RAM cap using available evidence
+through publication. The forecast accounts for occupied scratch disks,
+pending receipts, codec workers and the final writer. It includes later groups
+on each destination, when its current writer can release scratch, and which
+destinations share physical disks. Shared storage bandwidth comes from
+concurrent observations across the drives involved. Missing observations
+can still give a lower bound. When both modes fit and the current schedule
+has gaps, automatic selection can use repeated comparable whole fills with
+the same worker allocation. The Decisions view shows the reason for an
+admission and the resources it holds. Use `--construction incremental`,
+`staged`, `merged` or `external` to select a specific method.
+`--batch-members N` bounds construction batches independently of the
 final file membership. `--member-storage compact|raw` selects retained
 fragments; compact is the default.
+
+For a local CPU job with one writer and identified storage, automatic mode
+can reuse recent observations from completed groups in the user's private
+cache. It checks the boot, build, physical devices, CPU allocation, memory
+cap and workload before using a previous observation. The cache expires
+after 24 hours. Direct measurements from the current run take precedence.
+On Windows the owner checks the device GUID of every disk behind the
+volume. Replacing a disk starts a new comparison. A process running in a
+Windows job object uses measurements from its current run.
+Protected migration uses current resource observations. Shared plotting
+also measures delivery from its workers. See [Shared compute](#shared-compute).
+
+When automatic construction admits a fresh group in one incremental batch,
+the members stay in RAM and the plotter writes the final file directly to the
+destination. With pooled compute, the plotting host can hash completed compact
+members in order while other members arrive. The hash cache uses the same RAM
+grant as the batch.
 
 Repeat `-t`/`--temp-dir DIR` to offer scratch on additional filesystems, or use
 `--temp-dirs /scratch-a /scratch-b`. End a multi-directory list with another
@@ -652,10 +822,64 @@ uniformly matching drives. Explicit scratch directories remain available
 regardless of that policy. Saved jobs and previews retain their scratch
 restrictions. `--temp-capacity-bytes SIZE` caps scratch per filesystem.
 External construction needs permitted scratch.
+
+With I/O overlap enabled, external construction can use several independent
+HDDs for one plot. The planner leaves drives available for other simultaneous
+destinations and divides scratch work by the bandwidth each disk can supply.
+It starts unmeasured drives with an equal share and updates placement as bulk
+transfers finish. On Linux it compares the plotter's submitted reads and writes
+with block-device counters to estimate bandwidth used by other processes.
+It also measures simultaneous transfers to account for shared storage paths.
+
+The plotter reads ahead and flushes extents on separate spindles concurrently.
+During final packing it retries reads deferred by a busy disk before the
+current reader buffer runs out. The RAM grant bounds the read cache and the
+number of outstanding transfers. A single scratch HDD can also read ahead
+while an independent HDD writes the plot. Packing enables this when the
+cache can hold the queue and at least 2 MiB per retained run. On striped
+HDD scratch, the planner can retain additional runs when the cache provides
+16 MiB per reader after reserving space for disk queues. This can eliminate
+an intermediate scratch read and rewrite.
+Partitions and alternate paths to one drive share its bandwidth. Resuming a
+plot uses the scratch locations and capacities saved in its checkpoint.
+
+The external packer copies adjacent encoded chunks together and appends their
+lengths to the group index in batches. On Linux, an independent output HDD
+can start writing completed ranges while the plotter prepares the next chunks.
+The packer aligns these writes to page boundaries so appending the next chunk
+can proceed while the disk is busy.
+The packing checkpoint synchronizes the output and index before releasing
+consumed scratch.
+
+Before receiving compressed contributions from a compute worker, the
+plotting host uses the fragment count, the range of the deltas and the fixed
+compression table to bound the scratch it reserves. The same bound applies
+to the contribution produced from packed input.
+The host validates chunks as they arrive. With I/O overlap and spare CPU
+workers it can check a window of independent chunks in parallel within
+the codec RAM budget. A capacity probe checks chunks in order so it can
+stop receiving as soon as the next member cannot fit.
+When the current summary is in RAM, a chunk can extend it as soon as the
+same chunk from each preceding member has arrived. Concurrent workers
+can therefore contribute to the summary while both are still sending.
+Conservative sizing skips the summarized prefix of each stream and reads
+the remaining packets from scratch. When a fresh group can go straight to
+packing, the plotter can also bound the finished file from the validated
+symbol counts and largest packets in each stream. This lets members arrive
+out of order without a sizing reread when the bound fits. A retried stream
+can require rebuilding the summary. Tight capacity triggers exact sizing
+against the saved runs.
+During exact sizing, merged construction keeps a running total of index bits,
+saving one 64-bit length per chunk.
 With compute sharing disabled (`--compute off`), external construction can
 stream local GPU output to scratch when a complete member cannot fit in RAM.
 The producer and codec workspaces must still fit, and scratch must hold both
 incoming data and contributions.
+When a sealed scratch batch reaches a fixed group size and its runs fit the
+packer's reader budget, the host commits them directly in the packing
+checkpoint. This saves one summary write and one checkpoint per such group.
+Recovery resumes packing from those runs. If the checkpoint was interrupted
+before it committed, recovery starts from the previously committed members.
 When the final member count is fixed and the last batch fits in RAM, external
 construction packs it directly with the saved contributions, avoiding its
 temporary write and read. An interruption
@@ -665,13 +889,89 @@ checkpoints require a build that supports resident final batches; completed
 plots retain the ordinary v2 format.
 
 Writers sharing a physical drive serialize their I/O. Independent drives can
-progress together within the shared RAM and CPU limits. `--io-overlap on|off`,
+progress together within the shared RAM and CPU limits. With I/O overlap
+enabled, scratch HDDs can flush their portions of a checkpoint summary in
+parallel. The plotter waits for all portions before committing the checkpoint.
+External jobs on independent output HDDs can also share a codec worker.
+Before timing data are available, automatic construction tries to keep a
+complete fresh HDD group in RAM when the batch limit permits. It sizes the
+initial set of destinations using available generator slots and allows
+another group to receive members while an independent HDD is writing.
+If the complete group needs scratch, it recalculates the receiver count
+for encoded input before dividing the scratch HDDs among writers. One GPU
+can supply several destinations through independent member requests.
+Once an external group has sealed its scratch runs and released its staging
+memory, the pooled planner charges its remaining packing workspace. It can
+admit another receiver if that workspace and the new job fit together.
+With measured generation and storage costs it chooses the concurrency with
+the shortest projected completion time.
+
+The farm plan assigns final output to each destination. During `fill`, a
+queued output on its own HDD filesystem can lend its available space to
+active groups under the temporary-space policy. External construction
+stripes runs across eligible scratch HDDs using the available
+bandwidth. When writers are running together, it keeps a queued destination
+free if the remaining scratch drives have enough space for the grant and
+bandwidth to feed the writer. If the only next destination would become
+part of the scratch stripe, the planner can substitute an unreserved HDD
+with sufficient capacity and bandwidth, including one that has finished
+its own group. When one group replaces another, the planner
+includes the drives already in use when dividing scratch bandwidth. This
+leaves bandwidth for the following writer when enough space is available.
+If the packer's RAM requirements reduce how many groups can run
+together, the planner can give their freed scratch bandwidth to the groups
+that fit. With shared compute, groups can receive compressed contributions
+directly to scratch while other groups pack. The planner budgets the live
+receivers and packers together and checks that one ordinary member can be
+regenerated after the receivers drain. An ordinary retry can also wait for
+a running final HDD pack to publish and release its workspace. Incoming
+chunks can use idle threads from the shared codec pool within the
+destination's validation memory budget.
+
+When several groups are planned for the same output HDD, the next group
+can receive sealed GPU contributions while the current group packs. The
+planner uses measured transfer and packing times and reserves independent
+scratch bandwidth and RAM for both groups. The next group starts writing
+the destination after its predecessor publishes. Limited space, a busy
+scratch path or an unmeasured route can keep the two groups sequential.
+With RAM construction, an idle pool worker can instead send the next
+group's packed members while the output HDD writes its current file. The
+owner first offers work to ready destinations, then checks the next file's
+grant, available RAM, measured delivery time and remaining write time.
+It updates the write estimate after the first durable checkpoint, which
+accounts for drives that acknowledge buffered writes quickly and take
+longer to flush them. With spare CPU and RAM, the owner can also hash
+the next file's members during that write. If another task needs the CPU,
+the writer can resume hashing at the first unfinished member after verifying
+the identities of the completed prefix.
+If that worker leaves or its grant expires, the current file can still
+publish. The owner requests the missing work through normal admission
+afterward, preserving the next file's identity.
+
+After the scratch is released, the same disk can take its turn
+writing a final plot. The planner rechecks free space above `--leave-free`
+at that handoff. Saved scratch grants and the farming limits still apply.
+
+`--io-overlap on|off`,
 `--generation-overlap auto|on|off`, and `--cache-release on|off` control overlap
-and clean-cache release. `--window-bytes SIZE` sets the I/O window size;
-`--checkpoint-bytes SIZE` sets the target bytes between recovery checkpoints.
-These options override the automatic choices. On known HDDs, automatic
-incremental construction can increase the checkpoint interval up to 1 GiB when
-completed work on that drive shows a benefit, within the same memory budget.
+and clean-cache release. `--window-bytes SIZE` sets the I/O window size.
+
+For a compact group built in RAM, automatic GPU overlap can compact one member
+on the CPU while the pooled GPU generates the next. When a second GPU output
+buffer would exceed the device budget, the plotter can use a pinned host
+buffer for local batches of two or more members. At k=28 this needs 2,016 MiB
+of additional host memory over tiled transfers. The plotter checks the batch
+budget and live headroom before allocating it. Tight memory, an unavailable
+pinned allocation or protected farming resources keep the tiled path when
+the device output buffer is unavailable.
+
+`--checkpoint-bytes auto` is the default. Ordinary construction measures
+the time per durable byte and the time spent flushing each interval. During
+the first group it can try a target up to 4 GiB when that target predicts
+a shorter time to finish within available filesystem headroom. It returns
+to the previous interval if completed trials show a slowdown.
+Later fresh groups can reuse results from the same drive and construction
+settings in that run. `--checkpoint-bytes SIZE` fixes the interval.
 Longer intervals can require more work to be repeated after interruption.
 
 Construction checkpoints are private. New records require a compatible format,
@@ -689,16 +989,26 @@ and finalization phases with elapsed time and read/write totals. Output-file
 counts do not imply separate physical drives. `--no-progress` disables these
 updates; the terminal defaults match `plot`.
 
+For fills with several destinations, `controller_wait_seconds.destination_lanes`
+reports time spent at the simultaneous destination limit. Engine RAM,
+producer RAM and storage leases have separate counters. Several destinations
+can wait on different resources during the same interval. The JSON fields
+`controller_wait_seconds.consumer` and `storage_queue_wait_seconds` both
+measure time the controller spends waiting for outstanding work, including
+GPU deliveries, owner processing and disk writes.
+
 ### Farming layout
 
-Automatic directory planning chooses farming group size and meta families
-together. The plotting machine's RAM, GPU speed and temporary disks determine
-how to construct that layout; the planner does not use them as the final
-harvester's CPU or cache capacity. It uses the destination's physical-resource
-topology and a declared farming profile. The default preview reports the
-profile's source, CPU and memory allowances and initial file counts.
+The directory planner chooses how many members to put in each file and assigns
+collections within each shared-ID family. The plotting machine's RAM, GPU speed
+and temporary disks determine how to construct that layout. The planner models
+the harvester using the destination's physical-resource topology and the CPU
+and cache capacities in the declared farming profile. The default preview
+reports the profile's source, CPU and memory allowances and initial file counts.
 `--verbose` adds response estimates, assumptions, detected configuration,
 identity families, resource sharing and workload estimates.
+For measured construction and lookup costs at 71, 72 and 73 members, see
+[grouped plots on HDDs](BENCHMARKS.md#grouped-plots-on-hdds).
 
 File sizes are estimates: compressed output can be slightly larger or smaller,
 and a small difference can decide whether one more whole member fits. Filling
@@ -777,13 +1087,20 @@ xchplot2 plan /new/plots --harvester reader-profile.json --save-plan farm.plan
 
 Calibration reads the supplied files without changing them. It reports fresh
 and retained-reader quality lookups, foreground reader CPU time, and separate
-read-only storage observations. Storage observations remain report-only; they
-do not replace bandwidth, seek or concurrency assumptions. OS cache state is
-uncontrolled, so opening a fresh reader does not establish cold physical reads.
+read-only storage observations. Each file reports p50, p95, p99 and maximum
+wall time for opening a reader and looking up its first challenge, and for a
+different challenge on the retained reader. Percentiles use nearest rank across
+the requested samples. The repeated-challenge timing remains available under
+`retained_lookup`. The report also gives the smallest and largest sampled
+membership. The planner uses the configured bandwidth, seek and concurrency
+assumptions for storage. The operating system controls which file pages stay
+in cache between samples.
 Calibration does not solve full proofs or measure spare harvester capacity.
 
-Existing CPU inputs only increase from the scoped samples and margin. These
-are editable, conditional service envelopes, not measured worst-case bounds.
+The per-member CPU estimate uses the higher measured CPU time from the repeated
+and distinct challenges on the retained reader. Calibration can raise the
+existing CPU estimates using the sampled maxima and margin. The resulting
+estimates are editable and apply to the sampled conditions.
 The saved profile records the sampled k, strength, reader, method and margin,
 with its own calibration hostname/time. An imported baseline's configuration,
 inventory and hardware snapshot keep their original hostname/time. Planning
@@ -841,21 +1158,21 @@ lookups while increasing the repeated work. The planner compares balanced
 integer layouts within the declared storage, CPU, worker and memory limits.
 An efficient average workload alone does not establish a response deadline.
 
-Meta groups change eligibility correlations, so choose them together with file
+Collections change eligibility correlations, so choose them together with file
 size. The [filter implementation](https://github.com/Chia-Network/chia-blockchain/blob/main/chia/types/blockchain_format/proof_of_space.py)
 compares a hash of the group ID and filter challenge with the signage-point
-index XOR the meta value, masked by the effective filter. Distinct masked meta
-values exclude simultaneous eligibility only within the same group ID.
-Rotating meta numbers while generating unrelated group IDs does not provide
-that guarantee. When the effective filter shrinks, some meta values alias.
+index XOR the collection number, masked by the effective filter. Within one
+group ID, distinct masked collection numbers exclude simultaneous eligibility.
+Rotating collection numbers while generating unrelated group IDs does not provide
+that guarantee. When the effective filter shrinks, some collection numbers alias.
 Window scheduling also correlates neighboring signage points; a planner must
 evaluate consecutive challenges, including carried-over work.
 
-Within one shared-ID family, balance member counts across its usable meta
+Within one shared-ID family, balance member counts across its usable collection
 slots. With one file per slot and no other eligible work on the drive, this
 minimizes the largest activation. Ordinary files start at member index zero:
-reusing both the group ID and meta value in another such file duplicates member
-identities. Exhausted meta slots require a new identity family. Assign families
+reusing both the group ID and collection number in another such file duplicates member
+identities. Exhausted collection slots require a new identity family. Assign families
 per physical storage resource, keeping that assignment stable on resume.
 
 Measure or explicitly model the actual reader. The pinned k28 C++ reader
@@ -880,7 +1197,7 @@ together, including families on different drives. It bounds CPU, lookup-worker
 and physical I/O contention for that burst. The bound must fit both the response
 deadline and the signage-point interval, so admitted work finishes before the
 next arrival. The model assumes work-conserving queues with FIFO admission to
-CPU and read resources. Same-family meta exclusion is retained under both
+CPU and read resources. Same-family collection exclusion is retained under both
 modeled filter settings. A finite sample with no late responses cannot replace
 this admission check.
 
@@ -964,6 +1281,9 @@ reject them. Existing schema 1 profiles retain their reviewed-envelope behavior.
 
 A fresh replot scan includes directories from the selected reader configurations
 and adds explicit destinations, path-list files and `--discover-drives` results.
+Recursive inventory and fresh replot scans accept up to 128 inventory roots.
+They traverse subdirectories on the root's filesystem. Supply mounted child
+filesystems as separate roots.
 `--discover-farm` enables configuration discovery for ordinary `plan`/`fill` or
 `plan --inventory`; `--no-discover-farm` limits a replot scan to supplied roots.
 Use `--farm-config /path/to/config.yaml /other/reader/root` to include several
@@ -1124,8 +1444,13 @@ observed, declared or unknown. Observed CPU affinity and effective
 physical/container memory supply local hardware ceilings during migration setup.
 Configured lookup threads and live free-memory snapshots do not establish
 another service's workload bounds.
-Saved quality-reader calibration retains its sample scope and cannot establish
-worst-case queues or a full-proof solver reserve.
+Saved quality-reader calibration includes the smallest and largest sampled
+group membership when known. The Farm view shows when a requested group
+size lies outside that range. Older profiles without a known sample range
+show unknown coverage. Worst-case queues and the full-proof solver reserve
+require separate inputs.
+Profiles exported with a measured membership range use schema 3. Use a
+build that supports that schema to read them or their saved plans.
 
 For a local setup, start with the controller, selected Chia services and source
 files on the same physical host. Inventory all source and existing destination
@@ -1664,6 +1989,236 @@ leases; workers return computed fragments directly to the plotting host.
 Workers never receive destination paths, farmer/pool keys, seeds or private
 plot memos. Enroll only machines you trust to compute correctly.
 
+On a timed generation connection the worker reports its time sending results
+and the remaining time spent generating and encoding. After first output,
+the owner measures time reading frames, time waiting for the next frame,
+and time consuming frames, including scratch writes. Reads that overlap
+consumption count toward the planner's estimate of shared link usage.
+Send and receive waits include backpressure and can overlap. After three
+completed samples for a matching plot size, strength and result type, the
+owner can compare generation batch sizes and choose how many destinations
+receive concurrently. It uses the fewest receivers that can sustain the
+forecast rate under the shared link limit. A brokered worker on the plotting
+host contributes its measured generation and delivery time with zero network
+cost. CPU and GPU work on the same worker share its advertised slots.
+For fresh HDD scratch, the first timed delivery can help size the next
+scratch grant. The owner compares how many whole members additional
+receivers could deliver across the ready destinations. It reserves scratch
+bandwidth for the slots that can serve that batch size while ordinary
+receivers can still sample other workers. When detailed timings are
+unavailable, the owner uses whole-task timings. The full execution forecast
+also needs measured packing and storage costs for the destination.
+
+When all generation is remote, a fresh group packing from HDD scratch can
+use CPU threads while another group waits for its GPU delivery. The owner
+shares the available threads among runnable disk writers and keeps the
+packing workspace within the RAM already reserved for that group. Receive
+validation uses the same CPU budget.
+
+For the final group in automatic mode, the owner uses comparable
+single-writer publication timings when available. If it has a measured
+packed route and no such comparison, it switches to a whole-group stream
+only when it has a faster delivery estimate for that group size.
+When one HDD has a bounded number of members left and only one output
+format has been timed through publication, the owner also compares the
+remaining job time with the cost of trying the other format. If a group
+would be split among workers, that cost includes the slowest member the
+group must wait for. An unmeasured transfer is budgeted at the task
+timeout. Jobs with enough work left can still sample it. A changed worker
+roster or a different physical HDD requires a new comparison.
+
+For a final group built in RAM, the owner can also reuse measurements from
+jobs completed in the previous 24 hours. It compares packed delivery and
+whole-group streaming from the final request until the last file is durable.
+The comparison needs two completed observations of each format with the
+same worker instance, network path, resource grant and output drives. It
+can include up to four other drives already writing their final groups
+when their progress matches the observed range. The owner changes format
+only when the faster choice clears the observed variation and the margin
+for its sample count. If the quoted lane becomes busy, the grant or path
+changes, or the disk governor reports new farming pressure before the
+request starts, the owner returns to the ordinary choice. Explicit
+`--compute-output` settings keep their selected format. With
+`POS2GPU_PHASE_TIMING=1`, `terminal_publication` shows the ordinary
+choice, the measured ranges and the selected format.
+
+For independent GPU contributions, the owner sizes the next request using
+the available workers' measured time to generate and deliver a member and
+the work ready across destinations. It tracks pipelined and jointly encoded
+batches separately. Single-member contribution timings can help establish
+an independent pipeline's initial rate. For scratch construction, the
+owner can pipeline the members ready for one destination even when a joint
+batch fits. A cold pool opens enough scratch receivers to sample the
+offered worker slots. When several destinations are ready, one can submit
+an independent batch to a capable GPU while another supplies ordinary
+members to a worker with a narrower output mode. Further destinations keep
+their batches intact until the first delivery. After measuring the pipeline,
+the owner usually tries joint encoding with two members. When several
+destinations can each supply a full pipeline, the owner starts joint
+trials on intact batches up to the offered width.
+Destinations share the trial.
+Before sending plot IDs, the owner checks the worker the broker assigned.
+If a calibration request queues while a measured independent pipeline is
+idle, the owner can withdraw the trial before it occupies either GPU.
+If another measured pipeline can deliver the whole batch sooner, the owner
+can request independent encoding. If a worker's first measured delivery
+was an independent batch, the owner can use its per-member time to price
+the first joint trial. For an independent batch on a slower GPU, the
+owner can submit a prefix and the remaining members separately when the
+two GPUs are predicted to finish earlier together. This comparison includes
+the expected time until the other GPU is free. Each new request keeps the
+original deadline. A worker whose current lease has outlasted its measured
+duration needs a new observation before the owner can predict its return.
+If worker capacity falls while a joint scratch batch is queued, the owner
+can split it as soon as the broker reports that a smaller batch fits.
+Workers still collecting timings remain eligible while the owner forecasts
+service from measured workers.
+When multiple destinations and independent GPU slots are ready but delivery
+speed is unknown, each destination starts with one member. The first
+completed contribution lets the owner start filling longer pipelines.
+For CPU and GPU generation, the broker measures service from worker selection
+through delivery, including connection setup. It keeps separate timings for
+packed members, encoded contributions and complete fresh groups, and uses
+the requested batch size when available. Changing a worker's data endpoint
+starts a new timing history for that route. A worker can finish sending
+before the owner reports its first delivery. During that interval the
+broker can use the time already spent on that route for the same owner,
+workload and batch size. The broker can wait when busy workers
+together can finish the owner's ready queue before an idle worker would
+deliver the waiting job. A running lease from another owner can contribute to
+this estimate. The broker uses that owner's delivery history to predict the
+release and the waiting owner's route history to estimate the next delivery.
+If a wide batch should wait, the broker checks whether the
+idle worker can help by taking a later, shorter job. The wide batch keeps
+its queue position. Each job must still start within its admission deadline.
+During a multi-destination scratch fill the owner can also forecast generation
+for fresh groups with enough planned output space. A compatible idle GPU can
+take a whole independent batch if its measured delivery fits inside that
+interval. The forecast expires as time passes.
+If a pipeline runs past its average, the broker can wait up to the longest
+delivery it observed at that width. For a late single contribution or an
+independent batch, the next larger independent batch measured on the same
+GPU can also bound the wait.
+With at least three deliveries at the exact width, it can wait one observed
+range of variation beyond the longest sample if the busy worker can still
+finish the ready queue sooner. An overdue GPU batch can have up to one
+measured singleton delivery beyond its expected finish. For independently
+streamed members, the broker uses that allowance when the waiting job
+would commit another whole batch to the slower worker.
+A larger backlog, another queued owner, or a job running past its observed
+range lets an idle compatible worker take work. When one destination has
+the remaining work, the broker can keep an indivisible encoded group on
+a worker that recently delivered that exact batch. For packed members it
+also checks whether smaller measured requests can finish sooner using the
+worker's free slots and available CPU, RAM and GPU capacity. Independent
+destinations give new workers opportunities to establish their rates.
+
+A running broker can reuse a receipt across jobs from the same authenticated
+plotting host when the worker instance, data endpoint, receiving interface,
+host settings and exact resource request match. A receipt can guide a wait
+for the longer of the lease and worker registration timeouts, two minutes
+by default. The broker keeps the last eight deliveries at each batch size
+so it can still price the final single member after a run of larger batches.
+For a finite job, two or more matching deliveries from the past
+24 hours can guide the choice between immediately available workers. When
+their measured time ranges overlap, the usual scheduling order applies.
+The same comparison can keep a finite packed group on a worker that
+has repeatedly delivered that whole group size. The broker also checks
+whether smaller batches can finish sooner within the available grants.
+A newly started broker has an empty delivery history. The first assignment
+on an unmeasured route has no observed completion time. When the connection
+moves to another broker endpoint, the client checks its support for detailed
+worker availability and for reporting how much work remains in the job.
+
+The scheduler prioritizes the next batch that can start an idle output drive.
+Compatible worker slots and measured transfer rates limit concurrent receivers.
+When enough destinations are ready to keep the pool occupied, a compact
+in-memory receiver can request several packed members from a fast worker.
+The owner sizes these requests from measured packed deliveries. While workers
+are unmeasured, ready destinations share the available probe slots. A newly
+joined worker can take waiting work. When a grant or delivery changes the
+estimate, the owner can batch the remaining unsent members of a group. A
+failed transfer releases unfinished work for retry. Successful receipts
+keep their position in the group.
+
+If the broker grants a measured packed batch to a different worker, the
+owner can decline before sending the member IDs. It submits the first
+member and checks the price of the remaining batch at its exact size.
+With two funded receivers, a helper can deliver the first member while
+the faster worker delivers the rest. With one receiver, the first delivery
+finishes before the remaining batch starts. Both paths preserve member
+order and the original deadline. With `POS2GPU_PHASE_TIMING=1`, the
+`packed_route_decline` and `packed_route_reprice` events identify the
+group, first member and batch width.
+
+A fresh HDD destination can queue another packed batch within the memory and inflight
+limits. With one GPU slot, automatic admission uses deliveries at the same
+batch size to check that the remaining wait and the next delivery fit the
+task deadline. After a complete packed batch arrives, its writer can finish
+hashing while an independent destination starts the next transfer. The
+owner checks both writers, CPU availability and the memory needed by both
+destinations. If a busy worker
+can deliver before an idle worker and another destination can feed the idle
+one, the owner sizes the batch for the earlier delivery. If the other
+workers would each take longer to deliver one member, the owner checks
+that the grant matches the worker and backend it used to size that batch.
+A first trial at a new batch size can still split into smaller requests.
+An idle helper can take a member when that shortens the fast worker’s
+batch and the helper can deliver during work left on other outputs. The
+estimate includes shared network bandwidth, receive memory, output space
+and any scratch disks those outputs need. An unfinished group contributes
+only its next admissible batch. At the end of a job, a fast worker can keep
+an entire group if its batch should arrive before the helper’s first member.
+When all slots are busy, the owner can size queued work for the next known
+delivery. A new worker’s first transfer can proceed while measured workers
+continue using larger batches.
+Observed member sizes help it serve destinations with room before probing
+nearly full ones. A repeatedly deferred destination still gets a turn.
+When one measured producer has final packed batches ready for independent
+output disks, the controller compares dispatch orders using the predicted
+finish of the last file. It accounts for the turn a destination earns as
+it waits. For up to six eligible batches it checks every order consistent
+with those turns, including the effect of shared packing CPU and the time
+each disk needs to publish. For seven to 64 ready batches with independent
+writers and sufficient packing CPU, it compares the feasible first grants.
+It can keep a longer sequence when that sequence reaches the shortest time
+possible at the observed generation and write rates. Each grant rechecks
+the remaining members, workers, receiver memory and output drives. A
+change in those resources or new farming pressure releases the saved order.
+With `POS2GPU_PHASE_TIMING=1`, `terminal_grant` records the ordinary,
+proposed and issued writer and member range when the controller grants work.
+
+When a fresh fixed-size group fits one worker lease, it can arrive as
+encoded chunks in file order. The destination validates the chunks and can
+read the next network frame during validation or writing when an extra
+frame fits in RAM. It starts disk writeback during transfer and publishes
+after the complete stream and index are durable. A brokered worker in the
+owner's process can deliver the manifest and chunks directly to the same
+writer. A saved prefix can resume
+with another compatible producer. When other drives still need members, the
+worker can send consecutive packed members under one lease and overlap GPU
+generation with delivery.
+
+Near the output limit, external construction receives uncertain compressed
+members individually. The planner can reserve extra scratch for these
+transfers. When the remaining member limit and a completed group of the
+same k and strength indicate the job should fit, it keeps the normal scratch
+reservation and can use packed batches. The owner stops a compressed transfer
+once locally validated chunks prove the candidate would exceed the final
+file allowance. If the bound is inconclusive, exact sizing can still admit
+the member. Previously accepted members remain eligible for publication.
+
+In construction JSON, `pool_partial_capacity_probes` counts compressed
+transfers stopped early for capacity. `pool_timed_generation_tasks` counts
+measured tasks.
+The destination scheduler reports its most recent generation estimate in
+`pool_generation_seconds_per_member`. `pool_receiving_destinations` is the
+number of receivers it sized for the available worker capacity at that
+decision. Both fields start at zero. `pool_peak_active_generation` counts
+the most generation requests the owner had outstanding at once, including
+requests waiting for a worker. The `phases` object gives the logical bytes
+read and written in each construction phase.
+
 On the first machine, create a pool and an invitation for another machine:
 
 ```bash
@@ -1677,24 +2232,53 @@ Transfer the invitation privately to that machine, then run there:
 xchplot2 compute setup worker-b.invite
 ```
 
+You can issue and accept invitations while an enrolled owner is plotting.
+Existing connections can keep using their credentials during the update.
+For a temporary helper, run `xchplot2 compute worker --join worker-b.invite`
+in its terminal.
+It uses the invited identity and saved resource limits and offers compute
+until you stop the process. Repeating the command for the same enrollment
+preserves the credentials already in use.
+`compute setup` also accepts the same invitation again. Repeating identical
+settings keeps the running helper and its active tasks in place.
+
+On the plotting host, open the dashboard's Workers view or run
+`xchplot2 compute status -v`. Registration confirms contact with the
+broker. Eligibility also depends on the request's k, strength, device
+requirements and the helper's available resources. A first validated
+delivery confirms that the plotting host received usable work. The owner
+reconsiders unassigned work as the roster changes and measures each new
+worker instance on its own. A short remaining queue, a busy receiver or
+an occupied shared link can leave an eligible helper idle. A broker from
+an earlier build can still supply aggregate capacity during an upgrade.
+
+A participating owner can reuse recent timings for the same worker instance,
+physical receiving interface, resource request and output width. A fresh
+delivery on that route must confirm the cached interval. Decisions shows
+the sample count and age when the estimate uses earlier deliveries.
+
 Create a separate invitation for each additional machine. An invitation holds
 that machine's private TLS identity, not the pool's signing key. Delete
 transferred copies after joining. Enrollment is pool membership: every member
 can share with multiple plotting hosts. It is not an exclusive machine pair.
-`setup` reuses existing enrollment, accepts the same resource settings as
-`configure`, and installs and starts the helper's background worker. Use
-`--role plotter` or `--role worker` to choose that role explicitly. If service
-installation fails, enrollment and settings remain saved; the diagnostic gives
-the worker startup command. `init`, `join` and foreground `worker` remain
-available for separate setup steps.
+`setup` reuses existing enrollment and broker selection, accepts the same resource
+settings as `configure`, and installs and starts a worker on a helper.
+A new plotting-host setup installs and starts a background broker.
+New setups use TCP 18444 for the broker and TCP 18445 for the worker.
+Use `--role plotter` or `--role worker` to choose the role explicitly.
+If service installation fails, use the startup command in the diagnostic with
+the saved enrollment and settings. To run the steps individually, use `init`,
+`join` and the foreground `worker` command.
 
 After enrollment, `plot`, `fill`, and `grow` use shared compute automatically.
-Each job starts an embedded broker unless a dedicated broker is configured.
-Its local executor also offers bounded capacity while the job runs; nearby
-workers discover the broker and join. Several brokers can use one worker at
-once. The worker enforces one combined CPU, RAM, GPU and task-slot budget
-across their requests. One executor per enrolled machine identity prevents
-concurrent local jobs from advertising the same capacity twice.
+New plotting-host setups share one persistent broker between jobs. To select
+an existing dedicated broker, use `setup --broker HOST:PORT`. For an embedded
+broker per job, use `setup --broker auto`. While a plotting job runs, its local
+executor offers bounded capacity. Nearby workers discover the broker and join.
+Several brokers can use one worker at once. The worker enforces one combined
+CPU, RAM, GPU and task-slot budget across their requests. One executor per
+enrolled machine identity prevents concurrent local jobs from advertising
+the same capacity twice.
 
 Run `compute worker` to keep offering capacity independently of a plotting
 job; it stays in the foreground until stopped. Save defaults for future jobs:
@@ -1704,11 +2288,54 @@ xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
 xchplot2 compute status
 ```
 
+On a helper that also farms, run `xchplot2 compute worker --harvester local`.
+`--chia-root DIR` selects its local Chia configuration. The worker holds new
+tasks while its recent lookup p95 reaches half the farming deadline. The
+default deadline is eight seconds and `--farming-deadline-ms N` sets another.
+Fast zero-eligible challenges are excluded from this pressure estimate.
+Accepted tasks finish. Each broker sees that worker as paused, and the
+worker's foreground output shows the lookup pressure. When the tail recovers
+or observations expire, the worker returns to its configured admission state.
+
+On Windows and Linux, a compute worker that detects a lost GPU withdraws its
+GPU capacity while continuing CPU and codec work. Its next GPU offer requires
+a small generation in a fresh process to match the CPU reference. Recovery
+needs enough host RAM for the additional runtime and output, and a uniquely
+identifiable device. If a driver reports only the backend during concurrent
+generation, active GPUs on that backend verify independently. The worker
+retries with backoff while it accepts work.
+`compute status` and the worker view of `status --live --tui` show the
+driver error during recovery. After recovery, GPU members run in isolated
+processes until the worker restarts. If only smaller plots fit when the GPU
+recovers, a fresh process periodically checks whether larger ones can run.
+
 A standalone worker adapts to its available CPU affinity and host RAM, with one
 task slot and automatic CPU/GPU selection. Saved or explicit limits remain
-caps. Automatic GPU allocation uses available VRAM at startup with the backend's
-required safety allowance; it does not infer spare GPU compute time from free
-memory. A plotting job partitions its host budget between the embedded service, local work,
+caps. The worker rechecks available VRAM between assignments and while idle.
+When another application takes or releases GPU memory, the same worker can
+change tiers, withdraw plot sizes or offer them again. Each tier includes the
+backend's safety allowance and its own host RAM requirement. The broker uses
+observed delivery times to estimate how quickly a busy helper can finish.
+On Windows, a HIP worker also checks its OS-assigned memory budget and the
+dedicated memory in use on its selected GPU. Set `--gpu-bytes` to a known
+safe limit when Windows cannot identify the physical GPU or report these
+counters. The Workers view shows **Waiting for GPU memory** when a selected
+local GPU could resume after other applications release memory.
+
+A GPU worker can encode the last member of a batch directly from its
+pinned output buffer. Its host RAM reservation includes separate raw copies
+only for earlier members and accounts for retained GPU buffers across tasks.
+The worker releases its host output buffer if keeping it would prevent
+admission of another member at the same k. It checks after delivery and
+when a later capacity update detects memory pressure while the GPU is idle.
+Its device tables stay available for the next job.
+For a standalone worker, a reusable output buffer that the GPU runtime
+guarantees is page-locked counts toward the worker's existing resident
+memory. This also covers buffers the operating system reports as shared.
+When the worker keeps a buffer for reuse, it reports the remaining RAM and
+the revised per-job memory requirement together. Each broker can use the
+new figures to admit its next queued job as the previous lease finishes.
+A plotting job partitions its host budget between the embedded service, local work,
 construction and optional remote encoding, honoring saved offered limits.
 A worker registers with up to 128 brokers by default. Save another limit with
 `compute configure --max-brokers N`, or override it with
@@ -1735,6 +2362,11 @@ identities, owners, jobs, queue wait reasons, offered resources, broker
 reservations and actual worker usage. A worker shared by
 several brokers enforces its total limit locally; a broker's reservation view
 is not a pool-wide capacity measurement.
+The foreground worker reports its authenticated broker registrations. Run
+`compute status` on the plotting host to check its connection back to the
+worker. During plotting, `--progress` reports members generated, bytes
+received, members assembled and files published by the current process.
+Received bytes include retry traffic and local executor transfers.
 
 ```bash
 xchplot2 compute status --json
@@ -1765,10 +2397,10 @@ agree. Source-build identity is diagnostic provenance. Generation and codec
 eligibility are checked separately; incompatible work is not scheduled.
 Compatible releases can be rolled through workers without rebuilding every
 machine together. A wire-protocol change requires upgrading brokers, workers
-and plotting hosts together. This version uses compute protocol 6 and does not
-interoperate with protocol 5. Drain workers and wait for `drained` before
-replacing services. Preserve the saved enrollment directory, restart services,
-then run `compute resume` on the drained workers to accept new tasks.
+and plotting hosts together. This version uses compute protocol 8. Drain
+workers and wait for `drained` before replacing services. Preserve the saved
+enrollment directory, restart services, then run `compute resume` on the
+drained workers to accept new tasks.
 
 ### Background workers and brokers
 
@@ -1791,6 +2423,11 @@ and `remove` act only on the service generated for this identity. Use
 tasks should finish first. Restart after changing saved defaults or replacing
 the executable. After restarting a drained worker, run `compute resume` to
 accept new tasks; restarting alone does not clear its saved drain setting.
+
+An Intel GPU worker can remain registered after a compute-engine reset.
+If Level Zero reports `DEVICE_LOST` and subsequent jobs on that worker
+fail, restart the worker when idle to create a fresh GPU context. Confirm
+the next completed job reports a member from that worker.
 
 Linux uses a systemd user service; logout behavior follows the system's user
 manager policy. Windows uses Task Scheduler at user login, without elevation,
@@ -1828,12 +2465,61 @@ xchplot2 compute configure --broker auto
 ```
 
 `compute worker --broker HOST:PORT` can repeat direct addresses and also
-browse discovered brokers. `--discovery off` disables discovery; a standalone
-worker then needs a direct broker. Broker and worker `--listen` / `--advertise`
-options set fixed reachable endpoints. Firewalls must permit UDP 5353 for
-discovery and the chosen TCP listener ports; automatic embedded services and
-workers choose available TCP ports. Use explicit interfaces for a VPN rather
-than exposing the services publicly.
+browse discovered brokers. When IPv4 and IPv6 both reach the same broker,
+the worker counts it once and keeps its working plot-data address. A newly
+discovered broker can use the remaining capacity. With `--discovery off`,
+a standalone worker needs a direct broker. Broker and worker `--listen` / `--advertise`
+options override saved listener settings. Save predictable ports with
+`compute configure --broker-port 18444 --worker-port 18445`, then restart
+the affected services. The worker port also applies to a plotting job's local
+executor. Changing a local dedicated broker port updates its matching saved
+loopback route. Update explicit routes on remote machines to use the new port.
+Older compute profiles default to TCP 18444 for the broker and an available
+port for the worker. Set `--worker-port 0` to select an available worker port.
+Embedded per-job brokers choose available ports. Use a persistent broker
+when a firewall rule requires a fixed port.
+The current build reads older compute profiles automatically. Newly saved
+profiles include listener ports and require a build that supports them.
+
+On a host with separate management and plotting links, the broker handles
+leases. The plotting host connects to the worker's advertised address for
+plot data. For example, with `10.10.10.2` on the plotting host and
+`10.10.10.1` on the GPU worker, these commands use the dedicated link.
+
+```bash
+# Plotting host
+xchplot2 compute broker --listen 10.10.10.2:18444 --discovery off
+# GPU worker
+xchplot2 compute worker --broker 10.10.10.2:18444 --listen 10.10.10.1:18445 \
+  --advertise 10.10.10.1:18445 --discovery off --backend gpu
+```
+
+Use `--compute-broker 10.10.10.2:18444` on the plotting job. An existing
+broker can also stay on its management address. In that case use its address
+for both broker options and keep the worker listener and advertisement on
+the dedicated link. The plotting host must be able to reach the advertised
+worker port.
+
+Firewalls must permit the chosen TCP listeners and UDP 5353 when discovery is
+enabled. On each machine, `compute firewall` prints commands for its saved
+ports, inbound role (`broker`, `worker`, or `both`) and the peer addresses or
+LAN subnet you permit.
+
+```bash
+# Broker host with its LAN interface in the FedoraServer zone
+xchplot2 compute firewall --firewall firewalld --zone FedoraServer --role broker --from 192.168.1.0/24
+# Helper host using UFW on enp3s0
+xchplot2 compute firewall --firewall ufw --interface enp3s0 --role worker --from 192.168.1.0/24
+```
+
+Review and run the printed commands locally. The firewalld commands add both
+runtime and permanent rules. The UFW commands use the selected or saved
+interfaces. Use `--discovery off` for direct routes without mDNS, and repeat
+`--from` for additional IPv4 or IPv6 peers. Use `firewall-cmd --get-active-zones`
+to find the zone assigned to the LAN interface. Select the VPN interface when
+allowing connections over a VPN. For rule management, see the
+[firewalld rich-rule reference](https://firewalld.org/documentation/man-pages/firewalld.richlanguage.html)
+and [UFW manual](https://manpages.ubuntu.com/manpages/jammy/man8/ufw.8.html).
 
 The saved setup is in `$XDG_CONFIG_HOME/xchplot2/compute`, falling back to
 `$HOME/.config/xchplot2/compute`; Windows instead defaults to
@@ -1850,6 +2536,7 @@ Old ordinary manifests continue to use their original engine; use
 
 `--compute off` disables automatic sharing for a plotting command.
 `--compute-local off` uses pool workers without offering local capacity.
+Omit explicit private NUMA or multi-device selectors for remote-only work.
 `--compute-broker HOST:PORT` overrides the saved broker for one job.
 Advanced direct connections can still supply `--compute-owner-id`,
 `--compute-ca`, `--compute-cert` and `--compute-key`; the broker and worker
@@ -1868,10 +2555,112 @@ the machine's stable key namespace.
 controls the optional encoding partition (`0` disables it), and
 `--compute-timeout-ms N` / `--compute-socket-timeout-ms N` bound task and socket
 waits. The defaults are one hour per task and 30 seconds per socket operation.
+If a task expires during admission, a short control deadline lets the worker
+receive the broker's acknowledgement and release the slot. The original
+deadline still bounds execution.
+When a worker pauses or its queue fills before it starts a task, it can
+confirm the refusal directly with the broker. The broker can assign a retry
+to that worker once it has capacity, even if the owner's upload was interrupted.
+If the connection breaks during execution, the owner can retry on another
+eligible worker as soon as it reports the lost transfer. The broker keeps
+the original worker's resources reserved until it finishes or its lease
+expires. Only the current attempt can deliver the result.
+If a helper reports zero T1 matches before sending any plot data, the owner
+can retry the same member or batch once on another available executor. If
+that retry has no available executor, the error names the failing worker
+and instance. The original task deadline still applies.
+
 `--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
 `--compute-offer-slots`, and `--compute-offer-backend`. `compute worker --help`
 lists standalone task, thread, window and transport limits.
+
+For pooled construction, `--compute-output auto|packed|encoded` selects the
+preferred form of worker output. Packed members can stream directly into
+temporary HDD space as bounded tiles. Encoded output carries compressed
+contributions, or a complete fresh group when the worker and destination can
+admit it. Near the destination's space limit the owner can probe with a single
+compressed member. Recovery follows the saved construction transaction.
+
+With I/O and generation overlap enabled, an owner with multiple CPU workers
+can validate a packed tile while receiving the next frame. This uses the
+configured CPU pool and reuses the existing network buffer. When staging
+encoded contributions on scratch storage, the owner budgets one additional
+frame per concurrent receiver. It can read that frame while validating and
+writing the previous chunks. A single-CPU owner consumes each frame inline.
+With a compatible GPU and at least two worker CPU threads, the owner can
+send several ready members in one lease. With multiple eligible slots, it
+shares them among ready destinations with the same k and strength.
+A single destination can spread its ready members across GPUs. With one slot,
+the owner can also combine requests from different destinations.
+Once a new worker starts returning its first packed member, the owner can
+count the time since it sent the request. If that already exceeds a measured
+worker's expected time to finish a batch, the measured worker can resume
+batching. As the last destinations finish, the owner can also keep a batch
+together when every eligible route has been measured and that worker can
+finish the batch before any other could deliver one member. It checks the
+granted worker and endpoint before sending the member IDs. New arrivals can
+still receive single-member probes.
+When several destinations have enough RAM to receive independently, the
+owner can reserve a measured batch on a fast worker while another destination
+tries a new helper. The other destinations can submit work as soon as the
+broker grants the batch. If the worker leaves or the receive budget shrinks,
+the owner can send the original members individually.
+The broker reports a common batch width and the number of slots that can
+stream each independent batch size within the workers' CPU and memory budgets.
+The GPU generates and sorts the next member while the worker encodes the
+preceding member. Both members use the same pinned output
+buffer in turn. Each receiver gets its own ordered compressed chunks.
+This works when the worker has RAM for only one raw member. Encoding can
+reduce its CPU thread count between windows as other work needs the host.
+The owner budgets each scratch receiver, and disk pressure limits queued destinations.
+
+With multiple rotating destinations, automatic selection starts with the
+available worker and storage bandwidth. When a writer has more groups to
+produce, it samples independent writer counts and both output forms through
+durable publication. It tests intermediate writer counts around the fastest
+measured width. As drives finish or become available, it can reuse the
+fastest measured combination that still fits. When
+the worker slots for whole-group streams are occupied, another destination
+can receive packed members and assemble them on the storage host.
+When several HDDs can write independently, the owner can compare how long
+workers take to deliver packed members and complete encoded groups. It can
+also use timings from comparable completed fills. When the timings favor
+complete groups, independent writers can receive them concurrently. Without
+those timings, it can try one encoded group while a second worker and writer
+handle packed members. If a worker cannot take the whole group immediately,
+the writer can receive packed members without waiting for that worker.
+When disk I/O is slowing farming, the planner limits new pooled work on
+the affected HDDs and suspends writer trials there.
+`--compute-writers N` requests up to N active pooled HDD destinations for
+a repeatable comparison. The default is `auto`. The plotting JSON includes
+the peak active destinations, packed members streamed to scratch, fresh
+groups received from workers, and counts of independent contribution leases
+and members. Set `POS2GPU_PHASE_TIMING=1` on the worker to
+see member generation and chunk encoding wall times. For independent
+contributions, `pinned output wait` measures how long the preceding consumer
+holds the buffer before the device-to-host copy. Packed GPU generation
+can overlap its output callback, so its generation time includes backpressure
+from the receiver.
+The Workers tab shows each worker's failed assignments and the latest
+reason alongside its validated deliveries. With phase timing enabled,
+the owner identifies failed assignments
+by worker instance, sequence and attempt. The worker logs the reason for
+a failure after it accepts the lease. These fields let you match failures
+to retries across the two machines.
+
+An optional remote encoding probe uses recent broker timings and available
+CPU and task slots to decide whether it can finish within the local encoding
+time. Probes back off after repeated failures while local encoding
+continues. The owner passes the remaining time for a codec window to the
+broker. If that time runs out before a worker starts, the broker releases
+the reservation so generation can use the slot.
+When a window spans several network requests, the owner compares
+local encoding with each worker's total time per byte across its share of that
+window. Plotting JSON distinguishes calibration attempts, declined or failed
+codec windows and unavailable windows, and retains the latest bounded failure
+message in `pool_codec_last_failure`. These counters are separate from completed
+generation tasks.
 
 Workers may arrive or leave while jobs run. Lost or expired work is retried
 without publishing incomplete results. Available local compute permits
@@ -1986,14 +2775,14 @@ spaces. For `plan` and `fill` destination lists, use
 [`--paths-from` or `--paths0-from`](#grouped-plotting-and-drive-filling).
 Pass `--config` directly on the command line, not inside an argument file.
 
-## Plot indices and meta groups
+## Plot indices and collections
 
 Both are v2 PoS fields and default to 0. `plot -n N` writes N independent
 `.gplot` groups with fresh keys. `--group-members M` chooses M members per
 file; every file starts at member index zero.
-`--seed` and saved-job resume preserve those identities. The meta group (u8)
+`--seed` and saved-job resume preserve those identities. The collection number (u8)
 selects a challenge-isolation boundary. Every member of a group shares its
-group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || meta_group`.
+group ID and memo; its ID is SHA-256 of `group_id || u16_be(index) || collection`.
 
 The official version 2 format from
 [pos2-chip PR #118](https://github.com/Chia-Network/pos2-chip/pull/118)
@@ -2017,8 +2806,17 @@ do not establish support in a released farmer or network activation.
 ## Devices and CPU workers
 
 `xchplot2 devices` lists the IDs accepted by `--devices`. Without an enrolled
-compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses pos2-chip's CPU
-implementation. Combine selectors with commas:
+compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses xchplot2's native C++ member generator.
+A CPU worker generates and sorts the member in RAM, then hands the fragments to
+the plot writer. The RAM estimate accounts for k, strength and the number of CPU
+threads. When all match targets for a key fit in one bucket, threads share a read-only
+index and can skip the temporary query table.
+The SYCL and CUDA-only builds use the same generator. When CPU and GPU workers
+share a batch, the scheduler starts with estimates for the selected k and
+strength. It uses observed completion times to decide whether another member
+on a slower worker will shorten the job.
+
+Combine selectors with commas:
 
 | Selector | Workers |
 |---|---|
@@ -2054,8 +2852,9 @@ retires after `XCHPLOT2_CPU_WAIT_SECS` (default 300) if memory does not return.
 `XCHPLOT2_CPU_RESERVE_MB` keeps RAM available for other work.
 
 CPU workers run at nice +10 by default and are pinned to their selected NUMA
-node. Pinning controls locality, not pos2-chip's thread count; the CPU plotter
-can still oversubscribe the node. `-v` reports the actual affinity mask:
+node. The native generator sizes its thread team from the available CPUs and
+its input size. Each worker reserves its own table memory before generation.
+The writer uses the existing shared compression pool.
 
 ```text
 [cpu1#0] pinned to NUMA node 1 (cpus 32-63)
@@ -2132,8 +2931,8 @@ colon-separated `tiny` or `minimal` values). Pipeline plotting rejects
 `--max-host-ram`; select `--strategy work-queue` when a host-memory cap is needed.
 `--pipeline-depth N` controls the preallocated boundary-buffer count
 (default 2); increasing it uses more pinned host RAM. These strategy and
-stage controls apply to `plot` and `batch`. `--prefer-peer-copy` is a
-deprecated no-op alias because peer transport is already the default.
+stage controls apply to `plot` and `batch`. Remove `--prefer-peer-copy`
+from older commands. Peer transport is the default.
 
 ## Benchmarking
 
@@ -2207,6 +3006,12 @@ Minimal, and Tiny. Pinned is a separate manual tier, not a smaller automatic fal
 The owning driver supplies free VRAM after context creation. A missing
 reading or insufficient `peak + buffer` causes refusal before allocation.
 
+On Windows with the HIP backend, direct single-GPU plotting and its memory
+watchdog use the driver's reading for the plotting process. When sharing the
+Radeon with another application, `POS2GPU_MAX_VRAM_MB` can bound a direct
+plot's memory use. A compute worker with an automatic GPU limit also reads
+Windows' adapter-wide usage and process budget as it updates its offer.
+
 Integrated Intel GPUs share host memory. Admission uses the driver's free
 host-memory reading, bounded by physical host RAM and the runtime's allocation
 cap. CPU allocations and cache activity affect those counters, so they cannot
@@ -2253,14 +3058,12 @@ For boundary tests and the limits of software caps, see
 Lower VRAM tiers keep more intermediate data in host RAM. A tier can fit
 the GPU and still exceed the host's available memory.
 
-xchplot2 models each tier's host peak and checks it before allocating
-anything. When the tier does not fit, it **tries to spill eligible cold tables to a
-usable temporary directory** by default. If the remaining working set still does not fit, it refuses.
-Automatic spill is used only when admission would otherwise fail.
+xchplot2 checks each tier's estimated host peak before allocation. If the tier
+would exceed available host RAM, the plotter automatically tries to reduce its
+working set. If the remaining working set still does not fit, it refuses the plot.
 
 ```bash
-# Nothing to do — this is the default. A host that is short on RAM
-# spills, announces it, and plots.
+# Use the default automatic host RAM budget when RAM is tight.
 xchplot2 plot -k 28 -n 10 -f <farmer-pk> -c <pool-address>
 
 # Put the spill somewhere specific (a fast NVMe, not the array).
@@ -2275,29 +3078,26 @@ xchplot2 plot ... --max-host-ram min
 xchplot2 plot ... --no-auto-spill
 ```
 
-`--auto-spill` re-enables automatic spilling after an earlier
-`--no-auto-spill` flag or configuration setting. The environment override
-`XCHPLOT2_NO_AUTO_SPILL=1` still disables it; unset that variable to re-enable it.
+`--no-auto-spill` disables this automatic fallback. An explicit `--max-host-ram`
+budget still applies and can route tables to disk. Use `--auto-spill` to re-enable
+the fallback after an earlier flag or configuration setting. If you set
+`XCHPLOT2_NO_AUTO_SPILL=1`, unset it to re-enable the fallback.
 
-What gets spilled, in order, largest first — and only as far as the
-budget requires:
+The plotter makes these adjustments in order until the budget fits.
 
-1. the cold cap-sized tables, streamed through two shared 32 MiB staging
-   windows (64 MiB in total, however many tables spill) so the disk I/O
-   overlaps compute. Which tables depends on the tier: `tiny` and `pinned` route
-   `h_t1_meta`, `h_t3`, `h_t2_meta`, `h_t2_xbits`; `compact` and
-   `minimal` route `h_t3`, `h_frags`, `h_t2_xbits`;
-2. the D2H drain slots, 3 → 1, **last**. Spilling a table costs disk
-   I/O per plot; a drain slot costs producer/consumer overlap across
-   plots, which is the more expensive of the two in a batch.
+1. Spill the cold cap-sized tables largest first. Two shared 32 MiB staging
+   windows let disk I/O overlap compute. The `tiny` and `pinned` tiers can route
+   `h_t1_meta`, `h_t3`, `h_t2_meta` and `h_t2_xbits`. The `compact` and
+   `minimal` tiers can route `h_t3`, `h_frags` and `h_t2_xbits`.
+2. Reduce the D2H drain slot count from three toward one. Fewer slots use less
+   pinned host RAM and reduce producer/consumer overlap across plots.
 
 Notes:
 
-- **The temp dir must be real disk.** `/tmp` is tmpfs on most systemd
-  distributions, i.e. RAM — spilling there consumes the memory the
-  budget exists to bound. xchplot2 refuses a RAM-backed temp dir up
-  front (override with `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow RAM-backed spill), and checks the dir exists and is writable before
-  starting rather than failing mid-batch.
+- **Only spilled tables need a temp directory.** Before spilling, xchplot2
+  checks that the directory is writable and disk-backed. Spilling to a
+  RAM-backed directory such as a `/tmp` mounted on tmpfs consumes host memory.
+  Set `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` to allow it.
 - **Budget ~7.1 GiB of free space** for tiny at k=28, ~5.1 GiB for
   compact or minimal — the latter two route `h_frags` as well, a full
   2.03 GiB table even though it makes no engine I/O. This is checked
@@ -2322,7 +3122,7 @@ Notes:
 ### Single test plot
 
 ```bash
-xchplot2 test <k> <group-id-hex> [strength] [plot-index] [meta-group] [verbose]
+xchplot2 test <k> <group-id-hex> [strength] [plot-index] [collection] [verbose]
 ```
 
 This accepts a 64-character hex group ID and derives its member ID. It uses CPU phases by default;
@@ -2478,9 +3278,9 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_BUILD_CUDA=ON\|OFF` | Override the build-time CUB / nvcc-TU switch. Default is vendor-aware (NVIDIA → ON; AMD / Intel → OFF; no GPU → `nvcc`-presence). Force `OFF` on dual-toolchain hosts (CUDA + ROCm) where you want the SYCL-only build. |
 | `XCHPLOT2_STREAMING=1`        | Force the low-VRAM streaming pipeline even when the pool would fit.     |
 | `XCHPLOT2_STREAMING_TIER=plain\|compact\|minimal\|tiny\|pinned` | Force a streaming tier even when the pool fits. A non-auto `--tier` takes precedence. See [memory requirements](#memory-requirements). |
-| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's unswappable (pinned + anonymous) host peak, spilling the cold cap-sized tables to `--temp-dir` largest-first — and then the D2H drain slots, 3 → 1 — until the model fits. `min` takes everything this tier can. Equivalent CLI flag: `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
-| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then `/tmp`. **Must be real disk** — a RAM-backed dir is refused up front, since spilling to tmpfs consumes the memory the budget exists to bound. Equivalent CLI flag: `--temp-dir`. |
-| `XCHPLOT2_NO_AUTO_SPILL=1`    | Refuse to plot when the tier does not fit host RAM, instead of spilling automatically. The automatic spill only ever fires where the run would otherwise be rejected, so this trades a slower plot for a clear error. Equivalent CLI flag: `--no-auto-spill`. |
+| `XCHPLOT2_MAX_HOST_RAM=8G\|8192M\|<bytes>\|min` | Cap the streaming path's pinned and anonymous host memory. The plotter spills eligible tables largest first, then reduces the D2H drain slot count until the model fits. `min` spills every eligible table and uses one drain slot unless its count was set explicitly. Equivalent to `--max-host-ram`. See [Host RAM and disk-offload](#host-ram-and-disk-offload). |
+| `XCHPLOT2_TEMP_DIR=/path`     | Where spilled tables live. Falls back to `$TMPDIR`, then the system temp directory. The plotter checks this directory when it routes tables to disk. Equivalent CLI flag: `--temp-dir`. |
+| `XCHPLOT2_NO_AUTO_SPILL=1`    | Disable the automatic host-RAM fallback. An explicit host RAM budget can still route tables to disk. Equivalent to `--no-auto-spill`. |
 | `XCHPLOT2_ALLOW_RAM_TEMP_DIR=1` | Allow a RAM-backed spill directory with a warning. The spilled bytes consume RAM outside the stated host budget. No override is needed for a disk-backed directory. |
 | `XCHPLOT2_HOST_RESERVE_MB=N`  | Host RAM left for the rest of the box when admitting a streaming tier. Default 512. |
 | `XCHPLOT2_DRAIN_SLOTS=N`      | Pin the D2H drain slot count (1-3) and skip the budget's automatic reduction. Fewer slots means less pinned host memory and less producer/consumer overlap. |
@@ -2488,10 +3288,10 @@ common commands and options; use this reference for the complete command guide.
 | `XCHPLOT2_HOST_FREE_MB=N`     | Testing only — make the host report at most N MB free, so the host-RAM guard and the automatic spill can be exercised on a box that is not actually short. Clamps only: it can never talk the plotter past a real shortage. |
 | `POS2GPU_MAX_VRAM_MB=N` | Cap the free-VRAM query and enforce the selected budget. This tests admission and the watchdog on the current GPU; it does not emulate another physical card. |
 | `POS2GPU_VRAM_MARGIN_MB=N` | Buffer beyond the selected modeled VRAM peak, in MiB. Default 128. Raise it when other activity takes VRAM after admission. |
-| `POS2GPU_ASSERT_VRAM=1` | Fail when the watchdog's sampled device-wide decrease in free VRAM exceeds the declared budget, including its margin. Other processes can affect this measurement; repeat on an idle GPU before attributing a failure to the model. Armed by `bench`. |
+| `POS2GPU_ASSERT_VRAM=1` | Fail when the sampled decrease in free VRAM exceeds the declared budget, including its margin. The Windows HIP reading covers the plotting process. On a backend with device-wide readings, repeat on an idle GPU before attributing a failure to the model. Enabled by `bench`. |
 | `POS2GPU_STREAMING_STATS=1`   | Log every streaming-path `malloc_device` / `free`.                      |
 | `POS2GPU_POOL_DEBUG=1`        | Log pool allocation sizes at construction.                              |
-| `POS2GPU_PHASE_TIMING=1`      | Per-phase wall-time breakdown (Xs / sort / T1 / T2 / T3) on stderr. The [group construction engine](#construction-and-recovery) also reports output transfers, host CPU time and controller waits. Diagnostic synchronization can change overlap; these are not kernel-busy measurements. |
+| `POS2GPU_PHASE_TIMING=1`      | Writes phase timings for Xs, sort and T1–T3 to stderr. Group construction also reports controller waits and the target, collection and member range for hashing, fresh payload writes, file commit and durable publication. Per-target counters include time in codec, write and sync calls. Diagnostic synchronization can affect overlap. |
 | `ACPP_GFX=gfxXXXX` | AMD container AOT target; Cargo detects the GPU separately. See [AMD target selection](INSTALL.md#amd-target-selection). |
 | `ACPP_TARGETS=...` | Override Cargo target selection, such as `generic` or `hip:gfx1031`. For direct CMake use `-DACPP_TARGETS=...`. |
 | `CUDA_ARCHITECTURES=89`    | Override the CUDA arch autodetected from `nvidia-smi`.                  |

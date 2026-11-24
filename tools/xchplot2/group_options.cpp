@@ -50,6 +50,13 @@ void resolve_group_devices(pos2gpu::GroupOptions& result)
     if (result.devices.empty()) return;
     pos2gpu::BatchOptions selection;
     require(pos2gpu::parse_devices_arg(result.devices, selection), "invalid --devices selection");
+    // Backend-wide selectors also describe remote-only work on a machine
+    // with no matching local GPU, or with several NUMA nodes.
+    if (!result.automatic_local_compute && result.compute_mode != "off" && selection.device_ids.empty() && selection.cpu_node_ids.empty())
+    {
+        result.backend = selection.use_all_devices ? (selection.cpu_selected() ? "auto" : "gpu") : "cpu";
+        result.backend_set = true; return;
+    }
     // A single explicit GPU keeps the existing deferred admission: saved
     // plans and publication-only recovery need not initialize that device.
     if (!selection.use_all_devices && !selection.cpu_selected() && selection.device_ids.size() == 1)
@@ -92,7 +99,17 @@ void resolve_group_devices(pos2gpu::GroupOptions& result)
     }
     if (selection.cpu_selected())
     {
-        auto const nodes = pos2gpu::host_numa_nodes();
+        auto nodes = pos2gpu::host_numa_nodes();
+        auto const inherited = pos2gpu::current_thread_cpus();
+        if (!inherited.empty())
+        {
+            for (auto& node : nodes)
+            {
+                if (node.cpus.empty()) node.cpus = inherited;
+                else std::erase_if(node.cpus, [&](int cpu) { return !std::binary_search(inherited.begin(), inherited.end(), cpu); });
+            }
+            std::erase_if(nodes, [](auto const& node) { return node.cpus.empty(); });
+        }
         if (selection.use_all_cpu_nodes)
             for (auto const& node : nodes) devices.push_back({pos2gpu::cpu_device_id(node.node_id), "auto", node.cpus});
         else for (int id : selection.cpu_node_ids)
@@ -210,13 +227,13 @@ void reference_help()
         "  -S, --seed HEX             base seed (required for rollover/additional destinations)\n"
         "  --k EVEN                  18..28, default 28\n"
         "  --strength N              default 2\n"
-        "  --meta-group N            default 0\n"
+        "  -g, --collection N        collection number, default 0\n"
         "  -r, --resume              continue/recover an existing destination\n"
         "  --capacity-bytes N        logical destination cap; default filesystem capacity\n"
         "  --headroom-bytes N        filesystem bytes left free, default 67108864\n"
         "  -M, --max-ram N           modeled app buffer budget in bytes, default available RAM\n"
         "  --window-bytes N          fixed I/O window; default auto up to 16777216\n"
-        "  -j, --workers N           compression workers, default available CPU count\n"
+        "  -j, --workers N           shared plotting CPU budget, default available CPU count\n"
         "  --batch-members N         maximum additions per rewrite, default fits available RAM\n"
         "  --max-members N           stop at this total membership, default 65535\n"
         "  --max-groups N            per-directory rollover file limit; default fills capacity\n"
@@ -226,7 +243,9 @@ void reference_help()
         "  --tier T                  pool|plain|compact|minimal|tiny|pinned|auto, default auto\n"
         "  --member-storage raw|compact  retained member representation, default compact\n"
         "  --construction auto|incremental|staged|merged|external  assembly method, default auto\n"
-        "  --checkpoint-bytes N      fixed durability target; auto up to 268435456, merged 1073741824\n"
+        "  --compute-output auto|packed|encoded  preferred pooled generation output\n"
+        "  --compute-writers auto|N  active pooled HDD destinations, subject to admission\n"
+        "  --checkpoint-bytes SIZE|auto  bytes between recovery checkpoints (default auto)\n"
         "  --io-overlap on|off        overlap encoding and file I/O, default on\n"
         "  --generation-overlap auto|on|off  overlap GPU/CPU work within admitted budgets, default auto\n"
         "  --cache-release on|off     release clean construction file cache, default on\n"
@@ -260,6 +279,28 @@ void reference_help()
 
 void pos2gpu::configure_group_compute(GroupOptions& result)
 {
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    require(result.automatic_local_compute || (result.local_devices.empty() && result.producer_cpu_affinity.empty() &&
+        result.replot_gpu_devices.empty()), "--compute-local off conflicts with selected local devices");
+    if (!result.local_devices.empty() && (result.replot || (!result.from_plan.empty() &&
+        group_grow::farm::inventory_detail::is_replot_review(result.from_plan))))
+    {
+        // A directory resume can discover its private review after parsing.
+        // Rebuild the original combined budget before applying the reviewed
+        // single producer / authenticated local service allowance.
+        restore_group_compute_request(result);
+        for (auto& selected : result.local_devices)
+        {
+            if (is_cpu_device(selected.device))
+                result.producer_cpu_affinity.insert(result.producer_cpu_affinity.end(), selected.cpu_affinity.begin(), selected.cpu_affinity.end());
+            else result.replot_gpu_devices.push_back(std::move(selected));
+        }
+        // A fresh adaptive review starts with one of the nominated cards.
+        // Existing reviews resolve the physical identity within the full list.
+        if (!result.replot_gpu_devices.empty()) result.device = uint64_t(result.replot_gpu_devices.front().device);
+        result.local_devices.clear();
+    }
+#endif
     if (result.compute_requested) return;
     auto const& command = result.command;
     bool const farm_command = command == "fill" || command == "plan";
@@ -268,6 +309,7 @@ void pos2gpu::configure_group_compute(GroupOptions& result)
     result.compute_requested_backend = result.backend;
 #ifdef XCHPLOT2_GROUP_COMMANDS
     if (result.save_profile.empty() || !result.local_devices.empty() || result.replot) prepare_group_compute(result);
+    if (result.local_compute && !result.workers) result.workers = std::max(1u, group_grow::profile_detail::logical_cpus());
 #endif
     bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
         !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||
@@ -279,7 +321,7 @@ void pos2gpu::configure_group_compute(GroupOptions& result)
 #if !defined(GROW_POOL_NETWORK) || !GROW_POOL_NETWORK
         require(false, "network compute is unavailable in this build");
 #endif
-        require(result.local_compute || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
+        require(result.pool_broker.empty() || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
             !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty()),
             command.empty() ? "network compute requires a stable --pool-owner-id and mutual TLS credentials" : "network compute requires a stable --compute-owner-id and mutual TLS credentials");
         require(result.fixtures.empty(), "network compute cannot use fixture inputs");
@@ -400,7 +442,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             std::string_view const key = argv[i]; if (key == "--") break;
             if (!key.starts_with('-')) continue;
             require((replot_status && (key == "--status" || key == "--no-status" || key == "--from-plan" || key == "-F" ||
-                    key == "--watch" || key == "--no-watch" || key == "--inspect" || key == "--no-inspect" ||
+                    key == "--watch" || key == "--no-watch" || key == "--tui" || key == "--no-tui" || key == "--inspect" || key == "--no-inspect" ||
                     key == "--live" || key == "--no-live" || key == "--timeout-ms")) ||
                 (replot_status && status_live && (key == "--compute" || key == "--compute-directory" || key == "--compute-broker" ||
                     key == "--harvester" || key == "--farm-adapter" || key == "--chia-root" || key == "--chia-executable")) ||
@@ -471,6 +513,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         if (key == "--no-inventory") { result.inventory = false; continue; }
         if (key == "--status") { result.replot_status = true; continue; }
         if (key == "--no-status") { result.replot_status = command == "status"; continue; }
+        if (key == "--tui" || key == "--no-tui") { result.tui = key == "--tui"; continue; }
         if (key == "--watch") { result.status_watch = true; continue; }
         if (key == "--no-watch") { result.status_watch = false; continue; }
         if (key == "--inspect") { result.status_inspect = true; continue; }
@@ -585,6 +628,15 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 result.farming_profile_path = result.farming_detect_local ? fs::path{} : path(value);
                 result.farming_profile_set = true;
             }
+            else if (key == "--harvester-log")
+            {
+                require((command == "fill" || command == "plan") && !value.empty() && i + 1 < argc && *argv[i + 1],
+                    "--harvester-log requires a fill destination and a forwarded log file");
+                require(result.harvester_logs.size() < 1024, "too many harvester log bindings");
+                auto const& binding = result.harvester_logs.emplace_back(path(value), path(argv[++i]));
+                group_grow::farm::inventory_detail::bounded_text(group_grow::file_io::path_text(binding.first));
+                group_grow::farm::inventory_detail::bounded_text(group_grow::file_io::path_text(binding.second));
+            }
             else if (key == "--chia-root") { result.chia_root = path(value); result.chia_root_set = true; }
             else if (key == "--chia-executable") { result.chia_executable = path(value); result.chia_executable_set = true; }
             else if (key == "--relocate")
@@ -641,7 +693,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             }
             else if (key == "--k" || key == "-k") { result.k = number(value.c_str(), argv[i - 1]); result.k_set = true; }
             else if (key == "--strength" || key == "-s") { result.strength = number(value.c_str(), argv[i - 1]); result.strength_set = true; }
-            else if (key == "--meta-group" || key == "-g") { result.meta = number(value.c_str(), argv[i - 1]); result.meta_set = true; }
+            else if (key == "--collection" || key == "--meta-group" || key == "-g") { result.meta = number(value.c_str(), argv[i - 1]); result.meta_set = true; }
             else if (key == "--capacity-bytes")
             {
                 result.capacity = number(value.c_str(), argv[i - 1]);
@@ -683,7 +735,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             else if (key == "--farming-deadline-ms") result.farming_deadline_ms = number(value.c_str(), argv[i - 1]);
             else if (key == "--max-groups") { result.max_groups = number(value.c_str(), argv[i - 1]); result.max_groups_set = true; }
             else if (key == "--max-total-members") { result.max_total_members = number(value.c_str(), argv[i - 1]); result.max_total_members_set = true; }
-            else if (key == "--checkpoint-bytes") { result.checkpoint_bytes = number(value.c_str(), argv[i - 1]); result.checkpoint_set = true; }
+            else if (key == "--checkpoint-bytes")
+            {
+                result.checkpoint_set = value != "auto";
+                result.checkpoint_bytes = result.checkpoint_set ? number(value.c_str(), argv[i - 1]) :
+                    pos2gpu::GroupOptions::default_checkpoint_bytes;
+            }
             else if (key == "--backend") { result.backend = value; result.backend_set = true; result.devices.clear(); }
             else if (key == "--device") { result.device = number(value.c_str(), argv[i - 1]); result.device_set = true; result.devices.clear(); }
             else if (key == "--devices" || key == "-d")
@@ -727,6 +784,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
             "cannot determine an available RAM budget; retry when memory is available or set --max-host-ram");
     }
     bool const farm_command = command == "fill" || command == "plan";
+    require(!result.tui || result.replot_status || command == "plan" || command == "fill" || command == "grow" || command == "plot",
+        "--tui is available for planning, plotting or status");
+    require(!result.tui || progress != 0, "choose --tui or --no-progress");
     require((!result.status_watch && !result.status_inspect) || result.replot_status, "--watch and --inspect require status");
     require(!result.status_live || result.replot_status, "--live requires status");
     require(!status_timeout_set || (result.replot_status && result.status_live), "--timeout-ms requires status --live");
@@ -875,6 +935,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "sampled migration verification requires a nonzero first or periodic group count");
     require(result.farm_adapter == "chia" || result.replot || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
+    require(result.harvester_logs.empty() || (!result.replot && !result.inventory && !result.replot_status &&
+        !result.assess_jobs && !result.metadata_only && !result.calibrate &&
+        (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
+        "--harvester-log requires an ordinary fill or fill plan");
+    std::sort(result.harvester_logs.begin(), result.harvester_logs.end());
+    result.harvester_logs.erase(std::unique(result.harvester_logs.begin(), result.harvester_logs.end()), result.harvester_logs.end());
     require(!result.farm_adapter_timeout_set || result.replot ||
         (farm_command && !result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan)),
         "--farm-adapter-timeout-ms requires inventory, replot review or a saved migration plan");
@@ -913,7 +979,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--chia-root and --chia-executable require --harvester local");
     require(result.batch > 0 && result.batch <= 65535 && result.max_members > 0 &&
                 result.max_members <= 65535, "member caps must be in 1..65535");
-    require(result.workers <= 1024, "compression worker cap exceeds 1024");
+    require(result.workers <= 1024, "plotting CPU budget exceeds 1024");
     require(result.group_members <= 65535 && result.max_groups && result.max_total_members,
             "rollover group membership must fit in 1..65535 and limits must be positive");
     if (!result.target.empty()) result.target = fs::absolute(result.target).lexically_normal();
@@ -927,7 +993,7 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(command.empty() || !result.quiet || !result.verbose, "--quiet and --verbose are mutually exclusive");
     // Match plot/batch: an explicit progress choice wins; otherwise use stderr
     // TTY detection, with quiet suppressing the automatic progress display.
-    if (progress >= 0) result.progress = progress != 0;
+    if (result.tui || progress >= 0) result.progress = result.tui || progress != 0;
 #ifdef _WIN32
     else result.progress = !result.quiet && ::_isatty(::_fileno(stderr)) != 0;
 #else
@@ -979,12 +1045,9 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "--max-host-ram must be at least 16 MiB (16M)");
     require(!result.k || *result.k <= 255, "invalid k");
     require(!result.strength || *result.strength <= 255, "invalid strength");
-    require(!result.meta || *result.meta <= 255, "invalid meta group");
+    require(!result.meta || *result.meta <= 255, "invalid collection number");
     load_harvester_profile(result);
     resolve_group_devices(result);
-    require(result.local_devices.empty() || (!result.replot &&
-        (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
-        "migration uses its reviewed single-producer resources; select --backend cpu or --devices gpuN for migration");
     if (result.save_profile.empty() || !result.local_devices.empty()) configure_group_compute(result);
     else { auto checked = result; configure_group_compute(checked); }
     if (result.directory_farm && !farm_command)

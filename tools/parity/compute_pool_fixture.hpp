@@ -1,8 +1,6 @@
 // Local ephemeral CA/certificates for standalone network-compute tests.
 #pragma once
 #include "host/ComputeNetwork.hpp"
-#include <openssl/pem.h>
-#include <openssl/x509v3.h>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -12,6 +10,8 @@
 #else
 #include <unistd.h>
 #endif
+#include <openssl/pem.h>
+#include <openssl/x509v3.h>
 
 namespace pool_test
 {
@@ -65,9 +65,10 @@ inline Identity issue(fs::path const& path, std::string const& name, Identity co
         X509_gmtime_adj(X509_getm_notBefore(result.cert.get()), -60) &&
         X509_gmtime_adj(X509_getm_notAfter(result.cert.get()), 3600) &&
         X509_set_pubkey(result.cert.get(), result.key.get()) == 1, "cannot prepare test TLS identity");
-    auto subject = X509_get_subject_name(result.cert.get());
-    require(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-        reinterpret_cast<unsigned char const*>(name.c_str()), -1, -1, 0) == 1, "cannot name test certificate");
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject(X509_NAME_new(), X509_NAME_free);
+    require(subject && X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC,
+        reinterpret_cast<unsigned char const*>(name.c_str()), -1, -1, 0) == 1 &&
+        X509_set_subject_name(result.cert.get(), subject.get()) == 1, "cannot name test certificate");
     auto signing_cert = issuer ? issuer->cert.get() : result.cert.get();
     auto signing_key = issuer ? issuer->key.get() : result.key.get();
     require(X509_set_issuer_name(result.cert.get(), X509_get_subject_name(signing_cert)) == 1, "cannot set test issuer");

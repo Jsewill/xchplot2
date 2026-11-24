@@ -1,7 +1,9 @@
 // Storage limits shared by single-file growth and destination scheduling.
 #pragma once
 #include "host/GroupEngine.hpp"
+#include "host/GroupFarmService.hpp"
 #include "host/Utf8.hpp"
+#include <atomic>
 #include <cstring>
 #include <condition_variable>
 #include <cwctype>
@@ -85,6 +87,13 @@ struct StorageDevice
     // Both remain false for mixed media or an unknown rotation classification.
     bool nonrotating = false, rotating = false;
 };
+inline uint64_t storage_snapshot_bytes(StorageDevice const& device)
+{
+    uint64_t bytes = sizeof(device) + device.filesystem.size() + 1;
+    for (auto const& drive : device.drives)
+        bytes = grow_add(bytes, sizeof(std::string) + drive.size() + 1);
+    return bytes;
+}
 
 // Runtime feedback, never allocation authority or a saved scratch setting.
 // A permit covers one native I/O operation, so a recovered owner spanning many
@@ -93,6 +102,7 @@ class DiskIoGovernor
 {
 public:
     using Clock = std::chrono::steady_clock;
+    enum class Transfer { read, write, flush };
     struct Counters
     {
         uint64_t reads = 0, writes = 0, read_ms = 0, write_ms = 0;
@@ -106,14 +116,61 @@ public:
         bool farming_known = false, pressured = false;
         uint64_t completed_bytes = 0, waits = 0;
     };
-    explicit DiskIoGovernor(Sampler sampler = sample_device) : sampler_(std::move(sampler)) { pending_.reserve(4096); }
+    enum class Mode { protected_farm, observed_farm };
+    struct FarmingScope { std::filesystem::path log; std::vector<StorageDevice> devices; };
+    explicit DiskIoGovernor(Sampler sampler = sample_device, size_t pending_capacity = 4096, Mode mode = Mode::protected_farm,
+                            std::vector<FarmingScope> scopes = {})
+        : sampler_(std::move(sampler)), mode_(mode)
+    {
+        pending_.reserve(pending_capacity); sources_.reserve(scopes.size());
+        for (auto& scope : scopes) sources_.emplace_back(std::move(scope));
+    }
+    bool scoped() const { return !sources_.empty(); }
+    static bool shares_storage(StorageDevice const& a, StorageDevice const& b)
+    {
+        if (!a.filesystem.empty() && a.filesystem == b.filesystem) return true;
+        for (auto const& drive : a.drives)
+            if (std::find(b.drives.begin(), b.drives.end(), drive) != b.drives.end()) return true;
+        return false;
+    }
+    bool covers(StorageDevice const& device) const
+    {
+        return !scoped() || std::any_of(sources_.begin(), sources_.end(),
+            [&](auto const& source) { return source.covers(device); });
+    }
+    size_t farming_sources() const { return sources_.size(); }
+    FarmingScope const& farming_scope(size_t i) const { return sources_.at(i).scope; }
+    void refresh_farming_sources(Clock::time_point now)
+    {
+        std::lock_guard lock(mutex_);
+        Clock::time_point latest{};
+        for (auto& source : sources_)
+        {
+            auto const window = source.history.window(now);
+            source.known_until = window.feedback_expires;
+            source.pressure_until = !source.scope.devices.empty() && window.lookup_pressure.value_or(false) ?
+                window.feedback_expires : Clock::time_point{};
+            latest = std::max(latest, source.pressure_until);
+        }
+        observed_limit_until_.store(latest.time_since_epoch().count(), std::memory_order_relaxed);
+        changed_.notify_all();
+    }
+    Clock::time_point pressure_deadline() const
+    { std::lock_guard lock(mutex_); return pressure_until_; }
+    static uint64_t initial_memory_bytes(size_t pending_capacity = 4096)
+    { return sizeof(DiskIoGovernor) + 2 * pending_capacity * sizeof(Pending); }
+    bool limits_io(Clock::time_point now = Clock::now()) const
+    {
+        if (mode_ == Mode::protected_farm) return true;
+        return now.time_since_epoch().count() < observed_limit_until_.load(std::memory_order_relaxed);
+    }
 
     void register_device(StorageDevice const& device, std::optional<uint64_t> filesystem = {})
     {
         std::lock_guard lock(mutex_);
         if (!(device.nonrotating && !device.drives.empty()))
         {
-            if (device.drives.empty()) register_drive(unknown_drive);
+            if (device.drives.empty()) register_drive(unresolved(device));
             else for (auto const& name : device.drives) register_drive(name);
         }
         if (filesystem)
@@ -164,40 +221,106 @@ public:
         std::lock_guard lock(mutex_); ++selection_;
         for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end()) at->second.selected = selection_;
     }
+    // Bytes per nanosecond available to a scratch stream. Multiple paths to
+    // one volume do not multiply its rate. Prefer block-device service to a
+    // buffered syscall and let foreign traffic keep its observed share.
+    long double bandwidth(StorageDevice const& device, Clock::time_point now = Clock::now())
+    {
+        std::lock_guard lock(mutex_); poll_locked(now);
+        long double service = 0, occupied = 0;
+        for (auto const& name : device.drives) if (auto at = drives_.find(name); at != drives_.end())
+        {
+            auto const& drive = at->second;
+            service = std::max(service, drive.counters ? (drive.bulk_bytes ? drive.bulk_ns / drive.bulk_bytes : 0) : drive.ns_per_byte);
+            if (now < drive.share_until) occupied = std::max(occupied, drive.foreign_fraction);
+        }
+        return service > 0 ? (1 - occupied) / service : 0;
+    }
+    // Only combine rates observed during the same busy interval. In
+    // particular, isolated drive peaks cannot establish a shared HBA rate.
+    long double concurrent_bandwidth(std::span<StorageDevice const> devices, Clock::time_point now = Clock::now())
+    {
+        if (devices.size() < 2) return 0;
+        std::lock_guard lock(mutex_); poll_locked(now);
+        Clock::time_point sampled{}; long double total = 0;
+        size_t covered = 0, width = 0;
+        for (auto const& device : devices)
+        {
+            Clock::time_point latest{}; long double rate = 0;
+            size_t paths = 0;
+            for (auto const& name : device.drives) if (auto it = drives_.find(name); it != drives_.end())
+            {
+                auto const& drive = it->second;
+                if (drive.busy_sample > latest) { latest = drive.busy_sample; rate = 0; paths = 0; }
+                if (drive.busy_sample == latest && drive.busy_rate > 0)
+                { rate = std::max(rate, drive.busy_rate); width = drive.busy_width; ++paths; }
+            }
+            if (!rate || (total && latest != sampled)) return 0;
+            sampled = latest; total += rate; covered += paths;
+        }
+        return covered == width ? total : 0;
+    }
+    // Ordinary construction samples transfers without installing a farming
+    // throttle. The protected path already observes its own native permits.
+    void observe_transfer(StorageDevice const& device, uint64_t bytes, uint64_t ns,
+                          Transfer transfer = Transfer::read, Clock::time_point now = Clock::now())
+    {
+        if (!bytes || !device.rotating || device.drives.empty()) return;
+        std::lock_guard lock(mutex_);
+        for_drives(device, [&](Drive& drive)
+        {
+            drive.own_at = now;
+            drive.submit(transfer, bytes);
+            if (ns)
+            {
+                long double const cost = static_cast<long double>(ns) / bytes;
+                drive.ns_per_byte = drive.ns_per_byte ? (3 * drive.ns_per_byte + cost) / 4 : cost;
+            }
+        });
+        poll_locked(now);
+    }
     class Permit
     {
     public:
         Permit() = default;
         Permit(Permit&& other) noexcept
-            : governor_(std::exchange(other.governor_, nullptr)), device_(other.device_), bytes_(other.bytes_) {}
+            : governor_(std::exchange(other.governor_, nullptr)), device_(other.device_), bytes_(other.bytes_), limited_(other.limited_) {}
         Permit& operator=(Permit&& other) noexcept
         {
             if (this != &other)
             {
-                if (governor_) governor_->complete(*device_, 0, 0);
-                governor_ = std::exchange(other.governor_, nullptr); device_ = other.device_; bytes_ = other.bytes_;
+                complete(0, 0);
+                governor_ = std::exchange(other.governor_, nullptr); device_ = other.device_; bytes_ = other.bytes_; limited_ = other.limited_;
             }
             return *this;
         }
-        ~Permit() { if (governor_) governor_->complete(*device_, 0, 0); }
+        ~Permit() { complete(0, 0); }
         Permit(Permit const&) = delete;
         Permit& operator=(Permit const&) = delete;
         size_t bytes() const { return bytes_; }
-        void complete(uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
-        { if (auto* governor = std::exchange(governor_, nullptr)) governor->complete(*device_, bytes, elapsed_ns, now); }
+        void complete(uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now(), Transfer transfer = Transfer::read)
+        {
+            if (auto* governor = std::exchange(governor_, nullptr))
+            {
+                if (limited_) governor->complete(*device_, bytes, elapsed_ns, now, transfer);
+                else governor->observe_transfer(*device_, bytes, elapsed_ns, transfer, now);
+            }
+        }
     private:
         friend class DiskIoGovernor;
-        Permit(DiskIoGovernor* governor, StorageDevice const* device, size_t bytes)
-            : governor_(governor), device_(device), bytes_(bytes) {}
+        Permit(DiskIoGovernor* governor, StorageDevice const* device, size_t bytes, bool limited = true)
+            : governor_(governor), device_(device), bytes_(bytes), limited_(limited) {}
         DiskIoGovernor* governor_ = nullptr;
         StorageDevice const* device_ = nullptr;
         size_t bytes_ = 0;
+        bool limited_ = true;
     };
     Permit acquire(StorageDevice const& device, size_t requested, std::function<void()> const& check_running = {})
     {
         if (device.nonrotating && !device.drives.empty()) return Permit(nullptr, &device, requested);
         register_device(device);
         std::unique_lock lock(mutex_);
+        if (scoped() && !scoped_pressure(device, Clock::now())) return Permit(this, &device, requested, false);
         require(pending_.size() < 4096, "too many queued disk operations");
         uint64_t const ticket = ++ticket_; pending_.push_back({ticket, &device});
         try
@@ -206,7 +329,7 @@ public:
             {
                 if (check_running) { lock.unlock(); check_running(); lock.lock(); }
                 auto const now = Clock::now(); poll_locked(now);
-                if (queued_turn(ticket, now)) if (auto permit = try_acquire_locked(device, requested, now))
+                if (queued_turn(ticket, device, now)) if (auto permit = try_acquire_locked(device, requested, now))
                 {
                     erase_ticket(ticket); changed_.notify_all(); return std::move(*permit);
                 }
@@ -225,7 +348,8 @@ public:
     {
         if (device.nonrotating && !device.drives.empty()) return Permit(nullptr, &device, requested);
         register_device(device); std::lock_guard lock(mutex_); poll_locked(now);
-        if (!pending_.empty()) return {};
+        if (scoped() && !scoped_pressure(device, now)) return Permit(this, &device, requested, false);
+        if (!pending_.empty() && (!scoped() || !queued_turn(0, device, now))) return {};
         return try_acquire_locked(device, requested, now);
     }
     Permit acquire(int descriptor, size_t requested, std::function<void()> const& check_running = {})
@@ -242,11 +366,51 @@ public:
     Status status(Clock::time_point now = Clock::now()) const
     {
         std::lock_guard lock(mutex_);
-        return {drives_.size(), active_, limit_, farming_known(now), now < pressure_until_, completed_bytes_, waits_};
+        if (scoped())
+        {
+            size_t pressured = 0; bool known = false;
+            for (auto const& source : sources_) { pressured += now < source.pressure_until; known |= now < source.known_until; }
+            return {drives_.size(), active_, pressured, known, pressured != 0, completed_bytes_, waits_};
+        }
+        return {drives_.size(), active_, limit_, farming_known(now), now < pressure_until_ && limits_io(now), completed_bytes_, waits_};
     }
+    // A job-wide planning decision can only use an unscoped local observer.
+    bool pressured(StorageDevice const* device = nullptr) const
+    {
+        auto const now = Clock::now();
+        if (!scoped()) return status(now).pressured;
+        std::lock_guard lock(mutex_); return device && !(device->nonrotating && !device->drives.empty()) && scoped_pressure(*device, now);
+    }
+    // Show the controller's existing bulk-service estimate without polling or
+    // changing the feedback that governs construction.
+    std::optional<std::pair<long double, long double>> observed_bulk_bandwidth(std::string const& leaf,
+        Clock::time_point now = Clock::now()) const
+    {
+        std::lock_guard lock(mutex_);
+        auto const it = drives_.find(leaf);
+        if (it == drives_.end() || !it->second.bulk_ns) return {};
+        auto const& drive = it->second;
+        auto const rate = drive.bulk_bytes / drive.bulk_ns;
+        return std::pair{rate, now < drive.share_until ? rate * (1 - drive.foreign_fraction) : rate};
+    }
+    void record_farming_service(FarmingServiceRecord const& record, uint64_t deadline_ns, size_t source = 0)
+    { std::lock_guard lock(mutex_); (scoped() ? sources_.at(source).history : farming_service_).add(record, deadline_ns); }
+    FarmingServiceWindow farming_service(Clock::time_point now = Clock::now(), size_t source = 0) const
+    { std::lock_guard lock(mutex_); return (scoped() ? sources_.at(source).history : farming_service_).window(now); }
     uint64_t memory_bytes() const
     {
-        std::lock_guard lock(mutex_); uint64_t bytes = sizeof(*this) + 2 * pending_.capacity() * sizeof(Pending);
+        std::lock_guard lock(mutex_); uint64_t bytes = initial_memory_bytes(pending_.capacity());
+        bytes += sources_.capacity() * sizeof(Source);
+        for (auto const& source : sources_)
+        {
+            bytes += (source.scope.log.native().capacity() + 1) * sizeof(std::filesystem::path::value_type) +
+                source.scope.devices.capacity() * sizeof(StorageDevice);
+            for (auto const& device : source.scope.devices)
+            {
+                bytes += device.filesystem.capacity() + 1 + device.drives.capacity() * sizeof(std::string);
+                for (auto const& drive : device.drives) bytes += drive.capacity() + 1;
+            }
+        }
         for (auto const& [name, drive] : drives_) { (void)drive; bytes += sizeof(Drive) + sizeof(std::string) + 4 * sizeof(void*) + name.capacity() + 1; }
         for (auto const& [id, device] : filesystems_)
         {
@@ -274,71 +438,123 @@ private:
     static constexpr char const* unknown_drive = "unresolved";
     struct Drive
     {
+        struct Stream
+        {
+            long double physical = 0, submitted = 0, carry = 0;
+            long double outside()
+            {
+                long double const excess = physical - submitted - carry;
+                // Cached submissions may reach disk in the following interval.
+                // Credit them once, separately for reads and writes.
+                carry = std::min(submitted, std::max(0.L, -excess));
+                physical = submitted = 0;
+                return std::max(0.L, excess);
+            }
+        } reads, writes;
         std::optional<Counters> counters;
         Clock::time_point sampled{}, own_at{}, next{}, foreign_until{};
-        long double ns_per_byte = 0, device_ns_per_byte = 0;
+        long double ns_per_byte = 0, device_ns_per_byte = 0, foreign_fraction = 0;
+        Clock::time_point busy_sample{}, share_until{}, traffic_since{};
+        long double traffic_busy_ns = 0;
+        long double busy_rate = 0, interval_rate = 0, bulk_bytes = 0, bulk_ns = 0;
+        size_t busy_width = 0;
         uint64_t selected = 0;
         size_t active = 0;
+        void submit(Transfer transfer, uint64_t bytes)
+        {
+            if (transfer == Transfer::read) reads.submitted += bytes;
+            if (transfer == Transfer::write) writes.submitted += bytes;
+        }
     };
     std::map<std::string, Drive> drives_;
     std::map<uint64_t, StorageDevice> filesystems_;
     StorageDevice unknown_device_;
     Sampler sampler_;
+    Mode mode_;
+    struct Source
+    {
+        FarmingScope scope;
+        FarmingServiceHistory history;
+        Clock::time_point pressure_until{}, known_until{};
+        size_t active = 0;
+        explicit Source(FarmingScope value) : scope(std::move(value)) {}
+        bool covers(StorageDevice const& device) const
+        { return std::any_of(scope.devices.begin(), scope.devices.end(), [&](auto const& target) { return shares_storage(target, device); }); }
+    };
+    std::vector<Source> sources_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     struct Pending { uint64_t ticket; StorageDevice const* device; };
     std::vector<Pending> pending_;
     Clock::time_point sampled_{}, window_{}, pressure_until_{}, trial_after_{}, farming_at_{};
+    std::atomic<Clock::duration::rep> observed_limit_until_{0};
     size_t active_ = 0, limit_ = 1;
     uint64_t completed_bytes_ = 0, window_bytes_ = 0, waits_ = 0, selection_ = 0, ticket_ = 0;
     uint64_t farming_response_ = 0, farming_deadline_ = 0;
+    FarmingServiceHistory farming_service_;
     long double baseline_rate_ = 0;
     bool waiting_ = false, trial_ = false;
     void register_drive(std::string const& name)
     { require(drives_.contains(name) || drives_.size() < 4096, "too many disk feedback resources"); drives_.try_emplace(name); }
+    std::string unresolved(StorageDevice const& device) const
+    { return scoped() && !device.filesystem.empty() ? "filesystem " + device.filesystem : unknown_drive; }
     template<class Operation> void for_drives(StorageDevice const& device, Operation operation)
     {
-        if (device.drives.empty()) operation(drives_.at(unknown_drive));
+        if (device.drives.empty()) operation(drives_.at(unresolved(device)));
         else for (auto const& name : device.drives) operation(drives_.at(name));
     }
     void erase_ticket(uint64_t ticket)
     { pending_.erase(std::find_if(pending_.begin(), pending_.end(), [&](Pending const& p) { return p.ticket == ticket; })); }
+    bool scoped_pressure(StorageDevice const& device, Clock::time_point now) const
+    { return std::any_of(sources_.begin(), sources_.end(), [&](auto const& s) { return now < s.pressure_until && s.covers(device); }); }
+    bool at_limit(StorageDevice const& device, Clock::time_point now) const
+    {
+        if (!scoped()) return active_ >= limit_;
+        return std::any_of(sources_.begin(), sources_.end(), [&](auto const& s)
+            { return s.active && now < s.pressure_until && s.covers(device); });
+    }
     bool ready(StorageDevice const& device, Clock::time_point now)
     {
-        bool blocked = active_ >= limit_;
+        if (scoped() && !scoped_pressure(device, now)) return true;
+        bool blocked = at_limit(device, now);
         for_drives(device, [&](Drive& drive) { blocked = blocked || drive.active || now < drive.next; });
         return !blocked;
     }
-    bool queued_turn(uint64_t ticket, Clock::time_point now)
+    bool queued_turn(uint64_t ticket, StorageDevice const& device, Clock::time_point now)
     {
         // An older eligible request wins. A waiter for one busy physical disk
         // must not leave other independent disks idle behind it.
         for (auto const& pending : pending_)
         {
             if (pending.ticket == ticket) return true;
+            if (scoped() && !shares_storage(device, *pending.device) &&
+                std::none_of(sources_.begin(), sources_.end(), [&](auto const& s)
+                    { return now < s.pressure_until && s.covers(device) && s.covers(*pending.device); })) continue;
             if (ready(*pending.device, now)) return false;
         }
-        return false;
+        return true;
     }
     std::optional<Permit> try_acquire_locked(StorageDevice const& device, size_t requested, Clock::time_point now)
     {
+        if (scoped() && !scoped_pressure(device, now)) return Permit(this, &device, requested, false);
         bool local = false, foreign = false;
         for_drives(device, [&](Drive& drive)
         { local = local || drive.active || now < drive.next; foreign = foreign || now < drive.foreign_until; });
-        if (active_ >= limit_ || local)
+        if (at_limit(device, now) || local)
         {
             ++waits_;
-            if (active_ >= limit_ && !local) waiting_ = true;
+            if (!local) waiting_ = true;
             return {};
         }
-        if (foreign && now >= pressure_until_) pressure(now);
+        if (!scoped() && foreign && now >= pressure_until_) pressure(now);
         ++active_; size_t bytes = requested;
+        for (auto& source : sources_) if (source.covers(device)) ++source.active;
         for_drives(device, [&](Drive& drive)
         {
             ++drive.active; drive.own_at = now;
             // Aim for a short syscall, bounded even before a measured rate
             // exists. Cached timings are tuning evidence only.
-            uint64_t const quantum = now < pressure_until_ ? 5000000 : 20000000;
+            uint64_t const quantum = scoped() || now < pressure_until_ ? 5000000 : 20000000;
             long double const service = std::max(drive.ns_per_byte, drive.device_ns_per_byte);
             uint64_t const ceiling = drive.device_ns_per_byte ? 4 * 1024 * 1024 : 1024 * 1024;
             uint64_t const measured = service > 0 ? uint64_t(std::clamp<long double>(
@@ -355,6 +571,9 @@ private:
     {
         // Multiplicative decrease and a hold avoid repeated grow/shrink cycles.
         limit_ = std::max<size_t>(1, limit_ / 2); pressure_until_ = now + std::chrono::seconds(2);
+        if (mode_ == Mode::observed_farm && farming_known(now))
+            observed_limit_until_.store(std::min(pressure_until_, farming_at_ + std::chrono::seconds(30)).time_since_epoch().count(),
+                std::memory_order_relaxed);
         trial_after_ = now + std::chrono::seconds(5); trial_ = false; baseline_rate_ = 0;
     }
     void poll_locked(Clock::time_point now)
@@ -362,12 +581,32 @@ private:
         if (sampled_ != Clock::time_point{} && now >= sampled_ && now - sampled_ < std::chrono::milliseconds(250)) return;
         sampled_ = now;
         if (!farming_timely(now)) limit_ = std::min<size_t>(limit_, 2);
+        size_t busy = 0;
         for (auto& [name, drive] : drives_)
         {
+            drive.interval_rate = 0;
             auto current = sampler_ ? sampler_(name) : std::optional<Counters>{};
             if (current && drive.counters && current->busy_ms >= drive.counters->busy_ms &&
                 current->read_sectors >= drive.counters->read_sectors && current->write_sectors >= drive.counters->write_sectors)
             {
+                drive.reads.physical += (current->read_sectors - drive.counters->read_sectors) * 512.L;
+                drive.writes.physical += (current->write_sectors - drive.counters->write_sectors) * 512.L;
+                auto const interval = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.sampled).count();
+                drive.traffic_busy_ns += std::clamp<long double>((current->busy_ms - drive.counters->busy_ms) * 1000000.L,
+                    0, std::max<int64_t>(0, interval));
+                if (now - drive.traffic_since >= std::chrono::seconds(1))
+                {
+                    long double const physical = drive.reads.physical + drive.writes.physical;
+                    long double const outside = drive.reads.outside() + drive.writes.outside();
+                    auto const elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.traffic_since).count();
+                    // Attribute bulk traffic even while this plot is active.
+                    // Metadata-only contention is observable on a quiet disk.
+                    long double const fraction = physical >= 1024 * 1024 ? outside / physical :
+                        !drive.active && drive.own_at < drive.traffic_since ? 1.L : 0.L;
+                    drive.foreign_fraction = std::min(.99L, fraction * drive.traffic_busy_ns / elapsed);
+                    drive.share_until = now + std::chrono::seconds(2);
+                    drive.traffic_since = now; drive.traffic_busy_ns = 0;
+                }
                 // Sector and busy counters see completed block work below the
                 // page cache. Do not let fast cached writes erase that service
                 // cost or create an unbounded deferred writeback queue.
@@ -377,9 +616,25 @@ private:
                 {
                     long double const service = (current->busy_ms - drive.counters->busy_ms) * 1000000.L / (sectors * 512.L);
                     drive.device_ns_per_byte = drive.device_ns_per_byte ? (drive.device_ns_per_byte * 3 + service) / 4 : service;
+                    // Small metadata transactions and seeks do not measure a
+                    // spindle's sequential transfer rate. Weight bulk samples
+                    // by bytes so a short flush cannot sideline a whole disk.
+                    if (sectors >= 2048)
+                    {
+                        long double const ns_busy = (current->busy_ms - drive.counters->busy_ms) * 1000000.L;
+                        drive.bulk_bytes = .75L * drive.bulk_bytes + sectors * 512.L;
+                        drive.bulk_ns = .75L * drive.bulk_ns + ns_busy;
+                        auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - drive.sampled).count();
+                        if (ns > 0 && ns_busy >= .8L * ns)
+                        { drive.interval_rate = sectors * 512.L / ns; ++busy; }
+                    }
                 }
             }
-            else drive.device_ns_per_byte = 0;
+            else
+            {
+                drive.device_ns_per_byte = drive.bulk_bytes = drive.bulk_ns = drive.busy_rate = 0; drive.busy_sample = {};
+                drive.reads = {}; drive.writes = {}; drive.traffic_busy_ns = drive.foreign_fraction = 0; drive.traffic_since = now;
+            }
             if (current && drive.counters && now > drive.sampled && drive.own_at < drive.sampled &&
                 !drive.active && now - drive.own_at > std::chrono::seconds(1) &&
                 current->busy_ms >= drive.counters->busy_ms && current->queue_ms >= drive.counters->queue_ms)
@@ -391,6 +646,11 @@ private:
             }
             drive.counters = current; drive.sampled = now;
         }
+        // A serial tail cannot replace a joint measurement. Only reuse the
+        // sample for a plan covering the physical paths that produced it.
+        if (busy > 1) for (auto& [name, drive] : drives_) if (drive.interval_rate > 0)
+        { drive.busy_sample = now; drive.busy_rate = drive.interval_rate; drive.busy_width = busy; }
+        if (scoped()) return; // Each pressured reader has its own native permit.
         if (window_ == Clock::time_point{} || now < window_) { window_ = now; window_bytes_ = completed_bytes_; return; }
         if (now - window_ < std::chrono::seconds(2)) return;
         long double const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - window_).count();
@@ -410,13 +670,15 @@ private:
         }
         window_ = now; window_bytes_ = completed_bytes_; waiting_ = false;
     }
-    void complete(StorageDevice const& device, uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now())
+    void complete(StorageDevice const& device, uint64_t bytes, uint64_t elapsed_ns, Clock::time_point now = Clock::now(),
+                  Transfer transfer = Transfer::read)
     {
         std::lock_guard lock(mutex_);
         --active_; completed_bytes_ = grow_add(completed_bytes_, bytes);
+        for (auto& source : sources_) if (source.covers(device)) --source.active;
         for_drives(device, [&](Drive& drive)
         {
-            --drive.active; drive.own_at = now;
+            --drive.active; drive.own_at = now; drive.submit(transfer, bytes);
             if (bytes && elapsed_ns)
             {
                 long double const rate = static_cast<long double>(elapsed_ns) / bytes;
@@ -424,7 +686,7 @@ private:
             }
             // Leave regular gaps for foreign random reads. Unknown farming
             // feedback retains the larger reserve; pressure remains finite.
-            auto const divisor = now < pressure_until_ || now < drive.foreign_until ? 1 : farming_timely(now) ? 8 : 4;
+            auto const divisor = scoped() || now < pressure_until_ || now < drive.foreign_until ? 1 : farming_timely(now) ? 8 : 4;
             long double const physical = bytes * drive.device_ns_per_byte;
             long double const service = std::max(static_cast<long double>(elapsed_ns), physical);
             long double const deferred = std::max(0.L, physical - elapsed_ns);
@@ -712,6 +974,15 @@ inline std::string nvme_subsystem_name(std::span<uint8_t const> field)
     return std::string(name);
 }
 #ifdef _WIN32
+inline std::string disk_guid(DWORD number, STORAGE_DEVICE_NUMBER_EX const& id, DWORD bytes)
+{
+    if (bytes != sizeof(id) || id.Version != sizeof(id) || id.Size != sizeof(id) ||
+        id.DeviceType != FILE_DEVICE_DISK || id.DeviceNumber != number || number == MAXDWORD) return {};
+    std::array<uint8_t, sizeof(GUID)> guid;
+    std::memcpy(guid.data(), &id.DeviceGuid, guid.size());
+    if (std::all_of(guid.begin(), guid.end(), [](uint8_t byte) { return byte == 0; })) return {};
+    return group_tools::hex(guid);
+}
 inline std::string nvme_subsystem_reply(std::span<uint8_t const> encoded)
 {
     if (encoded.size() < sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) return {};
@@ -757,9 +1028,11 @@ inline std::string nvme_subsystem(HANDLE disk)
 // links through the kernel's filesystem-info ioctl and sysfs interface.
 // Windows maps a volume's extents to physical disk numbers. Volume GUIDs
 // identify filesystems, never evidence that their backing disks are separate.
-inline StorageDevice storage_device(std::filesystem::path const& directory)
+// Dated measurements can also request the device GUID for each Windows disk.
+inline StorageDevice storage_device(std::filesystem::path const& directory, std::vector<std::string>* windows_disk_guids = nullptr)
 {
     namespace fs = std::filesystem;
+    if (windows_disk_guids) windows_disk_guids->clear();
     file_io::Stat info{}; require(!file_io::inspect_path(directory.c_str(), &info), "cannot inspect destination device");
     StorageDevice result{std::to_string(uint64_t(info.st_dev)), {}};
 #ifdef __linux__
@@ -868,7 +1141,7 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
     }
     if (disks.empty()) return result;
     bool nonrotating = true, all_rotating = true;
-    std::vector<std::string> drives;
+    std::vector<std::string> drives, guids;
     for (auto number : disks)
     {
         auto device_name = L"\\\\.\\PhysicalDrive" + std::to_wstring(number);
@@ -887,6 +1160,15 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         // having distinct disk numbers. Their unresolved topology serializes.
         if (device->BusType == BusTypeUnknown || device->BusType == BusTypeVirtual || device->BusType == BusTypeFileBackedVirtual ||
             device->BusType == BusTypeSpaces || device->BusType == BusTypeRAID || device->BusType >= BusTypeMax) return result;
+        if (windows_disk_guids)
+        {
+            STORAGE_DEVICE_NUMBER_EX id{};
+            if (!::DeviceIoControl(disk.value, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, nullptr, 0, &id, sizeof(id), &returned, nullptr))
+                return result;
+            auto guid = storage_detail::disk_guid(number, id, returned);
+            if (guid.empty()) return result;
+            guids.push_back(std::move(guid));
+        }
         if (device->BusType == BusTypeNvme)
         {
             auto subsystem = storage_detail::nvme_subsystem(disk.value);
@@ -903,6 +1185,7 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         drives.push_back("windows:disk:" + std::to_string(number));
     }
     result.drives = std::move(drives); result.nonrotating = nonrotating; result.rotating = all_rotating;
+    if (windows_disk_guids) *windows_disk_guids = std::move(guids);
 #endif
     return result;
 }
@@ -921,22 +1204,31 @@ inline std::vector<size_t> writer_groups(std::span<StorageDevice const> devices)
     // job in that case rather than infer physical independence from st_dev.
     if (std::any_of(devices.begin(), devices.end(), [](auto const& item) { return item.drives.empty(); })) return groups;
     for (size_t i = 0; i < groups.size(); ++i) groups[i] = i;
-    for (size_t i = 0; i < devices.size(); ++i)
-        for (size_t j = 0; j < i; ++j)
+    // Join aliases by their leaves once, including volumes spanning more
+    // than one disk. Keep group numbers in first-destination order.
+    auto root = [&](size_t i)
+    {
+        while (groups[i] != i)
         {
-            bool overlap = false;
-            for (auto const& drive : devices[i].drives)
-                if (std::find(devices[j].drives.begin(), devices[j].drives.end(), drive) != devices[j].drives.end()) overlap = true;
-            if (!overlap || groups[i] == groups[j]) continue;
-            size_t const from = groups[i], to = groups[j];
-            for (auto& group : groups) if (group == from) group = to;
+            groups[i] = groups[groups[i]]; i = groups[i];
         }
-    std::vector<size_t> names;
+        return i;
+    };
+    std::map<std::string_view, size_t> leaves;
+    for (size_t i = 0; i < devices.size(); ++i)
+        for (auto const& drive : devices[i].drives)
+        {
+            auto [at, added] = leaves.try_emplace(drive, i);
+            if (!added) groups[root(i)] = root(at->second);
+        }
+    for (size_t i = 0; i < groups.size(); ++i) groups[i] = root(i);
+    std::vector<size_t> names(groups.size(), SIZE_MAX);
+    size_t next = 0;
     for (auto& group : groups)
     {
-        auto found = std::find(names.begin(), names.end(), group);
-        if (found == names.end()) { names.push_back(group); group = names.size() - 1; }
-        else group = size_t(found - names.begin());
+        auto& name = names[group];
+        if (name == SIZE_MAX) name = next++;
+        group = name;
     }
     return groups;
 }

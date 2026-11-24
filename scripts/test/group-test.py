@@ -19,6 +19,17 @@ def digest(path):
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
+def stamp(path):
+    info = path.stat()
+    return digest(path), info.st_size, info.st_mtime_ns
+
+
+def private_output(path):
+    partial = Path(str(path) + ".partial")
+    assert partial.is_file() and not path.exists(), (path, partial)
+    return partial
+
+
 def run(command, code=0, point=None, **kwargs):
     env = dict(os.environ)
     env.pop("XCHPLOT2_GROW_FAILPOINT", None)
@@ -83,7 +94,7 @@ def check(args, root):
         assert path.stat().st_mode & 0o777 == 0o600, "private plot permissions lost"
         if loaded_members is not None:
             loaded = [int(line.rsplit(" ", 1)[1]) for line in result.stderr.splitlines()
-                      if line.startswith(("loading fixture member ", "prefetching fixture member "))]
+                      if line.startswith(("loading fixture member ", "prefetching fixture member ", "regenerating member "))]
             assert loaded == list(loaded_members), (loaded, loaded_members, result.stderr)
             assert metrics["generated_members"] == len(loaded), metrics
         before = path.stat().st_mtime_ns, digest(path)
@@ -119,7 +130,13 @@ def check(args, root):
             assert metrics["generation_overlap_batches"] == 0, metrics
         elif name in ("small-batches", "single-members") and k == 18 and batch < len(originals):
             assert metrics["generation_overlap_batches"] > 0, metrics
-        assert metrics["sized_chunks"] == metrics["exact_plan_batches"] * (1 << (k - 6)), metrics
+        # Each exact plan encodes its last window and reuses those blocks to
+        # start the backward rewrite. Only the preceding chunks need sizing.
+        chunks = 1 << (k - 6)
+        exact = metrics["exact_plan_batches"]
+        assert metrics["fresh_single_pass_batches"] + exact == metrics["batches"], metrics
+        assert metrics["encode_chunks"] == metrics["batches"] * chunks, metrics
+        assert metrics["sized_chunks"] <= exact * (chunks - 1), metrics
         results["parity"].append({"case": name, **metrics})
         print("PASS canonical same-file construction:", name, flush=True)
 
@@ -279,8 +296,11 @@ def check(args, root):
         assert not list(scratch.iterdir()), "ordinary extension recreated external scratch"
         results["parity"].append({"case": "temporary-completion-extension", **metrics})
 
-        for point, committed, limit in (("external-run-after-checkpoint", stage_batch, len(originals)),
-                                        ("external-pack-after-checkpoint", len(originals), len(originals)),
+        # Resident external packing leaves the short batch first and the
+        # full final batch in memory until the output index is committed.
+        first_batch = 1 + (len(originals) - 1) % stage_batch
+        for point, committed, limit in (("external-run-after-checkpoint", first_batch, len(originals)),
+                                        ("external-pack-after-checkpoint", len(originals) - stage_batch, len(originals)),
                                         ("external-published-after-checkpoint", stage_batch, stage_batch)):
             name = "temporary-recovery-" + point
             path = target(name)
@@ -310,31 +330,32 @@ def check(args, root):
         checkpoint = holder / "checkpoint"
         assert checkpoint.is_file() and checkpoint.stat().st_size > 0
         saved_checkpoint = checkpoint.read_bytes()
-        before = digest(path), path.stat().st_size, path.stat().st_mtime_ns
+        partial = private_output(path)
+        before = stamp(partial)
         manifest = resume_inputs("retired-no-temp", stage_batch)
         command = [*mode_common, path, "--fixture-inputs", manifest, "--batch-members", stage_batch,
                    "--capacity-bytes", 67108864, "--checkpoint-bytes", 65536, "--resume"]
         checkpoint.write_bytes(b"!" + saved_checkpoint[1:])
         run(command, 1)
-        assert (digest(path), path.stat().st_size, path.stat().st_mtime_ns) == before
+        assert stamp(private_output(path)) == before
         assert checkpoint.read_bytes() == b"!" + saved_checkpoint[1:], "rejection changed retired metadata"
         checkpoint.write_bytes(saved_checkpoint)
         forged = Path(str(path) + ".external.retired-" + "f" * 64)
         forged.mkdir(mode=0o700)
         run(command, 1)
-        assert (digest(path), path.stat().st_size, path.stat().st_mtime_ns) == before and not list(forged.iterdir())
+        assert stamp(private_output(path)) == before and not list(forged.iterdir())
         forged.rmdir()
         # Establish that the cap admits the ordinary file alone, then restore
         # its retired holder: the identical no-op cap must include both.
-        charge = max(path.stat().st_size, path.stat().st_blocks * 512)
+        charge = max(partial.stat().st_size, partial.stat().st_blocks * 512)
         no_op = [*command, "--max-members", stage_batch, "--capacity-bytes", charge]
         saved_holder = scratch / "saved-retired-holder"
         holder.rename(saved_holder)
         idle = report(run(no_op))
-        assert idle["generated_members"] == 0 and (digest(path), path.stat().st_size, path.stat().st_mtime_ns) == before
+        assert idle["generated_members"] == 0 and stamp(path) == before
         saved_holder.rename(holder)
         run(no_op, 1)
-        assert (digest(path), path.stat().st_size, path.stat().st_mtime_ns) == before
+        assert stamp(path) == before
         metrics = complete(path, command, loaded_members=range(stage_batch, len(originals)), retired=[holder])
         results["parity"].append({"case": "retired-no-temp", **metrics})
         results["rejections"].append("no-temp retired ownership and fixed capacity preserve ordinary output")
@@ -387,7 +408,9 @@ def check(args, root):
         print("PASS temporary capacity fallback, ordinary extension and all-destination scratch audit", flush=True)
 
         if len(originals) >= 8:
+            # Exercise automatic selection between the in-file engines.
             automatic = [args.grow, *common_options, "--generation-overlap", "off",
+                         "--destination-temp", "off",
                          "--window-bytes", 65536, "--checkpoint-bytes", 1048576,
                          "--capacity-bytes", 67108864]
             for storage in ("raw", "compact"):
@@ -424,7 +447,7 @@ def check(args, root):
             path = target("automatic-io-budgets")
             command = [args.grow, path, "--fixture-inputs", inputs, "--max-members", len(originals),
                        "--batch-members", 1, "--capacity-bytes", 67108864,
-                       "--max-ram", args.max_ram, "--workers", 2]
+                       "--max-ram", args.max_ram, "--workers", 2, "--destination-temp", "off"]
             metrics = complete(path, command, loaded_members=range(len(originals)))
             assert metrics["tuning_changes"] > 0 and metrics["selected_window_bytes"] <= 16777216, metrics
             assert metrics["selected_checkpoint_bytes"] <= 268435456 and metrics["max_batch_members"] == 1, metrics
@@ -450,7 +473,8 @@ def check(args, root):
 
     path = target("capacity-rejection", native)
     before = digest(path), path.stat().st_size
-    command = [*common, path, "--resume", "--capacity-bytes", path.stat().st_size]
+    charge = max(path.stat().st_size, path.stat().st_blocks * 512)
+    command = [*common, path, "--resume", "--capacity-bytes", charge]
     metrics = report(run(command))
     assert metrics["members"] == 1 and metrics["stop_reason"] == "capacity", metrics
     assert (digest(path), path.stat().st_size) == before, "capacity rejection changed old group"
@@ -485,7 +509,7 @@ def check(args, root):
                   "direct-target-partial", "direct-target", "direct-committed",
                   "payload", "final-header-partial", "finalizing", "retire-partial", "retire-partial:2",
                   "retired", "index-partial", "index",
-                  "truncated", "published"]
+                  "truncated", "published", "publication-ready", "publication-renamed"]
         for fresh in [False, True]:
             extra = ["bootstrap"] if fresh else ["redo-written", "redo", "pending",
                                                 "target-partial", "target", "committed"]
@@ -495,6 +519,10 @@ def check(args, root):
                 command = [*common, path, "--batch-members", len(originals)]
                 failed = command + ([] if fresh else ["--resume"])
                 run(failed, 86, point)
+                if point == "publication-renamed":
+                    assert path.is_file() and not Path(str(path) + ".partial").exists()
+                else:
+                    private_output(path)
                 complete(path, command, True)
                 results["recovery"].append(name)
                 print("PASS recovery:", name, flush=True)
@@ -511,15 +539,16 @@ def check(args, root):
             path = target("pending-mismatch-" + point, native)
             command = [*common, path, "--batch-members", len(originals)]
             run(command + ["--resume"], 86, point)
-            before = digest(path)
+            before = stamp(private_output(path))
             run(command + ["--resume", "--group-id", wrong_group], 1)
-            assert digest(path) == before, "identity mismatch modified interrupted file"
+            assert stamp(private_output(path)) == before, "identity mismatch modified interrupted file"
             run(command + ["--resume", "--max-ram", 16777216, "--window-bytes", 33554432], 1)
-            assert digest(path) == before, "budget rejection modified interrupted file"
+            assert stamp(private_output(path)) == before, "budget rejection modified interrupted file"
             complete(path, command, True)
         results["rejections"].append("interrupted identity/RAM rejection preserves bytes")
 
-        # A real allocation/write size failure occurs before old-data mutation.
+        # The process file-size limit rejects the requested capacity before
+        # taking the old file out of publication.
         path = target("file-size-failure", native)
         command = [*common, path, "--batch-members", len(originals), "--resume"]
         before = digest(path)
@@ -528,10 +557,10 @@ def check(args, root):
             resource.setrlimit(resource.RLIMIT_FSIZE, (native.stat().st_size, native.stat().st_size))
 
         failed = subprocess.run([str(arg) for arg in command], capture_output=True, preexec_fn=limit_file)
-        assert failed.returncode != 0
-        assert digest(path) == before, "failed allocation changed the old group"
+        assert failed.returncode != 0 and b"filesystem or process file-size limit" in failed.stderr
+        assert digest(path) == before and set(path.parent.iterdir()) == {path}, "file-size rejection changed the old group"
         complete(path, command[:-1], True)
-        results["rejections"].append("real file-size allocation failure")
+        results["rejections"].append("process file-size limit preserves the published group")
 
         if args.modes:
             stage_points = ["stage-run-partial-flushed", "stage-run-flushed", "stage-run-committed",
@@ -564,11 +593,11 @@ def check(args, root):
             path = target("staged-pending-mismatch", native)
             command = [*staged_common, path, "--resume"]
             run(command, 86, "stage-run-committed")
-            before = digest(path), path.stat().st_size
+            before = stamp(private_output(path))
             for options in [["--group-id", wrong_group], ["--max-members", 1],
                             ["--max-ram", 16777216, "--window-bytes", 33554432]]:
                 run([*command, *options], 1)
-                assert (digest(path), path.stat().st_size) == before, \
+                assert stamp(private_output(path)) == before, \
                     "rejected staged request changed the interrupted file"
             committed = min(len(originals), 1 + stage_batch)
             manifest = resume_inputs("staged-pending-mismatch", committed)

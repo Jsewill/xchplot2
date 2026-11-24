@@ -159,12 +159,13 @@ struct BoundaryBuffers {
     std::uint32_t* h_t2_xbits        = nullptr;
     std::uint32_t* h_keys_merged     = nullptr;
     sycl::queue*   alloc_queue       = nullptr;
-    // When true, the buffers were allocated as device memory on the
+    // When true, T2 metadata and xbits were allocated as device memory on the
     // *consumer* (stage 2) GPU via sycl::malloc_device, not as host
     // pinned. Stage 1's gather q.memcpy to these pointers becomes a
     // cross-device D2D — AdaptiveCpp's CUDA backend routes it via
     // cudaMemcpyPeerAsync, eliminating the H2D leg of the boundary
-    // handoff. Same sycl::free path works for both allocation kinds.
+    // handoff. Keys stay host-pinned for Tiny's CPU scan. The same sycl::free
+    // path works for both allocation kinds.
     bool peer_copy_active = false;
 };
 
@@ -239,8 +240,8 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
     // that device; the buffers land in its host-pinned pool, portable
     // to every device in the same process on CUDA.
     //
-    // Peer-copy path (POS2GPU_PIPELINE_PEER_COPY=1): device memory on
-    // device_second's queue. Stage 1's gather q.memcpy to these
+    // Peer-copy path (POS2GPU_PIPELINE_PEER_COPY=1): T2 metadata and xbits
+    // use device memory on device_second's queue. Stage 1's gather q.memcpy to these
     // pointers becomes cross-device D2D — AdaptiveCpp's CUDA backend
     // routes it through cudaMemcpyPeerAsync, eliminating the H2D leg
     // of the boundary handoff. Targets the T2-sort PCIe contention
@@ -250,46 +251,43 @@ PipelineParallelSplitResult run_pipeline_parallel_split(
     buf.peer_copy_active = peer_copy;
     {
         // When peer-copy is on, allocate everything via stage 2's queue
-        // — host-pinned is portable across devices, so pinned_dst +
-        // h_meta still work for host-side use, AND the T2-boundary
-        // buffers become device memory on stage 2 (cross-device D2D
+        // — host-pinned is portable across devices, so pinned_dst,
+        // h_meta and h_keys_merged still work for host-side use. T2 metadata
+        // and xbits become device memory on stage 2 (cross-device D2D
         // via AdaptiveCpp's peer-copy routing).
         int const alloc_dev = peer_copy ? device_second : device_first;
         bind_current_device(alloc_dev);
         sycl::queue& q = sycl_backend::queue();
         buf.alloc_queue = &q;
 
-        // pinned_dst + h_meta stay host-pinned regardless — host-side
-        // code touches them (T1 sort tile-merge for h_meta; T3 final
-        // frag output for pinned_dst).
+        // pinned_dst, h_meta and h_keys_merged stay host-pinned regardless:
+        // the host consumes the fragments, T1 merge and Tiny T3 key scan.
         // Charge the whole boundary set at once. Checking each allocation in
         // turn would let the first four land and fail only on the fifth, with
         // ~8 GiB at k=28 already committed and nothing to do but unwind.
         host_pinned_reserve_check(
-            cap * (2 * sizeof(std::uint64_t)
+            cap * (2 * sizeof(std::uint64_t) + sizeof(std::uint32_t)
                    + (peer_copy ? 0
                                 : sizeof(std::uint64_t)
-                                      + 2 * sizeof(std::uint32_t))),
+                                      + sizeof(std::uint32_t))),
             "pipeline-parallel stage boundary");
 
         buf.pinned_dst = static_cast<std::uint64_t*>(
             sycl::malloc_host(cap * sizeof(std::uint64_t), q));
         buf.h_meta     = static_cast<std::uint64_t*>(
             sycl::malloc_host(cap * sizeof(std::uint64_t), q));
+        buf.h_keys_merged = static_cast<std::uint32_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint32_t), q));
 
         if (peer_copy) {
             buf.h_t2_meta     = static_cast<std::uint64_t*>(
                 sycl::malloc_device(cap * sizeof(std::uint64_t), q));
             buf.h_t2_xbits    = static_cast<std::uint32_t*>(
                 sycl::malloc_device(cap * sizeof(std::uint32_t), q));
-            buf.h_keys_merged = static_cast<std::uint32_t*>(
-                sycl::malloc_device(cap * sizeof(std::uint32_t), q));
         } else {
             buf.h_t2_meta     = static_cast<std::uint64_t*>(
                 sycl::malloc_host(cap * sizeof(std::uint64_t), q));
             buf.h_t2_xbits    = static_cast<std::uint32_t*>(
-                sycl::malloc_host(cap * sizeof(std::uint32_t), q));
-            buf.h_keys_merged = static_cast<std::uint32_t*>(
                 sycl::malloc_host(cap * sizeof(std::uint32_t), q));
         }
         if (!buf.pinned_dst || !buf.h_meta || !buf.h_t2_meta ||
@@ -514,8 +512,8 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
 
     // Allocate `depth` boundary buffer sets. Default path: host-pinned
     // on stage-0's queue (portable on CUDA). Peer-copy path
-    // (POS2GPU_PIPELINE_PEER_COPY=1, N=2 only for now): device memory
-    // on the *consumer* stage's queue — stage 1's gather q.memcpy to
+    // (POS2GPU_PIPELINE_PEER_COPY=1, N=2 only for now): T2 metadata and xbits
+    // use device memory on the *consumer* stage's queue — stage 1's gather q.memcpy to
     // these pointers becomes cross-device D2D via AdaptiveCpp's
     // cudaMemcpyPeerAsync routing. N=3+ stays on host-pinned (each
     // boundary's consumer differs; per-boundary allocation is a
@@ -533,15 +531,15 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         auto const mem = query_device_memory();
         auto const peak = tiers.empty() || tiers.back() == PipelineStageTier::Tiny
             ? streaming_tiny_peak_bytes(k0) : streaming_minimal_peak_bytes(k0);
-        uint64_t const boundary_bytes = uint64_t(depth) * cap * 16;
+        uint64_t const boundary_bytes = uint64_t(depth) * cap *
+            (sizeof(std::uint64_t) + sizeof(std::uint32_t));
         if (!vram_fits(mem.free_bytes, boundary_bytes + peak, vram_safety_margin()))
             throw InsufficientVramError("pipeline peer buffers plus tier and VRAM buffer do not fit; disable POS2GPU_PIPELINE_PEER_COPY or reduce depth");
     }
-    // pinned_dst + h_meta always host-pinned (host-side use). The 3
-    // T2-boundary buffers become device-on-consumer when peer_copy is
-    // on (cross-device D2D via AdaptiveCpp's peer-copy routing).
-    // Only the host arms are charged against host RAM; under peer_copy the
-    // boundary buffers are device allocations and the VRAM gate owns them.
+    // pinned_dst, h_meta and h_keys_merged are always host-pinned: Tiny
+    // scans the sorted T2 keys on the CPU. With peer_copy, T2 metadata and
+    // xbits use consumer-device memory and cross-device D2D copies.
+    // Charge each allocation to host RAM or VRAM according to its location.
     auto alloc_u64_host = [&](std::size_t n) -> std::uint64_t* {
         host_pinned_reserve_check(n * sizeof(std::uint64_t), "stage pinned u64");
         return static_cast<std::uint64_t*>(
@@ -574,7 +572,9 @@ std::vector<PipelineParallelSplitResult> run_pipeline_parallel_batch(
         bufs[i].h_meta        = alloc_u64_host(cap);
         bufs[i].h_t2_meta     = alloc_u64_boundary(cap);
         bufs[i].h_t2_xbits    = alloc_u32_boundary(cap);
-        bufs[i].h_keys_merged = alloc_u32_boundary(cap);
+        host_pinned_reserve_check(cap * sizeof(std::uint32_t), "stage boundary keys");
+        bufs[i].h_keys_merged = static_cast<std::uint32_t*>(
+            sycl::malloc_host(cap * sizeof(std::uint32_t), alloc_q));
         if (!bufs[i].pinned_dst || !bufs[i].h_meta || !bufs[i].h_t2_meta ||
             !bufs[i].h_t2_xbits || !bufs[i].h_keys_merged)
         {

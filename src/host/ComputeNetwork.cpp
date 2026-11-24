@@ -26,16 +26,29 @@
 #include <openssl/x509v3.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace group_grow::pool
 {
 namespace
 {
+constexpr uint32_t max_policy_frame = 262144;
+constexpr auto timed_generation_protocol = []
+{
+    constexpr std::string_view name = "xchplot2-generation-time/1";
+    std::array<unsigned char, 1 + name.size()> list{};
+    list.front() = static_cast<unsigned char>(name.size());
+    std::copy(name.begin(), name.end(), list.begin() + 1);
+    return list;
+}();
 void require(bool condition, char const* message)
 { if (!condition) throw std::runtime_error(message); }
 void transport_require(bool condition, char const* message)
@@ -141,17 +154,37 @@ struct Socket
     ~Socket() { if (value != invalid_socket) close_socket(value); }
     SocketHandle release() { auto const result = value; value = invalid_socket; return result; }
 };
-bool allowed_interface(SocketHandle fd, TlsOptions const& options)
+template<class Match> bool socket_interface(SocketHandle fd, Match match, bool* local_peer = nullptr)
 {
-    auto const& names = options.listen_interfaces;
-    if (names.empty() && !options.listen_lan) return true;
     sockaddr_storage local{}; AddressSize size = sizeof(local);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &size)) return false;
-    if (local.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr))
+    auto normalize = [](sockaddr_storage& value)
     {
-        in_addr ipv4{}; std::memcpy(&ipv4, reinterpret_cast<sockaddr_in6&>(local).sin6_addr.s6_addr + 12, sizeof(ipv4));
-        local = {}; auto& value = reinterpret_cast<sockaddr_in&>(local); value.sin_family = AF_INET; value.sin_addr = ipv4;
+        if (value.ss_family != AF_INET6 || !IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<sockaddr_in6&>(value).sin6_addr)) return;
+        in_addr ipv4{}; std::memcpy(&ipv4, reinterpret_cast<sockaddr_in6&>(value).sin6_addr.s6_addr + 12, sizeof(ipv4));
+        value = {}; auto& address = reinterpret_cast<sockaddr_in&>(value); address.sin_family = AF_INET; address.sin_addr = ipv4;
+    };
+    normalize(local);
+    sockaddr_storage peer{};
+    if (local_peer)
+    {
+        size = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &size)) return false;
+        normalize(peer);
     }
+    auto same_address = [](sockaddr_storage const& value, sockaddr const* address)
+    {
+        if (!address || address->sa_family != value.ss_family) return false;
+        if (value.ss_family == AF_INET) return reinterpret_cast<sockaddr_in const&>(value).sin_addr.s_addr ==
+            reinterpret_cast<sockaddr_in const*>(address)->sin_addr.s_addr;
+        return value.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6 const&>(value).sin6_addr,
+            &reinterpret_cast<sockaddr_in6 const*>(address)->sin6_addr, sizeof(in6_addr));
+    };
+    auto inspect = [&](auto const& item, sockaddr const* address)
+    {
+        if (local_peer && same_address(peer, address)) { *local_peer = true; return true; }
+        return same_address(local, address) && match(item, local.ss_family);
+    };
 #ifdef _WIN32
     ULONG bytes = 16384; std::vector<uint8_t> storage(bytes); ULONG result = ERROR_BUFFER_OVERFLOW;
     for (unsigned attempt = 0; attempt < 3 && result == ERROR_BUFFER_OVERFLOW; ++attempt)
@@ -164,26 +197,8 @@ bool allowed_interface(SocketHandle fd, TlsOptions const& options)
     if (result != NO_ERROR) return false;
     for (auto item = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()); item; item = item->Next)
     {
-        std::string friendly;
-        if (item->FriendlyName)
-        {
-            auto size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item->FriendlyName, -1, nullptr, 0, nullptr, nullptr);
-            if (size > 0 && size <= 1024)
-            { friendly.resize(size_t(size)); ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item->FriendlyName, -1, friendly.data(), size, nullptr, nullptr); friendly.pop_back(); }
-        }
-        bool const lan = options.listen_lan && item->OperStatus == IfOperStatusUp && !(item->Flags & IP_ADAPTER_NO_MULTICAST) &&
-            item->IfType != IF_TYPE_SOFTWARE_LOOPBACK && item->IfType != IF_TYPE_PPP && item->IfType != IF_TYPE_TUNNEL;
-        auto index = std::to_string(local.ss_family == AF_INET6 ? item->Ipv6IfIndex : item->IfIndex);
-        bool const named = std::any_of(names.begin(), names.end(), [&](auto const& name)
-        { return name == item->AdapterName || name == friendly || name == index || (name == "lo" && item->IfType == IF_TYPE_SOFTWARE_LOOPBACK); });
-        if (!lan && !named) continue;
         for (auto address = item->FirstUnicastAddress; address; address = address->Next)
-        {
-            auto value = address->Address.lpSockaddr;
-            if (!value || value->sa_family != local.ss_family) continue;
-            if (local.ss_family == AF_INET && reinterpret_cast<sockaddr_in&>(local).sin_addr.s_addr == reinterpret_cast<sockaddr_in*>(value)->sin_addr.s_addr) return true;
-            if (local.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr, &reinterpret_cast<sockaddr_in6*>(value)->sin6_addr, sizeof(in6_addr))) return true;
-        }
+            if (inspect(*item, address->Address.lpSockaddr)) return true;
     }
 #else
     ifaddrs* interfaces = nullptr;
@@ -191,17 +206,37 @@ bool allowed_interface(SocketHandle fd, TlsOptions const& options)
     std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> cleanup(interfaces, freeifaddrs);
     for (auto item = interfaces; item; item = item->ifa_next)
     {
-        bool const lan = options.listen_lan && (item->ifa_flags & IFF_UP) &&
-            (item->ifa_flags & IFF_MULTICAST) && !(item->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT));
-        if (!item->ifa_addr || item->ifa_addr->sa_family != local.ss_family ||
-            (!lan && std::find(names.begin(), names.end(), item->ifa_name) == names.end())) continue;
-        if (local.ss_family == AF_INET && reinterpret_cast<sockaddr_in&>(local).sin_addr.s_addr ==
-            reinterpret_cast<sockaddr_in*>(item->ifa_addr)->sin_addr.s_addr) return true;
-        if (local.ss_family == AF_INET6 && !std::memcmp(&reinterpret_cast<sockaddr_in6&>(local).sin6_addr,
-            &reinterpret_cast<sockaddr_in6*>(item->ifa_addr)->sin6_addr, sizeof(in6_addr))) return true;
+        if (inspect(*item, item->ifa_addr)) return true;
     }
 #endif
     return false;
+}
+bool allowed_interface(SocketHandle fd, TlsOptions const& options)
+{
+    auto const& names = options.listen_interfaces;
+    if (names.empty() && !options.listen_lan) return true;
+    return socket_interface(fd, [&](auto const& item, int family)
+    {
+#ifdef _WIN32
+        std::string friendly;
+        if (item.FriendlyName)
+        {
+            auto size = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item.FriendlyName, -1, nullptr, 0, nullptr, nullptr);
+            if (size > 0 && size <= 1024)
+            { friendly.resize(size_t(size)); ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, item.FriendlyName, -1, friendly.data(), size, nullptr, nullptr); friendly.pop_back(); }
+        }
+        bool const lan = options.listen_lan && item.OperStatus == IfOperStatusUp && !(item.Flags & IP_ADAPTER_NO_MULTICAST) &&
+            item.IfType != IF_TYPE_SOFTWARE_LOOPBACK && item.IfType != IF_TYPE_PPP && item.IfType != IF_TYPE_TUNNEL;
+        auto index = std::to_string(family == AF_INET6 ? item.Ipv6IfIndex : item.IfIndex);
+        return lan || std::any_of(names.begin(), names.end(), [&](auto const& name)
+        { return name == item.AdapterName || name == friendly || name == index || (name == "lo" && item.IfType == IF_TYPE_SOFTWARE_LOOPBACK); });
+#else
+        (void)family;
+        bool const lan = options.listen_lan && (item.ifa_flags & IFF_UP) &&
+            (item.ifa_flags & IFF_MULTICAST) && !(item.ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT));
+        return lan || std::find(names.begin(), names.end(), item.ifa_name) != names.end();
+#endif
+    });
 }
 // OpenSSL's default socket BIO writes can raise SIGPIPE on Linux. Use the
 // socket flag here so the library does not change the process signal policy.
@@ -256,6 +291,36 @@ void set_socket(SSL* ssl, SocketHandle fd)
     SSL_set_bio(ssl, bio, bio);
 }
 using Context = std::shared_ptr<SSL_CTX>;
+std::unique_ptr<X509, decltype(&X509_free)> certificate_from_file(std::string const& path)
+{
+#ifdef _WIN32
+    // OpenSSL's filename BIO uses the CRT, which omits FILE_SHARE_DELETE.
+    // Supply a buffered reader so a fingerprint lookup can keep reading the
+    // old certificate while an enrollment publishes its replacement.
+    struct File { HANDLE value; ~File() { if (value != INVALID_HANDLE_VALUE) ::CloseHandle(value); } };
+    auto const name = std::filesystem::path(reinterpret_cast<char8_t const*>(path.c_str()));
+    File handle{::CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    require(handle.value != INVALID_HANDLE_VALUE, "cannot read network certificate");
+    static std::unique_ptr<BIO_METHOD, decltype(&BIO_meth_free)> method([]
+    {
+        auto result = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "pool certificate file");
+        if (result && BIO_meth_set_read(result, [](BIO* bio, char* data, int size)
+            { DWORD count = 0; return ::ReadFile(BIO_get_data(bio), data, DWORD(size), &count, nullptr) ? int(count) : -1; }) == 1 &&
+            BIO_meth_set_ctrl(result, [](BIO*, int command, long, void*) -> long { return command == BIO_CTRL_FLUSH; }) == 1)
+            return result;
+        BIO_meth_free(result); return static_cast<BIO_METHOD*>(nullptr);
+    }(), BIO_meth_free);
+    std::unique_ptr<BIO, decltype(&BIO_free_all)> file(BIO_new(BIO_f_buffer()), BIO_free_all);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input(method ? BIO_new(method.get()) : nullptr, BIO_free);
+    require(file && input, "cannot read network certificate");
+    BIO_set_data(input.get(), handle.value); BIO_set_init(input.get(), 1); BIO_push(file.get(), input.release());
+#else
+    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
+    require(bool(file), "cannot read network certificate");
+#endif
+    return {PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free};
+}
 Context context(TlsOptions const& options, bool server)
 {
     require(!options.ca_file.empty() && !options.cert_file.empty() && !options.key_file.empty(),
@@ -272,10 +337,26 @@ Context context(TlsOptions const& options, bool server)
     SSL_CTX_set_max_cert_list(result.get(), 65536);
     SSL_CTX_set_options(result.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(result.get(), SSL_SESS_CACHE_OFF);
+    if (options.generation_timing)
+    {
+        if (server) SSL_CTX_set_alpn_select_cb(result.get(),
+            [](SSL*, unsigned char const** out, unsigned char* length, unsigned char const* offered,
+               unsigned int size, void*)
+            {
+                unsigned char* selected = nullptr;
+                if (SSL_select_next_proto(&selected, length, timed_generation_protocol.data(),
+                    timed_generation_protocol.size(), offered, size) != OPENSSL_NPN_NEGOTIATED)
+                    return SSL_TLSEXT_ERR_NOACK;
+                *out = selected; return SSL_TLSEXT_ERR_OK;
+            }, nullptr);
+        else require(SSL_CTX_set_alpn_protos(result.get(), timed_generation_protocol.data(),
+            timed_generation_protocol.size()) == 0, "cannot offer timed generation protocol");
+    }
     require(SSL_CTX_load_verify_locations(result.get(), options.ca_file.c_str(), nullptr) == 1,
             "cannot load network TLS CA");
-    require(SSL_CTX_use_certificate_chain_file(result.get(), options.cert_file.c_str()) == 1 &&
-        SSL_CTX_use_PrivateKey_file(result.get(), options.key_file.c_str(), SSL_FILETYPE_PEM) == 1 &&
+    require((load_bundled_tls_identity(options, result.get()) ||
+        (SSL_CTX_use_certificate_chain_file(result.get(), options.cert_file.c_str()) == 1 &&
+         SSL_CTX_use_PrivateKey_file(result.get(), options.key_file.c_str(), SSL_FILETYPE_PEM) == 1)) &&
         SSL_CTX_check_private_key(result.get()) == 1, "cannot load matching network TLS certificate and key");
     return result;
 }
@@ -332,13 +413,16 @@ std::string node_identity(X509* certificate)
     }
     throw std::runtime_error("authenticated network TLS connection failed");
 }
-void ssl_wait(SSL* ssl, int result, Deadline until)
+void ssl_wait(SSL* ssl, int result, Deadline const& until, std::function<void()> const& before_wait = {})
 {
     int const error_number = socket_error();
     int const error = SSL_get_error(ssl, result);
     auto socket = SocketHandle(reinterpret_cast<uintptr_t>(BIO_get_data(SSL_get_rbio(ssl))));
-    if (error == SSL_ERROR_WANT_READ) { wait_fd(socket, POLLIN, until); return; }
-    if (error == SSL_ERROR_WANT_WRITE) { wait_fd(socket, POLLOUT, until); return; }
+    if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+    {
+        if (before_wait) before_wait();
+        wait_fd(socket, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, until); return;
+    }
     ssl_failure(ssl, result, error, error_number);
 }
 void handshake(SSL* ssl, bool server, Deadline until)
@@ -375,9 +459,48 @@ void Writer::reserve(size_t bytes)
     }
 }
 void Writer::u8(uint8_t value) { reserve(1); data_.push_back(value); }
-void Writer::u16(uint16_t value) { reserve(2); u8(uint8_t(value >> 8)); u8(uint8_t(value)); }
-void Writer::u32(uint32_t value) { reserve(4); u16(uint16_t(value >> 16)); u16(uint16_t(value)); }
-void Writer::u64(uint64_t value) { reserve(8); u32(uint32_t(value >> 32)); u32(uint32_t(value)); }
+static uint64_t swap_word(uint64_t value)
+{
+#ifdef _MSC_VER
+    return _byteswap_uint64(value);
+#else
+    return __builtin_bswap64(value);
+#endif
+}
+template <typename T> static void encode_integer(uint8_t* bytes, T value)
+{
+    if constexpr (sizeof(T) == 8 && std::endian::native == std::endian::little)
+    {
+        auto word = swap_word(value);
+        std::memcpy(bytes, &word, sizeof(word));
+        return;
+    }
+    for (size_t i = sizeof(T); i > 0; --i) { bytes[i - 1] = uint8_t(value); value >>= 8; }
+}
+template <typename T> void Writer::integer(T value)
+{
+    std::array<uint8_t, sizeof(T)> encoded;
+    reserve(encoded.size());
+    encode_integer(encoded.data(), value);
+    data_.insert(data_.end(), encoded.begin(), encoded.end());
+}
+void Writer::u16(uint16_t value) { integer(value); }
+void Writer::u32(uint32_t value) { integer(value); }
+void Writer::u64(uint64_t value) { integer(value); }
+void Writer::words(std::span<uint64_t const> values)
+{
+    require(values.size() <= limit_ / sizeof(uint64_t), "network message exceeds its byte limit");
+    size_t const start = data_.size();
+    reserve(values.size_bytes());
+    data_.resize(start + values.size_bytes());
+    // Baseline x86 has BSWAP. Clang's SSE2 shuffles cost more until SSSE3
+    // provides a byte shuffle for the whole vector. The same applies on read.
+#if defined(__clang__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__SSSE3__)
+#pragma clang loop vectorize(disable)
+#endif
+    for (size_t i = 0; i < values.size(); ++i)
+        encode_integer(data_.data() + start + i * sizeof(uint64_t), values[i]);
+}
 void Writer::bytes(std::span<uint8_t const> value)
 {
     require(value.size() <= UINT32_MAX, "network blob is too large");
@@ -392,9 +515,31 @@ std::span<uint8_t const> Reader::take(size_t bytes)
     auto result = data_.subspan(position_, bytes); position_ += bytes; return result;
 }
 uint8_t Reader::u8() { return take(1)[0]; }
-uint16_t Reader::u16() { uint16_t const high = u8(); return uint16_t((high << 8) | u8()); }
-uint32_t Reader::u32() { uint32_t const high = u16(); return (high << 16) | u16(); }
-uint64_t Reader::u64() { uint64_t const high = u32(); return (high << 32) | u32(); }
+template <typename T> static T decode_integer(uint8_t const* bytes)
+{
+    if constexpr (sizeof(T) == 8 && std::endian::native == std::endian::little)
+    {
+        uint64_t word;
+        std::memcpy(&word, bytes, sizeof(word));
+        return swap_word(word);
+    }
+    T value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) value = T((value << 8) | bytes[i]);
+    return value;
+}
+template <typename T> T Reader::integer() { return decode_integer<T>(take(sizeof(T)).data()); }
+uint16_t Reader::u16() { return integer<uint16_t>(); }
+uint32_t Reader::u32() { return integer<uint32_t>(); }
+uint64_t Reader::u64() { return integer<uint64_t>(); }
+void Reader::words(std::span<uint64_t> values)
+{
+    auto const bytes = take(values.size_bytes());
+#if defined(__clang__) && (defined(__i386__) || defined(__x86_64__)) && !defined(__SSSE3__)
+#pragma clang loop vectorize(disable)
+#endif
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = decode_integer<uint64_t>(bytes.data() + i * sizeof(uint64_t));
+}
 std::span<uint8_t const> Reader::bytes(uint32_t limit)
 { uint32_t const size = u32(); require(size <= limit, "network blob exceeds its byte limit"); return take(size); }
 std::string Reader::string(uint32_t limit)
@@ -414,33 +559,28 @@ struct Channel::Impl
     TlsOptions options;
     Deadline creator_deadline = Deadline::max();
     std::string peer;
-    std::string peer_node, local_node, local_certificate;
+    std::string peer_node;
+    std::optional<ChannelMembership> membership;
     std::vector<uint8_t> sent_policy;
     bool policy_exchange = false;
     ~Impl() { if (ssl) SSL_free(ssl); if (fd != invalid_socket) close_socket(fd); }
-    void transfer(std::span<uint8_t> bytes, bool write, Deadline until)
+    void transfer(std::span<uint8_t> bytes, bool write, Deadline const& until, std::function<void()> const& before_wait = {})
     {
         size_t position = 0;
         while (position < bytes.size())
         {
-            if (!options.membership_directory.empty() && !membership_exchange) check_membership();
+            if (membership) membership->check();
             check_deadline(until); size_t moved = 0;
             ERR_clear_error(); clear_socket_error();
             int const result = write ? SSL_write_ex(ssl, bytes.data() + position, bytes.size() - position, &moved) :
                 SSL_read_ex(ssl, bytes.data() + position, bytes.size() - position, &moved);
             if (result == 1) { transport_require(moved, "network transfer made no progress"); position += moved; }
-            else ssl_wait(ssl, result, until);
+            else ssl_wait(ssl, result, until, before_wait);
             transport_require(Clock::now() <= until, "network operation timed out");
         }
     }
-    void check_membership() const
-    {
-        check_pool_peer(options.membership_directory, peer_node, peer);
-        check_pool_peer(options.membership_directory, local_node, local_certificate);
-    }
     void policy_blob(bool write, Deadline until)
     {
-        constexpr uint32_t limit = 262144;
         std::array<uint8_t, 4> header{};
         if (write)
         {
@@ -451,7 +591,7 @@ struct Channel::Impl
         else
         {
             transfer(header, false, until); Reader input(header); auto size = input.u32();
-            require(size <= limit, "network pool policy exceeds its byte limit");
+            require(size <= max_policy_frame, "network pool policy exceeds its byte limit");
             std::vector<uint8_t> policy(size); transfer(policy, false, until); accept_pool_policy(options.membership_directory, policy);
         }
     }
@@ -459,40 +599,38 @@ struct Channel::Impl
     {
         std::unique_ptr<X509, decltype(&X509_free)> certificate(SSL_get1_peer_certificate(ssl), X509_free);
         peer_node = node_identity(certificate.get());
-        local_node = node_identity(SSL_get_certificate(ssl)); local_certificate = fingerprint(SSL_get_certificate(ssl));
         // Learn a newer signed policy before applying its revocations. A peer
         // cannot relax the pinned authority's policy, even with expired data.
         // An old local policy may reject a peer that has just rotated. Defer
         // membership checks only during this bounded signed-policy exchange.
-        membership_exchange = true;
-        try
+        bool const exchange = !options.membership_directory.empty() && !options.read_only_membership;
+        Writer offer(5); offer.u32(0x47504d34); offer.u8(exchange);
+        std::array<uint8_t, 5> remote{};
+        auto send_offer = [&] { transfer({const_cast<uint8_t*>(offer.data().data()), offer.data().size()}, true, until); };
+        if (server) { transfer(remote, false, until); send_offer(); }
+        else { send_offer(); transfer(remote, false, until); }
+        Reader input(remote); require(input.u32() == 0x47504d34, "incompatible network membership protocol");
+        auto saved = input.u8(); require(saved <= 1, "invalid network membership capability"); input.finish();
+        policy_exchange = saved && exchange;
+        if (policy_exchange)
         {
-            bool const exchange = !options.membership_directory.empty() && !options.read_only_membership;
-            Writer offer(5); offer.u32(0x47504d34); offer.u8(exchange);
-            std::array<uint8_t, 5> remote{};
-            auto send_offer = [&] { transfer({const_cast<uint8_t*>(offer.data().data()), offer.data().size()}, true, until); };
-            if (server) { transfer(remote, false, until); send_offer(); }
-            else { send_offer(); transfer(remote, false, until); }
-            Reader input(remote); require(input.u32() == 0x47504d34, "incompatible network membership protocol");
-            auto saved = input.u8(); require(saved <= 1, "invalid network membership capability"); input.finish();
-            policy_exchange = saved && exchange;
-            if (policy_exchange)
-            {
-                auto policy = pool_policy(options.membership_directory);
-                std::array<uint8_t, 32> local_digest{}, remote_digest{}; unsigned size = 0;
-                require(EVP_Digest(policy.data(), policy.size(), local_digest.data(), &size, EVP_sha256(), nullptr) == 1 && size == local_digest.size(),
-                    "cannot identify signed pool policy");
-                if (server) { transfer(remote_digest, false, until); transfer(local_digest, true, until); }
-                else { transfer(local_digest, true, until); transfer(remote_digest, false, until); }
-                if (local_digest != remote_digest) { policy_blob(!server, until); policy_blob(server, until); }
-                else sent_policy = std::move(policy);
-            }
+            auto policy = pool_policy(options.membership_directory);
+            std::array<uint8_t, 32> local_digest{}, remote_digest{}; unsigned size = 0;
+            require(EVP_Digest(policy.data(), policy.size(), local_digest.data(), &size, EVP_sha256(), nullptr) == 1 && size == local_digest.size(),
+                "cannot identify signed pool policy");
+            if (server) { transfer(remote_digest, false, until); transfer(local_digest, true, until); }
+            else { transfer(local_digest, true, until); transfer(remote_digest, false, until); }
+            if (local_digest != remote_digest) { policy_blob(!server, until); policy_blob(server, until); }
+            else sent_policy = std::move(policy);
         }
-        catch (...) { membership_exchange = false; throw; }
-        membership_exchange = false;
-        if (!options.membership_directory.empty()) check_membership();
+        if (!options.membership_directory.empty())
+        {
+            auto local = SSL_get_certificate(ssl);
+            membership.emplace(options.membership_directory, ChannelMembership::Peer{peer_node, peer},
+                ChannelMembership::Peer{node_identity(local), fingerprint(local)});
+            membership->check();
+        }
     }
-    bool membership_exchange = false;
 };
 Channel::Channel() = default;
 Channel::Channel(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -569,16 +707,15 @@ void Channel::send(Message type, std::span<uint8_t const> payload)
     require(bool(impl_), "network channel is closed");
     auto const until = operation_deadline(impl_->options);
     require(payload.size() <= impl_->options.max_frame_bytes && valid_message(uint16_t(type)) && type != Message::Policy, "invalid network frame");
-    if (!impl_->options.membership_directory.empty()) impl_->check_membership();
-    if (impl_->policy_exchange)
+    if (impl_->membership) impl_->membership->check();
+    if (impl_->policy_exchange && impl_->membership->encoded() != impl_->sent_policy)
     {
-        auto policy = pool_policy(impl_->options.membership_directory);
-        if (policy != impl_->sent_policy)
-        {
-            Writer update(12); update.u32(0x47504331); update.u16(1); update.u16(uint16_t(Message::Policy)); update.u32(uint32_t(policy.size()));
-            impl_->transfer({const_cast<uint8_t*>(update.data().data()), update.data().size()}, true, until);
-            impl_->transfer(policy, true, until); impl_->sent_policy = std::move(policy);
-        }
+        // transfer() refreshes membership between TLS records. Keep the
+        // announced bytes stable if another policy arrives during the write.
+        auto policy = impl_->membership->encoded();
+        Writer update(12); update.u32(0x47504331); update.u16(1); update.u16(uint16_t(Message::Policy)); update.u32(uint32_t(policy.size()));
+        impl_->transfer({const_cast<uint8_t*>(update.data().data()), update.data().size()}, true, until);
+        impl_->transfer(policy, true, until); impl_->sent_policy = std::move(policy);
     }
     Writer header(12); header.u32(0x47504331); header.u16(1); header.u16(uint16_t(type)); header.u32(uint32_t(payload.size()));
     // Control frames fit one TLS write without a heap allocation. Bulk frames
@@ -595,25 +732,41 @@ void Channel::send(Message type, std::span<uint8_t const> payload)
 }
 Frame Channel::receive()
 {
+    Frame frame; receive(frame); return frame;
+}
+void Channel::receive(Frame& frame, std::function<void()> const& before_wait)
+{
     require(bool(impl_), "network channel is closed");
-    auto const until = operation_deadline(impl_->options);
+    auto until = operation_deadline(impl_->options);
+    bool published = false;
+    std::function<void()> publish;
+    if (before_wait) publish = [&]
+    {
+        if (published) return;
+        auto const start = Clock::now(); before_wait(); published = true;
+        // Local delivery consumes no socket budget. The task deadline still applies.
+        until += std::min(Clock::now() - start, impl_->options.deadline - until);
+    };
     unsigned updates = 0;
     for (;;)
     {
-        if (!impl_->options.membership_directory.empty()) impl_->check_membership();
+        if (impl_->membership) impl_->membership->check();
         std::array<uint8_t, 12> header{};
-        impl_->transfer(header, false, until);
+        impl_->transfer(header, false, until, publish);
         Reader reader(header);
         require(reader.u32() == 0x47504331 && reader.u16() == 1, "incompatible network frame protocol");
         auto const type = reader.u16(); auto const bytes = reader.u32(); reader.finish();
         bool const policy = Message(type) == Message::Policy;
-        require(valid_message(type) && bytes <= (policy ? 262144 : impl_->options.max_frame_bytes) &&
+        require(valid_message(type) && bytes <= (policy ? max_policy_frame : impl_->options.max_frame_bytes) &&
             (!policy || (impl_->policy_exchange && ++updates <= 4)), "invalid network frame type or size");
-        Frame result{Message(type), std::vector<uint8_t>(bytes)};
-        impl_->transfer(result.payload, false, until); check_deadline(until);
-        if (policy) { accept_pool_policy(impl_->options.membership_directory, result.payload); impl_->check_membership(); continue; }
-        if (!impl_->options.membership_directory.empty()) impl_->check_membership();
-        return result;
+        frame.type = Message(type);
+        if (bytes > frame.payload.capacity()) std::vector<uint8_t>().swap(frame.payload);
+        frame.payload.resize(bytes);
+        impl_->transfer(frame.payload, false, until, publish); check_deadline(until);
+        if (policy) { accept_pool_policy(impl_->options.membership_directory, frame.payload); impl_->membership->check(); continue; }
+        if (publish) { publish(); check_deadline(until); }
+        if (impl_->membership) impl_->membership->check();
+        return;
     }
 }
 void Channel::set_deadline(std::chrono::steady_clock::time_point until)
@@ -658,19 +811,70 @@ bool Channel::peer_closed()
     try { ssl_failure(impl_->ssl, result, error, error_number); }
     catch (TransientTransport const&) { return true; }
 }
+static uint32_t socket_ingress(SocketHandle fd) noexcept
+{
+    try
+    {
+        uint32_t index = 0; bool ambiguous = false, local_peer = false;
+        socket_interface(fd, [&](auto const& item, int)
+        {
+            uint32_t physical = 0;
+#ifdef _WIN32
+            MIB_IF_ROW2 row{}; row.InterfaceLuid = item.Luid;
+            if (::GetIfEntry2(&row) == NO_ERROR && row.InterfaceAndOperStatusFlags.HardwareInterface &&
+                row.InterfaceAndOperStatusFlags.ConnectorPresent) physical = row.InterfaceIndex;
+#else
+            std::string name(item.ifa_name);
+            if (auto alias = name.find(':'); alias != name.npos) name.resize(alias);
+            auto const device = std::filesystem::path("/sys/class/net") / name / "device";
+            std::error_code error;
+            if (std::filesystem::exists(device, error) && !std::filesystem::exists(device / "physfn", error) && !error)
+                physical = ::if_nametoindex(name.c_str());
+#endif
+            ambiguous |= !physical || (index && physical != index); index = physical;
+            return ambiguous;
+        }, &local_peer);
+        // A socket to another address owned by this host does not consume
+        // that network adapter, even when both ends use its unicast address.
+        return ambiguous || local_peer ? 0 : index;
+    }
+    catch (...) { return 0; }
+}
+uint32_t Channel::ingress_interface() const noexcept
+{ return impl_ ? socket_ingress(impl_->fd) : 0; }
+static std::string socket_local_address(SocketHandle fd)
+{
+    sockaddr_storage address{}; AddressSize length = sizeof(address);
+    std::array<char, NI_MAXHOST> host{};
+    if (!::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) &&
+        !::getnameinfo(reinterpret_cast<sockaddr*>(&address), length, host.data(), host.size(), nullptr, 0, NI_NUMERICHOST))
+        return host.data();
+    return {};
+}
+std::string Channel::local_address() const
+{ return impl_ ? socket_local_address(impl_->fd) : std::string{}; }
+bool Channel::generation_timing() const
+{
+    unsigned char const* selected = nullptr; unsigned size = 0;
+    if (!impl_) return false;
+    SSL_get0_alpn_selected(impl_->ssl, &selected, &size);
+    return size == timed_generation_protocol.front() &&
+        std::equal(timed_generation_protocol.begin() + 1, timed_generation_protocol.end(), selected);
+}
 std::string const& Channel::peer_identity() const
 { require(bool(impl_), "network channel is closed"); return impl_->peer; }
 std::string const& Channel::peer_node_id() const
 { require(bool(impl_), "network channel is closed"); return impl_->peer_node; }
 uint32_t Channel::max_frame_bytes() const
 { require(bool(impl_), "network channel is closed"); return impl_->options.max_frame_bytes; }
+uint32_t Channel::frame_buffer_bytes(uint32_t bytes) { return std::max(bytes, max_policy_frame); }
 uint64_t Channel::memory_bytes(uint32_t bytes)
 {
     // Budget one full receive frame and TLS/socket/certificate scratch. Chain
     // size and depth are bounded in context(); reserve additional scratch for
     // the saved credential bundle, signed policy and member registry. This is
     // admission allowance, rather than a measurement of OpenSSL resident pages.
-    return uint64_t(bytes) + 4194304;
+    return uint64_t(bytes) + 4194304 + ChannelMembership::cache_bytes();
 }
 void Channel::close() noexcept { impl_.reset(); }
 struct Listener::Impl
@@ -764,19 +968,13 @@ std::string random_token()
 }
 std::string certificate_identity(std::string const& path)
 {
-    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
-    require(bool(file), "cannot read network certificate");
-    std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
-    return fingerprint(certificate.get());
+    return fingerprint(certificate_from_file(path).get());
 }
 void validate_tls_credentials(TlsOptions const& options)
 { (void)context(options, false); }
 std::string certificate_node_id(std::string const& path)
 {
-    std::unique_ptr<BIO, decltype(&BIO_free)> file(BIO_new_file(path.c_str(), "r"), BIO_free);
-    require(bool(file), "cannot read network certificate");
-    std::unique_ptr<X509, decltype(&X509_free)> certificate(PEM_read_bio_X509(file.get(), nullptr, nullptr, nullptr), X509_free);
-    return node_identity(certificate.get());
+    return node_identity(certificate_from_file(path).get());
 }
 bool numeric_host(std::string const& value)
 {
@@ -804,7 +1002,7 @@ Endpoint parse_endpoint(std::string const& value)
     require(!host.empty() && port, "endpoint requires host and nonzero port");
     return {std::move(host), uint16_t(port)};
 }
-std::string local_address(Endpoint const& endpoint)
+std::string local_address(Endpoint const& endpoint, uint32_t* physical_interface)
 {
     initialize_sockets();
     addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM;
@@ -821,11 +1019,12 @@ std::string local_address(Endpoint const& endpoint)
         Socket socket{::socket(item->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
 #endif
         if (socket.value == invalid_socket || ::connect(socket.value, item->ai_addr, item->ai_addrlen)) continue;
-        sockaddr_storage address{}; AddressSize length = sizeof(address);
-        std::array<char, NI_MAXHOST> host{};
-        if (!::getsockname(socket.value, reinterpret_cast<sockaddr*>(&address), &length) &&
-            !::getnameinfo(reinterpret_cast<sockaddr*>(&address), length, host.data(), host.size(), nullptr, 0, NI_NUMERICHOST))
-            return host.data();
+        auto local = socket_local_address(socket.value);
+        if (!local.empty())
+        {
+            if (physical_interface) *physical_interface = socket_ingress(socket.value);
+            return local;
+        }
     }
     throw TransientTransport("cannot determine local route to broker");
 }

@@ -37,6 +37,15 @@
 namespace group_grow::file_io
 {
 namespace fs = std::filesystem;
+inline void start_writeback(int fd, uint64_t offset, uint64_t bytes)
+{
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+    (void)::sync_file_range(fd, off_t(offset), off_t(bytes), SYNC_FILE_RANGE_WRITE);
+#else
+    (void)fd; (void)offset; (void)bytes;
+#endif
+}
+
 inline fs::path native_path(char const* path) { return fs::path(reinterpret_cast<char8_t const*>(path)); }
 inline fs::path native_path(std::string const& path) { return native_path(path.c_str()); }
 inline fs::path const& native_path(fs::path const& path) { return path; }

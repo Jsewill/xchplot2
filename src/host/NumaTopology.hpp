@@ -1,23 +1,7 @@
 // NumaTopology.hpp — host NUMA node enumeration and per-node thread affinity.
 //
-// Why this exists: the CPU plotter is memory-latency-bound (that is the whole
-// premise of running several concurrent plots — they interleave each other's
-// stalls). On a multi-socket host, a worker whose threads are spread across
-// every socket pays a remote-memory penalty on the exact access pattern the
-// design leans on. Confining each worker to one node, so its working set is
-// allocated and read node-locally, is the fix.
-//
-// What this canNOT do, and it matters: pos2-chip sizes its fan-out from
-// std::thread::hardware_concurrency(), which reports the WHOLE HOST regardless
-// of the affinity mask (measured on glibc 2.43 — see nice_current_thread). So a
-// worker pinned to one node of an N-socket box still spawns N nodes' worth of
-// threads onto that node's cores. Pinning buys locality, not a thread cap, and
-// the residual oversubscription is why the per-node worker knee has to be
-// re-measured rather than inherited from the single-socket number (~4).
-// Capping the fan-out needs pos2-chip to take a thread count, which it does not
-// expose at the Plotter level, and it is a FetchContent dependency (gitignored,
-// pinned) — so it is not ours to patch in-tree.
-//
+// Allocate a worker's tables on its selected NUMA node and size the native
+// CPU generator to its effective affinity mask. Each lane inherits the mask.
 // Deliberately free of GPU / SYCL headers, and the parsing is split out from
 // the syscalls, so the cpulist grammar is unit-testable on synthetic input
 // without a multi-socket host to run on (tools/parity/numa_topology_test.cpp).
@@ -66,7 +50,7 @@ std::vector<NumaNode> host_numa_nodes();
 // Confine the CALLING thread to `cpus` — and, because Linux copies the affinity
 // mask into children at clone(), everything that thread goes on to spawn. Same
 // inheritance trick nice_current_thread() relies on, so it must be called on
-// the worker thread before it enters pos2-chip's plotter.
+// the worker thread before it starts the CPU generator.
 //
 // This sets CPU affinity only, and that is deliberate: Linux's default memory
 // policy is first-touch, so pages land on the node of the thread that first

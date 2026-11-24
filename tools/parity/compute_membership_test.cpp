@@ -189,6 +189,26 @@ void live_revocation()
     auto authority_link = connect_members(authority, first);
     auto generation = load_pool(first.directory)->policy_generation;
     require(generation == load_pool(authority.directory)->policy_generation, "handshake did not synchronize signed policy");
+    // Both files can change in place while an authenticated connection is open.
+    // Restore the timestamp too: unchanged size and time cannot vouch for a signature.
+    auto credentials = first.directory / "credentials.pem"; auto original = read(credentials);
+    auto timestamp = std::filesystem::last_write_time(credentials); auto damaged = original;
+    auto& digit = damaged.at(damaged.size() - 2); digit = digit == '0' ? '1' : '0';
+    persistent.server.send(Message::Reply, {}); (void)persistent.client.receive();
+    write(credentials, damaged); std::filesystem::last_write_time(credentials, timestamp);
+    rejects([&] { persistent.server.send(Message::Reply, {}); });
+    write(credentials, original);
+    auto ca = first.directory / "ca.pem"; auto trusted = read(ca);
+    auto foreign = create_pool(root / "other-authority", "other authority");
+    write(ca, read(foreign.directory / "ca.pem"));
+    rejects([&] { persistent.server.send(Message::Reply, {}); });
+    write(ca, trusted);
+#ifndef _WIN32
+    require(!::chmod(credentials.c_str(), 0644), "cannot change fixture permissions");
+    rejects([&] { persistent.server.send(Message::Reply, {}); });
+    require(!::chmod(credentials.c_str(), 0600), "cannot restore fixture permissions");
+#endif
+    persistent.server.send(Message::Reply, {}); (void)persistent.client.receive();
     revoke_pool_member(authority, second.node_id);
     Writer payload; payload.string("control"); authority_link.server.send(Message::Control, payload.data());
     auto received = authority_link.client.receive();

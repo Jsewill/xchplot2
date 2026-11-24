@@ -11,6 +11,20 @@ Demand memory(uint64_t amount)
 { Demand d; d.resource = "ram"; d.transient_units = amount; d.bounded = true; return d; }
 int main() try
 {
+    {
+        std::vector<pos2gpu::GpuDeviceInfo> devices(3);
+        for (size_t i = 0; i < devices.size(); ++i)
+        { devices[i].id = i; devices[i].physical_identity = "pci-fixture-" + std::to_string(i); devices[i].auto_dispatchable = true; }
+        pos2gpu::GroupOptions selected; selected.replot_gpu_devices = {{0, "tiny", {}}, {2, "compact", {}}};
+        bind_replot_gpu(selected, devices, [&](auto const& physical) { return physical == devices[2].physical_identity; });
+        require(selected.device == 2 && selected.tier == "compact", "migration lost its reviewed GPU or selected tier");
+        rejects([&] { bind_replot_gpu(selected, devices, [&](auto const& physical) { return physical == devices[1].physical_identity; }); },
+            "migration ran on an unselected physical GPU");
+        bool waiting = false;
+        try { bind_replot_gpu(selected, devices, [](auto const&) { return false; }); }
+        catch (ReplotResourcesUnavailable const&) { waiting = true; }
+        require(waiting, "a missing reviewed GPU became spare compute on another card");
+    }
     auto const host = profile_detail::host_name(); auto const cpus = profile_detail::logical_cpus();
     require(!host.empty() && cpus, "fixture cannot identify actual execution host/affinity");
     auto const directory = fs::temp_directory_path() / ("xchplot2-replot-resources-" + std::to_string(Clock::now().time_since_epoch().count()));
@@ -69,6 +83,53 @@ int main() try
             held += demand.resident_units + demand.transient_units;
         require(held == pos2gpu::ComputeSession::memory_bytes + resolved.pool_codec_ram,
             "automatic setup re-estimated an already resolved codec partition from the remaining owner budget");
+    }
+    for (bool compute : {false, true}) for (uint64_t lanes : {1, 2, 3, 4, 5, 6, 8})
+    {
+        auto automatic = profile; automatic.adaptive = true; automatic.workloads.clear();
+        automatic.resources[0].capacity = lanes; automatic.resources[0].conditional_shared = false;
+        automatic.resources[1].capacity = 2 * 1024 * mib;
+        auto& native = automatic.native; native.max_cpu_threads = std::max(uint64_t(1), lanes / 2);
+        Demand farming; farming.resource = "cpu"; farming.reserved_units = std::max(uint64_t(1), lanes / 4); farming.bounded = true;
+        native.cohorts.front().new_farming = {farming, memory(256 * mib)};
+        native.cohorts.front().proof_reserve.clear();
+        auto maximum = request; maximum.cpu_affinity_lanes = lanes; maximum.cpu_threads = native.max_cpu_threads;
+        maximum.adaptive_resources = true; maximum.verification_cpu_threads = 1;
+        if (compute)
+        {
+            native.compute_owner_identity = native.compute_broker_identity = std::string(64, 'a');
+            native.compute_broker_host = host;
+            auto broker = farming; broker.reserved_units = 1;
+            native.compute_services = {broker, memory(pos2gpu::ComputeSession::memory_bytes)};
+            ComputeWorkerEnvelope worker; worker.tls_identity = std::string(64, 'b'); worker.host = host;
+            worker.cpu_threads = lanes; worker.slots = 1; worker.host_bytes = 1024 * mib;
+            worker.standing_host_bytes = 128 * mib; worker.allowed_kinds = compute_generate_cpu;
+            auto executor = broker; executor.reserved_units = lanes;
+            auto resident = memory(worker.host_bytes - worker.standing_host_bytes); resident.resident_units = worker.standing_host_bytes;
+            worker.reservation = {executor, resident}; native.compute_workers = {worker};
+            maximum.compute_enabled = maximum.compute_offer_owned = true;
+            maximum.compute_offer_identity = worker.tls_identity; maximum.compute_offer_backend = "cpu";
+            maximum.compute_offer_ram_bytes = 256 * mib; maximum.compute_offer_cpu_threads = 1;
+            maximum.compute_session_ram_bytes = pos2gpu::ComputeSession::memory_bytes;
+        }
+        auto const room = replot_local_resources(automatic, maximum, 2 * 1024 * mib, lanes);
+        require(room.ram_bytes == maximum.ram_bytes && room.cpu_threads && room.cpu_threads <= native.max_cpu_threads,
+            "small-host automatic allocation lost its native owner beside the local compute services");
+        if (compute && lanes <= 5) require(room.cpu_threads == 1, "small-host compute sharing enabled producer fanout");
+        if (!compute && lanes == 5) require(room.cpu_threads == 2, "compute sharing reduced an ordinary native CPU partition");
+        auto selected = maximum; selected.ram_bytes = room.ram_bytes; selected.cpu_threads = room.cpu_threads;
+        for (auto phase : {std::pair{true, false}, {false, true}, {false, false}})
+        {
+            auto const stage = replot_stage(automatic, selected, {}, 0, phase.first, phase.second, false);
+            auto const assessed = assess_stage(automatic, stage);
+            require(assessed.feasible, "small-host allocation and phase assessment disagree about compute service sharing");
+            auto const held = std::find_if(assessed.margins.begin(), assessed.margins.end(),
+                [](auto const& margin) { return margin.resource == "ram"; });
+            require(held != assessed.margins.end() && held->occupied_units >= farming_health_memory_bytes + 256 * mib,
+                "CPU sharing released health or farming memory");
+            auto shortage = automatic; shortage.resources[1].capacity = held->occupied_units - 1;
+            require(!assess_stage(shortage, stage).feasible, "CPU sharing admitted a physical RAM shortage");
+        }
     }
     {
         ReplotVerification sampled{ReplotVerificationMode::sampled, 1, 3};
@@ -319,11 +380,26 @@ int main() try
             fs::rename(drives.back(), hidden); replicas.replicas.back().available = false;
             save([](auto& state) { state.retirements[0] = {ReplotRetirement::claim_intent, true}; });
             save([](auto& state) { state.retirements[0].state = ReplotRetirement::claimed; });
-            save([](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
             auto missing = load_replot_journals(drives, initial.review_digest, 64 * mib);
             require(missing.authority && missing.digest == replicas.digest && !missing.replicas.back().available,
                 "unavailable drive concealed newer durable controller progress");
-            fs::rename(hidden, drives.back());
+            // Return the drive after staging the next controller revision,
+            // while the complete replica set still retains its older digest.
+            auto next = next_replot_revision(replicas.state, replicas.digest,
+                [](auto& state) { state.retirements[0].state = ReplotRetirement::retired; });
+            bool staged = false, published = false;
+            publish_replot_journals(replicas, next, 64 * mib, [&]
+            {
+                if (!replicas.authority->pending && replicas.authority->digest == replicas.digest) return;
+                if (!staged) fs::rename(hidden, drives.back());
+                auto current = load_replot_journals(drives, initial.review_digest, 64 * mib);
+                require(replot_authority_matches(replicas, current),
+                    "returning drive rejected the controller's own in-progress publication");
+                if (replicas.authority->pending) staged = true; else published = true;
+                replicas.replicas.back() = std::move(current.replicas.back());
+            });
+            require(staged && published && !replot_authority_matches(replicas, missing),
+                "controller publication skipped a returning-drive fence or accepted its old revision");
             auto returning = load_replot_journals(drives, initial.review_digest, 64 * mib);
             publish_replot_journals(returning, returning.state, 64 * mib, [] {});
             require(returning.replicas.back().digest == returning.digest && replot_journals_unchanged(returning),
@@ -331,10 +407,14 @@ int main() try
             auto fork = next_replot_revision(returning.state, returning.digest, [](auto& state)
             { stream_state::Stamp stamp; stamp.bytes = 1; state.verified_stage = stamp; });
             auto const fork_body = replot_journal_text(fork);
+            auto const body = replot_journal_text(returning.state);
+            stream_state::atomic_save(returning.authority->path, fork_body + stream_state::digest(fork_body) + '\n');
+            require(!replot_authority_matches(returning, load_replot_journals(drives, initial.review_digest, 64 * mib)),
+                "returning drive accepted a controller revision outside its owned publication");
+            stream_state::atomic_save(returning.authority->path, body + stream_state::digest(body) + '\n');
             stream_state::atomic_save(returning.replicas.back().path, fork_body + stream_state::digest(fork_body) + '\n');
             rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },
                 "destination newer than controller authority was silently overwritten");
-            auto const body = replot_journal_text(returning.state);
             stream_state::atomic_save(returning.replicas.back().path, body + stream_state::digest(body) + '\n');
             fs::rename(authority_root, directory / "lost-controller");
             rejects([&] { (void)load_replot_journals(drives, initial.review_digest, 64 * mib); },
@@ -560,10 +640,10 @@ int main() try
             stage.construction[0].work_us == adaptive.native.construction[0].work_us,
             "CPU selection weakened a conditional modeled service bound");
         auto bounded = adaptive; bounded.native.construction[1].transient_units = 19 * mib;
-        auto small = maximum; small.ram_bytes = 16 * mib; small.controller_ram_bytes = 3 * mib;
-        auto const retained_controller = replot_stage(bounded, small, {}, 0, true, false, false);
+        auto limited_ram = maximum; limited_ram.ram_bytes = 16 * mib; limited_ram.controller_ram_bytes = 3 * mib;
+        auto const retained_controller = replot_stage(bounded, limited_ram, {}, 0, true, false, false);
         require(retained_controller.construction[1].resident_units + retained_controller.construction[1].transient_units ==
-            small.ram_bytes + small.controller_ram_bytes,
+            limited_ram.ram_bytes + limited_ram.controller_ram_bytes,
             "an allocation ceiling larger than the phase shape released actual controller memory");
         bounded = opaque; bounded.native.construction[0].reserved_units = std::min<uint64_t>(cpus, 2);
         auto const retained_cpu = replot_stage(bounded, smaller, {}, 0, true, false, false);

@@ -536,7 +536,7 @@ def qualify(nodes, summary, network=None, hosts=None, forwarded=False):
             ready_until = time.monotonic() + 600
             while True:
                 output = worker_node.read(worker_node.root / "gpu-worker.log", missing_ok=True).decode()
-                if "Waiting for plotting work." in output:
+                if "accepting plotting work." in output:
                     break
                 if worker_node.poll(gpu_worker) is not None or time.monotonic() >= ready_until:
                     raise RuntimeError("GPU worker did not become ready:\n" + output)

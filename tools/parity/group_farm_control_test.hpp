@@ -120,9 +120,16 @@ inline void idle_control_wakeup(fs::path const& parent)
         auto const progress = load_farming_progress(metadata, args.max_ram);
         return progress && progress->progress.sequence > sequence && stopped();
     }, "idle coordinator did not reload a policy published without a lasting availability change");
+    // Leave retirement to the original coordinator. A control command that
+    // starts another writer can win the lock and make that coordinator yield.
+    check(!::kill(child, SIGSTOP), "cannot stop idle retirement observer");
+    check(::waitpid(child, &stopped_status, WUNTRACED) == child && WIFSTOPPED(stopped_status), "idle retirement observer did not stop");
+    auto const retirement_plan = bytes(metadata.path / "grow-farm.plan");
     auto retirement = args; retirement.command = retirement.farm_action = "retire";
-    retirement.resume = true; retirement.action_destinations = {right};
+    retirement.resume = retirement.policy_only = true; retirement.action_destinations = {right};
     check(run_farming(retirement) == 0, "idle missing-peer retirement failed");
+    check(bytes(metadata.path / "grow-farm.plan") == retirement_plan, "retirement intent started a replacement coordinator");
+    check(!::kill(child, SIGCONT), "cannot resume idle retirement observer");
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     int status = 0; bool exited = false;
     while (std::chrono::steady_clock::now() < deadline)

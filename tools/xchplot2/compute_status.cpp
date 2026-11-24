@@ -114,6 +114,7 @@ void broker_json(BrokerSnapshot const& value)
         std::cout << ",\"producer_build\":"; string(worker.producer_build);
         std::cout << ",\"endpoint\":"; string(address(worker.endpoint));
         std::cout << ",\"admission\":"; string(pool::admission_name(worker.admission));
+        if (!worker.gpu_recovery.empty()) { std::cout << ",\"gpu_recovery\":"; string(worker.gpu_recovery); }
         std::cout << ",\"capacity\":"; resources(worker.capacity);
         std::cout << ",\"reserved\":"; resources(worker.reserved);
         std::cout << ",\"seen_ms\":" << worker.seen_ms << ",\"hardware\":"; hardware_json(worker.hardware); std::cout << '}';
@@ -153,6 +154,7 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
     std::cout << ",\"producer_build\":"; string(value.producer_build);
     std::cout << ",\"durable_control\":" << (value.durable_control ? "true" : "false");
     std::cout << ",\"admission\":"; string(pool::admission_name(value.admission));
+    if (!value.gpu_recovery.empty()) { std::cout << ",\"gpu_recovery\":"; string(value.gpu_recovery); }
     std::cout << ",\"capacity\":"; resources(value.capacity);
     std::cout << ",\"active\":"; resources(value.active);
     std::cout << ",\"hardware\":"; hardware_json(value.hardware);
@@ -169,6 +171,8 @@ void broker_text(BrokerSnapshot const& value, bool verbose)
         << value.summary.owners << " plotting job owners; " << value.summary.queued << " queued, " << value.summary.granted
         << " assigned, " << value.summary.running << " running\n";
     if (value.truncated) std::cerr << "Listing truncated; increase --limit to inspect more rows.\n";
+    for (auto const& worker : value.workers) if (!worker.gpu_recovery.empty())
+        std::cout << "  " << address(worker.endpoint) << " GPU recovering: " << worker.gpu_recovery << '\n';
     if (!verbose) return;
     for (auto const& worker : value.workers)
         std::cout << "  Worker " << worker.identity.substr(0, 12) << ' ' << address(worker.endpoint) << ' '
@@ -197,6 +201,7 @@ void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
             << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
             << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes";
     std::cout << '\n';
+    if (!value.gpu_recovery.empty()) std::cout << "  GPU recovering: " << value.gpu_recovery << '\n';
     std::cout << "  Worker control setting " << (value.durable_control ? "survives service restarts." : "lasts only for this process (explicit TLS credentials without enrollment).") << '\n';
     if (verbose) std::cout << "  Generation: " << value.compatibility << "; codec: " << value.codec_compatibility
         << "; producer: " << value.producer_build << '\n';
@@ -252,8 +257,8 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
     auto identity = pool::load_pool(directory);
     if (!identity)
     {
-        require(!control && brokers.empty() && workers.empty(), "shared compute is not configured; use compute init or compute join");
-        std::cout << (json ? "{\"configured\":false}\n" : "Shared compute is not configured. Use compute init or compute join.\n"); return 0;
+        require(!control && brokers.empty() && workers.empty(), "shared compute is not configured; use compute setup on a plotting host or compute setup INVITATION on a helper");
+        std::cout << (json ? "{\"configured\":false}\n" : "Shared compute is not configured. Run xchplot2 compute setup on a plotting host or xchplot2 compute setup INVITATION on a helper.\n"); return 0;
     }
     bool const explicit_workers = !workers.empty();
     bool const explicit_endpoints = explicit_workers || !brokers.empty();
@@ -265,7 +270,9 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         pool::DiscoveryOptions options; options.pool_id = identity->pool_id; options.node_id = identity->node_id;
         options.name = identity->name; options.server_name = identity->server_name; options.interfaces = identity->defaults.interfaces;
         pool::ComputeDiscovery discovery(std::move(options));
-        std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(1)));
+        // Match live job inspection: leave time for the initial one-second
+        // query retry when another browser consumed the throttled first reply.
+        std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(2)));
         for (auto const& service : discovery.services())
         {
             auto& destination = service.role == "broker" ? brokers : workers;
@@ -297,6 +304,7 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
         std::cout << ",\"backend\":"; string(identity->defaults.backend);
         std::cout << ",\"cpus\":" << identity->defaults.cpus << ",\"host_bytes\":" << identity->defaults.host_bytes
             << ",\"gpu_bytes\":" << identity->defaults.gpu_bytes << ",\"max_brokers\":" << identity->defaults.max_brokers
+            << ",\"broker_port\":" << identity->defaults.broker_port << ",\"worker_port\":" << identity->defaults.worker_port
             << ",\"discovery\":" << (identity->defaults.discovery ? "true" : "false") << ",\"interfaces\":[";
         bool comma = false;
         for (auto const& interface : identity->defaults.interfaces)
@@ -317,7 +325,9 @@ int pos2gpu::run_compute_status(int argc, char** argv) try
             std::cout << "LAN discovery: " << (identity->defaults.discovery ? "on" : "off")
                 << "\nOffered defaults: " << identity->defaults.backend << ", CPUs " << automatic(identity->defaults.cpus)
                 << ", host bytes " << automatic(identity->defaults.host_bytes) << ", GPU bytes " << automatic(identity->defaults.gpu_bytes)
-                << ", broker limit " << identity->defaults.max_brokers << "\nInterfaces:";
+                << ", broker limit " << identity->defaults.max_brokers
+                << "\nListener ports: broker " << identity->defaults.broker_port << ", worker "
+                << automatic(identity->defaults.worker_port) << "\nInterfaces:";
             if (identity->defaults.interfaces.empty()) std::cout << " active LAN interfaces";
             else for (auto const& interface : identity->defaults.interfaces) std::cout << ' ' << interface;
             std::cout << '\n';

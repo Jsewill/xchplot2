@@ -36,7 +36,7 @@ void help(bool all)
 #ifdef XCHPLOT2_GROUP_COMMANDS
         "Usage: xchplot2 compute broker [OPTIONS]\n"
         "  --directory DIR      saved compute setup directory\n"
-        "  --listen HOST:PORT   default: all selected interfaces, port 18444\n"
+        "  --listen HOST:PORT   override the saved broker port (default 18444)\n"
         "  --interface NAME     sharing/discovery interface; repeat for more\n"
         "  --discovery on|off   LAN advertising, default from saved setup\n"
 #else
@@ -117,7 +117,7 @@ int main(int argc, char** argv) try
     {
         options.tls.ca_file = identity->tls.ca_file; options.tls.cert_file = identity->tls.cert_file; options.tls.key_file = identity->tls.key_file;
         options.tls.membership_directory = identity->tls.membership_directory;
-        if (options.listen.host.empty()) options.listen = {"::", 18444};
+        if (options.listen.host.empty()) options.listen = {"::", identity->defaults.broker_port};
         if (interfaces.empty()) interfaces = identity->defaults.interfaces;
         options.tls.listen_lan = interfaces.empty();
         options.tls.listen_interfaces = interfaces;
@@ -125,7 +125,7 @@ int main(int argc, char** argv) try
         if (!discovery_set) discover = identity->defaults.discovery;
     }
     else if (discovery_set && discover)
-        throw std::runtime_error("LAN discovery needs saved pool membership; use compute init or compute join");
+        throw std::runtime_error("LAN discovery needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
     if (options.listen.host.empty() || !options.listen.port)
         throw std::runtime_error("broker needs saved pool membership, or --listen and explicit TLS credentials");
     stopping.store(false);

@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--seed", help="32-byte seed in hex; random by default")
     parser.add_argument("--k", type=int, default=28)
     parser.add_argument("--strength", type=int, default=2)
-    parser.add_argument("--meta-group", type=int, default=0, help="shared meta group (default: 0)")
+    parser.add_argument("--collection", "--meta-group", dest="meta_group", type=int, default=0, help="shared collection number (default: 0)")
     parser.add_argument("--plot-index", type=int, default=0, help="first member's index (default: 0)")
     parser.add_argument("--group-size", type=int, required=True, help="members per file")
     parser.add_argument("--files", type=int, default=1, help="files sharing one group ID (default: 1)")
@@ -76,7 +76,7 @@ def main():
     if not 18 <= args.k <= 28 or args.k % 2 or not 1 <= args.group_size <= 65535:
         parser.error("even k in 18..28 and group size in 1..65535 required")
     if not 0 <= args.meta_group <= 255 or not 2 <= args.strength <= args.k - 3:
-        parser.error("invalid strength or meta group")
+        parser.error("invalid strength or collection")
     if args.files < 1 or not 0 <= args.plot_index <= 65535 or args.plot_index + args.files * args.group_size > 65536:
         parser.error("--files must be positive and member indices must fit in 0..65535")
     if not 16 <= args.max_group_ram <= 1048576:

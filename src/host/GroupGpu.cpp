@@ -1,4 +1,5 @@
 #include "host/GroupGpu.hpp"
+#include "host/GpuCleanup.hpp"
 #include "host/GroupGpuPacked.hpp"
 
 #include "gpu/SyclBackend.hpp"
@@ -17,6 +18,10 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef XCHPLOT2_HAVE_CUB
+namespace pos2gpu { bool cuda_host_allocations_are_locked(int device_ordinal); }
+#endif
+
 namespace group_grow
 {
 namespace
@@ -27,6 +32,21 @@ constexpr uint64_t runtime_host_bytes = uint64_t(1300) << 20;
 // Match the production spill engine's aggregate pinned staging allocation.
 // The device drain splits it into alternating windows without growing the budget.
 constexpr uint64_t transfer_window_bytes = uint64_t(64) << 20;
+
+bool locked_host_allocations(sycl::queue const& queue)
+{
+    auto const device = queue.get_device();
+    // Host USM is allocated by the context. A mixed GPU context need not
+    // use this device's allocator for its host buffers.
+    for (auto const& other : queue.get_context().get_devices())
+        if (!other.is_cpu() && other != device) return false;
+    if (device.get_backend() == sycl::backend::hip) return true;
+#ifdef XCHPLOT2_HAVE_CUB
+    if (device.get_backend() == sycl::backend::cuda)
+        return pos2gpu::cuda_host_allocations_are_locked(device.AdaptiveCpp_device_id().get_id());
+#endif
+    return false;
+}
 
 uint64_t wall_stamp()
 {
@@ -102,16 +122,17 @@ struct TimedCopyEvent
     }
 };
 
-struct FreeU64
+template<class T, void (*Free)(T*)>
+struct FreePinned
 {
-    void operator()(uint64_t* p) const { if (p) pos2gpu::streaming_free_pinned_uint64(p); }
+    uint64_t bytes = 0;
+    void operator()(T* p) const noexcept
+    {
+        if (p) pos2gpu::release_gpu_memory("group pinned buffer", bytes, &pos2gpu::GpuCleanupCharges::host, [&] { Free(p); });
+    }
 };
-struct FreeU32
-{
-    void operator()(uint32_t* p) const { if (p) pos2gpu::streaming_free_pinned_uint32(p); }
-};
-using PinnedU64 = std::unique_ptr<uint64_t, FreeU64>;
-using PinnedU32 = std::unique_ptr<uint32_t, FreeU32>;
+using PinnedU64 = std::unique_ptr<uint64_t, FreePinned<uint64_t, pos2gpu::streaming_free_pinned_uint64>>;
+using PinnedU32 = std::unique_ptr<uint32_t, FreePinned<uint32_t, pos2gpu::streaming_free_pinned_uint32>>;
 
 uint64_t device_peak(int k, std::string const& tier)
 {
@@ -129,6 +150,35 @@ uint64_t host_peak(int k, std::string const& tier)
     if (tier == "minimal") return pos2gpu::streaming_minimal_host_bytes(k);
     return pos2gpu::streaming_tiny_host_bytes(k);
 }
+// The mandatory floor includes lazy tables and the same margin as preflight.
+// Candidate scratch can also use smaller runtime allocations below its full
+// threshold. apply_device_budget always bounds that allocation exactly.
+enum DeviceMode : unsigned { overlap_output = 1, compact_output = 2, full_match = 4 };
+unsigned device_modes(int k, int strength, uint64_t capacity, bool pool, uint64_t floor, uint64_t room,
+    bool overlap, bool compact, bool preserve)
+{
+    if (room < floor) return 0;
+    auto spare = room - floor;
+    auto const buckets = uint64_t(1) << ((k < 28 ? 2 : k - 26) + strength);
+    auto const match = pos2gpu::twophase_scratch_bytes(capacity, buckets, uint64_t(1) << strength);
+    auto fits = [&](uint64_t bytes) {
+        return bytes <= spare && (!preserve || detail::preserves_match_scratch(spare, spare - bytes, match));
+    };
+    unsigned modes = 0;
+    if (pool && overlap && fits(capacity * sizeof(uint64_t)))
+    {
+        modes |= overlap_output; spare -= capacity * sizeof(uint64_t);
+        if (compact && capacity <= UINT32_MAX)
+        {
+            auto const window = std::min(capacity, transfer_window_bytes / sizeof(uint64_t));
+            auto const packed = ((window + 1) / 2) * sizeof(uint64_t);
+            if (packed && detail::PackedTransferLayout(k, capacity).metadata_words <= window / 2 && fits(packed))
+            { modes |= compact_output; spare -= packed; }
+        }
+    }
+    if (spare >= match) modes |= full_match;
+    return modes;
+}
 } // namespace
 
 struct GpuProducer::Impl
@@ -136,8 +186,11 @@ struct GpuProducer::Impl
     int k, strength;
     GpuProducerOptions options;
     uint64_t capacity;
-    uint64_t twophase_budget_bytes = 0;
+    uint64_t twophase_budget_bytes = 0, base_device_floor = 0;
+    unsigned initial_device_modes = 0;
     bool profile = false;
+    bool locked_output = false;
+    bool prepared_borrowed_output = false;
     bool copy_event_profiling = false;
     uint64_t profile_member = 0;
     sycl::queue* queue = nullptr;
@@ -171,7 +224,11 @@ struct GpuProducer::Impl
             throw std::invalid_argument("same-file GPU growth does not permit XCHPLOT2_SPILL_T1META disk offload");
         pos2gpu::bind_current_device(options.device_id);
         capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
+        for (auto* buffer : {&output, &meta, &t3, &t2_meta}) buffer->get_deleter().bytes = capacity * sizeof(uint64_t);
+        transfer.get_deleter().bytes = transfer_capacity() * sizeof(uint64_t);
+        for (auto* buffer : {&keys, &xbits}) buffer->get_deleter().bytes = capacity * sizeof(uint32_t);
         queue = &pos2gpu::sycl_backend::queue();
+        locked_output = locked_host_allocations(*queue);
         // Match production admission: discard earlier cached scratch before
         // sampling free VRAM, and reserve the complete path peak before grants.
         pos2gpu::sycl_backend::set_twophase_budget(*queue, 0);
@@ -193,12 +250,10 @@ struct GpuProducer::Impl
                     memory_before_pool.free_bytes, required, margin);
                 auto const overlap_budget = pos2gpu::vram_scratch_budget(
                     memory_before_pool.free_bytes, required + capacity * sizeof(uint64_t), margin);
-                auto const buckets = uint64_t(1) << ((k < 28 ? 2 : k - 26) + strength);
-                auto const match_scratch = pos2gpu::twophase_scratch_bytes(capacity, buckets, uint64_t(1) << strength);
-                if (options.member_overlap && pos2gpu::vram_fits(memory_before_pool.free_bytes,
-                        required + capacity * sizeof(uint64_t), margin) &&
-                    (!options.preserve_match_scratch || detail::preserves_match_scratch(
-                        twophase_budget_bytes, overlap_budget, match_scratch)))
+                base_device_floor = required + margin;
+                initial_device_modes = device_modes(k, strength, capacity, true, base_device_floor,
+                    memory_before_pool.free_bytes, options.member_overlap, options.compact_transfer, options.preserve_match_scratch);
+                if (initial_device_modes & overlap_output)
                 {
                     // This optional allocation must not turn an otherwise
                     // admitted pooled run into CPU/streaming fallback when a
@@ -214,7 +269,7 @@ struct GpuProducer::Impl
                             try
                             {
                                 candidate_queue = std::make_unique<sycl::queue>(queue->get_context(),
-                                    queue->get_device(), pos2gpu::sycl_backend::async_error_handler,
+                                    queue->get_device(), pos2gpu::sycl_backend::queue_error_handler(),
                                     sycl::property_list{sycl::property::queue::in_order{},
                                                         sycl::property::queue::enable_profiling{}});
                                 copy_event_profiling = true;
@@ -223,7 +278,7 @@ struct GpuProducer::Impl
                         }
                         if (!candidate_queue)
                             candidate_queue = std::make_unique<sycl::queue>(queue->get_context(),
-                                queue->get_device(), pos2gpu::sycl_backend::async_error_handler,
+                                queue->get_device(), pos2gpu::sycl_backend::queue_error_handler(),
                                 sycl::property::queue::in_order{});
                         auto* candidate_output = sycl::malloc_device<uint64_t>(capacity, *queue);
                         if (candidate_output)
@@ -237,29 +292,20 @@ struct GpuProducer::Impl
                             // member overlap fits. Reserve its complete tile
                             // beside the lazy pool and independent output;
                             // preserve an already admitted fast match path.
-                            if (options.compact_transfer && capacity <= UINT32_MAX)
+                            if (initial_device_modes & compact_output)
                             {
-                                detail::PackedTransferLayout const layout(k, capacity);
                                 uint64_t const words = (transfer_capacity() + 1) / 2;
-                                uint64_t const packed_peak = required + capacity * sizeof(uint64_t) + words * sizeof(uint64_t);
-                                uint64_t const packed_budget = pos2gpu::vram_scratch_budget(
-                                    memory_before_pool.free_bytes, packed_peak, margin);
-                                if (words && layout.metadata_words <= transfer_capacity() / 2 &&
-                                    pos2gpu::vram_fits(memory_before_pool.free_bytes, packed_peak, margin) &&
-                                    (!options.preserve_match_scratch || detail::preserves_match_scratch(
-                                        overlap_budget, packed_budget, match_scratch)))
+                                uint64_t const packed_budget = overlap_budget - words * sizeof(uint64_t);
+                                try
                                 {
-                                    try
+                                    device_packed = sycl::malloc_device<uint64_t>(words, *queue);
+                                    if (device_packed)
                                     {
-                                        device_packed = sycl::malloc_device<uint64_t>(words, *queue);
-                                        if (device_packed)
-                                        {
-                                            packed_scratch_words = words;
-                                            twophase_budget_bytes = packed_budget;
-                                        }
+                                        packed_scratch_words = words;
+                                        twophase_budget_bytes = packed_budget;
                                     }
-                                    catch (std::exception const&) {}
                                 }
+                                catch (std::exception const&) {}
                             }
                         }
                     }
@@ -288,6 +334,7 @@ struct GpuProducer::Impl
         auto const required = device_peak(k, selected);
         if (!pos2gpu::vram_fits(memory.free_bytes, required, margin))
             throw pos2gpu::InsufficientVramError("GPU growth tier peak plus VRAM buffer exceeds free device memory");
+        base_device_floor = required + margin;
         twophase_budget_bytes = pos2gpu::vram_scratch_budget(memory.free_bytes, required, margin);
     }
 
@@ -300,36 +347,47 @@ struct GpuProducer::Impl
         auto cleanup = [](char const* name, auto&& action)
         {
             try { action(); }
+            catch (sycl::exception const& error)
+            {
+                pos2gpu::record_async_error(error.what());
+                std::fprintf(stderr, "%s cleanup failed: %s\n", name, error.what());
+            }
             catch (std::exception const& error)
             { std::fprintf(stderr, "%s cleanup failed: %s\n", name, error.what()); }
             catch (...)
             { std::fprintf(stderr, "%s cleanup failed: unknown exception\n", name); }
         };
         cleanup("GPU output", [&] { handoff.finish(); });
+        // Borrowed and tiled pipelines can fail at a host-side check before
+        // their last wait. Surface pending driver errors before releasing USM.
+        cleanup("GPU generation queue", [&] { queue->wait_and_throw(); });
         if (device_output)
         {
             // A completed wait can still report an asynchronous error. Attempt
             // every remaining wait/free independently instead of leaking all
             // later resources after the first error.
-            cleanup("GPU generation queue", [&] { queue->wait_and_throw(); });
             cleanup("GPU copy queue", [&] { copy_queue->wait_and_throw(); });
-            cleanup("GPU device output", [&]
-            {
-                sycl::free(device_output, *queue);
-                device_output = nullptr;
-            });
-            cleanup("GPU compact output", [&]
-            {
-                if (device_packed) sycl::free(device_packed, *queue);
-                device_packed = nullptr;
-            });
+            pos2gpu::release_gpu_memory("GPU device output", capacity * sizeof(uint64_t), &pos2gpu::GpuCleanupCharges::device,
+                [&] { sycl::free(device_output, *queue); });
+            if (device_packed)
+                pos2gpu::release_gpu_memory("GPU compact output", packed_scratch_words * sizeof(uint64_t),
+                    &pos2gpu::GpuCleanupCharges::device, [&] { sycl::free(device_packed, *queue); });
         }
-        cleanup("two-phase scratch", [&] { pos2gpu::sycl_backend::release_twophase_scratch(*queue); });
+        if (pos2gpu::gpu_cleanup_charges) pos2gpu::sycl_backend::retire_worker_twophase_scratch(*queue);
+        else cleanup("two-phase scratch", [&] { pos2gpu::sycl_backend::release_twophase_scratch(*queue); });
     }
 
     void check_generation() const
     {
         handoff.check_generation();
+    }
+
+    void check_backend_result() const
+    {
+        queue->throw_asynchronous();
+        if (pos2gpu::async_error_count())
+            throw std::runtime_error("GPU member generation reported an asynchronous backend error: " +
+                                     pos2gpu::first_async_error());
     }
 
     uint64_t next_profile_member() { return profile ? ++profile_member : 0; }
@@ -348,10 +406,15 @@ struct GpuProducer::Impl
         return std::min(capacity, transfer_window_bytes / sizeof(uint64_t));
     }
 
-    void prepare_tiled_output()
+    void release_full_output()
     {
         if (pool) pool->release_pinned(0);
         else release(output);
+    }
+
+    void prepare_tiled_output()
+    {
+        release_full_output();
         if (!transfer)
             transfer.reset(pos2gpu::streaming_alloc_pinned_uint64(transfer_capacity()));
         if (!transfer) throw std::runtime_error("GPU growth pinned transfer allocation failed");
@@ -415,8 +478,9 @@ struct GpuProducer::Impl
     {
         if (!buffer) return;
         queue->wait_and_throw();
-        pos2gpu::streaming_free_pinned_uint64(buffer.get());
-        (void)buffer.release();
+        auto* owned = buffer.release();
+        pos2gpu::checked_gpu_free(buffer.get_deleter().bytes, &pos2gpu::GpuCleanupCharges::host,
+            [&] { pos2gpu::streaming_free_pinned_uint64(owned); });
     }
 
     uint64_t retained() const
@@ -436,7 +500,8 @@ GpuProducer::GpuProducer(int k, int strength, GpuProducerOptions options)
     : impl_(std::make_unique<Impl>(k, strength, std::move(options))) {}
 GpuProducer::~GpuProducer() = default;
 
-GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOptions const& options)
+std::vector<GpuProducerPreflight> GpuProducer::preflight_profiles(int k, int strength,
+    GpuProducerOptions const& options, bool current)
 {
     if (k < 18 || k > 28 || (k & 1) || strength < 2 || strength > k - 3)
         throw std::invalid_argument("GPU producer requires even k in [18, 28] and strength in [2, k-3]");
@@ -448,42 +513,77 @@ GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOpti
     if (char const* v = std::getenv("XCHPLOT2_SPILL_T1META"); v && v[0] == '1')
         throw std::invalid_argument("same-file GPU growth does not permit XCHPLOT2_SPILL_T1META disk offload");
     pos2gpu::bind_current_device(options.device_id);
-    auto memory = pos2gpu::query_device_memory();
-    if (options.max_vram_bytes) memory.free_bytes = std::min(memory.free_bytes, options.max_vram_bytes);
-    auto const margin = pos2gpu::vram_safety_margin();
+    auto const adapter_host_bytes = runtime_host_bytes + sizeof(Impl);
+    uint64_t room = UINT64_MAX;
+    if (current)
+    {
+        room = pos2gpu::query_device_memory().free_bytes;
+        if (options.max_vram_bytes) room = std::min(room, options.max_vram_bytes);
+    }
     auto const capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
-    GpuProducerPreflight result;
-    result.physical_identity = pos2gpu::gpu_physical_identity(options.device_id);
-    result.tier = options.tier;
-    if (result.tier == "auto" || result.tier == "pool")
+    auto const margin = pos2gpu::vram_safety_margin();
+    auto const identity = pos2gpu::gpu_physical_identity(options.device_id);
+    std::vector<GpuProducerPreflight> result;
+    auto append = [&](char const* tier, uint64_t device, uint64_t host)
+    {
+        if (!pos2gpu::vram_fits(room, device, margin)) return;
+        // A less-preferred mode with the same or a greater floor can never
+        // become the automatic choice at any amount of free memory.
+        if (!result.empty() && device + margin >= result.back().device_bytes) return;
+        result.push_back({tier, host, host + capacity * sizeof(uint64_t), device + margin, identity});
+    };
+    if (options.tier == "auto" || options.tier == "pool")
     {
         auto const sizing = pos2gpu::GpuBufferPool::sizing(k);
-        if (pos2gpu::vram_fits(memory.free_bytes, sizing.device_bytes(), margin))
+        append("pool", sizing.device_bytes(), adapter_host_bytes + sizing.pinned_bytes);
+        if (current && !result.empty()) return result;
+    }
+    for (auto tier : {"plain", "compact", "minimal", "tiny", "pinned"})
+        if (options.tier == tier || (options.tier == "auto" && std::string_view(tier) != "pinned"))
         {
-            result.tier = "pool";
-            result.device_bytes = sizing.device_bytes() + margin;
-            result.borrowed_host_bytes = runtime_host_bytes + sizeof(Impl) + sizing.pinned_bytes;
+            append(tier, device_peak(k, tier), std::max(host_peak(k, tier), adapter_host_bytes + capacity * sizeof(uint64_t)));
+            if (current && !result.empty()) break;
         }
-        else if (result.tier == "pool")
-            throw pos2gpu::InsufficientVramError("GPU growth pool exceeds offered device memory");
-    }
-    if (!result.device_bytes)
-    {
-        if (result.tier == "auto")
-            for (char const* tier : {"plain", "compact", "minimal", "tiny"})
-            {
-                result.tier = tier;
-                if (pos2gpu::vram_fits(memory.free_bytes, device_peak(k, result.tier), margin)) break;
-            }
-        auto const required = device_peak(k, result.tier);
-        if (!pos2gpu::vram_fits(memory.free_bytes, required, margin))
-            throw pos2gpu::InsufficientVramError("GPU growth tier exceeds offered device memory");
-        result.device_bytes = required + margin;
-        result.borrowed_host_bytes = std::max(host_peak(k, result.tier),
-            runtime_host_bytes + sizeof(Impl) + capacity * sizeof(uint64_t));
-    }
-    result.owning_host_bytes = result.borrowed_host_bytes + capacity * sizeof(uint64_t);
     return result;
+}
+
+std::vector<GpuProducerPreflight> GpuProducer::preflight_tiers(int k, int strength, GpuProducerOptions const& options)
+{
+    return preflight_profiles(k, strength, options, false);
+}
+
+GpuProducerPreflight GpuProducer::preflight(int k, int strength, GpuProducerOptions const& options)
+{
+    auto result = preflight_profiles(k, strength, options, true);
+    if (!result.empty()) return std::move(result.front());
+    if (options.tier == "pool") throw pos2gpu::InsufficientVramError("GPU growth pool exceeds offered device memory");
+    throw pos2gpu::InsufficientVramError("GPU growth tier exceeds offered device memory");
+}
+
+unsigned GpuProducer::worker_budget_class(int k, int strength, GpuProducerPreflight const& profile, uint64_t room)
+{
+    auto const capacity = pos2gpu::match_phase_capacity(k, k < 28 ? 2 : k - 26);
+    return device_modes(k, strength, capacity, profile.tier == "pool", profile.device_bytes, room, true, true, true);
+}
+
+bool GpuProducer::apply_device_budget(uint64_t room)
+{
+    auto& p = *impl_;
+    if (room < p.base_device_floor) return false;
+    auto const modes = device_modes(p.k, p.strength, p.capacity, bool(p.pool), p.base_device_floor, room,
+        p.options.member_overlap, p.options.compact_transfer, p.options.preserve_match_scratch);
+    if ((modes ^ p.initial_device_modes) & (overlap_output | compact_output)) return false;
+    uint64_t fixed = p.base_device_floor;
+    if (p.device_output) fixed += p.capacity * sizeof(uint64_t);
+    if (p.device_packed) fixed += p.packed_scratch_words * sizeof(uint64_t);
+    if (fixed > room) return false;
+    auto const scratch = room - fixed;
+    if (scratch != p.twophase_budget_bytes)
+    {
+        pos2gpu::sycl_backend::set_twophase_budget(*p.queue, scratch);
+        p.twophase_budget_bytes = scratch;
+    }
+    return true;
 }
 
 uint64_t GpuProducer::host_generation_peak_bytes() const
@@ -519,6 +619,42 @@ uint64_t GpuProducer::host_tiled_generation_peak_bytes() const
     return std::max(host_peak(impl_->k, impl_->selected), retained) + window;
 }
 uint64_t GpuProducer::retained_host_bytes() const { return impl_->retained(); }
+uint64_t GpuProducer::locked_host_output_bytes() const
+{
+    return impl_->locked_output ? impl_->output_bytes() +
+        (impl_->transfer ? impl_->transfer_capacity() * sizeof(uint64_t) : 0) : 0;
+}
+void GpuProducer::release_host_output()
+{
+    impl_->check_generation();
+    impl_->finish_output();
+    OutputWallTimings wall(impl_->profile && impl_->prepared_borrowed_output, "host-output-release", 0);
+    impl_->release_full_output();
+    impl_->release(impl_->transfer);
+    impl_->prepared_borrowed_output = false;
+    wall.complete = true;
+}
+std::string GpuProducer::device_loss(std::exception_ptr failure, std::string_view backend)
+{
+    auto device_error = [&](char const* what) -> std::string
+    {
+        auto const native = pos2gpu::lost_gpu_backend(what);
+        if (native.empty()) return {};
+        if (native != backend) { pos2gpu::record_async_error(what); return {}; }
+        auto const message = std::string_view(what);
+        return std::string(message.substr(message.size() > 240 ? message.size() - 240 : 0));
+    };
+    try { if (failure) std::rethrow_exception(failure); }
+    catch (sycl::exception const& e) {
+        return device_error(e.what());
+    }
+    catch (pos2gpu::InsufficientVramError const& e) {
+        // An allocation can surface a pre-existing terminal driver error.
+        return device_error(e.what());
+    }
+    catch (...) {}
+    return {};
+}
 uint64_t GpuProducer::runtime_host_allowance_bytes() noexcept { return runtime_host_bytes; }
 uint64_t GpuProducer::device_resident_bytes() const
 {
@@ -574,6 +710,7 @@ GpuProducer::BorrowedFragments GpuProducer::generate_borrowed(std::array<uint8_t
         auto const scratch = impl_->scratch();
         result = pos2gpu::run_gpu_pipeline_streaming(config, impl_->output.get(), impl_->capacity, scratch);
     }
+    impl_->check_backend_result();
     auto const fragments = result.fragments();
     if (fragments.size() > impl_->capacity)
         throw std::runtime_error("GPU producer fragment count exceeds the admitted bound");
@@ -582,6 +719,56 @@ GpuProducer::BorrowedFragments GpuProducer::generate_borrowed(std::array<uint8_t
     borrowed.fragments_ = fragments;
     wall.complete = true;
     return borrowed;
+}
+void GpuProducer::generate_borrowed_into(std::array<uint8_t, 32> const& plot_id,
+    std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy)
+{
+    (void)generate_borrowed_into_async(plot_id, std::move(consume), before_copy);
+}
+bool GpuProducer::try_prepare_borrowed_output()
+{
+    impl_->check_generation();
+    if (!impl_->pool || !impl_->options.member_overlap || impl_->device_output) return false;
+    if (impl_->pool->h_pinned_t3[0]) { impl_->prepared_borrowed_output = true; return true; }
+    impl_->finish_output();
+    impl_->release(impl_->transfer);
+    // Only the optional pinned allocation may fall back. Errors from pending
+    // consumers or from actual generation stay visible to the controller.
+    OutputWallTimings wall(impl_->profile, "host-output-allocation", 0);
+    try
+    {
+        impl_->prepared_borrowed_output = impl_->pool->ensure_pinned(0) != nullptr;
+        wall.complete = impl_->prepared_borrowed_output;
+        return wall.complete;
+    }
+    catch (std::runtime_error const&) { return false; }
+    catch (std::bad_alloc const&) { return false; }
+}
+std::shared_future<uint64_t> GpuProducer::generate_borrowed_into_async(std::array<uint8_t, 32> const& plot_id,
+    std::function<void(std::span<uint64_t const>)> consume, std::function<void()> const& before_copy)
+{
+    impl_->check_generation();
+    if (!impl_->pool || !consume) throw std::logic_error("borrowed output handoff requires a pooled GPU and a consumer");
+    OutputWallTimings wall(impl_->profile, "generation-borrowed", impl_->next_profile_member());
+    if (impl_->transfer) wall.slot_wait_ns += impl_->finish_output(wall.member);
+    impl_->release(impl_->transfer);
+    auto const result = pos2gpu::run_gpu_pipeline(impl_->config(plot_id), *impl_->pool, 0,
+        [&] { before_copy(); wall.slot_wait_ns += impl_->finish_output(wall.member); });
+    impl_->check_backend_result();
+    auto const fragments = result.fragments();
+    if (!result.t3_fragments_storage.empty() || fragments.size() > impl_->capacity)
+        throw std::logic_error("GPU producer returned invalid borrowed output");
+    bool const profile_output = impl_->prepared_borrowed_output && impl_->profile;
+    if (profile_output) wall.bytes = fragments.size_bytes();
+    auto pending = impl_->handoff.launch([fragments, consume = std::move(consume), profile = profile_output, member = wall.member]
+    {
+        OutputWallTimings consumer(profile, "output-borrowed", member);
+        { AddWallTime timing(consumer.consume_ns, profile); consume(fragments); }
+        consumer.complete = true;
+        return uint64_t(fragments.size());
+    });
+    wall.complete = true;
+    return pending;
 }
 uint64_t GpuProducer::generate_into(std::array<uint8_t, 32> const& plot_id,
     std::function<void(std::span<uint64_t const>, uint64_t)> const& consume)
@@ -610,6 +797,7 @@ uint64_t GpuProducer::generate_into(std::array<uint8_t, 32> const& plot_id,
     auto const config = impl_->config(plot_id);
     auto const result = impl_->pool ? pos2gpu::run_gpu_pipeline(config, *impl_->pool, sink) :
         pos2gpu::run_gpu_pipeline_streaming(config, sink, impl_->scratch(false));
+    impl_->check_backend_result();
     if (!result.fragments().empty() || result.t3_count > impl_->capacity)
         throw std::logic_error("GPU producer tiled output returned invalid fragment storage or count");
     wall.complete = true;
@@ -665,14 +853,13 @@ std::shared_future<uint64_t> GpuProducer::generate_output_async(
     try
     {
         auto const result = pos2gpu::run_gpu_pipeline(impl_->config(plot_id), *impl_->pool, output);
-        if (pos2gpu::async_error_count())
-            throw std::runtime_error("GPU member generation reported an asynchronous backend error: " +
-                                     pos2gpu::first_async_error());
+        impl_->check_backend_result();
         if (!result.fragments().empty() || result.t3_count > impl_->capacity)
             throw std::logic_error("GPU producer device output returned invalid fragment storage or count");
-        auto pending = impl_->handoff.launch([impl = impl_.get(), count = result.t3_count, member = wall.member,
+        auto pending = impl_->handoff.launch([impl = impl_.get(), count = result.t3_count, member = wall.member, scope = pos2gpu::scoped_async_errors(),
                                       consume = std::move(consume), consume_packed = std::move(consume_packed)]() mutable
         {
+            pos2gpu::ScopedAsyncErrors bind(scope);
             OutputWallTimings wall(impl->profile, consume_packed ? "output-packed" : "output-raw", member);
             wall.observes_copy_wait = true;
             auto& queue = *impl->copy_queue;

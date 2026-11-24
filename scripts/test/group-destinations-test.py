@@ -26,11 +26,13 @@ def snapshot(paths):
     return [(digest(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths]
 
 
-def run(command, code=0, point=None, **kwargs):
+def run(command, code=0, point=None, timing=False, **kwargs):
     env = dict(os.environ)
     env.pop("XCHPLOT2_GROW_FAILPOINT", None)
     if point:
         env["XCHPLOT2_GROW_FAILPOINT"] = point
+    if timing:
+        env["POS2GPU_PHASE_TIMING"] = "1"
     result = subprocess.run([str(value) for value in command], capture_output=True,
                             text=True, env=env, **kwargs)
     assert result.returncode == code, (command, result.returncode, result.stdout, result.stderr)
@@ -47,7 +49,7 @@ def check(args, root):
               "--k", 18, "--max-members", 3, "--batch-members", 1,
               "--capacity-bytes", 64 * 1024 * 1024, "--max-ram", args.max_ram,
               "--window-bytes", 65536, "--checkpoint-bytes", 1048576, "--workers", 2,
-              "--backend", args.backend]
+              "--backend", args.backend, "--destination-temp", "off"]
     results = {"parity": [], "recovery": [], "rejections": []}
 
     def targets(name):
@@ -84,16 +86,19 @@ def check(args, root):
     holder, = paths[-1].parent.glob(paths[-1].name + ".external.retired-*")
     checkpoint = holder / "checkpoint"
     saved_checkpoint = checkpoint.read_bytes()
-    before = snapshot(paths)
+    # Retirement precedes publication of the newly constructed last file.
+    held = [*paths[:-1], Path(str(paths[-1]) + ".partial")]
+    assert not paths[-1].exists()
+    before = snapshot(held)
     checkpoint.write_bytes(b"!" + saved_checkpoint[1:])
     run([*ordinary, "--resume"], code=1)
-    assert snapshot(paths) == before, "later retired corruption was found after modifying an earlier output"
+    assert not paths[-1].exists() and snapshot(held) == before, "later retired corruption modified an output"
     assert checkpoint.read_bytes() == b"!" + saved_checkpoint[1:]
     checkpoint.write_bytes(saved_checkpoint)
     forged = Path(str(paths[-1]) + ".external.retired-" + "f" * 64)
     forged.mkdir(mode=0o700)
     run([*ordinary, "--resume"], code=1)
-    assert snapshot(paths) == before and not list(forged.iterdir()), "forged retired metadata changed an output or was removed"
+    assert not paths[-1].exists() and snapshot(held) == before and not list(forged.iterdir()), "forged retired metadata changed an output or was removed"
     forged.rmdir()
     result = report(run([*ordinary, "--resume"]))
     assert result["members"] == len(paths) * 3 and result["peak_modeled_bytes"] <= args.max_ram, result
@@ -299,15 +304,18 @@ def check(args, root):
     # engine release and completed-file audit without requiring many drives.
     directory = root / "many-destinations"
     directory.mkdir(mode=0o700)
-    paths = [directory / f"drive-{index}.gplot" for index in range(64)]
+    paths = [directory / f"drive-{index}.gplot" for index in range(65)]
     options = [paths[0]]
     for path in paths[1:]:
         options += ["--destination", path]
     bounded_ram = min(args.max_ram, 256 * 1024 * 1024)
     command = [*common, *options, "--construction", "incremental", "--max-members", 1,
-               "--capacity-bytes", 64 * 64 * 1024 * 1024, "--max-ram", bounded_ram,
+               "--capacity-bytes", len(paths) * 64 * 1024 * 1024, "--max-ram", bounded_ram,
                "--generation-overlap", "on"]
-    result = report(run(command))
+    filled = run(command, timing=True)
+    first = next(row for row in filled.stderr.splitlines() if row.startswith("[grow-controller-timing] phase=grant "))
+    assert f" forecast_remaining_members={len(paths)} " in first and f" forecast_unmeasured_lanes={len(paths)} " in first, first
+    result = report(filled)
     assert result["destinations"] == len(paths) and result["members"] == len(paths), result
     assert result["writer_groups"] == 1 and result["peak_modeled_bytes"] <= bounded_ram, result
     before = snapshot(paths)

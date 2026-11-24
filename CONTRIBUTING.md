@@ -53,7 +53,7 @@ identities with matching numeric representation; the
 recorded source build is provenance for new plans. Bump the schema for
 incompatible saved-policy or plan-format changes,
 the model identity when assessment semantics change, and the key-derivation
-identity when owner/seed derivation, family/meta schedules or group-key
+identity when owner/seed derivation, family/collection schedules or group-key
 derivation changes. Keep existing plan bytes and parent digests stable when
 loading compatible records. New construction checkpoints use explicit format,
 algorithm and native-representation identities; bump the affected identity when
@@ -110,6 +110,7 @@ src/gpu/                  GPU kernels and sort backends
 src/host/
 ├── GpuPipeline           Xs → T1 → T2 → T3 orchestration
 ├── GpuBufferPool         persistent device buffers and host drain slots
+├── CpuTables / CpuPlotMemory   native CPU member generation and RAM admission
 ├── BatchPlotter          workers, memory admission, and writer queues
 ├── BatchManifest         saved identities and recovery manifests
 ├── GroupPlotter          group construction, drive scheduling and recovery
@@ -146,17 +147,26 @@ Keep each workflow focused on its own checks:
 | Workflow | Purpose |
 | --- | --- |
 | `CI` | Lint, documentation, Rust, host C++ tests with sanitizers, CPU construction and compute tests, Python harness checks, and container-installer fixtures |
-| `arch-matrix` | Compile CUDA objects for the documented GPU architectures |
+| `arch-matrix` | Compile sm_86 and sm_89 together with CUDA 13 and sm_120 with CUDA 12.9. The installation containers cover sm_61 and sm_75. |
 | `install-matrix` | Fresh dependency installation, complete Cargo/CMake builds, installed CLI tests, and production container builds |
 | `Binary release` | Package and test Linux and Windows archives on both host architectures |
 | `GPU hardware` | Execute correctness and memory suites on the trusted GPU fleet |
 
-Build workflows filter changes to their inputs; lightweight CI runs on every
-PR and `main` push. CI, architecture and installation workflows cancel older
-runs for the same event and ref. Release builds cancel superseded PR runs only;
-running tag and manual release builds are not cancelled.
+Build workflows filter changes to their inputs. CI starts on every PR and
+`main` push so spelling checks cover all tracked text, then selects lint and
+test jobs by their inputs. Documentation checks also run for deletions and
+renames that could break local links. Release PRs select Linux and Windows
+builds separately. Manual dispatch runs all checks for the selected
+workflow, subject to its platform, architecture or suite inputs. Scheduled
+installation checks and tag release builds retain their full matrices.
+CI and installation workflows keep each push run because their job filters
+cover only that push. Their PR and manual runs, and architecture workflow
+runs, cancel older runs for the same event and ref. Release builds cancel
+superseded PR runs only; running tag and manual release builds are not cancelled.
 GPU execution remains separate from hosted build and CPU checks.
 Update path filters when adding a build input or a script called by a workflow.
+For workflows with job filters, update both the workflow trigger and the
+`changes` job. Keep test fixtures scoped to the jobs that build or run them.
 
 ## Install CI
 
@@ -185,14 +195,21 @@ Both the installed Cargo executable and the CMake executable run
 SIGTERM, saved manifest and completed-file preservation on resume, forced
 publication failure, partial cleanup, and full proofs. Windows uses the same
 harness with Ctrl-Break and keeps its Unicode benchmark checks.
-CI runs on PRs, `main` pushes, manual dispatch, and weekly to catch package
-repository changes. The existing container and CUDA architecture matrices
-remain separate coverage. The [binary release job](#binary-releases) checks
-native Windows separately.
 
-Linux installs also run `scripts/test/group-cli.py --automatic-compute` and
-`scripts/test/compute-cli.py` against both installed binaries. The grouped
-suite covers full proofs, read-only plans, all construction engines' crash
+On PRs and `main` pushes, ordinary application and CLI test changes run one
+clean Ubuntu 24.04 NVIDIA install. Installer changes exercise every native and
+WSL install in the table, including the three Cargo toolchain bootstrap cases.
+Build-system and dependency changes also rebuild the five production containers.
+GPU source changes exercise those containers alongside the representative
+install. Containerfile and container-only test changes run the container matrix.
+Weekly and manual runs cover all installs and containers. The
+[binary release job](#binary-releases) checks native Windows separately.
+
+The Ubuntu NVIDIA install and its WSL counterpart also run
+`scripts/test/group-cli.py --automatic-compute` and `scripts/test/compute-cli.py`
+against both binaries. Other installs use `native-install.sh VENDOR --smoke`
+to check the backend, parity, interrupted plots, recovery and full proofs.
+The grouped suite covers read-only plans, all construction engines' crash
 recovery, saved enrollment, several brokers sharing a worker, worker
 replacement and broker outages. The compute suite checks authenticated status,
 pause/drain/resume, renewal, revocation and background service commands.
@@ -230,7 +247,9 @@ on trusted `main` / `cuda-only` pushes, schedules, and manual dispatches:
 
 Register runners and set `GPU_CORRECTNESS_MATRIX` to the installed fleet before
 setting the Actions repository variable `GPU_RUNNERS_READY` to `true`.
-That enables automatic push and daily runs. Without a correctness matrix,
+That enables automatic push and daily runs. Pushes test the changed branch
+only; schedules and manual dispatch can also test other configured refs.
+Without a correctness matrix,
 the original NVIDIA, AMD, Intel, and `cuda-only` lanes remain the default.
 Automatic weekly physical runs additionally require `GPU_PHYSICAL_MATRIX`;
 manual physical dispatch retains the default matrix below. Until readiness
@@ -258,8 +277,8 @@ as a physical dedicated VRAM capacity.
 
 Every suite also compares two k=18 raw-member vectors against CPU output on each
 selected tier and spill variant: strength 3 with an all-`ff` group ID, maximum
-index/meta group (65535/255), and a patterned 255-byte memo; strength 4 with a
-group ID containing bytes `00` through `1f` and index/meta group 1/1. Each path must
+index/collection (65535/255), and a patterned 255-byte memo; strength 4 with a
+group ID containing bytes `00` through `1f` and index/collection 1/1. Each path must
 report positive solved full proofs. The summary records vector parameters,
 reference hashes, and proof counts. Production k=28 checks and original log
 names remain intact. The baseline writes an official single-member `.gplot`; the boundary

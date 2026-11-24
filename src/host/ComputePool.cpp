@@ -8,12 +8,21 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <stdexcept>
 #include <utility>
 
 namespace group_grow::pool
 {
+std::string worker_diagnostic(std::string text)
+{
+    // Worker diagnostics are printed on terminals on the owner as well as the worker.
+    // Keep a bounded ASCII line even when a peer sends arbitrary diagnostics.
+    if (text.size() > 240) text.erase(0, text.size() - 240);
+    for (char& c : text) if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) c = ' ';
+    return text;
+}
 void write_worker_hardware(Writer& out, WorkerHardware const& value)
 {
     out.string(value.host); out.string(value.gpu_identity);
@@ -33,9 +42,15 @@ WorkerHardware read_worker_hardware(Reader& in)
 namespace
 {
 using Clock = std::chrono::steady_clock;
+constexpr char broker_restarted[] = "broker restarted; open a new owner session";
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker };
+enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute, RegisterGpuRecovery, StatusGpuRecovery, GenerationRoutesGpuRecovery, AcquireFiniteGeneration, FinitePackedRoute, GenerationPaths, DeliveredOnPath, PublicationRoute };
+class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
+class UnsupportedProfiles : public std::runtime_error { using std::runtime_error::runtime_error; };
+class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
+constexpr uint8_t independent_flag = 0x80;
 void write_endpoint(Writer& writer, Endpoint const& endpoint)
 { writer.string(endpoint.host); writer.u16(endpoint.port); writer.string(endpoint.server_name); }
 Endpoint read_endpoint(Reader& reader)
@@ -50,13 +65,19 @@ Resources read_resources(Reader& reader)
 void write_task(Writer& writer, Task const& task)
 {
     writer.string(task.task_id); writer.string(task.compatibility); writer.u64(task.attempt); writer.u64(task.sequence); writer.u64(task.work_units);
-    writer.u8(uint8_t(task.kind)); writer.u8(task.k); writer.u8(task.strength); write_resources(writer, task.resources);
+    writer.u8(uint8_t(task.kind) | (task.independent_members ? independent_flag : 0)); writer.u8(uint8_t(task.generation_output));
+    writer.u8(task.k); writer.u8(task.strength); write_resources(writer, task.resources);
     writer.u32(task.chunk_count); writer.u64(task.max_output_bytes);
 }
 Task read_task(Reader& reader)
 {
     Task result; result.task_id = reader.string(256); result.compatibility = reader.string(256);
-    result.attempt = reader.u64(); result.sequence = reader.u64(); result.work_units = reader.u64(); result.kind = Kind(reader.u8());
+    result.attempt = reader.u64(); result.sequence = reader.u64(); result.work_units = reader.u64();
+    auto const kind = reader.u8(); result.kind = Kind(kind & ~independent_flag); result.independent_members = kind & independent_flag;
+    result.generation_output = GenerationOutput(reader.u8());
+    require(result.generation_output <= GenerationOutput::Fresh &&
+        (!result.independent_members || result.generation_output == GenerationOutput::Contributions) &&
+        (result.kind != Kind::Pack || result.generation_output == GenerationOutput::Packed), "invalid generation output");
     result.k = reader.u8(); result.strength = reader.u8(); result.resources = read_resources(reader);
     result.chunk_count = reader.u32(); result.max_output_bytes = reader.u64(); return result;
 }
@@ -69,14 +90,14 @@ OwnerSession read_session(Reader& reader)
     OwnerSession result; result.owner_id = reader.string(256); result.token = reader.string(64);
     result.epoch = reader.string(64); result.generation = reader.u64(); return result;
 }
-void write_profiles(Writer& writer, std::vector<GenerationProfile> const& profiles)
+void write_profiles(Writer& writer, std::vector<GenerationProfile> const& profiles, bool extended)
 {
     require(profiles.size() <= max_generation_profiles, "too many generation profiles");
     writer.u32(uint32_t(profiles.size()));
     for (auto const& profile : profiles)
     {
-        writer.u8(uint8_t(profile.kind)); writer.u8(profile.k); writer.u8(profile.strength); writer.u32(profile.cpu_threads);
-        write_resources(writer, profile.resources); writer.u64(profile.member_host_bytes); writer.u32(profile.max_batch_members);
+        writer.u8(uint8_t(profile.kind) | (extended && profile.independent_unavailable ? independent_flag : 0)); writer.u8(profile.k); writer.u8(profile.strength); writer.u32(profile.cpu_threads);
+        write_resources(writer, profile.resources); writer.u64(profile.member_host_bytes); writer.u32(!extended && profile.independent_unavailable ? 1 : profile.max_batch_members);
     }
 }
 std::vector<GenerationProfile> read_profiles(Reader& reader)
@@ -85,20 +106,21 @@ std::vector<GenerationProfile> read_profiles(Reader& reader)
     std::vector<GenerationProfile> profiles; profiles.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
     {
-        GenerationProfile profile; profile.kind = Kind(reader.u8()); profile.k = reader.u8(); profile.strength = reader.u8();
+        GenerationProfile profile; auto const kind = reader.u8(); profile.kind = Kind(kind & ~independent_flag);
+        profile.independent_unavailable = kind & independent_flag; profile.k = reader.u8(); profile.strength = reader.u8();
         profile.cpu_threads = reader.u32(); profile.resources = read_resources(reader);
         profile.member_host_bytes = reader.u64(); profile.max_batch_members = reader.u32(); profiles.push_back(profile);
     }
     return profiles;
 }
-void write_offer(Writer& writer, WorkerOffer const& offer)
+void write_offer(Writer& writer, WorkerOffer const& offer, bool extended)
 {
     writer.string(offer.instance); writer.string(offer.compatibility); writer.string(offer.codec_compatibility);
     writer.string(offer.producer_build); write_endpoint(writer, offer.endpoint);
     write_resources(writer, offer.capacity); writer.u64(offer.capacity_revision); writer.u32(offer.generation_threads); writer.u32(offer.capabilities); writer.u8(offer.min_k); writer.u8(offer.max_k);
-    write_profiles(writer, offer.generation_profiles);
+    write_profiles(writer, offer.generation_profiles, extended);
     writer.u32(offer.codec_limits.max_chunks); writer.u64(offer.codec_limits.max_task_bytes); writer.u8(uint8_t(offer.admission));
-    write_worker_hardware(writer, offer.hardware);
+    write_worker_hardware(writer, offer.hardware); writer.u32(offer.independent_k_mask);
 }
 WorkerOffer read_offer(Reader& reader)
 {
@@ -107,15 +129,16 @@ WorkerOffer read_offer(Reader& reader)
     result.endpoint = read_endpoint(reader); result.capacity = read_resources(reader); result.capacity_revision = reader.u64(); result.generation_threads = reader.u32(); result.capabilities = reader.u32();
     result.min_k = reader.u8(); result.max_k = reader.u8(); result.generation_profiles = read_profiles(reader);
     result.codec_limits.max_chunks = reader.u32(); result.codec_limits.max_task_bytes = reader.u64();
-    result.admission = WorkerAdmission(reader.u8()); result.hardware = read_worker_hardware(reader); return result;
+    result.admission = WorkerAdmission(reader.u8()); result.hardware = read_worker_hardware(reader);
+    result.independent_k_mask = reader.u32(); return result;
 }
-void write_update(Writer& writer, std::optional<CapacityUpdate> const& update)
+void write_update(Writer& writer, std::optional<CapacityUpdate> const& update, bool extended)
 {
     writer.u8(bool(update)); if (update)
     {
         writer.u64(update->revision); write_resources(writer, update->capacity);
         writer.u8(bool(update->generation_profiles));
-        if (update->generation_profiles) write_profiles(writer, *update->generation_profiles);
+        if (update->generation_profiles) write_profiles(writer, *update->generation_profiles, extended);
     }
 }
 std::optional<CapacityUpdate> read_update(Reader& reader)
@@ -179,6 +202,13 @@ struct BrokerClient::Connections
     ControlMetrics metrics;
     Endpoint endpoint;
     uint64_t route_revision = 1;
+    // Each request records unsupported operations against the broker it queried.
+    // An older reply in flight must not disable them on the replacement.
+    struct GenerationApi
+    {
+        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true}, tier_profiles{true}, publication{true};
+    };
+    std::atomic<std::shared_ptr<GenerationApi>> generation_api{std::make_shared<GenerationApi>()};
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
     {
         require(limit && limit <= control_channel_limit, "invalid broker control channel limit");
@@ -199,6 +229,7 @@ void BrokerClient::reroute(Endpoint const& endpoint)
     if (connections_->endpoint == endpoint) return;
     require(connections_->route_revision != UINT64_MAX, "broker route revision exhausted");
     connections_->endpoint = endpoint; ++connections_->route_revision;
+    connections_->generation_api.store(std::make_shared<Connections::GenerationApi>());
 }
 bool BrokerClient::shared() const noexcept { return connections_.use_count() != 1; }
 void BrokerClient::disconnect_idle()
@@ -262,9 +293,15 @@ std::vector<uint8_t> BrokerClient::call(Writer const& writer, std::string* peer_
         Reader reader(frame.payload); auto const code = ErrorCode(reader.u8()); auto message = reader.string(512); reader.finish();
         require(code == ErrorCode::Invalid || code == ErrorCode::StaleOwner || code == ErrorCode::StaleDelivery ||
             code == ErrorCode::StaleLease, "invalid broker error code");
+        if (code == ErrorCode::StaleOwner && message == broker_restarted) throw BrokerRestarted("compute broker: " + message);
         if (code == ErrorCode::StaleOwner) throw StaleOwnerSession("compute broker: " + message);
         if (code == ErrorCode::StaleDelivery) throw StaleDelivery("compute broker: " + message);
         if (code == ErrorCode::StaleLease) throw StaleLease("compute broker: " + message);
+        if (message == "unknown broker operation") throw UnknownOperation("compute broker: " + message);
+        if (message == "broker resource accounting underflow") throw CapacityReserved("compute broker: " + message);
+        if (message == "invalid generation resource profile" || message == "independent members require a GPU profile")
+            throw UnsupportedProfiles("compute broker: " + message);
+        if (message == "invalid generation backlog") throw UnsupportedBacklog("compute broker: " + message);
         throw std::runtime_error("compute broker: " + message);
     }
     require(frame.type == Message::Reply && frame.payload.size() <= 65536, "invalid broker response");
@@ -280,14 +317,47 @@ uint64_t BrokerClient::memory_bytes(unsigned channels)
 OwnerSession BrokerClient::open_owner(std::string const& owner_id, bool ephemeral)
 {
     auto writer = request(Operation::OpenOwner); writer.string(owner_id); writer.u8(ephemeral); auto bytes = call(writer);
-    Reader reader(bytes); auto result = read_session(reader); reader.finish(); return result;
+    Reader reader(bytes); auto result = read_session(reader); reader.finish();
+    connections_->generation_api.store(std::make_shared<Connections::GenerationApi>()); return result;
 }
 void BrokerClient::close_owner(OwnerSession const& session)
 { auto writer = request(Operation::CloseOwner); write_session(writer, session); auto bytes = call(writer); Reader(bytes).finish(); }
-std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const& task)
+std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const& task, Clock::time_point other_work_until)
 {
-    auto writer = request(Operation::Acquire); write_session(writer, owner); write_task(writer, task);
-    std::string peer, node; auto bytes = call(writer, &peer, &node);
+    auto const now = Clock::now();
+    auto const api = connections_->generation_api.load();
+    bool const finite = other_work_until != Clock::time_point{} && other_work_until <= now && task.kind != Kind::Pack &&
+        (task.generation_output == GenerationOutput::Packed || task.generation_output == GenerationOutput::Fresh) &&
+        api->finite.load();
+    auto writer = request(finite ? Operation::AcquireFiniteGeneration : Operation::Acquire);
+    write_session(writer, owner); write_task(writer, task);
+    uint32_t remaining = 0, backlog = 0;
+    if (tls_.deadline != Clock::time_point::max())
+    {
+        auto const left = std::chrono::ceil<std::chrono::milliseconds>(tls_.deadline - now).count();
+        if (left <= 0) throw TransientTransport("broker control request timed out");
+        remaining = uint32_t(std::min<int64_t>(left, UINT32_MAX));
+        if (task.kind != Kind::Pack && (task.independent_members || api->backlog.load()) && other_work_until > now)
+        {
+            auto const ahead = std::chrono::duration_cast<std::chrono::milliseconds>(other_work_until - now).count();
+            backlog = uint32_t(std::min<int64_t>(remaining, ahead));
+        }
+    }
+    writer.u32(remaining); writer.u32(backlog);
+    std::string peer, node; std::vector<uint8_t> bytes;
+    try { bytes = call(writer, &peer, &node); }
+    catch (UnknownOperation const&)
+    {
+        if (!finite) throw;
+        api->finite.store(false); return acquire(owner, task, other_work_until);
+    }
+    catch (UnsupportedBacklog const&)
+    {
+        // Older protocol-8 brokers reject this optional field before opening
+        // or granting the job. Only that explicit rejection permits fallback.
+        if (task.independent_members || !backlog) throw;
+        api->backlog.store(false); return acquire(owner, task);
+    }
     Reader reader(bytes); auto const present = reader.u8(); require(present <= 1, "invalid broker grant flag");
     std::optional<Lease> result; if (present)
     {
@@ -297,10 +367,133 @@ std::optional<Lease> BrokerClient::acquire(OwnerSession const& owner, Task const
     }
     reader.finish(); return result;
 }
-uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task)
+bool BrokerClient::generation_paths(OwnerSession const& owner, GenerationPaths const& paths)
 {
-    auto writer = request(Operation::GenerationHint); write_session(writer, owner); write_task(writer, task); auto bytes = call(writer);
-    Reader reader(bytes); auto const result = reader.u32(); reader.finish(); return result;
+    auto const api = connections_->generation_api.load();
+    if (!api->paths.load()) return false;
+    require(paths.size() <= max_status_page_size, "excessive generation paths");
+    auto writer = request(Operation::GenerationPaths); write_session(writer, owner); writer.u8(uint8_t(paths.size()));
+    for (auto const& [worker, path] : paths) { writer.string(worker); writer.string(path); }
+    try { auto bytes = call(writer); Reader(bytes).finish(); }
+    catch (UnknownOperation const&) { api->paths.store(false); return false; }
+    return true;
+}
+std::optional<std::pair<std::string, Kind>> BrokerClient::finite_packed_route(OwnerSession const& owner, Task const& task)
+{
+    auto const api = connections_->generation_api.load();
+    if (!api->finite.load()) return {};
+    auto writer = request(Operation::FinitePackedRoute); write_session(writer, owner); write_task(writer, task);
+    std::vector<uint8_t> bytes;
+    try { bytes = call(writer); }
+    catch (UnknownOperation const&) { api->finite.store(false); return {}; }
+    Reader reader(bytes); auto const identity = reader.string(64);
+    if (identity.empty()) { reader.finish(); return {}; }
+    auto const kind = Kind(reader.u8()); reader.finish();
+    require(identifier(identity, 64) && (kind == Kind::GenerateCpu || kind == Kind::GenerateGpu), "invalid finite generation route");
+    return std::pair{identity, kind};
+}
+std::optional<PublicationRoute> BrokerClient::publication_route(OwnerSession const& owner, Task const& task)
+{
+    auto const api = connections_->generation_api.load();
+    if (!api->publication.load()) return {};
+    auto writer = request(Operation::PublicationRoute); write_session(writer, owner); write_task(writer, task);
+    std::vector<uint8_t> bytes;
+    try { bytes = call(writer); }
+    catch (UnknownOperation const&) { api->publication.store(false); return {}; }
+    Reader in(bytes); PublicationRoute route; route.identity = in.string(64);
+    if (route.identity.empty()) { in.finish(); return {}; }
+    route.instance = in.string(64); route.endpoint = read_endpoint(in); route.kind = Kind(in.u8());
+    route.resources = read_resources(in); in.finish();
+    require(identifier(route.identity, 64) && identifier(route.instance, 64) && !route.endpoint.host.empty() && route.endpoint.port &&
+        (route.kind == Kind::GenerateGpu || route.kind == Kind::GenerateCpu) && route.resources.slots == 1 &&
+        route.resources.cpu_threads && route.resources.host_bytes, "invalid publication route");
+    return route;
+}
+uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task, uint32_t* slots,
+    GenerationAvailability* availability, std::string const& codec, std::shared_ptr<GenerationRoster const>* roster)
+{
+    require(!roster || availability, "worker roster requires a detailed capacity hint");
+    auto query = [&](Operation op)
+    {
+        auto writer = request(op); write_session(writer, owner); write_task(writer, task);
+        if (availability) writer.string(codec);
+        return call(writer);
+    };
+    auto const api = connections_->generation_api.load();
+    bool routes = roster && api->routes.load();
+    std::vector<uint8_t> bytes;
+    bool recovery = routes && api->gpu_recovery.load();
+    if (recovery) try { bytes = query(Operation::GenerationRoutesGpuRecovery); }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); recovery = false; }
+    if (routes && !recovery) try { bytes = query(Operation::GenerationRoutes); }
+    catch (UnknownOperation const&)
+    {
+        // Older compatible brokers still supply the aggregate capacity. Only
+        // an explicitly unknown advisory operation selects this fallback.
+        api->routes.store(false); routes = false;
+    }
+    if (!routes) bytes = query(availability ? Operation::GenerationAvailability : Operation::GenerationHint);
+    Reader reader(bytes); auto const result = reader.u32(), parallel = reader.u32();
+    if (availability)
+    {
+        availability->admission.reset();
+        availability->independent_batch = reader.u32();
+        auto const available = reader.u8();
+        require(availability->independent_batch <= max_generation_batch_members &&
+            (available == 0 || available == 1 || available == 3), "invalid worker availability");
+        availability->codec_available = available & 1;
+        availability->concurrent_codec = available & 2;
+        auto previous = parallel;
+        for (auto& count : std::span(availability->independent_slots).subspan(1))
+        {
+            count = reader.u32();
+            require(count <= previous, "invalid independent generation slot count");
+            previous = count;
+        }
+    }
+    if (roster)
+    {
+        roster->reset();
+        if (routes)
+        {
+            auto snapshot = std::make_shared<GenerationRoster>();
+            auto const complete = reader.u8(), count = reader.u8();
+            require(complete <= 1 && count <= max_status_page_size && (complete || count == max_status_page_size),
+                "invalid generation roster size");
+            snapshot->complete = complete; snapshot->routes.reserve(count);
+            for (unsigned i = 0; i < count; ++i)
+            {
+                GenerationRoute route; route.identity = reader.string(64); route.instance = reader.string(64);
+                route.endpoint = read_endpoint(reader); route.host = reader.string(255); route.gpu_identity = reader.string(255);
+                route.cpu_slots = reader.u32(); route.gpu_slots = reader.u32();
+                require(identifier(route.identity, 64) && identifier(route.instance, 64) &&
+                    !route.endpoint.host.empty() && route.endpoint.port && (route.cpu_slots || route.gpu_slots) &&
+                    (snapshot->routes.empty() || snapshot->routes.back().identity < route.identity), "invalid generation route");
+                snapshot->routes.push_back(std::move(route));
+            }
+            GenerationAdmission admission;
+            admission.registered = reader.u32(); admission.eligible = reader.u32();
+            admission.available_slots = reader.u32(); admission.other_owner_tasks = reader.u32();
+            uint64_t waiting = 0;
+            for (auto& number : admission.waiting) { number = reader.u32(); waiting += number; }
+            require(admission.eligible <= admission.registered && admission.available_slots <= parallel &&
+                count == std::min<uint32_t>(admission.eligible, max_status_page_size) &&
+                snapshot->complete == (admission.eligible == count) &&
+                waiting >= admission.registered - admission.eligible && waiting <= admission.registered,
+                "invalid generation admission");
+            if (recovery)
+            {
+                auto count = reader.u8(); require(count <= max_status_page_size && count <= admission.registered,
+                    "invalid GPU recovery count");
+                while (count--) snapshot->recovering_gpus.push_back({reader.string(255), worker_diagnostic(reader.string(240))});
+            }
+            availability->admission = admission;
+            *roster = std::move(snapshot);
+        }
+    }
+    reader.finish();
+    if (slots) *slots = parallel;
+    return result;
 }
 void BrokerClient::cancel(OwnerSession const& owner, std::string const& task, uint64_t attempt)
 {
@@ -309,11 +502,76 @@ void BrokerClient::cancel(OwnerSession const& owner, std::string const& task, ui
 }
 void BrokerClient::renew(Lease const& lease)
 { auto writer = request(Operation::Renew); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
+std::vector<uint8_t> BrokerClient::call_profiles(std::span<GenerationProfile const> profiles,
+    std::function<Writer(bool)> const& encode, std::string* peer_identity, std::string* peer_node_id)
+{
+    auto const api = connections_->generation_api.load();
+    if (api->tier_profiles.load() && std::ranges::any_of(profiles, &GenerationProfile::independent_unavailable))
+    {
+        try { return call(encode(true), peer_identity, peer_node_id); }
+        catch (UnsupportedProfiles const&) { api->tier_profiles.store(false); }
+    }
+    // An older V8 broker rejects flagged profile kinds before applying the
+    // registration or releasing the lease. Its single width applies to both
+    // output modes, so it can safely accept singletons on these streaming ks.
+    return call(encode(false), peer_identity, peer_node_id);
+}
+std::optional<std::pair<std::string, Endpoint>> BrokerClient::register_recovering_gpu(WorkerOffer const& offer,
+    bool retain_route, std::string* peer_identity, std::string* peer_node_id)
+{
+    if (offer.gpu_recovery.empty()) return {};
+    auto const api = connections_->generation_api.load();
+    if (!api->gpu_recovery.load()) return {};
+    try
+    {
+        auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+            auto writer = request(Operation::RegisterGpuRecovery); write_offer(writer, offer, extended);
+            writer.u8(retain_route); writer.string(offer.gpu_recovery); return writer;
+        }, peer_identity, peer_node_id);
+        Reader in(bytes); auto epoch = in.string(64); auto endpoint = read_endpoint(in); in.finish();
+        require(!epoch.empty() && endpoint.port, "invalid GPU recovery registration");
+        return std::pair{std::move(epoch), std::move(endpoint)};
+    }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); return {}; }
+}
 std::string BrokerClient::register_worker(WorkerOffer const& offer, std::string* peer_identity, std::string* peer_node_id)
 {
-    auto writer = request(Operation::Register); write_offer(writer, offer); auto bytes = call(writer, peer_identity, peer_node_id);
+    if (auto received = register_recovering_gpu(offer, false, peer_identity, peer_node_id)) return received->first;
+    auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+        auto writer = request(Operation::Register); write_offer(writer, offer, extended); return writer;
+    }, peer_identity, peer_node_id);
     Reader reader(bytes); auto epoch = reader.string(64); reader.finish();
     require(!epoch.empty(), "broker registration omitted its epoch"); return epoch;
+}
+std::string BrokerClient::register_worker_route(WorkerOffer& offer, std::string* peer_identity, std::string* peer_node_id)
+{
+    if (auto received = register_recovering_gpu(offer, true, peer_identity, peer_node_id))
+    { offer.endpoint = std::move(received->second); return received->first; }
+    try
+    {
+        auto bytes = call_profiles(offer.generation_profiles, [&](bool extended) {
+            auto writer = request(Operation::RegisterWorkerRoute); write_offer(writer, offer, extended); return writer;
+        }, peer_identity, peer_node_id);
+        Reader reader(bytes); auto epoch = reader.string(64); auto endpoint = read_endpoint(reader); reader.finish();
+        require(!epoch.empty() && !endpoint.host.empty() && endpoint.port, "broker route registration omitted its endpoint or epoch");
+        offer.endpoint = std::move(endpoint); return epoch;
+    }
+    catch (UnknownOperation const&) {}
+    // Older brokers can expose the same worker's current endpoint through
+    // authenticated status. The caller's registration deadline bounds every page.
+    auto const identity = certificate_identity(tls_.cert_file);
+    StatusRequest query;
+    for (;;)
+    {
+        auto page = status(query);
+        auto found = std::find_if(page.worker_records.begin(), page.worker_records.end(),
+            [&](auto const& worker) { return worker.identity == identity && worker.instance == offer.instance; });
+        if (found != page.worker_records.end()) { offer.endpoint = found->endpoint; break; }
+        if (!page.next_cursor) break;
+        require(page.next_cursor > query.cursor && page.next_cursor <= 4096, "invalid broker worker status cursor");
+        query.cursor = page.next_cursor;
+    }
+    return register_worker(offer, peer_identity, peer_node_id);
 }
 void BrokerClient::unregister_worker(std::string const& instance)
 { auto writer = request(Operation::Unregister); writer.string(instance); auto bytes = call(writer); Reader(bytes).finish(); }
@@ -322,32 +580,53 @@ bool BrokerClient::retire_worker(std::string const& instance)
     auto writer = request(Operation::RetireWorker); writer.string(instance); auto bytes = call(writer); Reader reader(bytes);
     auto const idle = reader.u8(); require(idle <= 1, "invalid worker retirement flag"); reader.finish(); return idle;
 }
-bool BrokerClient::heartbeat(std::string const& instance, uint64_t revision)
+bool BrokerClient::heartbeat(std::string const& instance, uint64_t revision, std::optional<WorkerAdmission> admission)
 {
-    auto writer = request(Operation::Heartbeat); writer.string(instance); writer.u64(revision); auto bytes = call(writer);
+    auto writer = request(Operation::Heartbeat); writer.string(instance); writer.u64(revision);
+    writer.u8(admission ? uint8_t(*admission) : 0); auto bytes = call(writer);
     Reader reader(bytes); auto const current = reader.u8(); require(current <= 1, "invalid broker heartbeat flag");
     reader.finish(); return current;
 }
-bool BrokerClient::begin(Lease const& lease, std::string const& owner)
+bool BrokerClient::begin(Lease const& lease, std::string const& owner, bool* awaiting_admission)
 {
     auto writer = request(Operation::Begin); write_lease(writer, lease); writer.string(owner); auto bytes = call(writer);
-    Reader reader(bytes); auto const result = reader.u8(); require(result <= 1, "invalid broker begin flag"); reader.finish(); return result;
+    Reader reader(bytes); auto const result = BeginResult(reader.u8());
+    require(result <= BeginResult::AwaitingAdmission, "invalid broker begin result"); reader.finish();
+    if (awaiting_admission) *awaiting_admission = result == BeginResult::AwaitingAdmission;
+    return result == BeginResult::Running;
 }
 void BrokerClient::finish(Lease const& lease, std::optional<CapacityUpdate> const& update)
 {
-    auto writer = request(Operation::Finish); write_lease(writer, lease); write_update(writer, update);
-    auto bytes = call(writer); Reader(bytes).finish();
+    std::span<GenerationProfile const> profiles;
+    if (update && update->generation_profiles) profiles = *update->generation_profiles;
+    auto bytes = call_profiles(profiles, [&](bool extended) {
+        auto writer = request(Operation::Finish); write_lease(writer, lease); write_update(writer, update, extended); return writer;
+    });
+    Reader(bytes).finish();
 }
-void BrokerClient::delivered(Lease const& lease, DeliveryObservation const& observation)
+void BrokerClient::delivered(Lease const& lease, DeliveryObservation const& observation, std::string const& generation_path)
 {
-    auto writer = request(Operation::Delivered); write_lease(writer, lease); writer.u64(observation.elapsed_ns);
-    writer.u64(observation.input_bytes); writer.u64(observation.output_bytes); auto bytes = call(writer); Reader(bytes).finish();
+    auto const api = connections_->generation_api.load();
+    bool const scoped = !generation_path.empty() && api->paths.load();
+    auto writer = request(scoped ? Operation::DeliveredOnPath : Operation::Delivered);
+    write_lease(writer, lease); writer.u64(observation.elapsed_ns); writer.u64(observation.input_bytes); writer.u64(observation.output_bytes);
+    if (scoped) writer.string(generation_path);
+    try { auto bytes = call(writer); Reader(bytes).finish(); }
+    catch (UnknownOperation const&)
+    {
+        if (!scoped) throw;
+        api->paths.store(false); delivered(lease, observation);
+    }
 }
 
 void BrokerClient::reject(Lease const& lease, FailureCode reason, std::optional<CapacityUpdate> const& update)
 {
-    auto writer = request(Operation::Reject); write_lease(writer, lease); writer.u8(uint8_t(reason)); write_update(writer, update);
-    auto bytes = call(writer); Reader(bytes).finish();
+    std::span<GenerationProfile const> profiles;
+    if (update && update->generation_profiles) profiles = *update->generation_profiles;
+    auto bytes = call_profiles(profiles, [&](bool extended) {
+        auto writer = request(Operation::Reject); write_lease(writer, lease); writer.u8(uint8_t(reason)); write_update(writer, update, extended); return writer;
+    });
+    Reader(bytes).finish();
 }
 void BrokerClient::abandon(Lease const& lease)
 { auto writer = request(Operation::Abandon); write_lease(writer, lease); auto bytes = call(writer); Reader(bytes).finish(); }
@@ -358,8 +637,19 @@ void BrokerClient::worker_admission(std::string const& instance, WorkerAdmission
 }
 BrokerStatusPage BrokerClient::status(StatusRequest const& query)
 {
-    auto writer = request(Operation::Status); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
-    BrokerStatusPage result; auto bytes = call(writer, &result.identity); Reader in(bytes); result.section = StatusSection(in.u8());
+    BrokerStatusPage result;
+    auto page = [&](Operation op)
+    {
+        auto writer = request(op); writer.u8(uint8_t(query.section)); writer.u64(query.cursor); writer.u32(query.limit);
+        return call(writer, &result.identity);
+    };
+    auto const api = connections_->generation_api.load();
+    bool recovery = query.section == StatusSection::Workers && api->gpu_recovery.load();
+    std::vector<uint8_t> bytes;
+    if (recovery) try { bytes = page(Operation::StatusGpuRecovery); }
+    catch (UnknownOperation const&) { api->gpu_recovery.store(false); recovery = false; }
+    if (!recovery) bytes = page(Operation::Status);
+    Reader in(bytes); result.section = StatusSection(in.u8());
     require(result.section == query.section, "broker status section mismatch");
     result.host = in.string(255);
     result.next_cursor = in.u64(); result.workers = in.u64(); result.owners = in.u64(); result.jobs = in.u64();
@@ -375,6 +665,7 @@ BrokerStatusPage BrokerClient::status(StatusRequest const& query)
             value.endpoint = read_endpoint(in);
             value.capacity = read_resources(in); value.reserved = read_resources(in); value.admission = WorkerAdmission(in.u8()); value.seen_ms = in.u64();
             value.hardware = read_worker_hardware(in);
+            if (recovery) value.gpu_recovery = worker_diagnostic(in.string(240));
             result.worker_records.push_back(std::move(value));
         }
         else if (result.section == StatusSection::Owners)
@@ -434,23 +725,79 @@ struct BrokerServer::Impl
         uint8_t k, strength;
         uint32_t cpu_threads;
         std::string owner;
-        struct Sample { DeliveryObservation observation; uint64_t units = 0; };
+        GenerationOutput output;
+        bool independent;
+        struct Sample { uint64_t elapsed_ns = 0, units = 0; };
         std::array<Sample, 8> samples{};
         size_t count = 0, next = 0;
         uint64_t assigned = 0;
-        bool matches(Task const& task, Kind selected, std::string const& source, uint32_t threads) const
-        { return owner == source && kind == selected && k == task.k && strength == task.strength && cpu_threads == threads; }
-        long double cost(uint64_t units) const
+        // Other widths cannot replace a still-current price for this exact
+        // request. Allocate receipt storage only for widths the worker delivers.
+        struct Price { uint64_t elapsed_ns; Clock::time_point at; Resources resources; std::string origin; };
+        std::array<std::vector<Price>, max_generation_batch_members> prices;
+        bool matches(Task const& task, Kind selected, std::string const& source, uint32_t threads, bool framing = true) const
+        { return owner == source && kind == selected && k == task.k && strength == task.strength && cpu_threads == threads &&
+            output == task.generation_output && (!framing || independent == task.independent_members); }
+        long double cost(uint64_t units, bool singletons = false) const
         {
-            long double total = 0;
+            long double total = 0, same = 0; size_t used = 0, exact = 0;
             for (size_t i = 0; i < count; ++i)
-                total += static_cast<long double>(samples[i].observation.elapsed_ns) / samples[i].units;
-            return total / count * units;
+                if (!singletons || samples[i].units == 1)
+                {
+                    auto const elapsed = samples[i].elapsed_ns;
+                    if (samples[i].units == units) { same += elapsed; ++exact; }
+                    total += static_cast<long double>(elapsed) / samples[i].units; ++used;
+                }
+            // A pipeline pays setup once. Its measured duration at this width
+            // is more informative than scaling other widths by member count.
+            if (exact) return same / exact;
+            return used ? total / used * units : std::numeric_limits<long double>::max();
         }
-        void add(DeliveryObservation observation, uint64_t units)
-        { samples[next] = {observation, units}; next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size()); }
+        long double remaining_ns(uint64_t units, long double elapsed, bool strictly_larger = false) const
+        {
+            uint64_t width = UINT64_MAX, lower = UINT64_MAX, upper = 0;
+            size_t observations = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                auto const& sample = samples[i];
+                // A smaller joint batch also pays for setup and its final
+                // delivery. Its first overrun can still fall inside a wider
+                // measured batch of the same framing. An ordinary singleton
+                // has no joint encoding, so it keeps its own service class.
+                if (sample.units < units || (!independent && units == 1 && sample.units != units)) continue;
+                if (strictly_larger && sample.units == units) continue;
+                if (sample.units < width) { width = sample.units; lower = UINT64_MAX; upper = 0; observations = 0; }
+                if (sample.units != width) continue;
+                auto const ns = sample.elapsed_ns;
+                lower = std::min(lower, ns); upper = std::max(upper, ns); ++observations;
+            }
+            long double remaining = upper - elapsed;
+            // A live HDD flush can run just beyond the slowest recent
+            // delivery. Bound its extension by the variation at this width.
+            if (remaining <= 0 && width == units && observations >= 3) remaining += upper - lower;
+            return remaining;
+        }
+        void add(DeliveryObservation observation, uint64_t units, Resources const& resources, std::string origin)
+        {
+            if (kind != Kind::Pack)
+            {
+                auto& width = prices.at(size_t(units - 1));
+                Price price{observation.elapsed_ns, Clock::now(), resources, std::move(origin)};
+                if (width.size() < samples.size()) width.push_back(std::move(price));
+                else *std::min_element(width.begin(), width.end(), [](auto const& a, auto const& b)
+                    { return a.at < b.at; }) = std::move(price);
+            }
+            samples[next] = {observation.elapsed_ns, units};
+            next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size());
+        }
     };
-    struct Worker { WorkerOffer offer; Clock::time_point seen; std::vector<History> histories; };
+    struct Worker
+    {
+        WorkerOffer offer;
+        Clock::time_point seen;
+        std::vector<History> histories;
+        Clock::time_point route_since = seen;
+    };
     struct Owner
     {
         std::string identity;
@@ -459,17 +806,21 @@ struct BrokerServer::Impl
         long double service = 0;
         bool ephemeral = false;
         Clock::time_point seen = Clock::now();
+        BrokerClient::GenerationPaths paths;
     };
     struct Job
     {
         std::string owner;
         uint64_t status_id = 0;
+        uint64_t assignment = 0;
         Task requested;
         std::optional<Lease> lease;
         State state = State::Queued;
-        Clock::time_point expires, touched;
+        Clock::time_point expires, touched, granted_at, start_by = Clock::time_point::max();
+        Clock::time_point other_work_until{};
         Clock::time_point created = Clock::now();
-        bool observed = false;
+        Clock::time_point unreported_finish{};
+        bool observed = false, finite = false, abandoned = false;
         struct Failure { std::string worker, instance; Kind kind; };
         std::vector<Failure> failures;
     };
@@ -502,6 +853,16 @@ struct BrokerServer::Impl
     }
     bool reserved(Job const& job) const
     { return job.lease && (job.state == State::Granted || job.state == State::Running || job.state == State::Cancelled); }
+    void release_unstarted(Job& job)
+    {
+        // A cold batch that never began learned nothing about its worker.
+        auto const& lease = *job.lease;
+        auto worker = workers.find(lease.worker_identity);
+        if (job.requested.work_units > 1 && worker != workers.end() && worker->second.offer.instance == lease.worker_instance)
+            for (auto& sample : worker->second.histories)
+                if (!sample.count && sample.assigned == job.assignment) sample.assigned = 0;
+        job.state = State::Finished;
+    }
     void expire()
     {
         auto const now = Clock::now();
@@ -510,7 +871,8 @@ struct BrokerServer::Impl
             // An owner's deadline can also prevent its final Cancel request.
             // Polls keep queued work alive; abandoned requests must become
             // evictable and stop consuming grants when workers return.
-            if ((reserved(job) && now >= job.expires) ||
+            if (((job.state == State::Queued || job.state == State::Granted) && now >= job.start_by) ||
+                (reserved(job) && now >= job.expires) ||
                 (job.state == State::Queued && now - job.touched >= std::chrono::milliseconds(options.lease_ms)))
             { job.state = State::Expired; job.touched = now; }
         }
@@ -530,7 +892,7 @@ struct BrokerServer::Impl
     }
     Owner& owner(std::string const& identity, OwnerSession const& session)
     {
-        if (session.epoch != epoch) throw StaleOwnerSession("broker restarted; open a new owner session");
+        if (session.epoch != epoch) throw StaleOwnerSession(broker_restarted);
         auto it = owners.find(owner_key(identity, session.owner_id));
         if (it == owners.end() || it->second.session.token != session.token ||
             it->second.session.generation != session.generation) throw StaleOwnerSession("stale owner session");
@@ -539,7 +901,10 @@ struct BrokerServer::Impl
     Job& lease_job(Lease const& lease)
     {
         if (lease.epoch != epoch) throw StaleLease("stale broker epoch");
-        auto it = jobs.find(task_key(owner_key(lease.owner_identity, lease.owner_id), lease.owner_session, lease.task.task_id));
+        auto const key = task_key(owner_key(lease.owner_identity, lease.owner_id), lease.owner_session, lease.task.task_id);
+        auto it = jobs.find(key);
+        if (it == jobs.end() || !it->second.lease || it->second.lease->token != lease.token)
+            it = jobs.find(key + '/' + lease.token);
         if (it == jobs.end() || !it->second.lease) throw StaleLease("compute lease is no longer registered");
         require(it->second.lease->token == lease.token &&
             it->second.lease->broker_identity == lease.broker_identity && it->second.lease->broker_node_id == lease.broker_node_id &&
@@ -559,7 +924,7 @@ struct BrokerServer::Impl
             it->second.session.generation == job.lease->owner_generation;
     }
     using Availability = std::map<std::string, Resources>;
-    Availability available() const
+    Availability available(std::string const& observer = {}, uint32_t* other_owner_tasks = nullptr) const
     {
         Availability result;
         for (auto const& [identity, worker] : workers) result.emplace(identity, worker.offer.capacity);
@@ -570,6 +935,7 @@ struct BrokerServer::Impl
                 // work whose original worker process has disappeared.
                 auto at = result.find(job.lease->worker_identity);
                 if (at == result.end()) continue;
+                if (other_owner_tasks && job.owner != observer) ++*other_owner_tasks;
                 if (!fits(job.lease->task.resources, at->second)) at->second = Resources{0, 0, 0, 0};
                 else subtract(at->second, job.lease->task.resources);
             }
@@ -588,6 +954,9 @@ struct BrokerServer::Impl
         auto candidate = [&](Kind kind) -> std::optional<Candidate>
         {
             if (!(offer.capabilities & capability(kind))) return reject(WaitReason::UnsupportedKind);
+            if (task.independent_members && (kind != Kind::GenerateGpu || !(offer.independent_k_mask & (1u << task.k)) ||
+                (task.resources.cpu_threads ? task.resources.cpu_threads : offer.generation_threads) < 2))
+                return reject(WaitReason::UnsupportedKind);
             for (auto const& failure : job.failures)
                 if (failure.worker == identity && failure.instance == offer.instance &&
                     (failure.kind == kind || failure.kind == Kind::GenerateAny)) return reject(WaitReason::RetryExcluded);
@@ -604,8 +973,9 @@ struct BrokerServer::Impl
                         value.cpu_threads == offer.generation_threads; });
                 if (profile != offer.generation_profiles.end())
                 {
+                    if (task.independent_members && task.work_units > 1 && profile->independent_unavailable) return reject(WaitReason::UnsupportedKind);
                     if (task.work_units > profile->max_batch_members) return reject(WaitReason::UnsupportedParameters);
-                    auto const extra = task.work_units - 1;
+                    auto const extra = task.independent_members ? 0 : task.work_units - 1;
                     if (profile->member_host_bytes && extra > (UINT64_MAX - profile->resources.host_bytes) / profile->member_host_bytes) return reject(WaitReason::HostCapacity);
                     auto const threads = demand.cpu_threads;
                     demand = profile->resources; demand.cpu_threads = threads;
@@ -666,17 +1036,231 @@ struct BrokerServer::Impl
         {
             it = std::min_element(worker.histories.begin(), worker.histories.end(),
                 [](History const& a, History const& b) { return a.assigned < b.assigned; });
-            *it = History{selected, task.k, task.strength, threads, owner}; return *it;
+            *it = History{selected, task.k, task.strength, threads, owner, task.generation_output, task.independent_members}; return *it;
         }
-        worker.histories.push_back(History{selected, task.k, task.strength, threads, owner});
+        worker.histories.push_back(History{selected, task.k, task.strength, threads, owner, task.generation_output, task.independent_members});
         return worker.histories.back();
+    }
+    struct DatedCost
+    {
+        uint64_t low = UINT64_MAX, high = 0;
+        unsigned samples = 0;
+        void observe(Clock::time_point at, Clock::time_point now, uint64_t elapsed)
+        {
+            // Use the same one-day limit as the owner's construction calibration.
+            if (at > now || now - at >= std::chrono::hours(24)) return;
+            low = std::min(low, elapsed); high = std::max(high, elapsed); ++samples;
+        }
+    };
+    struct DatedRoutes
+    {
+        DatedCost fastest;
+        uint64_t other_low = UINT64_MAX;
+        std::string const* worker = nullptr;
+        Candidate route{};
+        void observe(std::string const& id, Candidate candidate, DatedCost const& cost)
+        {
+            if (cost.samples >= 2 && (!worker || cost.high < fastest.high))
+            {
+                other_low = std::min(other_low, fastest.low);
+                fastest = cost; worker = &id; route = candidate;
+            }
+            else other_low = std::min(other_low, cost.low);
+        }
+        bool separated() const { return worker && fastest.high < other_low; }
+    };
+    long double recent_cost(std::string const& identity, Worker const& worker, Task const& task, Kind kind, std::string const& owner,
+                            Resources const& resources, Clock::time_point now, bool lower = false, DatedCost* dated = nullptr) const
+    {
+        if (!task.work_units || task.work_units > max_generation_batch_members) return std::numeric_limits<long double>::max();
+        auto const since = now - std::chrono::milliseconds(std::max(options.lease_ms, options.worker_ms));
+        uint64_t result = 0;
+        auto const& source = owners.at(owner);
+        auto const path = std::find_if(source.paths.begin(), source.paths.end(), [&](auto const& item)
+            { return item.first == identity; });
+        for (auto const& history : worker.histories)
+            if ((path != source.paths.end() || history.owner == owner) && history.matches(task, kind, history.owner, resources.cpu_threads))
+                for (auto const& sample : history.prices[size_t(task.work_units - 1)])
+                    if (sample.resources == resources)
+                    {
+                        bool const bound = path != source.paths.end() && sample.origin == path->second;
+                        if (sample.at > since && (bound || (history.owner == owner && (sample.origin.empty() || path == source.paths.end()))))
+                            result = lower && result ? std::min(result, sample.elapsed_ns) : std::max(result, sample.elapsed_ns);
+                        else if (bound && dated) dated->observe(sample.at, now, sample.elapsed_ns);
+                    }
+        return result ? result : std::numeric_limits<long double>::max();
+    }
+    struct DeliveryCost { long double ns = std::numeric_limits<long double>::max(); uint64_t assigned = 0; };
+    static DeliveryCost delivery_cost(Worker const& worker, Task const& task, Kind kind, std::string const& owner, uint32_t threads)
+    {
+        DeliveryCost exact, prior;
+        for (auto const& sample : worker.histories)
+        {
+            if (!sample.matches(task, kind, owner, threads, false)) continue;
+            if (sample.independent == task.independent_members)
+            {
+                exact = {sample.cost(task.work_units), sample.assigned};
+                if (sample.count) return exact;
+            }
+            // An ordinary contribution singleton and an independent stream
+            // deliver the same chunks. Joint encoding has its own cost.
+            else if (kind == Kind::GenerateGpu && (task.independent_members || task.work_units == 1))
+                prior = {sample.cost(task.work_units, !sample.independent), sample.assigned};
+        }
+        if (prior.ns < exact.ns) return {prior.ns, std::max(prior.assigned, exact.assigned)};
+        return exact;
+    }
+    using Nanoseconds = std::chrono::duration<long double, std::nano>;
+    static long double pending_delivery_cost(std::vector<Job const*> const& deliveries, Worker const& worker,
+                                             Job const& waiting, Candidate const& candidate, Clock::time_point now, bool& active)
+    {
+        auto const& task = waiting.requested;
+        Job const* latest = nullptr;
+        long double elapsed = 0;
+        for (auto const* job : deliveries)
+        {
+            auto const& lease = *job->lease;
+            auto const& completed = lease.task;
+            if (job->owner != waiting.owner || job->granted_at < worker.route_since ||
+                lease.worker_instance != worker.offer.instance || lease.endpoint != worker.offer.endpoint ||
+                completed.kind != candidate.kind || completed.compatibility != task.compatibility ||
+                completed.resources.cpu_threads != candidate.resources.cpu_threads || completed.k != task.k ||
+                completed.strength != task.strength || completed.generation_output != task.generation_output) continue;
+            // A pending singleton is also a lower bound on the time required
+            // to deliver those same chunks in an independent stream.
+            if (!(task.independent_members && completed.work_units == 1) &&
+                (completed.independent_members != task.independent_members || completed.work_units != task.work_units)) continue;
+            if (job->state == State::Finished)
+            {
+                if (!latest || job->unreported_finish > latest->unreported_finish) latest = job;
+            }
+            else { active = true; elapsed = std::max(elapsed, Nanoseconds(now - job->granted_at).count()); }
+        }
+        if (latest) return std::max(elapsed, Nanoseconds(latest->unreported_finish - latest->granted_at).count());
+        return active ? elapsed : std::numeric_limits<long double>::max();
+    }
+    static long double remaining_on_lease(Worker const& worker, Job const& waiting, Job const& running, Clock::time_point now)
+    {
+        auto const& lease = *running.lease;
+        auto const& held = lease.task.resources;
+        auto const active_ns = delivery_cost(worker, lease.task, lease.task.kind, running.owner, held.cpu_threads).ns;
+        auto const elapsed = Nanoseconds(now - running.granted_at).count();
+        auto finish = active_ns - elapsed;
+        if (finish <= 0)
+        {
+            // A shorter pipeline still pays setup for the whole lease. Allow
+            // observed variation before spilling to a slower idle worker.
+            auto const sample = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                { return item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads); });
+            if (sample != worker.histories.end()) finish = sample->remaining_ns(lease.task.work_units, elapsed);
+            if (finish <= 0 && sample != worker.histories.end() && !lease.task.independent_members && lease.task.work_units > 1)
+                finish = sample->remaining_ns(lease.task.work_units, elapsed, true);
+            if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && lease.task.work_units > 1 &&
+                (!lease.task.independent_members || (waiting.requested.independent_members && waiting.requested.work_units > 1)))
+            {
+                // A late batch can still be delivering its last member. Before
+                // committing another whole pipeline, allow one measured
+                // singleton on the running route to bound that wait.
+                auto const ordinary = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                    { return !item.independent && item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads, false); });
+                if (ordinary != worker.histories.end())
+                {
+                    auto const member = ordinary->cost(1, true);
+                    if (member < std::numeric_limits<long double>::max()) finish = active_ns - elapsed + member;
+                }
+            }
+            if (finish <= 0 && lease.task.kind == Kind::GenerateGpu && (lease.task.independent_members || lease.task.work_units == 1))
+            {
+                // A singleton delivers the same chunks as one member of an
+                // independent pipeline. The next larger measured lease can
+                // still bound its completion after its own samples run out.
+                auto const pipeline = std::find_if(worker.histories.begin(), worker.histories.end(), [&](auto const& item)
+                    { return item.independent && item.matches(lease.task, lease.task.kind, running.owner, held.cpu_threads, false); });
+                if (pipeline != worker.histories.end()) finish = pipeline->remaining_ns(lease.task.work_units, elapsed, true);
+            }
+        }
+        return finish;
+    }
+    bool earlier_on_release(std::vector<Job*> const& queue, Job const& waiting, std::vector<Job const*> const& active,
+        Availability const& free, std::string const& idle, Kind idle_kind, long double idle_ns, Clock::time_point now, bool recent = false) const
+    {
+        struct Route
+        {
+            std::string const* identity;
+            Worker const* worker;
+            Resources held, capacity;
+            Kind kind;
+            long double ready;
+        };
+        std::vector<Route> routes;
+        for (auto const* running : active)
+        {
+            auto const& lease = *running->lease;
+            if (lease.worker_identity == idle && lease.task.kind == idle_kind) continue;
+            auto const at = workers.find(lease.worker_identity);
+            if (at == workers.end() || at->second.offer.instance != lease.worker_instance ||
+                at->second.offer.endpoint != lease.endpoint || running->granted_at < at->second.route_since) continue;
+            // The current owner's delivery predicts when the lease releases.
+            // Each queued owner still needs its own estimate on this route.
+            auto const& held = lease.task.resources;
+            long double ready;
+            if (recent)
+            {
+                auto const upper = recent_cost(at->first, at->second, lease.task, lease.task.kind, running->owner, held, now);
+                if (upper == std::numeric_limits<long double>::max()) continue;
+                ready = upper - Nanoseconds(now - running->granted_at).count();
+            }
+            else ready = remaining_on_lease(at->second, waiting, *running, now);
+            if (ready <= 0 || ready >= idle_ns || ready >= Nanoseconds(running->expires - now).count()) continue;
+            auto capacity = free.at(at->first);
+            capacity.slots += held.slots; capacity.cpu_threads += held.cpu_threads;
+            capacity.host_bytes += held.host_bytes; capacity.gpu_bytes += held.gpu_bytes;
+            routes.push_back({&at->first, &at->second, held, capacity, lease.task.kind, ready});
+        }
+        // Predict the owner's ready queue on the routes that can release
+        // capacity before this idle worker would deliver. Reuse each lease's
+        // resources and use a worker's unreserved capacity only once.
+        for (auto const* job : queue)
+        {
+            auto const deadline = Nanoseconds(job->start_by - now).count();
+            auto best = routes.end();
+            auto finish = idle_ns;
+            Resources required;
+            for (auto at = routes.begin(); at != routes.end(); ++at)
+            {
+                if (at->ready >= deadline || at->ready >= finish) continue;
+                auto const next = eligible(*job, *at->identity, *at->worker, at->capacity, at->kind);
+                if (!next) continue;
+                auto const cost = recent ? recent_cost(*at->identity, *at->worker, job->requested, next->kind, job->owner, next->resources, now) :
+                    delivery_cost(*at->worker, job->requested, next->kind, job->owner, next->resources.cpu_threads).ns;
+                if (cost >= finish - at->ready) continue;
+                best = at; finish = at->ready + cost; required = next->resources;
+            }
+            if (best == routes.end()) return false;
+            best->ready = finish;
+            if (!fits(required, best->held))
+                for (auto& route : routes)
+                    if (&route != &*best && route.worker == best->worker) route.capacity = route.held;
+        }
+        return true;
     }
     void schedule()
     {
         auto capacity = available();
         std::map<std::string, std::vector<Job*>> queued;
+        std::vector<Job const*> active_generation;
+        std::map<std::string, std::vector<Job const*>> pending_delivery;
+        auto const recent = Clock::now() - std::chrono::milliseconds(options.lease_ms);
         for (auto& [key, job] : jobs)
             if (job.state == State::Queued && owners.contains(job.owner)) queued[job.owner].push_back(&job);
+            else if ((job.state == State::Granted || job.state == State::Running) &&
+                job.lease->task.kind != Kind::Pack && active_owner(job))
+            {
+                active_generation.push_back(&job);
+                if (!job.observed) pending_delivery[job.lease->worker_identity].push_back(&job);
+            }
+            else if (job.state == State::Finished && job.unreported_finish != Clock::time_point{} &&
+                job.unreported_finish > recent && active_owner(job)) pending_delivery[job.lease->worker_identity].push_back(&job);
         for (auto& [owner, queue] : queued)
             std::sort(queue.begin(), queue.end(), [](Job const* a, Job const* b)
             { return a->requested.sequence < b->requested.sequence; });
@@ -696,17 +1280,6 @@ struct BrokerServer::Impl
             for (auto const& owner_id : waiting)
             {
                 auto& queue = queued.at(owner_id);
-                auto job_it = queue.end();
-                for (auto it = queue.begin(); it != queue.end(); ++it)
-                {
-                    bool const ready = std::any_of(workers.begin(), workers.end(), [&](auto const& worker)
-                    { return eligible(**it, worker.first, worker.second, capacity.at(worker.first)).has_value(); });
-                    // Keep blocked jobs' original sequence so they regain FIFO
-                    // priority as soon as a compatible worker has room.
-                    if (ready) { job_it = it; break; }
-                }
-                if (job_it == queue.end()) continue;
-                auto& job = **job_it;
                 std::vector<std::string> candidates;
                 for (auto const& [identity, worker] : workers) candidates.push_back(identity);
                 auto worker_start = std::upper_bound(candidates.begin(), candidates.end(), last_worker);
@@ -714,29 +1287,96 @@ struct BrokerServer::Impl
                 std::string chosen;
                 Kind chosen_kind = Kind::GenerateCpu;
                 Resources chosen_resources;
-                long double best_cost = std::numeric_limits<long double>::max();
-                uint64_t oldest_age = 0;
-                bool explore = false;
-                for (auto const& identity : candidates)
+                auto const now = Clock::now();
+                // A wide request can wait for the busy GPU while a smaller
+                // request from the same owner finishes on the idle GPU.
+                auto job_it = std::find_if(queue.begin(), queue.end(), [&](Job const* job)
                 {
-                    auto& worker = workers.at(identity);
-                    for (auto const kind : {Kind::GenerateGpu, Kind::GenerateCpu, Kind::Pack})
+                    chosen.clear();
+                    long double best_cost = std::numeric_limits<long double>::max();
+                    auto const other_work = Nanoseconds(job->other_work_until - now).count();
+                    bool const gpu = job->requested.kind == Kind::GenerateGpu || job->requested.kind == Kind::GenerateAny;
+                    uint64_t oldest_age = 0;
+                    bool explore = false, awaiting_first = false, incumbent = false;
+                    DatedRoutes dated_routes;
+                    for (auto const& identity : candidates)
                     {
-                        auto selected = eligible(job, identity, worker, capacity.at(identity), kind);
-                        if (!selected) continue;
-                        auto const& sample = history(worker, job.requested, selected->kind, job.owner, selected->resources.cpu_threads);
-                        uint64_t const age = assignments - sample.assigned;
-                        bool const trial = !sample.assigned || (!sample.count && age >= 8) || age >= 32;
-                        auto const cost = sample.count ? sample.cost(job.requested.work_units) :
-                            std::numeric_limits<long double>::max();
-                        if (chosen.empty() || (trial && (!explore || age > oldest_age)) ||
-                            (!trial && !explore && cost < best_cost))
-                        { chosen = identity; chosen_kind = selected->kind; chosen_resources = selected->resources;
-                            best_cost = cost; oldest_age = age; explore = trial; }
+                        auto& worker = workers.at(identity);
+                        for (auto const kind : {Kind::GenerateGpu, Kind::GenerateCpu, Kind::Pack})
+                        {
+                            auto selected = eligible(*job, identity, worker, capacity.at(identity), kind);
+                            if (!selected) continue;
+                            auto const sample = delivery_cost(worker, job->requested, selected->kind, job->owner, selected->resources.cpu_threads);
+                            auto cost = sample.ns;
+                            if (job->finite)
+                            {
+                                DatedCost dated;
+                                auto const prior = recent_cost(identity, worker, job->requested, selected->kind, job->owner,
+                                    selected->resources, now, false, pending_delivery.contains(identity) ? nullptr : &dated);
+                                if (prior < std::numeric_limits<long double>::max())
+                                {
+                                    if (!incumbent || prior < best_cost)
+                                    {
+                                        incumbent = true; chosen = identity; chosen_kind = selected->kind;
+                                        chosen_resources = selected->resources; best_cost = prior; explore = awaiting_first = false;
+                                    }
+                                    continue;
+                                }
+                                if (incumbent) continue;
+                                dated_routes.observe(identity, *selected, dated);
+                            }
+                            uint64_t const age = assignments - sample.assigned;
+                            bool const unmeasured = sample.ns == std::numeric_limits<long double>::max();
+                            // A worker with spare slots can still be sending
+                            // its first delivery. Finish can free the last
+                            // slot before the owner accepts the last frame.
+                            bool active_trial = false;
+                            if (unmeasured && !pending_delivery.empty())
+                            {
+                                auto const pending = pending_delivery.find(identity);
+                                if (pending != pending_delivery.end())
+                                    cost = pending_delivery_cost(pending->second, worker, *job, *selected, now, active_trial);
+                            }
+                            bool const provisional = cost != sample.ns;
+                            // Revisit measured GPU routes during enough
+                            // parallel work to cover their delivery time.
+                            bool const trial = !provisional && (!sample.assigned || (unmeasured && age >= 8) ||
+                                (age >= 32 && (!gpu || cost <= other_work)));
+                            if (chosen.empty() || (trial && (!explore || age > oldest_age)) ||
+                                (!trial && !explore && std::pair(active_trial, cost) < std::pair(awaiting_first, best_cost)))
+                            { chosen = identity; chosen_kind = selected->kind; chosen_resources = selected->resources;
+                                best_cost = cost; oldest_age = age; explore = trial; awaiting_first = active_trial; }
+                        }
                     }
-                }
-                if (!chosen.empty())
+                    if (chosen.empty()) return false;
+                    // A finite group has no independent delivery to hide a new route's trial.
+                    // A recent exact-width route can release in time for every ready request.
+                    if (job->finite)
+                    {
+                        if (waiting.size() == 1 && earlier_on_release(queue, *job, active_generation, capacity, chosen, chosen_kind,
+                            incumbent ? best_cost : std::numeric_limits<long double>::max(), now, true)) return false;
+                        // Older receipts only compare immediately available workers.
+                        // Overlapping intervals leave the ordinary trial order in place.
+                        if (!incumbent && dated_routes.separated())
+                        { chosen = *dated_routes.worker; chosen_kind = dated_routes.route.kind; chosen_resources = dated_routes.route.resources; }
+                        return true;
+                    }
+                    // The owner can see planned fill work beyond the jobs
+                    // that currently have receive buffers and a scratch grant.
+                    if (!awaiting_first && best_cost <= other_work) return true;
+                    // Elapsed time on an unfinished first task is a floor,
+                    // not evidence that its other slots are quicker. Let a
+                    // measured route serve a queue it can handle before the
+                    // jobs' deadlines. Other owners retain normal admission.
+                    if (awaiting_first && waiting.size() == 1)
+                        return !earlier_on_release(queue, *job, active_generation, capacity, chosen, chosen_kind,
+                            std::numeric_limits<long double>::max(), now);
+                    return chosen_kind == Kind::Pack || explore || best_cost == std::numeric_limits<long double>::max() ||
+                        waiting.size() != 1 || !earlier_on_release(queue, *job, active_generation, capacity, chosen, chosen_kind, best_cost, now);
+                });
+                if (job_it != queue.end())
                 {
+                    auto& job = **job_it;
                     auto const& identity = chosen;
                     auto& worker = workers.at(identity);
                     if (assignments == UINT64_MAX)
@@ -744,7 +1384,8 @@ struct BrokerServer::Impl
                         assignments = 0;
                         for (auto& [id, value] : workers) for (auto& sample : value.histories) sample.assigned = 0;
                     }
-                    history(worker, job.requested, chosen_kind, job.owner, chosen_resources.cpu_threads).assigned = ++assignments;
+                    job.assignment = ++assignments;
+                    history(worker, job.requested, chosen_kind, job.owner, chosen_resources.cpu_threads).assigned = job.assignment;
                     auto& owner = owners.at(owner_id);
                     Lease lease; lease.token = random_token(); lease.epoch = epoch; lease.owner_identity = owner.identity;
                     lease.broker_identity = broker_identity; lease.broker_node_id = broker_node_id;
@@ -754,7 +1395,10 @@ struct BrokerServer::Impl
                     lease.task = job.requested; lease.task.kind = chosen_kind; lease.task.resources = chosen_resources; lease.ttl_ms = options.lease_ms;
                     job.lease = std::move(lease); job.state = State::Granted;
                     subtract(capacity.at(identity), chosen_resources); queue.erase(job_it);
-                    job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms); job.touched = Clock::now();
+                    job.granted_at = job.touched = now;
+                    job.expires = now + std::chrono::milliseconds(options.lease_ms);
+                    if (chosen_kind != Kind::Pack)
+                    { active_generation.push_back(&job); pending_delivery[identity].push_back(&job); }
                     last_owner = owner_id; last_worker = identity; granted = true;
                     auto const share = options.owner_shares.find(owner.session.owner_id);
                     owner.service += static_cast<long double>(job.requested.kind == Kind::Pack ? 1 : job.requested.work_units) /
@@ -783,7 +1427,7 @@ struct BrokerServer::Impl
                 (offer.capabilities & capability(value.kind)) && value.k >= offer.min_k && value.k <= offer.max_k &&
                 !(value.k & 1) && value.strength <= 32 && value.cpu_threads == (threads ? threads : offer.generation_threads) &&
                 value.resources.cpu_threads == value.cpu_threads && value.resources.slots == 1 && value.resources.host_bytes &&
-                (value.kind == Kind::GenerateGpu || !value.resources.gpu_bytes) &&
+                (value.kind == Kind::GenerateGpu || (!value.resources.gpu_bytes && !value.independent_unavailable)) &&
                 value.max_batch_members && value.max_batch_members <= max_generation_batch_members,
                 "invalid generation resource profile");
             require(std::none_of(profiles.begin(), it, [&](GenerationProfile const& old)
@@ -813,45 +1457,51 @@ struct BrokerServer::Impl
         else check_profiles(offer, offer.generation_profiles, threads);
         check_capacity(lease.worker_identity, update->capacity, &releasing);
         offer.capacity = update->capacity; offer.capacity_revision = update->revision;
+        if (offer.capacity.gpu_bytes) offer.gpu_recovery.clear();
         offer.generation_threads = threads;
         if (update->generation_profiles) offer.generation_profiles = *update->generation_profiles;
         worker->second.seen = Clock::now();
     }
-    void make_room()
+    bool make_room()
     {
-        if (jobs.size() < options.max_tasks) return;
+        if (jobs.size() < options.max_tasks) return true;
         auto oldest = jobs.end();
         for (auto it = jobs.begin(); it != jobs.end(); ++it)
             if (!reserved(it->second) && it->second.state != State::Queued &&
                 (oldest == jobs.end() || it->second.touched < oldest->second.touched)) oldest = it;
-        require(oldest != jobs.end(), "broker task capacity is full"); jobs.erase(oldest);
+        if (oldest == jobs.end()) return false;
+        jobs.erase(oldest); return true;
+    }
+    static WaitReason reserved_reason(WaitReason reason)
+    {
+        switch (reason)
+        {
+        case WaitReason::CpuCapacity: return WaitReason::CpuReserved;
+        case WaitReason::HostCapacity: return WaitReason::HostReserved;
+        case WaitReason::GpuCapacity: return WaitReason::GpuReserved;
+        case WaitReason::SlotCapacity: return WaitReason::SlotReserved;
+        default: return WaitReason::ResourcesReserved;
+        }
     }
     WaitReason waiting(Job const& job, Availability const& capacity) const
     {
         if (job.state == State::Cancelled) return WaitReason::OwnerCancelled;
         if (job.state != State::Queued) return WaitReason::None;
-        WaitReason reason = WaitReason::NoWorkers, reserved_reason = WaitReason::None;
+        WaitReason reason = WaitReason::NoWorkers, busy = WaitReason::None;
         for (auto const& [identity, worker] : workers)
         {
             WaitReason candidate = WaitReason::None;
             if (eligible(job, identity, worker, worker.offer.capacity, {}, &candidate))
             {
                 if (eligible(job, identity, worker, capacity.at(identity), {}, &candidate)) return WaitReason::FairQueue;
-                switch (candidate)
-                {
-                case WaitReason::CpuCapacity: reserved_reason = WaitReason::CpuReserved; break;
-                case WaitReason::HostCapacity: reserved_reason = WaitReason::HostReserved; break;
-                case WaitReason::GpuCapacity: reserved_reason = WaitReason::GpuReserved; break;
-                case WaitReason::SlotCapacity: reserved_reason = WaitReason::SlotReserved; break;
-                default: reserved_reason = WaitReason::ResourcesReserved; break;
-                }
+                busy = reserved_reason(candidate);
                 continue;
             }
             if (uint8_t(candidate) > uint8_t(reason)) reason = candidate;
         }
-        return reserved_reason != WaitReason::None ? reserved_reason : reason;
+        return busy != WaitReason::None ? busy : reason;
     }
-    void status(Reader& reader, Writer& response)
+    void status(Reader& reader, Writer& response, bool recovery)
     {
         auto const section = StatusSection(reader.u8()); auto const cursor = reader.u64(); auto const limit = reader.u32(); reader.finish();
         require(section >= StatusSection::Workers && section <= StatusSection::Jobs && limit && limit <= max_status_page_size,
@@ -893,6 +1543,7 @@ struct BrokerServer::Impl
                 response.u8(uint8_t(worker.offer.admission));
                 response.u64(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - worker.seen).count()));
                 write_worker_hardware(response, worker.offer.hardware);
+                if (recovery) response.string(worker.offer.gpu_recovery);
             }
             ++index; if (index >= cursor && index - cursor >= count) break;
         }
@@ -931,7 +1582,8 @@ struct BrokerServer::Impl
         auto const operation = Operation(reader.u8()); Writer response(65536); expire();
         switch (operation)
         {
-        case Operation::Status: status(reader, response); break;
+        case Operation::Status:
+        case Operation::StatusGpuRecovery: status(reader, response, operation == Operation::StatusGpuRecovery); break;
         case Operation::WorkerAdmission:
         {
             auto const instance = reader.string(64); auto const admission = WorkerAdmission(reader.u8()); reader.finish();
@@ -966,8 +1618,17 @@ struct BrokerServer::Impl
             owners.erase(key); schedule(); break;
         }
         case Operation::Acquire:
+        case Operation::AcquireFiniteGeneration:
         {
-            auto session = read_session(reader); auto task = read_task(reader); reader.finish();
+            auto session = read_session(reader); auto task = read_task(reader);
+            auto const remaining = reader.u32(), ahead = reader.u32(); reader.finish();
+            require(!ahead || (task.kind != Kind::Pack && ahead <= remaining), "invalid generation backlog");
+            bool const finite = operation == Operation::AcquireFiniteGeneration;
+            require(!finite || (!ahead && task.kind != Kind::Pack && task.generation_output != GenerationOutput::Contributions),
+                "invalid finite generation request");
+            auto const now = Clock::now();
+            auto const start_by = remaining ? now + std::chrono::milliseconds(remaining) : Clock::time_point::max();
+            auto const other_work_until = ahead ? now + std::chrono::milliseconds(ahead) : Clock::time_point{};
             auto& source = owner(identity, session);
             require(identifier(task.task_id, 256) && identifier(task.compatibility, 256) && task.attempt && task.sequence && task.work_units &&
                 task.k >= 18 && task.k <= 28 && !(task.k & 1) && task.strength <= 32 && task.resources.slots &&
@@ -977,6 +1638,7 @@ struct BrokerServer::Impl
                 (task.kind == Kind::Pack || task.work_units <= max_generation_batch_members), "invalid compute task");
             require((task.kind != Kind::GenerateCpu && task.kind != Kind::Pack) || !task.resources.gpu_bytes,
                     "CPU task cannot reserve GPU memory");
+            require(!task.independent_members || task.kind == Kind::GenerateGpu, "independent members require GPU generation");
             if (task.kind == Kind::Pack)
                 require(task.chunk_count && task.max_output_bytes && task.max_output_bytes <= UINT32_MAX &&
                     task.work_units <= UINT32_MAX && task.work_units >= codec_window_header_bytes &&
@@ -987,7 +1649,8 @@ struct BrokerServer::Impl
             auto it = jobs.find(key);
             if (it == jobs.end())
             {
-                require(task.sequence > source.highest_sequence, "stale task sequence"); make_room();
+                require(task.sequence > source.highest_sequence, "stale task sequence");
+                require(make_room(), "broker task capacity is full");
                 source.highest_sequence = task.sequence;
                 require(next_status_id != UINT64_MAX, "broker diagnostic sequence exhausted");
                 Job job; job.status_id = ++next_status_id; job.owner = owner_key(identity, session.owner_id); job.requested = task; job.touched = Clock::now();
@@ -1000,19 +1663,29 @@ struct BrokerServer::Impl
                         "task identity has been reused");
                 if (task.attempt > job.requested.attempt)
                 {
-                    // Do not release a running worker on owner retry. It must
-                    // finish or expire before the retry can consume its share.
                     auto same_task = task; same_task.attempt = job.requested.attempt;
                     require(same_task == job.requested, "retry changes task body");
                     require(job.failures.size() < max_retry_failures, "task retry capacity is exhausted");
-                    if (reserved(job)) { response.u8(0); return response; }
-                    job.requested = task; job.lease.reset(); job.state = State::Queued; job.observed = false;
+                    if (reserved(job))
+                    {
+                        if (job.state != State::Cancelled || !job.abandoned || !make_room())
+                        { response.u8(0); return response; }
+                        // The data peer disappeared. Keep its fenced reservation charged until
+                        // Finish or expiry while the retry competes for a different worker.
+                        require(next_status_id != UINT64_MAX, "broker diagnostic sequence exhausted");
+                        require(jobs.emplace(key + '/' + job.lease->token, job).second, "duplicate abandoned lease");
+                        job.status_id = ++next_status_id;
+                    }
+                    job.requested = task; job.lease.reset(); job.state = State::Queued;
+                    job.observed = job.abandoned = false; job.unreported_finish = {};
+                    job.start_by = Clock::time_point::max();
                 }
                 else require(task == job.requested, "stale or changed task attempt");
                 require(job.state == State::Queued || job.state == State::Granted, "task needs a new attempt");
                 job.touched = Clock::now();
             }
-            schedule(); auto& job = it->second;
+            auto& job = it->second; job.start_by = std::min(job.start_by, start_by);
+            job.other_work_until = other_work_until; job.finite = finite; schedule();
             response.u8(job.state == State::Granted); if (job.state == State::Granted) write_lease(response, *job.lease); break;
         }
         case Operation::Cancel:
@@ -1023,16 +1696,35 @@ struct BrokerServer::Impl
             {
                 require(it->second.requested.attempt == attempt, "stale cancellation attempt");
                 auto& job = it->second;
-                if (job.state == State::Granted) job.state = State::Finished;
+                if (job.state == State::Granted) release_unstarted(job);
                 else if (job.state == State::Running) job.state = State::Cancelled;
                 else if (job.state == State::Queued) job.state = State::Finished;
-                job.touched = Clock::now();
+                job.unreported_finish = {}; job.touched = Clock::now();
             }
             schedule(); break;
         }
         case Operation::Register:
+        case Operation::RegisterWorkerRoute:
+        case Operation::RegisterGpuRecovery:
         {
-            auto offer = read_offer(reader); reader.finish();
+            auto offer = read_offer(reader);
+            bool retain_route = operation == Operation::RegisterWorkerRoute;
+            if (operation == Operation::RegisterGpuRecovery)
+            {
+                auto const flag = reader.u8(); offer.gpu_recovery = worker_diagnostic(reader.string(240));
+                require(flag <= 1 && !offer.capacity.gpu_bytes && !offer.gpu_recovery.empty() &&
+                    (offer.capabilities & capability(Kind::GenerateGpu)), "invalid withdrawn GPU registration");
+                retain_route = flag;
+            }
+            if (offer.independent_k_mask)
+            {
+                uint32_t supported = 0;
+                for (auto const& profile : offer.generation_profiles)
+                    if (profile.kind == Kind::GenerateGpu && profile.k <= 28) supported |= 1u << profile.k;
+                require(!(offer.independent_k_mask & ~supported) &&
+                    (offer.capabilities & capability(Kind::GenerateGpu)), "independent members require a GPU profile");
+            }
+            reader.finish();
             require(identifier(offer.instance, 64) && identifier(offer.compatibility, 256) &&
                 (!(offer.capabilities & capability(Kind::Pack)) || identifier(offer.codec_compatibility, 256)) &&
                 offer.producer_build.size() <= 128 && !offer.endpoint.host.empty() &&
@@ -1070,8 +1762,9 @@ struct BrokerServer::Impl
             else
             {
                 auto& saved = it->second.offer;
+                if (retain_route) offer.endpoint = saved.endpoint;
                 require(saved.compatibility == offer.compatibility && saved.codec_compatibility == offer.codec_compatibility &&
-                    saved.capabilities == offer.capabilities &&
+                    saved.capabilities == offer.capabilities && saved.independent_k_mask == offer.independent_k_mask &&
                     saved.min_k == offer.min_k && saved.max_k == offer.max_k && saved.codec_limits == offer.codec_limits,
                     "worker registration changed without a new instance");
                 require(saved.hardware.host == offer.hardware.host && saved.hardware.gpu_identity == offer.hardware.gpu_identity,
@@ -1082,17 +1775,22 @@ struct BrokerServer::Impl
                     saved.capacity_revision = offer.capacity_revision; saved.generation_profiles = offer.generation_profiles;
                     saved.generation_threads = offer.generation_threads;
                     // Existing leases retain their original route and identity.
-                    // Only new grants use a worker's authenticated new address.
+                    // New grants start fresh delivery history on the new route.
+                    if (saved.endpoint != offer.endpoint)
+                    { it->second.histories.clear(); it->second.route_since = Clock::now(); }
                     saved.endpoint = offer.endpoint;
                 }
                 else if (offer.capacity_revision == saved.capacity_revision)
                     require(saved.capacity == offer.capacity && saved.generation_profiles == offer.generation_profiles &&
                         saved.generation_threads == offer.generation_threads &&
                         saved.endpoint == offer.endpoint, "capacity revision changed its value");
+                if (saved.capacity_revision == offer.capacity_revision) saved.gpu_recovery = std::move(offer.gpu_recovery);
                 saved.admission = offer.admission; saved.producer_build = offer.producer_build;
                 saved.hardware = std::move(offer.hardware); it->second.seen = Clock::now();
             }
-            response.string(epoch); schedule(); break;
+            response.string(epoch);
+            if (operation != Operation::Register) write_endpoint(response, workers.at(identity).offer.endpoint);
+            schedule(); break;
         }
         case Operation::Unregister:
         {
@@ -1130,19 +1828,32 @@ struct BrokerServer::Impl
             require(identity == lease.worker_identity && direct_owner == lease.owner_identity, "lease peer identity mismatch");
             auto& job = lease_job(lease);
             auto worker = workers.find(identity);
-            bool const accepted = job.state == State::Granted && active_owner(job) && worker != workers.end() &&
-                worker->second.offer.instance == lease.worker_instance && worker->second.offer.admission == WorkerAdmission::Accepting;
-            if (accepted) { job.state = State::Running; job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms); }
-            response.u8(accepted); break;
+            auto result = BeginResult::Stale;
+            if (job.state == State::Granted && active_owner(job) && worker != workers.end() &&
+                worker->second.offer.instance == lease.worker_instance)
+            {
+                if (worker->second.offer.admission != WorkerAdmission::Accepting) result = BeginResult::AwaitingAdmission;
+                else
+                {
+                    result = BeginResult::Running; job.state = State::Running;
+                    job.expires = Clock::now() + std::chrono::milliseconds(options.lease_ms);
+                }
+            }
+            response.u8(uint8_t(result)); break;
         }
         case Operation::Heartbeat:
         {
-            auto instance = reader.string(64); auto revision = reader.u64(); reader.finish();
-            require(identifier(instance, 64) && revision, "invalid worker heartbeat");
+            auto instance = reader.string(64); auto revision = reader.u64(); auto const admission = reader.u8(); reader.finish();
+            require(identifier(instance, 64) && revision && admission <= uint8_t(WorkerAdmission::Drained), "invalid worker heartbeat");
             auto worker = workers.find(identity);
             bool const current = worker != workers.end() && worker->second.offer.instance == instance &&
                 worker->second.offer.capacity_revision == revision;
-            if (current) worker->second.seen = Clock::now();
+            if (current)
+            {
+                worker->second.seen = Clock::now();
+                if (admission && WorkerAdmission(admission) != worker->second.offer.admission)
+                { worker->second.offer.admission = WorkerAdmission(admission); schedule(); }
+            }
             response.u8(current); break;
         }
         case Operation::Renew:
@@ -1160,15 +1871,29 @@ struct BrokerServer::Impl
             auto& job = lease_job(lease);
             if (job.state != State::Running && job.state != State::Cancelled && job.state != State::Finished)
                 throw StaleLease("compute lease is not running");
-            if (job.state != State::Finished) update_capacity(lease, update, job);
+            if (job.state != State::Finished)
+            {
+                update_capacity(lease, update, job);
+                if (job.state == State::Running && !job.observed && lease.task.kind != Kind::Pack)
+                    job.unreported_finish = Clock::now();
+            }
             job.state = State::Finished; job.touched = Clock::now(); schedule(); break;
         }
         case Operation::Reject:
         {
             auto lease = read_lease(reader); auto reason = FailureCode(reader.u8()); auto update = read_update(reader);
             reader.finish();
-            require(identity == lease.worker_identity && reason == FailureCode::UnsupportedResources, "invalid worker admission rejection");
+            require(identity == lease.worker_identity && (reason == FailureCode::UnsupportedResources ||
+                (reason == FailureCode::RefusedBeforeBegin && !update)), "invalid worker admission rejection");
             auto& job = lease_job(lease);
+            if (reason == FailureCode::RefusedBeforeBegin)
+            {
+                if (job.state != State::Granted || !active_owner(job)) throw StaleLease("worker refusal needs a current unstarted grant");
+                release_unstarted(job);
+                // The worker attested that it never began this exact lease.
+                // An owner whose upload connection closed cannot abandon it later.
+                job.lease.reset(); job.touched = Clock::now(); schedule(); break;
+            }
             if (job.state != State::Running) throw StaleLease("rejected compute lease is not running");
             update_capacity(lease, update, job);
             job.state = State::Finished; job.touched = Clock::now();
@@ -1186,7 +1911,7 @@ struct BrokerServer::Impl
             if (!active_owner(job)) throw StaleLease("abandoned lease owner was fenced");
             if (job.state == State::Running) job.state = State::Cancelled;
             else if (job.state == State::Granted) job.state = State::Finished;
-            job.touched = Clock::now();
+            job.abandoned = true; job.unreported_finish = {}; job.touched = Clock::now();
             bool const known = std::any_of(job.failures.begin(), job.failures.end(), [&](Job::Failure const& failure)
             { return failure.worker == lease.worker_identity && failure.instance == lease.worker_instance && failure.kind == Kind::GenerateAny; });
             if (!known && job.failures.size() < max_retry_failures)
@@ -1194,36 +1919,288 @@ struct BrokerServer::Impl
             schedule(); break;
         }
         case Operation::Delivered:
+        case Operation::DeliveredOnPath:
         {
             auto lease = read_lease(reader); auto elapsed = reader.u64(); auto input = reader.u64(); auto output = reader.u64();
+            std::string origin;
+            if (operation == Operation::DeliveredOnPath)
+            {
+                auto path = reader.string(64);
+                require(path.size() == 64 && path.find_first_not_of("0123456789abcdef") == path.npos, "invalid generation path");
+                origin = identity + ':' + path;
+            }
             reader.finish(); require(identity == lease.owner_identity, "delivery observation owner mismatch");
             try
             {
                 auto& job = lease_job(lease);
-                if (!active_owner(job) || (job.state != State::Running && job.state != State::Finished))
+                if (!active_owner(job) || job.abandoned || (job.state != State::Running && job.state != State::Finished))
                     throw StaleDelivery("delivery observation owner or lease was fenced");
                 require(elapsed && output && !job.observed, "invalid or repeated delivery observation");
                 auto worker = workers.find(lease.worker_identity);
                 if (worker == workers.end() || worker->second.offer.instance != lease.worker_instance)
                     throw StaleDelivery("delivery worker registration expired");
-                history(worker->second, lease.task, lease.task.kind, job.owner, lease.task.resources.cpu_threads).add({elapsed, input, output}, lease.task.work_units);
-                job.observed = true; break;
+                if (worker->second.offer.endpoint == lease.endpoint && job.granted_at >= worker->second.route_since)
+                    history(worker->second, lease.task, lease.task.kind, job.owner, lease.task.resources.cpu_threads).add({elapsed, input, output}, lease.task.work_units, lease.task.resources, std::move(origin));
+                job.observed = true; job.unreported_finish = {}; break;
             }
             catch (StaleLease const& error) { throw StaleDelivery(error.what()); }
         }
-        case Operation::GenerationHint:
+        case Operation::GenerationPaths:
         {
-            auto session = read_session(reader); auto task = read_task(reader); reader.finish(); (void)owner(identity, session);
+            auto const session = read_session(reader); auto& source = owner(identity, session);
+            auto const count = reader.u8(); require(count <= max_status_page_size, "excessive generation paths");
+            BrokerClient::GenerationPaths paths; paths.reserve(count);
+            for (unsigned i = 0; i < count; ++i)
+            {
+                auto worker = reader.string(64), path = reader.string(64);
+                require((paths.empty() || paths.back().first < worker) && identifier(worker, 64) && path.size() == 64 && path.find_first_not_of("0123456789abcdef") == path.npos,
+                    "invalid generation path");
+                paths.emplace_back(std::move(worker), identity + ':' + path);
+            }
+            reader.finish(); source.paths = std::move(paths); break;
+        }
+        case Operation::PublicationRoute:
+        {
+            auto session = read_session(reader); Job job; job.requested = read_task(reader); reader.finish();
+            (void)owner(identity, session); job.owner = owner_key(identity, session.owner_id);
+            auto& t = job.requested; auto const members = t.work_units;
+            require(t.kind != Kind::Pack && t.generation_output == GenerationOutput::Packed && !t.independent_members &&
+                members && members <= max_generation_batch_members, "invalid publication width");
+            uint32_t other_owner_tasks = 0; auto const room = available(job.owner, &other_owner_tasks);
+            if (other_owner_tasks) { response.string(""); break; }
+            std::optional<PublicationRoute> route;
+            uint64_t lanes = 0;
+            if (std::any_of(jobs.begin(), jobs.end(), [](auto const& job) { return job.second.state == State::Queued; }))
+            { response.string(""); break; }
+            for (auto const& [id, worker] : workers)
+            {
+                t.work_units = 1; t.generation_output = GenerationOutput::Packed;
+                auto const& capacity = worker.offer.capacity;
+                auto const single = eligible(job, id, worker, capacity);
+                if (!single) continue;
+                lanes += capacity.parallel_tasks(single->resources);
+                if (lanes > 1) break;
+                if (t.kind == Kind::GenerateAny && single->kind == Kind::GenerateGpu && capacity.slots > 1)
+                {
+                    // The default GPU profile can exhaust VRAM while another CPU lane still fits.
+                    if (auto cpu = eligible(job, id, worker, capacity, Kind::GenerateCpu))
+                    {
+                        auto residual = capacity; subtract(residual, cpu->resources);
+                        if (eligible(job, id, worker, residual)) { ++lanes; break; }
+                    }
+                }
+                if (room.at(id) != capacity) continue;
+                t.work_units = members;
+                auto const packed = eligible(job, id, worker, capacity);
+                t.generation_output = GenerationOutput::Fresh;
+                auto const fresh = eligible(job, id, worker, capacity);
+                if (packed && fresh && packed->kind == fresh->kind && packed->resources == fresh->resources)
+                    route = PublicationRoute{id, worker.offer.instance, worker.offer.endpoint, packed->kind, packed->resources};
+            }
+            if (lanes != 1 || !route) { response.string(""); break; }
+            response.string(route->identity); response.string(route->instance); write_endpoint(response, route->endpoint);
+            response.u8(uint8_t(route->kind)); write_resources(response, route->resources); break;
+        }
+        case Operation::FinitePackedRoute:
+        {
+            auto session = read_session(reader); Job job; job.requested = read_task(reader); reader.finish();
+            (void)owner(identity, session); job.owner = owner_key(identity, session.owner_id);
+            auto& t = job.requested;
+            require(t.kind != Kind::Pack && t.generation_output == GenerationOutput::Packed && !t.independent_members &&
+                t.work_units > 1 && t.work_units <= max_generation_batch_members, "invalid finite packed width");
+            auto const room = available(); auto const now = Clock::now();
+            std::pair<std::string, Kind> best; long double finish = std::numeric_limits<long double>::max();
+            DatedRoutes dated_routes;
+            for (auto const& [id, worker] : workers)
+                for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
+                    if (auto ready = eligible(job, id, worker, room.at(id), kind))
+                    {
+                        DatedCost dated;
+                        auto const cost = recent_cost(id, worker, t, kind, job.owner, ready->resources, now, false,
+                            room.at(id) == worker.offer.capacity ? &dated : nullptr);
+                        if (cost < finish) { finish = cost; best = {id, kind}; }
+                        dated_routes.observe(id, *ready, dated);
+                    }
+            bool const dated_batch = best.first.empty() && dated_routes.separated();
+            if (dated_batch)
+            {
+                best = {*dated_routes.worker, dated_routes.route.kind};
+                finish = dated_routes.fastest.high;
+            }
+            auto split_cost = [&](std::string const& id, Worker const& worker, Candidate const& next, bool lower = false)
+            {
+                DatedCost dated;
+                auto const cost = recent_cost(id, worker, t, next.kind, job.owner, next.resources, now, lower,
+                    dated_batch ? &dated : nullptr);
+                // An older full-batch upper bound must beat the possible split.
+                return cost == std::numeric_limits<long double>::max() && dated.samples ? static_cast<long double>(dated.low) : cost;
+            };
+            if (!best.first.empty())
+            {
+                // A worker can offer several slots under one identity. Compare
+                // exact smaller leases in waves that fit its current resources.
+                auto const width = uint32_t(t.work_units);
+                auto const& worker = workers.at(best.first); auto const& free = room.at(best.first);
+                std::array<long double, max_generation_batch_members + 1> split;
+                split.fill(finish); split[0] = 0;
+                for (uint32_t members = 1; members < width; ++members)
+                {
+                    t.work_units = members;
+                    for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
+                        if (auto next = eligible(job, best.first, worker, free, kind))
+                        {
+                            auto const cost = split_cost(best.first, worker, *next);
+                            if (cost >= finish) continue;
+                            auto const lanes = free.parallel_tasks(next->resources);
+                            for (uint32_t filled = members; filled <= width; ++filled)
+                                for (uint32_t count = 1; count <= std::min(lanes, filled / members); ++count)
+                                    split[filled] = std::min(split[filled], split[filled - count * members] + cost);
+                        }
+                }
+                if (split[width] < finish) best.first.clear();
+            }
+            // If another route can deliver an actual singleton no later than the
+            // whole batch, keep those IDs available for ordinary split placement.
+            if (!best.first.empty())
+            {
+                t.work_units = 1;
+                for (auto const& [id, worker] : workers)
+                    for (auto kind : {Kind::GenerateGpu, Kind::GenerateCpu})
+                        if (id != best.first)
+                            if (auto next = eligible(job, id, worker, dated_batch ? room.at(id) : worker.offer.capacity, kind))
+                                if (split_cost(id, worker, *next, true) <= finish)
+                                    best.first.clear();
+            }
+            response.string(best.first); if (!best.first.empty()) response.u8(uint8_t(best.second)); break;
+        }
+        case Operation::GenerationHint:
+        case Operation::GenerationAvailability:
+        case Operation::GenerationRoutes:
+        case Operation::GenerationRoutesGpuRecovery:
+        {
+            auto session = read_session(reader); auto task = read_task(reader);
+            bool const detailed = operation != Operation::GenerationHint;
+            auto const codec = detailed ? reader.string(256) : std::string{};
+            reader.finish(); (void)owner(identity, session);
             require(task.kind == Kind::GenerateCpu || task.kind == Kind::GenerateGpu || task.kind == Kind::GenerateAny,
                 "generation hint requires a generation task");
-            Job job; job.requested = std::move(task); uint32_t maximum = 0;
+            bool const independent_request = task.independent_members;
+            auto const requested_output = task.generation_output;
+            Job job; job.requested = std::move(task); uint32_t maximum = 0, slots = 0;
+            uint32_t independent = independent_request ? 0 : max_generation_batch_members;
+            std::array<uint32_t, max_generation_batch_members + 1> independent_slots{};
+            GenerationRoster roster;
+            bool const recovery = operation == Operation::GenerationRoutesGpuRecovery;
+            bool const report_routes = operation == Operation::GenerationRoutes || recovery;
+            GenerationAdmission admission; admission.registered = uint32_t(workers.size());
+            bool codec_available = false, concurrent_codec = false;
+            auto const free = report_routes ? available(owner_key(identity, session.owner_id), &admission.other_owner_tasks) :
+                detailed ? available() : Availability{};
             for (auto const& [identity, worker] : workers)
+            {
+                auto const& capacity = worker.offer.capacity;
+                if (recovery && !worker.offer.gpu_recovery.empty() && roster.recovering_gpus.size() < max_status_page_size)
+                    roster.recovering_gpus.push_back({worker.offer.hardware.host.empty() ? identity : worker.offer.hardware.host,
+                        worker.offer.gpu_recovery});
+                job.requested.independent_members = false;
+                job.requested.generation_output = requested_output;
+                bool const codec_room = detailed && worker.offer.admission == WorkerAdmission::Accepting && worker.offer.codec_compatibility == codec &&
+                    (worker.offer.capabilities & capability(Kind::Pack)) && free.at(identity).slots &&
+                    free.at(identity).cpu_threads && free.at(identity).host_bytes;
+                job.requested.work_units = 1;
+                WaitReason reason = WaitReason::None;
+                auto candidate = eligible(job, identity, worker, capacity, {}, report_routes ? &reason : nullptr);
+                if (codec_room)
+                {
+                    codec_available = true;
+                    concurrent_codec |= !candidate || (capacity.slots > candidate->resources.slots &&
+                        capacity.cpu_threads > candidate->resources.cpu_threads && capacity.host_bytes > candidate->resources.host_bytes);
+                }
+                if (!candidate)
+                {
+                    if (report_routes)
+                    {
+                        if (worker.offer.admission == WorkerAdmission::Paused) reason = WaitReason::WorkerPaused;
+                        else if (worker.offer.admission != WorkerAdmission::Accepting) reason = WaitReason::WorkerDraining;
+                        ++admission.waiting[size_t(reason)];
+                    }
+                    continue;
+                }
+                auto const parallel = capacity.parallel_tasks(candidate->resources);
+                slots += std::min(UINT32_MAX - slots, parallel);
+                if (report_routes)
+                {
+                    ++admission.eligible;
+                    auto const& remaining = free.at(identity);
+                    auto const ready = remaining == capacity ? candidate : eligible(job, identity, worker, remaining, {}, &reason);
+                    if (ready)
+                        admission.available_slots += std::min({parallel, remaining.parallel_tasks(ready->resources),
+                            UINT32_MAX - admission.available_slots});
+                    else ++admission.waiting[size_t(reserved_reason(reason))];
+                    if (roster.routes.size() == max_status_page_size) roster.complete = false;
+                    else
+                    {
+                        auto lanes = [&](Kind kind)
+                        {
+                            if (candidate->kind == kind) return parallel;
+                            auto const other = eligible(job, identity, worker, capacity, kind);
+                            return other ? capacity.parallel_tasks(other->resources) : 0u;
+                        };
+                        auto const& offer = worker.offer;
+                        roster.routes.push_back({identity, offer.instance, offer.endpoint, offer.hardware.host,
+                            offer.hardware.gpu_identity, lanes(Kind::GenerateCpu), lanes(Kind::GenerateGpu)});
+                    }
+                }
                 for (uint32_t count = max_generation_batch_members; count > maximum; --count)
                 {
                     job.requested.work_units = count;
-                    if (eligible(job, identity, worker, worker.offer.capacity)) { maximum = count; break; }
+                    if (eligible(job, identity, worker, capacity)) { maximum = count; break; }
                 }
-            response.u32(maximum); break;
+                if (!detailed) continue;
+                uint32_t width = 0;
+                if (job.requested.kind != Kind::GenerateCpu && worker.offer.independent_k_mask)
+                {
+                    job.requested.independent_members = true;
+                    job.requested.generation_output = GenerationOutput::Contributions;
+                    for (uint32_t count = max_generation_batch_members; count; --count)
+                    {
+                        job.requested.work_units = count;
+                        if (eligible(job, identity, worker, capacity, Kind::GenerateGpu)) { width = count; break; }
+                    }
+                }
+                // Planning shares work over all eligible lanes. A formed
+                // independent request needs only one matching worker.
+                independent = independent_request ? std::max(independent, width) : std::min(independent, width);
+                // Independent batches reuse the ordinary GPU singleton's resources.
+                for (uint32_t n = 1; n <= width; ++n)
+                    independent_slots[n] += std::min(UINT32_MAX - independent_slots[n], parallel);
+            }
+            response.u32(maximum); response.u32(slots);
+            if (detailed)
+            {
+                response.u32(slots ? independent : 0);
+                response.u8(uint8_t(codec_available) | (uint8_t(concurrent_codec) << 1));
+                for (auto n : std::span(independent_slots).subspan(1)) response.u32(n);
+            }
+            if (report_routes)
+            {
+                response.u8(roster.complete); response.u8(uint8_t(roster.routes.size()));
+                for (auto const& route : roster.routes)
+                {
+                    response.string(route.identity); response.string(route.instance); write_endpoint(response, route.endpoint);
+                    response.string(route.host); response.string(route.gpu_identity);
+                    response.u32(route.cpu_slots); response.u32(route.gpu_slots);
+                }
+                response.u32(admission.registered); response.u32(admission.eligible);
+                response.u32(admission.available_slots); response.u32(admission.other_owner_tasks);
+                for (auto number : admission.waiting) response.u32(number);
+                if (recovery)
+                {
+                    response.u8(uint8_t(roster.recovering_gpus.size()));
+                    for (auto const& gpu : roster.recovering_gpus) { response.string(gpu.host); response.string(gpu.cause); }
+                }
+            }
+            break;
         }
         default: throw std::runtime_error("unknown broker operation");
         }

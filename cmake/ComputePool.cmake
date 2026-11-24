@@ -60,6 +60,9 @@ function(pos2_pool_targets upstream_dir grow_include)
     # following the existing construction tests. Do not link it a second time.
     add_executable(pos2_pr118_grow_worker_test "${repo_dir}/tools/parity/compute_worker_test.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(pos2_pr118_grow_worker_test PRIVATE GROW_GPU_BACKEND=1)
+    endif()
     add_executable(pos2_pr118_grow_worker_client_test "${repo_dir}/tools/parity/compute_worker_client_test.cpp"
         "${repo_dir}/src/host/ComputeSession.cpp"
         "${upstream_dir}/src/pos/sha/sha256.c")
@@ -107,6 +110,7 @@ function(pos2_pool_targets upstream_dir grow_include)
     endforeach()
     add_executable(pos2_pr118_grow_pool_codec_test "${repo_dir}/tools/parity/compute_pool_codec_test.cpp")
     add_executable(pos2_pr118_grow_pool_owner_test "${repo_dir}/tools/parity/compute_pool_owner_test.cpp"
+        "${repo_dir}/tools/xchplot2/group_options.cpp"
         "${repo_dir}/src/host/ComputeSession.cpp"
         $<TARGET_OBJECTS:pos2_pr118_grow_worker_reference>)
     target_compile_definitions(pos2_pr118_grow_pool_owner_test PRIVATE GROW_TEST_CONSTRUCTION=1 GROW_POOL_NETWORK=1)

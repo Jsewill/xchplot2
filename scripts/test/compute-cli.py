@@ -80,7 +80,7 @@ def check(binary, root, service_manager=False):
 
     try:
         for name in ("setup", "members", "revoke", "renew-request", "renew-sign", "renew-import", "policy-export", "policy-import",
-                     "status", "pause", "drain", "resume", "service"):
+                     "status", "pause", "drain", "resume", "service", "firewall"):
             assert "Usage:" in run("authority", name, "--help").stdout
         for name, advanced in (("worker", "--max-task-bytes"), ("broker", "--max-tasks")):
             common = run("authority", name, "--help").stdout
@@ -90,22 +90,52 @@ def check(binary, root, service_manager=False):
         initialized = run("authority", "init", "--name", "authority", "--quiet")
         assert "Created pool" in initialized.stdout and "Plot, fill" not in initialized.stdout
         original_node = status("authority")["node_id"]
-        assert "Shared compute is configured" in run("authority", "setup", "--quiet").stdout
+        assert "Shared compute is configured" in run("authority", "setup", "--broker", "auto", "--quiet").stdout
         assert status("authority")["node_id"] == original_node
         run("authority", "setup", "--backend", "invalid", code=1)
         assert status("authority")["node_id"] == original_node
         directories["setup-plotter"] = root / "setup-plotter"
-        run("setup-plotter", "setup", "--name", "new-plotter", "--cpus", 1, "--host-bytes", "512M", "--backend", "cpu")
+        run("setup-plotter", "setup", "--name", "new-plotter", "--cpus", 1, "--host-bytes", "512M", "--backend", "cpu", "--broker", "auto")
         assert status("setup-plotter")["configured"]
+        assert status("setup-plotter")["defaults"]["worker_port"] == 18445
+        before = (directories["setup-plotter"] / "profile").read_bytes()
+        rendered = run("setup-plotter", "firewall", "--firewall", "firewalld", "--zone", "FedoraServer",
+                       "--from", "10.1.10.20/32", "--role", "broker", "--discovery", "off").stdout
+        rule = 'rule family="ipv4" source address="10.1.10.20/32" port port="18444" protocol="tcp" accept'
+        assert f"sudo firewall-cmd --zone=FedoraServer --add-rich-rule='{rule}'" in rendered
+        assert f"sudo firewall-cmd --zone=FedoraServer --permanent --add-rich-rule='{rule}'" in rendered
+        rendered = run("setup-plotter", "firewall", "--firewall", "ufw", "--interface", "eth0",
+                       "--from", "2001:db8::/64", "--role", "worker", "--discovery", "on").stdout
+        assert "sudo ufw allow in on eth0 proto tcp from 2001:db8::/64 to any port 18445" in rendered
+        assert "sudo ufw allow in on eth0 proto udp from 2001:db8::/64 to any port 5353" in rendered
+        for invalid in ("10.0.0.1/33", "2001:db8::/129", "peer.example", "10.0.0.1;echo bad", "fe80::1%eth0"):
+            assert not run("setup-plotter", "firewall", "--firewall", "ufw", "--from", invalid, code=1).stdout
+        assert not run("setup-plotter", "firewall", "--firewall", "firewalld", "--from", "10.0.0.1", code=1).stdout
+        for setting, value in (("--broker-port", 0), ("--worker-port", 65536), ("--worker-port", 18444)):
+            run("setup-plotter", "configure", setting, value, code=1)
+        assert (directories["setup-plotter"] / "profile").read_bytes() == before
+        print("PASS source-scoped literal firewall commands, IPv6, input rejection and read-only rendering", flush=True)
         for name in ("worker", "owner"):
             invitation = root / (name + ".invite")
             run("authority", "invite", invitation, "--name", name)
-            run(name, "join", invitation)
+            if name == "owner":
+                run(name, "join", invitation)
+            else:
+                port = pool.port()
+                new = start(name, "worker", "--join", invitation, "--backend", "cpu", "--cpus", 1,
+                            "--host-bytes", "512M", "--listen", f"127.0.0.1:{port}", "--discovery", "off",
+                            "--broker", f"127.0.0.1:{pool.port()}", port=port)
+                new.stop()
+        refused = run("worker", "worker", "--join", root / "owner.invite", code=1)
+        assert "differs from this machine's saved compute enrollment" in refused.stderr
         broker_port, worker_port = pool.port(), pool.port()
         broker_address, worker_address = f"127.0.0.1:{broker_port}", f"127.0.0.1:{worker_port}"
         for name in ("authority", "worker", "owner"):
             run(name, "configure", "--discovery", "off", "--broker", broker_address,
-                "--backend", "cpu", "--cpus", 2, "--host-bytes", "1G", "--max-brokers", 32)
+                "--backend", "cpu", "--cpus", 2, "--host-bytes", "1G", "--max-brokers", 32,
+                "--broker-port", broker_port, "--interface", "lo")
+        run("worker", "configure", "--worker-port", worker_port)
+        assert not run("authority", "firewall", "--firewall", "ufw", "--role", "worker", "--from", "127.0.0.1", code=1).stdout
         config = root / "verbose.toml"
         config.write_text("[defaults]\nverbose=true\nquiet=false\n", encoding="utf-8")
         assert "Usage:" in run("authority", "service", "--help", config=config).stdout
@@ -124,11 +154,13 @@ def check(binary, root, service_manager=False):
         assert run("authority", "members", "-q").stdout == roster
         assert "Policy generation:" in run("authority", "members", config=config).stdout
         print("PASS concise/verbose/quiet output, configuration overrides and invariant JSON status", flush=True)
-        broker = start("authority", "broker", "--listen", broker_address, "--worker-ms", 3000,
-                       "--lease-ms", 3000, "--verbose", "--no-verbose", port=broker_port)
-        worker_args = ("worker", "--listen", worker_address, "--slots", 1, "--generation-threads", 1,
+        worker_args = ("worker", "--slots", 1, "--generation-threads", 1,
                        "--max-frame-bytes", "64K", "--max-task-bytes", "16M", "--quiet", "--no-quiet")
-        worker = start("worker", *worker_args, port=worker_port)
+        worker = start("worker", *worker_args, "--join", root / "worker.invite", port=worker_port)
+        until(lambda: "Waiting for an authenticated broker connection." in worker.log.read_text(encoding="utf-8"))
+        broker = start("authority", "broker", "--worker-ms", 3000,
+                       "--lease-ms", 3000, "--verbose", "--no-verbose", port=broker_port)
+        until(lambda: "accepting plotting work." in worker.log.read_text(encoding="utf-8"))
         live = until(lambda: (value if (value := status("owner", "--worker", worker_address))["workers"] else None))
         worker_node = live["workers"][0]["node_id"]
         assert live["workers"][0]["broker_limit"] == 32
@@ -178,7 +210,7 @@ def check(binary, root, service_manager=False):
         run("authority", "renew-sign", request, replacement)
         run("worker", "renew-import", replacement)
         worker.stop()
-        worker = start("worker", *worker_args, port=worker_port)
+        worker = start("worker", *worker_args, "--join", root / "worker.invite", port=worker_port)
         renewed = until(lambda: (value if (value := status("worker", "--worker", worker_address))["workers"] else None))
         assert renewed["workers"][0]["node_id"] == worker_node
         assert renewed["workers"][0]["identity"] != before
@@ -253,14 +285,37 @@ def check(binary, root, service_manager=False):
         run("authority", "service", "install", env=environment, code=1)
         assert units[0].read_text() == "[Service]\nExecStart=/bin/true\n"
         print("PASS generated user service, exact manager actions and unrelated-unit preservation", flush=True)
+        run("setup-plotter", "setup", "--cpus", 2, env=environment)
+        assert status("setup-plotter")["defaults"]["broker"] == "auto"
+        assert not list(units[0].parent.glob("*-broker-*.service"))
+        directories["setup-broker"] = root / "setup-broker"
+        run("setup-broker", "setup", "--broker-port", 23456, "--worker-port", 23457, env=environment)
+        plotter = status("setup-broker")
+        assert plotter["defaults"]["broker"] == "127.0.0.1:23456"
+        assert plotter["defaults"]["broker_port"] == 23456 and plotter["defaults"]["worker_port"] == 23457
+        broker_units = [path for path in units[0].parent.glob("*.service") if "-broker-" in path.name]
+        assert len(broker_units) == 1 and " compute broker " in broker_units[0].read_text()
+        run("setup-broker", "configure", "--broker-port", 23458)
+        assert status("setup-broker")["defaults"]["broker"] == "127.0.0.1:23458"
+        run("setup-broker", "service", "remove", "--role", "broker", env=environment)
+        assert not broker_units[0].exists()
         directories["setup-worker"] = root / "setup-worker"
         invitation = root / "setup-worker.invite"
         run("authority", "invite", invitation, "--name", "setup-worker")
         run("setup-worker", "setup", invitation, "--backend", "cpu", "--cpus", 1, "--host-bytes", "512M",
             "--discovery", "off", env=environment)
         helper = status("setup-worker")
-        run("setup-worker", "setup", "--cpus", 2, env=environment)
+        previous_calls = len(calls.read_text().splitlines())
+        run("setup-worker", "setup", invitation, "--cpus", 1, env=environment)
+        repeated = [json.loads(line) for line in calls.read_text().splitlines()[previous_calls:]]
+        assert not any("restart" in action for action in repeated)
+        previous_calls = len(calls.read_text().splitlines())
+        rejected = run("setup-worker", "setup", root / "worker.invite", env=environment, code=1)
+        assert "differs from this machine" in rejected.stderr and len(calls.read_text().splitlines()) == previous_calls
         assert status("setup-worker")["node_id"] == helper["node_id"]
+        run("setup-worker", "setup", "--cpus", 2, "--worker-port", 0, env=environment)
+        assert status("setup-worker")["node_id"] == helper["node_id"]
+        assert status("setup-worker")["defaults"]["worker_port"] == 0
         helper_units = [path for path in units[0].parent.glob("*.service") if path != units[0]]
         assert len(helper_units) == 1
         setup_calls = [json.loads(line) for line in calls.read_text().splitlines()]
@@ -302,6 +357,7 @@ def main():
     args = parser.parse_args()
     args.scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="compute cli é-", dir=args.scratch) as directory:
+        os.environ["XDG_CACHE_HOME"] = str(Path(directory).resolve() / "performance-cache")
         check(args.binary.resolve(), Path(directory).resolve(), args.service_manager)
 
 

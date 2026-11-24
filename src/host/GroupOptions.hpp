@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -10,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; class DiskIoGovernor; class WorkerIdentityReservation; }
+namespace group_grow { struct FarmingProfile; struct WorkerConfig; struct WorkerTaskAdmission; struct ProgressRegistry; class DiskIoGovernor; struct WorkerIdentityReservation; class DashboardTerminal; class DashboardJob; }
 
 namespace pos2gpu {
 class ComputeSession;
@@ -31,7 +32,8 @@ struct GroupComputeOptions
     std::function<void()> compute_admit_session;
     std::function<void(group_grow::WorkerConfig const&)> compute_admit_worker;
     std::function<void(group_grow::WorkerTaskAdmission const&)> compute_admit_task;
-    std::string pool_offer_backend = "cpu";
+    std::string pool_offer_backend = "cpu", pool_output = "auto";
+    unsigned pool_writers = 0;
     uint64_t pool_offer_ram = 0, pool_offer_cpus = 0, pool_offer_vram = 0, pool_offer_slots = 1, pool_inflight = 64;
     uint64_t pool_offer_ram_limit = 0, pool_offer_cpu_limit = 0, pool_offer_vram_limit = 0;
     uint64_t pool_timeout_ms = 3600000, pool_socket_timeout_ms = 30000, pool_frame_bytes = 1024 * 1024;
@@ -43,6 +45,11 @@ struct GroupOptions : GroupComputeOptions
 {
     std::string command;
     bool json = false, quiet = false, verbose = false, progress = false, report_metrics = true;
+    bool tui = false;
+    std::chrono::steady_clock::time_point command_started = std::chrono::steady_clock::now();
+    std::shared_ptr<group_grow::DashboardTerminal> dashboard;
+    std::shared_ptr<group_grow::DashboardJob> dashboard_job;
+    std::shared_ptr<group_grow::ProgressRegistry> parent_progress;
     std::function<bool()> cancelled;
     std::function<void(std::filesystem::path const&, uint16_t, uint64_t, bool)> on_output;
     std::filesystem::path target, fixtures, manifest, save_plan, from_plan, save_profile;
@@ -87,9 +94,14 @@ struct GroupOptions : GroupComputeOptions
     uint64_t capacity = 0, headroom = 64 * 1024 * 1024, temporary_capacity = 0;
     uint64_t window = 16 * 1024 * 1024, workers = 0, batch = 65535, max_members = 65535;
     uint64_t group_members = 0, max_groups = UINT64_MAX, max_total_members = UINT64_MAX;
-    uint64_t checkpoint_bytes = 256 * 1024 * 1024, device = 0;
+    static constexpr uint64_t default_checkpoint_bytes = 256ull * 1024 * 1024;
+    uint64_t checkpoint_bytes = default_checkpoint_bytes, device = 0;
     std::string devices;
     std::vector<GroupLocalDevice> local_devices;
+    // A reviewed migration runs a single producer. Its CPU generator can
+    // inherit the union of the selected NUMA nodes within that same grant.
+    std::vector<int> producer_cpu_affinity;
+    std::vector<GroupLocalDevice> replot_gpu_devices;
     bool local_compute = false;
     std::string backend = "cpu";
     std::string tier = "auto";
@@ -108,6 +120,7 @@ struct GroupOptions : GroupComputeOptions
     uint64_t replot_proof_cpus = 0, replot_proof_solves = 1;
     bool protected_resources = false;
     std::shared_ptr<group_grow::DiskIoGovernor> disk_io;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> harvester_logs;
     uint64_t protected_gpu_bytes = 0;
     bool inventory = false;
     bool extend = false, update = false, cancel_update = false, allow_missing = false;

@@ -1,16 +1,16 @@
 # xchplot2
 
 CPU and GPU plotter for Chia v2 proofs of space (CHIP-48). Produces ordinary
-PoS2 1.0 `.gplot` files using the pinned
-[pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
+PoS2 1.0 `.gplot` files compatible with the pinned
+[pos2-chip](https://github.com/Chia-Network/pos2-chip) reference.
 
 This is the **`main` branch**, using SYCL/AdaptiveCpp with a CUB fast path
 on NVIDIA. The [`cuda-only` branch](https://github.com/Jsewill/xchplot2/tree/cuda-only)
 provides the native CUDA implementation for NVIDIA.
 
-This build pins [pos2-chip 1.0.0](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.0).
-The new Feistel cipher and group format are incompatible with earlier plots;
-existing plots must be replotted and old job manifests cannot be resumed.
+This build pins [pos2-chip 1.0.1](https://github.com/Chia-Network/pos2-chip/releases/tag/1.0.1).
+Plots and job manifests from 1.0.0 remain compatible. Experimental PoS2
+plots made before 1.0 require replotting with a new job manifest.
 Farmer plot-group integration has merged upstream; release and activation
 support must still be confirmed in the
 [compatibility notes](contrib/pos2-pr118/README.md).
@@ -25,8 +25,10 @@ save a layout for later execution. Add `fill --replot` to
 configured farm directories and optional exclusions. Use the intended harvester's profile when plotting
 on another machine. Repeat `fill DIR` to continue through any member, or add
 options to change future work while keeping existing plots and reservations.
-`pause`, `drain`, `resume` and `retire` control a job or selected destinations;
-`status DIR --watch` follows saved progress.
+`pause`, `drain`, `resume` and `retire` control a job or selected destinations.
+Use `fill DIR --tui` to see seconds per newly published member, construction
+decisions, hardware activity and worker deliveries. From another terminal,
+`xchplot2 status DIR --tui` opens a read-only view. Press `q` to close it.
 `--discover-drives DIR` selects supported drives mounted beneath a directory
 at any depth. See [drive filling](REFERENCE.md#grouped-plotting-and-drive-filling)
 for recovery and policy changes. [Shared compute](REFERENCE.md#shared-compute)
@@ -83,7 +85,7 @@ for CPU-reference comparisons.
 | Intel | AdaptiveCpp Level Zero; see the [required settings and limitations](REFERENCE.md#troubleshooting). Use CPU plotting on integrated Intel GPUs for production. |
 | VRAM | Tiny's base k=28 floor is 1,228 MiB free after context creation, including the default 128 MiB buffer. Backend sort scratch can raise it. |
 | Host RAM | Depends on tier and worker count. Lower VRAM tiers generally use more host RAM; see [memory requirements](REFERENCE.md#memory-requirements). |
-| CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses pos2-chip's CPU plotter. |
+| CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses xchplot2’s native C++ member generator. |
 | OS | Linux; WSL2 requires support from the GPU vendor. [Native Windows builds](INSTALL.md#windows) are experimental. macOS is unsupported. |
 
 See the [installation guide](INSTALL.md) for drivers, runtime versions and
@@ -124,9 +126,28 @@ recover old plots already deleted under the allowance.
 |---|---|
 | [xchplot2 compute](REFERENCE.md#shared-compute) | Set up sharing, offer capacity, or run a dedicated broker |
 
-Run `xchplot2 compute setup` on the first machine, then create an invitation for
-each helper. On a helper, `xchplot2 compute setup INVITATION` enrolls it and starts
-its persistent worker. Plotting jobs discover enrolled helpers automatically.
+Run `xchplot2 compute setup` on the plotting host before starting its first
+shared job. You can add a helper while the plotter is running.
+
+1. On the pool administrator, run `xchplot2 compute invite helper.invite --name helper`.
+2. Transfer that invitation privately to the helper and run `xchplot2 compute setup helper.invite` there.
+3. Open **Workers** in the dashboard to see when the helper becomes eligible
+   and when it delivers its first validated work. Press `a` in the
+   dashboard to bring up these commands.
+
+For one group, one drive or a whole farm, the scheduler aims to finish the
+last requested file as soon as possible. It uses observed generation,
+transfer, encoding and storage times to assign work, and adjusts those
+assignments as workers join, leave or change how much work they can take.
+GPU workers update the plot sizes they can produce as other applications
+take or release video memory. A helper on a slow link can shorten
+a large fill even when a small job would finish before its first member
+arrived. The Overview and final summary show elapsed seconds per newly
+published member. A resumed job counts inherited members separately.
+
+For a temporary helper, `xchplot2 compute worker --join helper.invite` runs
+in the foreground. For broker discovery, direct addresses and firewall ports,
+see the [network guide](REFERENCE.md#networks-and-dedicated-brokers).
 
 ### Plotting jobs
 

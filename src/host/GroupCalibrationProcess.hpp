@@ -78,8 +78,11 @@ inline BackgroundPriority install_background_priority() noexcept
 inline uint64_t install_cpu_cap(uint64_t requested)
 {
 #ifdef _WIN32
-    USHORT groups = 1, group = 0;
-    check(::GetProcessGroupAffinity(::GetCurrentProcess(), &groups, &group) && groups == 1,
+    // Only the group count is needed. The sizing query also avoids Server
+    // 2022's DWORD alignment requirement for the output array of USHORTs.
+    USHORT groups = 0;
+    check(!::GetProcessGroupAffinity(::GetCurrentProcess(), &groups, nullptr) &&
+        ::GetLastError() == ERROR_INSUFFICIENT_BUFFER && groups == 1,
         "bounded proof CPU affinity requires a single Windows processor group");
     DWORD_PTR allowed = 0, system = 0;
     check(::GetProcessAffinityMask(::GetCurrentProcess(), &allowed, &system) && allowed,
@@ -91,9 +94,12 @@ inline uint64_t install_cpu_cap(uint64_t requested)
     for (unsigned id = 0; id < sizeof(allowed) * CHAR_BIT && picked < requested; ++id)
         if (allowed & (DWORD_PTR(1) << id)) { selected |= DWORD_PTR(1) << id; ++picked; }
     DWORD_PTR actual = 0;
-    check(picked == requested && ::SetProcessAffinityMask(::GetCurrentProcess(), selected) &&
-        ::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) && actual == selected,
-        "cannot enforce bounded proof CPU affinity");
+    check(picked == requested && ::SetProcessAffinityMask(::GetCurrentProcess(), selected), "cannot enforce bounded proof CPU affinity");
+    if (!::GetProcessAffinityMask(::GetCurrentProcess(), &actual, &system) || actual != selected)
+    {
+        (void)::SetProcessAffinityMask(::GetCurrentProcess(), allowed);
+        throw std::runtime_error("cannot verify bounded proof CPU affinity");
+    }
     return requested;
 #elif defined(__linux__)
     cpu_set_t allowed, selected, actual; CPU_ZERO(&allowed); CPU_ZERO(&selected); CPU_ZERO(&actual);
@@ -131,8 +137,7 @@ public:
 #ifdef _WIN32
         DWORD_PTR system = 0;
         check(::GetProcessAffinityMask(::GetCurrentProcess(), &original_, &system) && original_, "cannot save scoped CPU affinity");
-        try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }
-        catch (...) { (void)::SetProcessAffinityMask(::GetCurrentProcess(), original_); throw; }
+        lanes_ = install_cpu_cap(requested); active_ = requested != 0;
 #elif defined(__linux__)
         check(!::sched_getaffinity(0, sizeof(original_), &original_), "cannot save scoped CPU affinity");
         try { lanes_ = install_cpu_cap(requested); active_ = requested != 0; }

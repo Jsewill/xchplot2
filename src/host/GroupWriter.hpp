@@ -1,8 +1,16 @@
-// One ordered file consumer per physical-drive group, with at most one waiting
-// task in addition to the running task. Borrowed arguments outlive the worker.
+// One ordered consumer per output, with at most one waiting task in addition
+// to the running task. Borrowed arguments outlive the worker.
 #pragma once
-#include "host/GroupEngine.hpp"
+#include "host/GroupFormat.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <type_traits>
+#include <utility>
 
 namespace group_grow
 {
@@ -95,16 +103,20 @@ public:
     ~OrderedWriter()
     {
         { std::lock_guard lock(mutex_); stopping_ = true; }
-        ready_.notify_one(); thread_.join();
+        ready_.notify_one(); room_.notify_all(); thread_.join();
     }
     OrderedWriter(OrderedWriter const&) = delete;
     OrderedWriter& operator=(OrderedWriter const&) = delete;
     bool has_room() const { std::lock_guard lock(mutex_); return !task_.valid(); }
     bool busy() const { std::lock_guard lock(mutex_); return active_ || task_.valid(); }
-    std::future<void> submit(std::function<void()> operation)
+    std::future<void> submit(std::function<void()> operation, bool wait_for_room = false)
     {
         std::packaged_task<void()> task(std::move(operation)); auto result = task.get_future();
-        { std::lock_guard lock(mutex_); require(!stopping_ && !task_.valid(), "destination writer queue is full"); task_ = std::move(task); }
+        {
+            std::unique_lock lock(mutex_);
+            if (wait_for_room) room_.wait(lock, [this] { return stopping_ || !task_.valid(); });
+            group_tools::require(!stopping_ && !task_.valid(), "destination writer queue is full"); task_ = std::move(task);
+        }
         ready_.notify_one(); return result;
     }
 private:
@@ -119,14 +131,14 @@ private:
                 if (stopping_ && !task_.valid()) return;
                 task = std::move(task_); active_ = true;
             }
-            notify_(); task();
+            room_.notify_one(); notify_(); task();
             { std::lock_guard lock(mutex_); active_ = false; }
             notify_();
         }
     }
     std::function<void()> notify_;
     mutable std::mutex mutex_;
-    std::condition_variable ready_;
+    std::condition_variable ready_, room_;
     std::packaged_task<void()> task_;
     bool stopping_ = false, active_ = false;
     std::thread thread_;

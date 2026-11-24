@@ -191,6 +191,8 @@ void inventory(fs::path const& directory)
     rejects([&] { (void)inventory_detail::catalog_deadline({}, 100001); }, "catalog allowance ignored the entry bound");
     auto malicious = observed; malicious.plots[0].relative_path = "../outside";
     rejects([&] { (void)farm_inventory_text(malicious); }, "parent path escaped inventory root");
+    malicious.plots[0].relative_path = "/outside";
+    rejects([&] { (void)farm_inventory_text(malicious); }, "root-relative path escaped inventory root");
     malicious = observed; malicious.plots[1].alias_of = 0;
     rejects([&] { (void)farm_inventory_text(malicious); }, "forged alias hid another native file");
     std::array<fs::path, 2> overlap{directory, directory / "nested"}; auto overlapped = scan_farm_inventory(overlap);
@@ -321,7 +323,7 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
         value.identity = observe_inventory_file(root, file_io::path_text(value.path.filename()), options.limits).identity; return value;
     };
     for (unsigned i = 0; i < files; ++i) write(prototype.path.parent_path() / ("prefix-" + std::to_string(i) + ".plot2"), bytes);
-    auto registry = [&](bool wrong = false, bool duplicate = false, bool wrong_meta = false)
+    auto registry = [&](bool wrong = false, bool duplicate = false, bool wrong_meta = false, char const* field = "collection")
     {
         std::ofstream out(options.root / "plots.json"); out << "{\"success\":true,\"plots\":[";
         for (unsigned i = 0; i < files + unsigned(duplicate); ++i)
@@ -329,7 +331,7 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
             auto expected = expectation(i % files); if (i) out << ','; out << "{\"filename\":"; profile_detail::quote(out, file_io::path_text(expected.path));
             out << ",\"size\":130,\"plot_id\":\"" << expected.group_id << "\",\"file_size\":" << expected.identity.stamp.bytes << ",\"time_modified\":" << expected.identity.stamp.mtime
                 << ",\"pool_contract_puzzle_hash\":\"" << expected.pool_contract_puzzle_hash << "\",\"plot_public_key\":\"" << (wrong && i == files - 1 ? std::string(96, '7') : loaded_key)
-                << "\",\"meta_group\":" << unsigned(expected.meta_group + uint8_t(wrong_meta && i == files - 1)) << ",\"group_size\":" << expected.members << '}';
+                << "\",\"" << field << "\":" << unsigned(expected.meta_group + uint8_t(wrong_meta && i == files - 1)) << ",\"group_size\":" << expected.members << '}';
         }
         out << "]}";
     };
@@ -343,12 +345,13 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
     auto published = [&](std::string_view path, std::string_view id)
     {
         if (id != prototype.group_id) return false;
+        auto const filename = file_io::native_path(std::string(path));
         for (unsigned i = 0; i < files; ++i)
-            if (path == file_io::path_text(expectation(i).path)) return true;
+            if (filename == expectation(i).path) return true;
         return false;
     };
     auto future = [&](std::string_view path, std::string_view id)
-    { return path != file_io::path_text(expectation(files - 1).path) && published(path, id); };
+    { return file_io::native_path(std::string(path)) != expectation(files - 1).path && published(path, id); };
     rejects([&] { TargetReadinessSnapshot unpublished(options, projection, prototype.k, prototype.strength, service, &complete_scope, future); },
         "target registry accepted an unpublished future replacement name");
     auto before = count();
@@ -365,10 +368,11 @@ void target_prefix_snapshot(HarvesterAdapterOptions const& options, NetworkProje
         require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot accepted a mismatched loaded public key");
         rejects([&] { mismatch.finish(); }, "failed prefix check retained a healthy snapshot");
     }
-    registry(false, false, true);
+    for (auto field : {"collection", "meta_group"})
     {
+        registry(false, false, true, field);
         TargetReadinessSnapshot mismatch(options, projection, prototype.k, prototype.strength, service); auto expected = expectation(files - 1);
-        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot ignored an explicitly reported wrong meta group");
+        require(!mismatch.check(expected, publication(expected, files - 1)).ready, "prefix snapshot ignored an explicitly reported wrong collection");
     }
     registry(false, true);
     rejects([&] { TargetReadinessSnapshot duplicate(options, projection, prototype.k, prototype.strength, service); }, "duplicate target registry paths accepted");
@@ -1139,8 +1143,16 @@ void retired_workload_batches(fs::path const& directory)
         "reader version changed during a grouped absence observation");
     fs::remove(first.root / "retirement-version-change"); fs::remove(first.root / "version");
     { std::ofstream changed(first.root / "retirement-config-change"); changed << '1'; }
+#ifdef _WIN32
+    auto const config = first.root / "config/config.yaml";
+    auto const original = stream_state::stamp(config);
+    observed = observe_source_batches_retired(first, catalog, batches, {}, &scope);
+    require(observed.no_loaded_records[0] && observed.no_loaded_records[1] && stream_state::stamp(config) == original,
+        "native config pin allowed the registry process to change the reviewed configuration");
+#else
     rejects([&] { (void)observe_source_batches_retired(first, catalog, batches, {}, &scope); },
         "reader configuration changed during a grouped absence observation");
+#endif
     fs::remove(first.root / "retirement-config-change");
     {
         auto bounded = first; bounded.limits.memory_bytes = 64 * 1024 * 1024;
@@ -1203,7 +1215,7 @@ void farming_log(fs::path const& directory)
     using namespace std::chrono;
     fs::create_directories(directory / "config"); fs::create_directory(directory / "logs");
     auto const config = directory / "config/config.yaml", log = directory / "logs/harvester.log";
-    std::string const settings = "logging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
+    std::string const settings = "self_hostname: localhost\nlogging: &logging\n  log_stdout: False\n  log_filename: logs/harvester.log\nharvester:\n  num_threads: 4\n  plot_directories: []\n  logging: *logging\n";
     { std::ofstream out(config); out << settings; }
     auto const wall = system_clock::now(); auto const begin = FarmingLogSampler::Clock::now();
     auto record = [&](std::string_view elapsed, system_clock::time_point when = system_clock::now())
@@ -1218,10 +1230,111 @@ void farming_log(fs::path const& directory)
     write(record("9.00000", wall));
     HarvesterAdapterOptions options; options.root = directory; options.host = profile_detail::host_name();
     FarmingLogSampler sampler(options);
+    auto const grant = LocalFarmingService::memory_bound() + DiskIoGovernor::initial_memory_bytes();
+    require(!LocalFarmingService::start(directory, 8000000000, grant - 1), "local observation exceeded its owner memory grant");
+    auto local = LocalFarmingService::start(directory, 8000000000, grant);
+    require(local && local->governor->farming_service().log_observed && !local->governor->farming_service().completions &&
+        !local->governor->limits_io(), "headless selection replayed a historical lookup or throttled without pressure");
+    // The ordinary owner has no dashboard thread. Its selected reader alone
+    // must deliver timely pressure to the same permits used by external I/O.
+    auto wait_for = [&](auto const& predicate)
+    {
+        auto const until = steady_clock::now() + seconds(5);
+        while (!predicate() && steady_clock::now() < until) std::this_thread::sleep_for(milliseconds(25));
+        require(predicate(), "headless local farm sampler failed to observe an appended completion");
+    };
+    auto quick = record("0.04000"); quick.replace(quick.find("3 plots"), 1, "0"); write(quick);
+    wait_for([&] { return local->governor->farming_service().completions == 1; });
+    require(!local->governor->status().farming_known && !local->governor->limits_io(),
+        "zero-eligible service alone established farming capacity");
+    write(record("8.82000")); wait_for([&] { return local->governor->limits_io(); });
+    auto const incident = local->governor->farming_service();
+    require(incident.eligible_completions == 1 && incident.zero_eligible_completions == 1 && incident.missed_deadline == 1 &&
+        incident.max_ns == 8820000000 && !local->governor->limits_io(steady_clock::now() + seconds(31)),
+        "ordinary eligible deadline miss did not back off the I/O governor or stale pressure persisted");
+    local.reset();
+    StorageDevice shared{"shared", {"disk-a"}}, alias{"alias", {"disk-a"}}, unrelated{"other", {"disk-b"}}, unknown;
+    auto forwarded = LocalFarmingService::start({}, 8000000000, grant + 65536, {{log, {shared}}});
+    require(forwarded && forwarded->governor->scoped() && !forwarded->governor->limits_io(),
+        "forwarded log replayed a record from before subscription");
+    write(record("8.00000", wall - minutes(2)) + quick);
+    wait_for([&] { return forwarded->governor->farming_service().completions == 1; });
+    require(!forwarded->governor->farming_service().lookup_pressure && !forwarded->governor->limits_io(),
+        "stale or fast zero-eligible shared lookups became live pressure");
+    write(record("4.50000") + record("0.02000"));
+    wait_for([&] { return forwarded->governor->limits_io(); });
+    auto const& io = *forwarded->governor;
+    require(io.farming_service().lookup_pressure == true && io.pressured(&alias) && !io.pressured() && !io.pressured(&unrelated) &&
+        io.covers(StorageDevice{shared.filesystem, {}}) && !io.covers(unknown),
+        "forwarded tail pressure spread beyond its associated hardware");
+    constexpr size_t transfer = 8 * 1024 * 1024;
+    auto permit = forwarded->governor->acquire(shared, transfer);
+    auto independent = forwarded->governor->try_acquire(unrelated, transfer);
+    require(permit.bytes() < transfer && independent && independent->bytes() == transfer &&
+        !forwarded->governor->try_acquire(alias, transfer), "forwarded pressure blocked unrelated I/O or missed a physical alias");
+    permit.complete(0, 0);
+    require(!io.farming_service(steady_clock::now() + seconds(31)).lookup_pressure &&
+        !io.limits_io(steady_clock::now() + seconds(31)), "stale forwarded lookups continued limiting I/O");
+    forwarded.reset();
+    auto const second = directory / "logs/other.log", missing = directory / "logs/absent.log";
+    { std::ofstream out(second); out << record("9.00000"); }
+    StorageDevice other_shared{"remote", {}}, other_alias{other_shared.filesystem, {}}, unbound{"quiet", {}};
+    auto multi = LocalFarmingService::start({}, 8000000000, grant + 2 * 1024 * 1024,
+        {{log, {shared}}, {second, {other_shared}}, {missing, {unbound}}});
+    require(multi && multi->governor->farming_sources() == 3 && !multi->governor->limits_io(),
+        "multiple forwarded files replayed old completions");
+    auto& scoped = *multi->governor;
+    write(record("5.00000"));
+    wait_for([&] { return scoped.pressured(&shared); });
+    require(!scoped.pressured(&other_shared) && !scoped.pressured(&unbound) &&
+        !scoped.farming_service(steady_clock::now(), 2).log_observed, "missing or quiet reader inherited pressure");
+    { std::ofstream out(second, std::ios::app); out << record("4.50000") << record("0.02000"); }
+    wait_for([&] { return scoped.pressured(&other_alias); });
+    auto first_io = scoped.try_acquire(shared, transfer), second_io = scoped.try_acquire(other_shared, transfer);
+    require(first_io && second_io && first_io->bytes() < transfer && second_io->bytes() < transfer &&
+        !scoped.try_acquire(alias, transfer) && !scoped.try_acquire(other_alias, transfer) &&
+        scoped.try_acquire(unbound, transfer)->bytes() == transfer, "different readers shared a limit or aliases bypassed one");
+    first_io->complete(0, 0); second_io->complete(0, 0);
+    std::string timely;
+    for (unsigned i = 0; i < 25; ++i) timely += record("0.02000");
+    write(timely);
+    wait_for([&] { return !scoped.pressured(&shared); });
+    require(scoped.farming_service().lookup_pressure == false && scoped.pressured(&other_shared) &&
+        scoped.try_acquire(alias, transfer)->bytes() == transfer && !scoped.pressured(),
+        "one reader's recovery changed a separate reader's active hardware limit");
+    multi.reset();
+    // Mix an installed local reader with another host. Only configured local
+    // storage and the explicitly bound remote storage have lookup evidence.
+    auto mixed_settings = settings;
+    mixed_settings.replace(mixed_settings.find("plot_directories: []"), std::string("plot_directories: []").size(),
+        "plot_directories:\n    - " + file_io::path_text(directory));
+    { std::ofstream out(config); out << mixed_settings; }
+    auto const local_storage = storage_device(directory);
+    std::array<StorageDevice, 2> targets{local_storage, other_shared};
+    auto mixed = LocalFarmingService::start(directory, 8000000000, grant + 1024 * 1024, {{second, {other_shared}}}, targets);
+    require(mixed && mixed->governor->farming_sources() == 2 && !mixed->governor->limits_io(), "mixed monitor failed to bind both readers");
+    write(record("5.00000"));
+    StorageDevice const local_mount{local_storage.filesystem, {}};
+    wait_for([&] { return mixed->governor->pressured(&local_mount); });
+    require(!mixed->governor->pressured(&other_shared) && !mixed->governor->pressured(&unbound),
+        "an installed local reader spilled pressure into a remote destination");
+    mixed.reset();
+    { std::ofstream out(config); out << settings; }
     require(!sampler.sample(begin, wall), "historical farming log was accepted as a current observation");
     write(record("0.25000", wall));
     require(sampler.sample(begin + seconds(1), wall) == 250000000, "fresh completed farming lookup time was not observed");
     require(!sampler.sample(begin + seconds(2), wall), "one farming completion was counted repeatedly");
+    FarmingServiceHistory observed;
+    auto observe = [&](FarmingServiceRecord const& event) { observed.add(event, 1000000000); };
+    auto zero = record("0.05000", wall); zero.replace(zero.find("3 plots"), 1, "0");
+    write(zero + record("2.00000", wall));
+    auto const polled = begin + milliseconds(2500);
+    require(sampler.sample(polled, wall, observe) == 2000000000, "multiple lookup records lost the governor's maximum");
+    auto const window = observed.window(polled);
+    require(window.log_observed && window.counts_known && window.completions == 2 && window.eligible_completions == 1 &&
+        window.zero_eligible_completions == 1 && window.loaded_plots == 500 && window.deadline_known && window.missed_deadline == 1 &&
+        window.p50_ns == 50000000 && window.p95_ns == 2000000000 && !observed.window(polled + seconds(31)).completions,
+        "completed log observations mixed arrivals, lost eligibility, or retained stale timing");
     auto partial = record("2.00000", wall); write(partial.substr(0, partial.size() - 1));
     require(!sampler.sample(begin + seconds(3), wall), "partial farming log record was accepted");
     write("\n"); require(sampler.sample(begin + seconds(4), wall) == 2000000000, "split farming record was lost");
@@ -1229,7 +1342,8 @@ void farming_log(fs::path const& directory)
     write(record("nan", wall)); write(record("-1", wall));
     require(!sampler.sample(begin + seconds(5), wall), "stale, future or invalid log duration became farming feedback");
     fs::rename(log, log.string() + ".1"); write(record("7.00000", wall));
-    require(!sampler.sample(begin + seconds(6), wall), "log rotation replayed an existing record");
+    require(!sampler.sample(begin + seconds(6), wall, observe) && observed.window(begin + seconds(6)).incomplete,
+        "log rotation replayed an existing record or left a complete-coverage claim");
     write(record("0.50000", wall)); require(sampler.sample(begin + seconds(7), wall) == 500000000, "rotated log did not recover on a fresh append");
     write("truncated\n", false); require(!sampler.sample(begin + seconds(8), wall), "truncation reused an old partial record");
     write(record("0.75000", wall)); require(sampler.sample(begin + seconds(9), wall) == 750000000, "truncated log could not resume observations");
@@ -1238,12 +1352,20 @@ void farming_log(fs::path const& directory)
     auto remote = options; remote.host = "unreviewed-remote-host"; FarmingLogSampler remote_sampler(remote);
     require(!remote_sampler.sample(begin, wall), "local CLI log became a remote farming observation");
     auto retired = settings; auto const dirs = retired.find("plot_directories: []");
-    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - /remaining-plots");
+    std::ostringstream remaining; profile_detail::quote(remaining, file_io::path_text(directory / "remaining-plots"));
+    retired.replace(dirs, std::string("plot_directories: []").size(), "plot_directories:\n    - " + remaining.str());
     { std::ofstream out(config); out << retired; }
     write(record("1.25000", wall)); require(sampler.sample(begin + seconds(11), wall) == 1250000000,
         "ordinary plot-directory retirement permanently disabled unchanged farming telemetry");
     { std::ofstream out(config); out << settings << "changed: true\n"; }
-    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall), "changed reader logging configuration supplied old-context feedback");
+    write(record("1.50000", wall)); require(!sampler.sample(begin + seconds(12), wall, observe), "changed reader logging configuration supplied old-context feedback");
+    { std::ofstream out(config); out << settings; }
+    require(!sampler.sample(begin + seconds(13), wall, observe), "restoring the selected reader replayed records from an unbound interval");
+    write(record("0.12500", wall)); require(sampler.sample(begin + seconds(14), wall, observe) == 125000000,
+        "restored local reader did not recover fresh farming evidence");
+    auto remote_config = settings; remote_config.replace(remote_config.find("localhost"), std::string("localhost").size(), "remote.example");
+    { std::ofstream out(config); out << remote_config; }
+    require(!LocalFarmingService::start(directory, 8000000000, grant), "an ordinary remote RPC configuration supplied local farming evidence");
     fs::remove_all(directory);
 }
 int main(int argc, char** argv)

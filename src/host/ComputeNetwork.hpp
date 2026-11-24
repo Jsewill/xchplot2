@@ -2,6 +2,7 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -47,6 +48,9 @@ struct TlsOptions
     // Diagnostic probes enforce saved membership without learning/persisting
     // peer policies. No policy exchange is negotiated on these channels.
     bool read_only_membership = false;
+    // Opt in on direct generation channels. Older peers keep the original
+    // empty result terminator when TLS does not negotiate the timed protocol.
+    bool generation_timing = false;
 };
 // A numeric route avoids the synchronous hostname resolver. Scoped IPv6
 // interface suffixes are local routing information and are accepted here.
@@ -61,10 +65,13 @@ public:
     void u16(uint16_t value);
     void u32(uint32_t value);
     void u64(uint64_t value);
+    void words(std::span<uint64_t const> values);
     void bytes(std::span<uint8_t const> value);
     void string(std::string const& value);
     std::vector<uint8_t> const& data() const { return data_; }
+    void clear() { data_.clear(); }
 private:
+    template <typename T> void integer(T value);
     void reserve(size_t bytes);
     uint32_t limit_;
     std::vector<uint8_t> data_;
@@ -77,11 +84,13 @@ public:
     uint16_t u16();
     uint32_t u32();
     uint64_t u64();
+    void words(std::span<uint64_t> values);
     std::span<uint8_t const> bytes(uint32_t limit);
     std::string string(uint32_t limit = 4096);
     void finish() const;
     size_t remaining() const { return data_.size() - position_; }
 private:
+    template <typename T> T integer();
     std::span<uint8_t const> take(size_t bytes);
     std::span<uint8_t const> data_;
     size_t position_ = 0;
@@ -109,6 +118,9 @@ public:
                            std::chrono::steady_clock::time_point connect_deadline = std::chrono::steady_clock::time_point::max());
     void send(Message, std::span<uint8_t const> payload);
     Frame receive();
+    // Run the callback before the first socket wait or before returning a
+    // ready frame. The final membership check follows local delivery.
+    void receive(Frame& frame, std::function<void()> const& before_wait = {});
     // Shorten future operations on an exclusively owned channel; never extend
     // a deadline already imposed by its creator or an earlier task boundary.
     void set_deadline(std::chrono::steady_clock::time_point);
@@ -124,9 +136,16 @@ public:
     // not consume application bytes or wait for a request/response.
     bool peer_closed();
     std::string const& peer_identity() const;
+    // Physical adapter associated with this socket's local address, when
+    // unique. Virtual, ambiguous and unavailable paths return zero.
+    uint32_t ingress_interface() const noexcept;
+    std::string local_address() const;
+    bool generation_timing() const;
     std::string const& peer_node_id() const;
     explicit operator bool() const noexcept { return bool(impl_); }
     uint32_t max_frame_bytes() const;
+    // A reusable frame may also hold an enrolled policy update.
+    static uint32_t frame_buffer_bytes(uint32_t max_frame_bytes);
     static uint64_t memory_bytes(uint32_t max_frame_bytes);
     void close() noexcept;
 private:
@@ -158,5 +177,5 @@ void validate_tls_credentials(TlsOptions const&);
 std::string certificate_node_id(std::string const& cert_file);
 Endpoint parse_endpoint(std::string const&);
 // Address of the local interface used to reach this peer; sends no data.
-std::string local_address(Endpoint const&);
+std::string local_address(Endpoint const&, uint32_t* physical_interface = nullptr);
 } // namespace group_grow::pool

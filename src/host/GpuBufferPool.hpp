@@ -50,6 +50,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 
 namespace pos2gpu {
@@ -144,8 +145,8 @@ struct GpuBufferPool {
 
     // Release an idle output slot when switching to a bounded consumer. The
     // caller must finish every host consumer and exclude concurrent slot use
-    // first. Waits for queued device work; leaves the slot accounted as live
-    // if waiting or freeing throws. Existing batch callers may keep all slots.
+    // first. A failed wait keeps the slot live. An unconfirmed driver free is
+    // charged to the owning worker without a second free of the same pointer.
     void release_pinned(int idx);
 
     // Returns pool.d_pair_a, allocating it on first use. Deferred
@@ -181,6 +182,7 @@ struct GpuBufferPool {
     void release_pair_a();
 
 private:
+    void release_allocations(bool partial = false) noexcept;
     std::mutex pinned_mu_[kNumPinnedBuffers];
     std::mutex pair_a_mu_;
 };
@@ -219,6 +221,12 @@ bool device_memory_probe(int device_ordinal,
                          size_t& free_bytes,
                          size_t& total_bytes,
                          bool    physical_space = false);
+
+// Current allocatable worker headroom, including its own confirmed resident
+// device buffers when they can be reused or released. A valid zero means full.
+// An explicit operator partition may use the runtime's own reading if the
+// separate Windows HIP adapter counter is unavailable.
+std::optional<size_t> worker_gpu_headroom(int device_ordinal, size_t resident = 0, bool permit_runtime_only = false);
 
 // VRAM the picker holds back beyond a path's model peak, shared by the pool
 // gate and the streaming tier picker.

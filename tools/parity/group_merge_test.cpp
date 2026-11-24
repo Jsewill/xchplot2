@@ -710,6 +710,46 @@ Config configuration()
     result.memory_limit_bytes = std::max(Engine::memory_bytes(18, result, 16), MergeEngine::memory_bytes(18, result, 16));
     return result;
 }
+void native_cpu_budget()
+{
+    using namespace grow_controller_test;
+    Arguments args; args.backend = "cpu"; args.workers = 1;
+    Backend backend; backend.mode = "cpu";
+    backend.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    auto const requested = identity_from(identity());
+    std::thread::id producer;
+    std::atomic<bool> started{false}, escaped{false}, released{false};
+    std::atomic<unsigned> generation_checks{0};
+    args.cancelled = [&]
+    {
+        if (std::this_thread::get_id() != producer) escaped.store(true);
+        if (released.load()) ++generation_checks;
+        return false;
+    };
+    std::future<Member> generated;
+    {
+        CodecScheduler::Lease occupied(backend.cpu_scheduler.get());
+        generated = std::async(std::launch::async, [&]
+        {
+            producer = std::this_thread::get_id();
+            started.store(true);
+            return backend.generate(requested, 0, args, nullptr, nullptr);
+        });
+        while (!started.load()) std::this_thread::yield();
+        require(generated.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready,
+            "native CPU generation escaped the shared plotting budget");
+        released.store(true);
+    }
+    auto output = generated.get();
+    require(output.size() && generation_checks.load() > 1 && !escaped.load(),
+        "native CPU generation used a thread outside its one-lane grant");
+    { CodecScheduler::Lease reclaimed(backend.cpu_scheduler.get()); }
+    args.cancelled = [] { return true; };
+    bool interrupted = false;
+    try { (void)backend.generate(requested, 0, args, nullptr, nullptr); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted, "native CPU budget wait ignored cancellation");
+}
 std::vector<std::vector<uint64_t>> members(size_t count = 8, uint64_t symbols = 64)
 {
     std::vector<std::vector<uint64_t>> result(count);
@@ -2760,6 +2800,44 @@ void destination_admission()
     auto memory = [](unsigned workers, uint16_t batch)
     { return 256 * mib + workers * mib + uint64_t(batch) * 4096; };
     auto neutral = [](size_t active, unsigned, uint16_t) { return 1.0L / active; };
+    auto packing = [&](size_t writers, size_t limit, uint64_t bytes)
+    { return destination_plan(bytes, metadata, 0, 0, 3, 1, 1, 1, memory, neutral, limit, writers); };
+    require(packing(0, 0, budget).active == 1 && packing(1, 0, budget).active == 2 &&
+        packing(2, 0, budget).active == 3 && packing(0, 1, budget).active == 1 &&
+        packing(1, 1, budget).active == 2 &&
+        packing(2, 0, metadata + 2 * memory(1, 1)).active == 2,
+        "packing writers did not share a codec worker within the RAM and receiver limits");
+    require(pooled_scratch_receivers(3, 2, 0, 0) == 2 && pooled_scratch_receivers(3, 2, 1, 1) == 2 &&
+        pooled_scratch_receivers(3, 2, 3, 2) == 2 && pooled_scratch_receivers(3, 2, 3, 3) == 3,
+        "pooled scratch sized a singleton probe like a batch receiver or ignored a useful measured route");
+    require(pooled_scratch_receivers(3, 3, 0, 0) == 3 && pooled_scratch_receivers(3, 3, 3, 2) == 2 &&
+        pooled_scratch_receivers(2, 2, 3, 1) == 2 && pooled_scratch_receivers(3, 0, 1, 1) == 3 &&
+        pooled_scratch_receivers(1, 0, 0, 0) == 1,
+        "pooled scratch discarded homogeneous capacity, used stale fleet timings or changed singleton fallback");
+    auto future_members = [](uint64_t committed, uint16_t batch, bool unopened, uint64_t room)
+    { return independent_pool_members(9, committed, batch, unopened, room, [](uint16_t n) { return 100 * uint64_t(n); }); };
+    require(future_members(0, 0, true, 100) == 9 && !future_members(0, 0, true, 99) &&
+        future_members(0, 4, false, 400) == 4 && future_members(3, 4, false, 399) == 3 &&
+        future_members(8, 4, false, 400) == 1 && !future_members(9, 4, false, 400) &&
+        !future_members(3, 0, false, 400) && !future_members(3, 0, true, 400) && !future_members(0, 0, false, 400),
+        "independent packed work ignored an admitted next batch or counted ordered and unadmitted members");
+    require(!packed_queue_fits_deadline(100'000'000, 1'200'000'000, 1e9L, 2000) &&
+        packed_queue_fits_deadline(1'100'000'000, 1'200'000'000, 1e9L, 2000) &&
+        !packed_queue_fits_deadline(1'200'000'000, 1'200'000'000, 1e9L, 2000) &&
+        !packed_queue_fits_deadline(1, 0, 1e9L, 2000) && !packed_queue_fits_deadline(50'000'000, 100'000'000, 1e9L, 1100),
+        "single-worker packed prequeue missed its grant poll, elapsed receipt or next batch deadline");
+    auto packed_lanes = [&](size_t unfinished, uint64_t inflight, uint64_t bytes)
+    {
+        // One full receiver and one independent busy writer occupy both ordinary lanes.
+        size_t const receiving = 1 + packed_successor_lane(2, 1, 1, unfinished, inflight);
+        return destination_plan(bytes, metadata, generation, member, unfinished, 8, 3, 3, memory,
+            neutral, receiving, 1);
+    };
+    require(packed_lanes(4, 2, budget).active == 3 && packed_lanes(4, 2, budget).batch == 3 &&
+        packed_lanes(4, 1, budget).active == 2 && packed_lanes(3, 2, budget).active == 2 &&
+        packed_lanes(4, 2, metadata + generation + 6 * member + 2 * memory(4, 3)).active == 2 &&
+        !packed_successor_lane(3, 1, 1, 8, 3),
+        "a measured packed successor exceeded RAM, the inflight cap or the remaining disjoint work");
     auto const bounded = destination_plan(budget, metadata, generation, member, independent, 32, 64, 1, memory, neutral);
     require(bounded.active > 1 && bounded.active < devices.size() && bounded.batch && bounded.workers,
         "many destinations did not activate a bounded useful subset");
@@ -2774,6 +2852,53 @@ void destination_admission()
         independent, 32, 16, 1, memory, [](size_t active, unsigned, uint16_t batch) { return (batch < 16 ? 10000.0L : 1.0L) / active; });
     require(expensive_rewrites.active < bounded.active && expensive_rewrites.batch == 16,
         "observed rewrite costs did not favor fewer larger batches");
+    auto hdd = [&](uint64_t room, bool whole)
+    {
+        return destination_plan(room * mib, 0, 0, mib, 4, 4, 3, 1,
+            [](unsigned, uint16_t) { return mib; }, neutral, 4, 0, whole);
+    };
+    auto const partial = hdd(7, false), together = hdd(7, true), limited = hdd(2, true);
+    require(partial.active == 4 && partial.batch == 1 && together.active == 2 && together.batch == 3 &&
+        limited.active == 1 && limited.batch == 2 && hdd(15, true).active == 4,
+        "fresh HDD admission failed to fit whole groups or fall back within the RAM budget");
+    auto const whole_workers = destination_plan(5 * mib, 0, 0, mib, 1, 8, 3, 1,
+        [](unsigned grant, uint16_t) { return grant * mib; }, neutral, 1, 0, true);
+    require(whole_workers.workers == 3 && whole_workers.batch == 3,
+        "whole-group HDD admission discarded a fitting intermediate worker grant");
+    auto finishing = [&](uint64_t room, PackingGrant pack)
+    {
+        return destination_plan(room, 0, 3 * mib, 3 * mib, 3, 6, 1, 1,
+            [](unsigned, uint16_t) { return mib; }, neutral, 2, 1, false, pack);
+    };
+    require(finishing(9 * mib, {}).active == 2 && finishing(9 * mib, {1, mib}).active == 3 &&
+        finishing(9 * mib - 1, {1, mib}).active == 2 && !finishing(9 * mib, {1, 7 * mib}).active,
+        "a sealed pack retained a generation slot or spent more than the actual remaining RAM");
+    auto const occupied = finishing(9 * mib, {3, 3 * mib});
+    require(!occupied.active && occupied.empty_reason == ControllerWait::destination_lanes &&
+        finishing(9 * mib, {1, 7 * mib}).empty_reason == ControllerWait::engine_memory,
+        "destination admission did not distinguish occupied lanes from exhausted workspace");
+    auto receivers = [&](uint64_t room, uint64_t publishing)
+    {
+        PackingGrant pack{3, 6 * mib, publishing};
+        auto retry = [&](size_t active, unsigned, uint16_t)
+        { return pack.can_recover(room, 0, (active - pack.active) * 2 * mib, 5 * mib, true) ?
+            1.L / active : std::numeric_limits<long double>::infinity(); };
+        return destination_plan(room, 0, 0, 0, 5, 5, 1, 1,
+            [](unsigned, uint16_t) { return 2 * mib; }, retry, 5, 0, false, pack).active;
+    };
+    require(receivers(11 * mib, 4 * mib) == 5 && receivers(11 * mib, 2 * mib) == 4 &&
+        receivers(9 * mib, 4 * mib) == 4 && !receivers(11 * mib, 0),
+        "streamed receivers lost a recoverable slot or spent a publishing writer's live memory");
+    for (auto room : {9 * mib, 10 * mib})
+    {
+        auto const owning = destination_plan(room, 0, 3 * mib, 3 * mib, 2, 4, 2, 1,
+            [](unsigned, uint16_t) { return 2 * mib; }, neutral, 1, 1);
+        auto const recoverable = admitted_batch_cap(2, 1, room - 3 * mib, 3 * mib, [](uint16_t) { return 2 * mib; });
+        auto const receiving = destination_plan(room, 0, 3 * mib, 0, 2, 4, recoverable, owning.batch,
+            [](unsigned, uint16_t count) { return 2 * mib + count * (mib / 8); }, neutral, 1, 1);
+        require(owning.active * owning.batch == 2 && receiving.active == 2 && receiving.batch == 2,
+            "bounded receivers lost a fitting parallel HDD or its recoverable batch");
+    }
     devices.back().drives.clear(); groups = writer_groups(devices);
     auto const unknown = destination_plan(budget, metadata, generation, member,
         *std::max_element(groups.begin(), groups.end()) + 1, 32, 64, 1, memory, neutral);
@@ -2824,14 +2949,230 @@ void destination_admission()
         "successor singleton fallback bypassed actual workspace admission");
 }
 
+void independent_terminal_dispatch()
+{
+    // Seven independent writers exceed the small exact-search ceiling.
+    // The longest write is already first, but the last, three-member batch
+    // determines when the complete farm becomes durable.
+    std::array<unsigned, 7> generation{3, 3, 3, 3, 3, 6, 9}, disk{24, 12, 12, 12, 12, 12, 21};
+    std::array<ExecutionReady, 7> ready;
+    std::array<ExecutionLane, 7> lanes;
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = generation[i]; work.cpu = 5; work.destination = disk[i];
+        work.known = work.io_overlap = true; work.batches = 1; lanes[i].destination = i;
+        ready[i] = {i, 0, work.cpu + work.destination, true, uint16_t(generation[i] / 3), false, work.generation};
+    }
+    std::array<size_t, 7> order{0, 1, 2, 3, 4, 5, 6};
+    auto completion = [&]
+    {
+        unsigned released = 0, last = 0;
+        for (auto i : order) { released += generation[i]; last = std::max(last, released + disk[i]); }
+        return last;
+    };
+    unsigned const ordinary = completion();
+    auto optimum = ordinary;
+    while (std::next_permutation(order.begin(), order.end())) optimum = std::min(optimum, completion());
+    auto const chosen = execution_terminal_first(ready, lanes, 7, 1);
+    require(chosen == 6 && ordinary == 51 && optimum == 42, "the ordinary critical writer was never promoted");
+    std::rotate(order.begin(), order.begin() + *chosen, order.begin() + *chosen + 1);
+    require(completion() == optimum && execution_terminal_first(ready, lanes, 2, 1) == chosen,
+        "the first grant missed the independently attainable durable lower bound");
+    require(!execution_terminal_first(ready, lanes, 1, 1), "the independent ordering overrode scarce packing CPU");
+    ready[0].deferrals = ready.size();
+    require(!execution_terminal_first(ready, lanes, 7, 1), "the critical writer overtook an aged grant");
+    ready[0].deferrals = 0; lanes[0].work.scratch_write = 1;
+    require(!execution_terminal_first(ready, lanes, 7, 1), "unattributed scratch service acquired an independent tail");
+    lanes[0].work.scratch_write = 0; lanes[0].work.destination = 39; ready[0].remaining = 44;
+    require(!execution_terminal_first(ready, lanes, 7, 1), "an equal completion changed ordinary terminal priority");
+
+    // The stable sorted suffix would price [1, 3, 2, 0] at 40, but its
+    // third grant is aged. The real rotating owner issues [1, 3, 0, 2]
+    // and finishes at 42, slower than the ordinary 41.
+    std::array<unsigned, 4> p{3, 2, 3, 1}, q{30, 38, 33, 23};
+    for (size_t i = 0; i < p.size(); ++i)
+    {
+        lanes[i].work.generation = p[i]; lanes[i].work.cpu = 1; lanes[i].work.destination = q[i];
+        ready[i] = {i, 0, static_cast<long double>(q[i] + 1), true, uint16_t(p[i]), false,
+            static_cast<long double>(p[i])};
+    }
+    std::array<size_t, 4> feasible{};
+    require(execution_terminal_first(std::span(ready).first(4), std::span(lanes).first(4), 4, 1, feasible) == 1 &&
+        feasible == std::array<size_t, 4>{1, 2, 3, 0}, "a saved terminal order priced work beyond the age fence");
+    for (size_t i = 0; i < 3; ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = std::array{2, 2, 1}[i]; work.destination = std::array{36, 20, 35}[i];
+        ready[i] = {i, size_t(std::array{2, 2, 1}[i]), work.cpu + work.destination, true,
+            uint16_t(work.generation), false, work.generation};
+    }
+    require(!execution_terminal_first(std::span(ready).first(3), std::span(lanes).first(3), 3, 1),
+        "an early fairness release turned ordinary 39 into a projected win but actual 40");
+
+}
+
+void farm_scale_execution()
+{
+    using namespace grow_controller_test;
+    std::vector<ExecutionLane> lanes(1024);
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& lane = lanes[i];
+        lane.destination = i; lane.members = 1;
+        lane.work.destination = lane.work.destination_bytes = 1; lane.work.batches = 1; lane.work.known = true;
+    }
+    // Put the expensive writer beyond the terminal order search's mask.
+    // Independent disks can overlap; aliases owe the sum, even when every
+    // logical destination can receive. A measured joint rate also covers
+    // output traffic in the absence of any scratch files.
+    lanes.back().work.destination = 4096;
+    auto estimate = [&](long double shared = 0)
+    { return pipeline_execution_estimate(lanes, 32, 2, 1, lanes.size(), true, 0, lanes.size() - 1, shared); };
+    auto independent = estimate();
+    require(independent.known && independent.remaining_members == lanes.size() && independent.target_release >= 4096 &&
+        independent.limit == ExecutionLimit::disk, "a late physical writer disappeared from the farm forecast");
+    auto joint = estimate(.125L);
+    require(joint.known && joint.completion >= lanes.size() / .125L && joint.limit == ExecutionLimit::shared_storage,
+        "an observed shared storage ceiling was multiplied by destination count");
+    for (auto& lane : lanes) lane.destination = 0;
+    auto aliases = estimate();
+    require(aliases.completion == 4096 + lanes.size() - 1 && aliases.completion > independent.completion,
+        "physical aliases created independent farm-scale writer service");
+    lanes.back().work.known = false;
+    auto partial = estimate();
+    require(!partial.known && partial.unmeasured == 1 && partial.remaining_members == aliases.remaining_members &&
+        partial.lower_bound == aliases.lower_bound, "unmeasured late service erased measured physical work");
+    ConstructionForecast rewrite; rewrite.members = 2; rewrite.batches = 1;
+    rewrite.incremental.read = rewrite.incremental.write = 10; rewrite.incremental.syncs = 1;
+    ConstructionHistory history; ConstructionSample sample;
+    sample.elapsed_ns = 100; sample.written_bytes = 10; sample.write_ns = 20;
+    sample.cpu_measured = sample.serial_cpu_measured = true; sample.codec_bytes = 10;
+    history.add(sample);
+    auto priced = construction_execution_work(rewrite, history, 1, false);
+    require(!priced.known && priced.missing == missing_destination && priced.destination == sample.write_ns,
+        "a fresh write supplied unobserved prefix read or sync performance");
+    sample.read_bytes = 10; sample.read_ns = 30; sample.syncs = 1; sample.sync_ns = 40;
+    history.add(sample); priced = construction_execution_work(rewrite, history, 1, false);
+    require(priced.known && priced.destination == sample.read_ns + sample.write_ns + sample.sync_ns,
+        "matched output observations did not cover growth through sync");
+
+    lanes.resize(2);
+    lanes[0].destination = 0; lanes[0].work.destination = 4;
+    lanes[1].destination = 1; lanes[1].work.destination = 2;
+    auto future = lanes[0]; future.predecessor = 0; future.work = {}; future.members = 20000;
+    future.work.add_files(lanes[0].work, future.members); lanes.push_back(future);
+    auto const no_loan = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true, 0, 1);
+    // The first writer borrows the second HDD. Return it at the first
+    // publication so the other owner can start before the long rollover tail.
+    lanes[0].scratch = {{1, 1, 0, true}}; lanes[0].committed = true;
+    auto const loan = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true, 0, 1);
+    require(loan.known && loan.rollover_members == future.members && loan.remaining_members == future.members + 2 &&
+        std::fabs(loan.completion - 4 * (future.members + 1)) < 1e-7L && loan.target_release == no_loan.target_release + 4,
+        "a borrowed future destination lost its release boundary or its repeated publication cost");
+    lanes[2].work.known = lanes[0].work.known = false;
+    auto unknown = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true);
+    require(!unknown.known && unknown.unmeasured == 1 && unknown.rollover_members == future.members,
+        "incomplete evidence on one writer became several unknown destinations or hid future files");
+
+    FarmingRun farm; farm.state.fixed_extent = true; farm.lanes.resize(1); farm.state.directories.resize(1);
+    auto& directory = farm.state.directories[0]; auto& layout = directory.layout;
+    layout.total_members = 133; layout.files = 34; layout.group_members = 4; layout.fixed_members = true; layout.meta_slots = 4;
+    Arguments args;
+    auto saved = farm.construction_rollovers(args, 0, 4);
+    require(saved.next.members == 4 && saved.next.meta == layout.meta(1) && saved.members == layout.total_members - 4 &&
+        !saved.open && !saved.unmeasured_members, "fixed farm horizon lost its terminal partial or collection schedule");
+    args.max_groups = 4; args.max_total_members = 13;
+    saved = farm.construction_rollovers(args, 0, 4);
+    require(saved.members == 9, "farm horizon exceeded the member limit inside its last file");
+    farm.state.capacity_fill = true; directory.extents = {3, 1, 2, 3, 4, 1}; args.max_total_members = 64;
+    saved = farm.construction_rollovers(args, 0, 3);
+    require(saved.members == 6 && saved.next.members == 1 && !saved.open,
+        "farm horizon replaced admitted extents with uniform groups or exceeded its file cap");
+    args.max_groups = 64;
+    require(farm.construction_rollovers(args, 0, 3).open, "unused capacity beyond admitted extents appeared fixed");
+    farm.lanes[0].ordinal = directory.extents.size(); farm.lanes[0].completed_members = 14;
+    auto waiting = farm.construction_rollovers(args, 0, 0);
+    require(waiting.open && !waiting.members && !waiting.next.members,
+        "an ungranted farm extent counted the preceding publication twice");
+    args.max_total_members = farm.lanes[0].completed_members;
+    require(!farm.construction_rollovers(args, 0, 0).open, "a limit-complete farm still waited for another extent");
+    args.max_total_members = 64;
+    directory.control = "draining";
+    require(!farm.construction_rollovers(args, 0, 3).members, "draining a writer still priced unstarted rollovers");
+}
+
 void execution_planning()
 {
     using namespace grow_controller_test;
+    farm_scale_execution();
+    // Independent small oracle: enumerate every integer start for the two
+    // writes after serial generation, rejecting overlapping shared writers.
+    // Fixed orders let us check incumbent commitments as well as the optimum.
+    auto oracle = [](unsigned first, unsigned second, bool shared)
+    {
+        unsigned best = 8 + first + second;
+        for (unsigned a = 4; a + first <= best; ++a)
+            for (unsigned b = 8; b + second <= best; ++b)
+                if (!shared || a + first <= b || b + second <= a)
+                    best = std::min(best, std::max(a + first, b + second));
+        return best;
+    };
+    std::array<ExecutionLane, 2> two;
+    for (auto& lane : two)
+    { lane.work.generation = 4; lane.work.batches = 1; lane.work.known = lane.work.io_overlap = true; }
+    auto finish = [&] { return pipeline_execution_estimate(two, 2, 1, 1, 3, true); };
+    for (bool shared : {false, true}) for (unsigned a : {1u, 4u, 9u}) for (unsigned b : {1u, 4u, 9u})
+    {
+        two[0].destination = 0; two[1].destination = shared ? 0 : 1;
+        two[0].work.destination = a; two[1].work.destination = b;
+        auto const projected = finish();
+        require(projected.known && projected.completion == oracle(a, b, shared) && projected.lower_bound <= projected.completion,
+            "independent enumeration disagreed with the forecast for a fixed dispatch order");
+    }
+    require(oracle(1, 9, false) == 17 && oracle(9, 1, false) == 13, "small scheduling oracle lost the final drain");
+    two[0].destination = 0; two[0].work.destination = 1;
+    two[1].destination = 1; two[1].work.destination = 9;
+    auto const grant = pipeline_execution_estimate(two, 2, 1, 1, 3, true, 0, 0);
+    require(grant.target_release == 5 && grant.completion == 17,
+        "a group grant acquired the cohort's final publication time");
+    two[1].committed = true; two[1].ready_after = 10;
+    two[1].work.generation = 0; two[1].work.destination = 3; two[1].destination = 1;
+    two[0].work.destination = 1;
+    two[1].scratch = {{two[0].destination, 1, 0, true}};
+    require(finish().completion == 18, "a queued destination used a committed scratch spindle before durable release");
+    two[1].scratch = {{2, 1, 0, true}};
+    require(finish().completion == 13, "a delayed delivery blocked an independent destination");
+    two[1].work.known = false;
+    require(!finish().known && finish().unmeasured == 1 && finish().lower_bound > 0,
+        "missing service evidence erased the committed receipt or invented a complete upper bound");
+    SharedConstructionHistory ram, scratch;
+    SharedConstructionHistory::Publication::Shape load{3, 1};
+    auto modes = [&](bool trial)
+    { return choose_construction_mode(false, load, load, &ram, &scratch, trial); };
+    require(!modes(true).external, "a cold optional mode displaced a whole fitting group");
+    ram.publication.begin(load); ram.publication.times.add(3, 300);
+    require(!modes(false).external && modes(true).reason == ConstructionModeReason::trial,
+        "scratch trial ignored remaining useful work or the measured RAM control");
+    scratch.publication.begin(load);
+    require(!modes(true).external, "an incomplete scratch trial ran repeatedly");
+    scratch.publication.times.add(3, 150);
+    require(modes(false).external, "a fitting RAM group excluded faster measured scratch at the same cap");
+    auto old_roster = std::make_shared<int>(), joined = std::make_shared<int>();
+    load.supply = {2, old_roster}; scratch.publication.begin(load); scratch.publication.times.add(3, 150);
+    load.supply = {2, joined};
+    require(!scratch.publication.rate(load), "an equal-slot worker replacement retained the previous route comparison");
+    require(!choose_construction_mode(false, load, load, nullptr, nullptr, false, 100, 99).external &&
+        choose_construction_mode(false, load, load, nullptr, nullptr, false, 100, 70).external,
+        "whole-schedule selection lost its incumbent or ignored a faster feasible scratch schedule");
     GenerationHistory generation;
     require(generation.member_ns() == 0, "cold generation acquired an invented rate");
     for (unsigned i = 0; i < 8; ++i) generation.add(4, 400);
     generation.add(1, 10000);
     require(generation.member_ns() == 100, "generation history lost its bounded robust rate");
+    generation.add(2, 1000, 22, 2);
+    require(generation.member_ns(22, 2) == 500 && !generation.member_ns(28, 2) && !generation.member_ns(22, 3),
+        "a changed farm cohort inherited an incompatible local generation rate");
     std::vector<ExecutionLane> lanes;
     for (size_t i = 0; i < 60; ++i)
     {
@@ -2840,11 +3181,12 @@ void execution_planning()
         lanes.push_back({work, i});
     }
     auto memory = [](unsigned, uint16_t batch) { return mib + uint64_t(batch) * 4096; };
-    auto select = [&](size_t resources)
+    auto select = [&](size_t resources, unsigned workers = 24)
     {
-        return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), 24, 16, 1, memory,
-            [&](size_t active, unsigned workers, uint16_t)
-            { return pipeline_execution_estimate(lanes, active, 24, workers, resources, true).completion; });
+        return destination_plan(14000000000ull, mib, mib, mib, lanes.size(), workers, 16, 1, memory,
+            [&](size_t active, unsigned grant, uint16_t)
+            { return pipeline_execution_estimate(lanes, active, workers, grant, resources, true).completion; },
+            lanes.size(), 0, false, {}, construction_margin(1));
     };
     auto const producer_bound = select(lanes.size());
     require(producer_bound.active == 1,
@@ -2852,26 +3194,87 @@ void execution_planning()
     for (auto& lane : lanes) { lane.work.generation = 1; lane.work.destination = 1000; }
     auto const independent = select(lanes.size());
     require(independent.active > 1, "independent measured outputs did not admit useful overlap");
+    require(select(lanes.size(), 1).active > 1, "one shared codec worker serialized independent measured HDDs");
     for (auto& lane : lanes) lane.destination = 0;
-    require(select(1).active == 1, "partitions multiplied one physical output's execution capacity");
+    require(select(1).active == 1 && select(1, 1).active == 1, "partitions multiplied one physical output's execution capacity");
     for (size_t i = 0; i < lanes.size(); ++i)
     {
-        lanes[i].destination = i; lanes[i].scratch = lanes.size();
+        lanes[i].destination = i; lanes[i].scratch = {{lanes.size(), 1}};
         lanes[i].work.destination = 1; lanes[i].work.scratch_read = lanes[i].work.scratch_write = 1000;
     }
     require(select(lanes.size() + 1).active == 1, "shared scratch demand was divided by active destinations");
     lanes.back().work.known = false;
     require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
         "an unmeasured destination inherited another drive's service rate");
-    lanes.back().work.known = true; lanes.back().scratch = SIZE_MAX;
+    lanes.back().work.known = true; lanes.back().scratch.clear();
     require(!pipeline_execution_estimate(lanes, 1, 24, 24, lanes.size() + 1, true).known,
         "unknown scratch attribution acquired an execution estimate");
+    independent_terminal_dispatch();
     std::array<ExecutionReady, 3> ready{{{7, 0, 100, true}, {8, 0, 300, true}, {9, 0, 200, true}}};
     require(execution_generation_order(ready) == 8, "generation did not start the longest measured downstream tail");
     ready.back().known = false;
-    require(execution_generation_order(ready) == 7, "unknown consumers changed the safe rotating generation order");
+    require(execution_generation_order(ready) == 8, "an unmeasured consumer erased observed downstream tails");
+    ready[1].members_to_pack = 2; ready[2].members_to_pack = 1;
+    require(execution_generation_order(ready) == 9, "cold generation did not release the nearest packable group");
+    ready[2].known = true;
+    require(execution_generation_order(ready) == 9, "a measured downstream tail delayed the nearest idle drive");
+    ready[1].time_to_write = 2; ready[2].time_to_write = 10;
+    require(execution_generation_order(ready) == 8, "the scheduler ignored different measured member production times");
+    ready[2].tight_capacity = true;
+    require(execution_generation_order(ready) == 8, "speculative capacity probe delayed a fitting measured destination");
+    ready[1].tight_capacity = true;
+    require(execution_generation_order(ready) == 7, "speculative capacity probes displaced a fitting destination");
     ready.back().deferrals = ready.size();
-    require(execution_generation_order(ready) == 9, "measured generation order starved a deferred destination");
+    require(execution_generation_order(ready) == 9, "generation order starved a deferred capacity probe");
+    std::array<ExecutionReady, 3> final{{{8, 0, 1, true, 1, false, 1}, {9, 0, 2, true, 2, false, 2}, {10, 0, 10, true, 3, false, 3}}};
+    std::array<ExecutionLane, 3> terminal{{{{1, 0, 0, 0, 0, 1, 1, true, true}, 4},
+        {{2, 0, 0, 0, 0, 2, 1, true, true}, 7}, {{3, 0, 0, 0, 0, 10, 1, true, true}, 12}}};
+    require(execution_generation_order(final) == 8 && execution_terminal_first(final, terminal, 3, 1) == 10 &&
+        execution_terminal_first(std::span(final).subspan(1), std::span(terminal).subspan(1), 2, 1) == 10,
+        "a short first receipt lengthened publication across independent idle disks");
+    final[0].deferrals = final.size(); require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering starved an aged destination");
+    final[0].deferrals = 0; final[1].tight_capacity = true;
+    require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering displaced a fitting destination");
+    final[1].tight_capacity = false; terminal[2].destination = terminal[0].destination;
+    require(!execution_terminal_first(final, terminal, 3, 1), "terminal ordering multiplied a shared physical writer");
+    terminal[2].destination = 12; terminal[1].work.batches = 2;
+    require(!execution_terminal_first(final, terminal, 3, 1), "partial final service was treated as a complete batch");
+    terminal[1].work.batches = 1; terminal[1].work.known = false;
+    require(!execution_terminal_first(final, terminal, 3, 1), "unmeasured final service changed generation order");
+    for (size_t i = 0; i < terminal.size(); ++i)
+    {
+        auto& work = terminal[i].work; work.known = true;
+        work.generation = std::array{4, 6, 9}[i]; work.cpu = std::array{9, 4, 9}[i]; work.destination = std::array{8, 5, 13}[i];
+        final[i].time_to_write = work.generation; final[i].remaining = work.cpu + work.destination;
+    }
+    std::array<size_t, 3> dispatch{};
+    require(execution_terminal_first(final, terminal, 1, 1, dispatch) == final[0].index && dispatch == std::array<size_t, 3>{0, 2, 1},
+        "the terminal schedule missed the 26-unit order after pricing 32 and 31 units");
+    TerminalGenerationPlan plan; std::array<TerminalGenerationBatch, 3> inputs{};
+    for (size_t i = 0; i < inputs.size(); ++i) inputs[i] = {final[i].index, terminal[i].destination, 1, 0, final[i].members_to_pack};
+    auto roster = std::make_shared<int>(1); GenerationSupply supply{1, roster};
+    require(plan.choose(final, terminal, inputs, 3, 1, 1, supply, true, 1, 100) == final[0].index,
+        "the controller omitted the first exact terminal grant");
+    plan.grant(final[0].index, inputs[0].count);
+    auto const pending = std::span(final).subspan(1); auto const remaining = std::span(inputs).subspan(1);
+    require(execution_generation_order(pending) == final[1].index &&
+        plan.choose(pending, std::span(terminal).subspan(1), remaining, 3, 1, 1, supply, true, 2, 100) == final[2].index,
+        "the first pending receive restored ordinary order before the second terminal grant");
+    auto accepted = plan; accepted.grant(final[2].index, inputs[2].count);
+    require(accepted.next(remaining.first(1), pending.first(1), supply, 3) == final[1].index,
+        "the final ordinary grant lost its planned member range");
+    accepted.grant(final[1].index, inputs[1].count); require(!accepted.count, "completed terminal grants kept an order");
+    inputs[2].plot[0] = 1; require(!plan.next(remaining, pending, supply, 2), "changed member kept the saved terminal order");
+    inputs[2].plot[0] = 0; inputs[2].time_to_write = 10;
+    require(!plan.next(remaining, pending, supply, 2), "changed ordinary priority kept an earlier terminal forecast");
+    inputs[2].time_to_write = 0; final[2].deferrals = pending.size();
+    require(!plan.next(remaining, pending, supply, 2), "a saved terminal order bypassed an aged grant");
+    final[2].deferrals = 0; auto replacement = std::make_shared<int>(1);
+    require(!plan.next(remaining, pending, {1, replacement}, 2) && !plan.next(remaining, pending, supply, 100),
+        "a replaced worker or elapsed horizon kept the saved terminal order");
+    plan.grant(final[1].index, inputs[1].count); require(!plan.count, "a different actual grant retained a terminal plan");
+    for (auto& lane : terminal) { lane.work.generation = 1; lane.work.cpu = 1; lane.work.destination = 1; }
+    require(!execution_terminal_first(final, terminal, 1, 1, dispatch), "equal terminal completions changed ordinary priority");
 
     Config cfg; cfg.capacity_bytes = 1000000000000ull; cfg.window_bytes = mib;
     cfg.checkpoint_bytes = 16 * mib; cfg.workers = 24; cfg.merge_inputs = 4;
@@ -2952,11 +3355,158 @@ void execution_planning()
         "a heterogeneous peer consumed another owner's ordinary singleton fallback headroom");
     std::array<ExecutionLane, 2> mixed;
     for (auto& lane : mixed) { lane.work.generation = 1; lane.work.batches = 1; lane.work.known = lane.work.io_overlap = true; }
-    mixed[0].destination = 0; mixed[0].scratch = 1; mixed[0].work.scratch_write = 1000;
+    mixed[0].destination = 0; mixed[0].scratch = {{1, 1}}; mixed[0].work.scratch_write = 1000;
     mixed[1].destination = 1; mixed[1].work.destination = 1000;
     auto const same_nvme = pipeline_execution_estimate(mixed, 2, 24, 12, 2, true);
     require(same_nvme.known && same_nvme.completion >= mixed[0].work.scratch_write + mixed[1].work.destination,
         "NVMe output and another owner's scratch multiplied the same physical resource");
+    mixed[0].scratch = {{1, 2}, {2, 1}, {2, 1}}; mixed[0].parallel_scratch = true;
+    mixed[0].work.scratch_bytes = 3000;
+    auto stripe = [&](long double bandwidth)
+    { return pipeline_execution_estimate(mixed, 2, 24, 12, 3, false, bandwidth).completion; };
+    require(stripe(0) == 1502 && stripe(1) == 3002,
+        "striped execution lost shared destination service or exceeded observed simultaneous bandwidth");
+    mixed[1].work.destination = 0;
+    require(stripe(0) == 502, "two paths to one scratch disk multiplied its parallel service");
+    mixed[0].parallel_scratch = false;
+    require(stripe(0) == 1002, "an unmeasured stripe earned an unobserved bandwidth gain");
+    mixed[0].parallel_scratch = true;
+    mixed[0].scratch.front().transfer_ns = 4000;
+    require(stripe(0) == 4002, "a fall in available scratch bandwidth left the execution estimate unchanged");
+    PoolPublicationHistory publications;
+    PoolPublicationHistory::Shape const shape{28, 2, 3};
+    auto choose = [&] { return publications.select(shape, 2, 2, 2, "auto"); };
+    auto first = choose();
+    require(first.encoded && first.trial && publications.begin(shape, first, 10) &&
+        publications.begin(shape, choose(), 12) && !publications.begin(shape, choose(), 13), "pooled trial did not fill two writers");
+    publications.publish(3, 20, true);
+    require(!publications.begin(shape, choose(), 21) && choose().encoded, "first publication ended a live pooled trial");
+    publications.publish(3, 80, true);
+    auto second = choose();
+    require(!second.encoded && second.trial && publications.begin(shape, second, 100) &&
+        publications.begin(shape, choose(), 110), "packed control did not use the same writer width");
+    publications.publish(3, 140, true); publications.publish(3, 150, true);
+    require(!choose().encoded && !choose().trial, "pooled output ignored the last durable publication");
+    require(publications.select(shape, 2, 2, 0, "auto").width == 1, "automatic writers skipped the narrower control");
+    require(publications.begin(shape, choose(), 200) && publications.begin(shape, choose(), 210) &&
+        !publications.begin(shape, choose(), 215), "steady-state sample enrolled an extra writer");
+    publications.publish(3, 400, true); publications.publish(3, 500, true);
+    require(choose().encoded, "publication policy ignored a slower completed wave");
+    auto different = publications.select({28, 2, 8}, 2, 2, 2, "auto");
+    require(different.trial && different.encoded, "pooled timings leaked into a different group shape");
+
+    PoolPublicationHistory scaling;
+    for (auto const& [width, encoded, per_member] : std::array<std::tuple<size_t, bool, unsigned>, 6>{
+        {{2, false, 30}, {2, true, 12}, {3, false, 20}, {3, true, 16}, {4, false, 18}, {4, true, 19}}})
+    {
+        auto trial = scaling.select(shape, 5, 2, 0, "auto", false);
+        require(trial.width == width && trial.encoded == encoded, "pooled scaling did not compare like writer widths");
+        for (size_t i = 0; i < width; ++i) require(scaling.begin(shape, trial, 0), "could not enroll scaling trial");
+        for (size_t i = 0; i < width; ++i) scaling.publish(3, width * 3 * per_member, true);
+    }
+    require(scaling.select(shape, 5, 2, 0, "auto", false).width == 5,
+        "improving packed transfers did not test the remaining physical writer");
+
+    PoolPublicationHistory interior;
+    for (unsigned wave = 0; wave < 16; ++wave)
+    {
+        auto const choice = interior.select(shape, 8, 4, 0, "packed");
+        if (!choice.trial) break;
+        auto const distance = choice.width > 6 ? choice.width - 6 : 6 - choice.width;
+        for (size_t i = 0; i < choice.width; ++i) require(interior.begin(shape, choice, 0), "could not enroll HDD width trial");
+        for (size_t i = 0; i < choice.width; ++i) interior.publish(3, choice.width * 3 * (10 + distance), true);
+    }
+    auto const refined = interior.select(shape, 8, 4, 0, "packed");
+    require(!refined.trial && refined.width == 6 && !refined.encoded,
+        "pooled publication missed the fastest writer count between two coarse trials");
+
+    PoolPublicationHistory limited;
+    auto limited_choice = [&] { return limited.select(shape, 2, 2, 2, "auto"); };
+    require(limited.begin(shape, limited_choice(), 10), "could not start partial publication trial");
+    limited.publish(3, 11, true);
+    require(limited.begin(shape, limited_choice(), 20) && limited.begin(shape, limited_choice(), 21),
+        "could not start complete publication trial");
+    limited.publish(3, 40, true); limited.publish(3, 50, true);
+    require(!limited_choice().encoded, "partial cohort was timed as two independent writers");
+    auto const last = limited.select(shape, 2, 2, 0, "auto", true, false);
+    require(limited.observed(shape) && !last.trial && last.width == 2 && !last.encoded,
+        "the final pass started an unneeded trial instead of reusing its measured winner");
+    PoolPublicationHistory cold;
+    auto const once = cold.select(shape, 4, 2, 0, "auto", false, false);
+    require(!cold.observed(shape) && !once.trial && !once.encoded && once.width == 2,
+        "a one-pass fill replaced the unmeasured startup plan");
+    require(!cold.final_group_encoded(shape, false, false, 20, 0) &&
+        !cold.final_group_encoded(shape, true, false, 20, 0) &&
+        !cold.final_group_encoded(shape, true, true, 20, 0),
+        "the final group switched measured packed generation to an unmeasured fresh width");
+    require(cold.final_group_encoded(shape, false, false, 20, 10) &&
+        !cold.final_group_encoded(shape, true, false, 20, 30) &&
+        cold.final_group_encoded(shape, false, false, 0, 0),
+        "the final group did not preserve a faster fresh stream or the cold startup choice");
+    {
+        std::array<StorageDevice, 2> volumes{{{"fs-a", {"disk-a"}}, {"fs-b", {"disk-a"}}}};
+        require(same_publication_drives(volumes), "two volumes on one disk lost their comparable publication history");
+        volumes.back().drives = {"disk-b"};
+        require(!same_publication_drives(volumes), "a single remaining disk inherited the other disk's publication latency");
+        volumes.front().drives.clear(); volumes.back().drives.clear();
+        require(!same_publication_drives(volumes) && same_publication_drives(std::span(volumes).first(1)),
+            "serialization of unknown topology made distinct destinations comparable");
+        PoolPublicationHistory finite;
+        auto const offer = std::make_shared<int>(0);
+        PoolPublicationHistory::Shape const finite_shape{28, 2, 3, {3, offer}};
+        auto const incumbent = finite.select(finite_shape, 1, 1, 0, "auto");
+        require(incumbent.encoded && finite.begin(finite_shape, incumbent, 1), "could not enroll the incumbent publication");
+        finite.publish(3, 1 + 18'000'000'000, true);
+        auto const packed_trial = finite.select(finite_shape, 1, 1, 0, "auto");
+        auto const job_members = remaining_publication_members(12, 3, 4, 1, 3);
+        size_t queries = 0;
+        auto price = [&](std::optional<long double> ns)
+        { return [&, ns](bool encoded) { require(!encoded, "the incumbent was priced as its own trial"); ++queries; return ns; }; };
+        auto bounded = [&](uint64_t members, std::optional<long double> wave, uint64_t timeout = 300'000'000'000)
+        { return finite.finite_output(finite_shape, members, timeout, price(wave)); };
+        require(!packed_trial.encoded && packed_trial.trial && job_members == 9 &&
+            bounded(job_members, 0) == true && bounded(job_members, 111'000'000'000) == true &&
+            !bounded(job_members, 8'000'000'000) && !bounded(job_members, std::nullopt),
+            "the sole writer failed to compare the exact trial wave with its remaining durable publications");
+        require(bounded(50, 0) == true && !bounded(51, 0) && !bounded(job_members, 0, 30'000'000'000) &&
+            !finite.finite_output({28, 2, 3, {3, std::make_shared<int>(0)}}, job_members, 300'000'000'000, price(0)) &&
+            remaining_publication_members(UINT64_MAX, 3, 4, 1, 3) == 9 &&
+            remaining_publication_members(12, 3, UINT64_MAX, 1, UINT16_MAX) == 9 && queries == 5,
+            "a changed worker supply, a fitting deadline or a long job inherited a short writer's trial limit");
+        // Recheck the actual grant: an aggregate RTX singleton forecast remains
+        // positive even when the Fresh estimator has no strict worker sample.
+        auto const terminal = finite.final_group_encoded(finite_shape, true, false, 3'500'000'000, 0);
+        require(!terminal && finite.begin(finite_shape, {1, true, false}, 21'000'000'000) &&
+            bounded(3, 0).value_or(terminal) && !bounded(3, 8'000'000'000).value_or(terminal),
+            "the actual final grant overrode its bounded incumbent or hid a cheaper measured wave");
+        finite.publish(3, 39'000'000'000, true);
+        require(!finite.select(finite_shape, 1, 1, 1, "packed").encoded && finite.begin(finite_shape, packed_trial, 41'000'000'000),
+            "the explicit packed output or a new measured trial was lost");
+        finite.publish(3, 49'000'000'000, true);
+        require(!bounded(3, 0) && !finite.final_group_encoded(finite_shape, true, false, 0, 1),
+            "an earlier incumbent displaced a faster durable comparison");
+    }
+    PoolPublicationHistory final_wave;
+    auto const packed_tail = final_wave.select(shape, 1, 1, 1, "auto", false);
+    require(!packed_tail.encoded && final_wave.begin(shape, packed_tail, 10), "could not enroll a packed tail publication");
+    final_wave.publish(3, 100, true);
+    require(!final_wave.final_group_encoded(shape, true, false, 0, 0),
+        "a measured packed publication permitted an unmeasured fresh tail");
+    auto const fresh_tail = final_wave.select(shape, 1, 1, 1, "auto", false);
+    require(fresh_tail.encoded && final_wave.begin(shape, fresh_tail, 110), "could not enroll a fresh tail publication");
+    final_wave.publish(3, 170, true);
+    require(final_wave.final_group_encoded(shape, false, false, 10, 15) &&
+        !final_wave.final_group_encoded({28, 2, 4}, false, false, 10, 15),
+        "the final group ignored a faster matching durable publication when its worker delivery was slower");
+    auto const five = cold.select(shape, 5, 5, 5, "auto", false);
+    for (unsigned i = 0; i < 5; ++i) require(cold.begin(shape, five, 20), "could not enroll five HDD writers");
+    require(cold.select(shape, 6, 2, 2, "encoded").width == 2 && cold.select(shape, 6, 2, 2, "encoded").encoded,
+        "an in-flight publication sample overrode an explicit width or output");
+    for (unsigned i = 0; i < 5; ++i) cold.publish(3, 80, true);
+    auto const reused = cold.select(shape, 6, 2, 0, "auto", true, false);
+    require(reused.width == 5 && !reused.encoded && !reused.trial && cold.select(shape, 4, 2, 0, "auto", true, false).width == 2,
+        "a changed writer count lost a measured feasible width or reused one beyond the available HDDs");
+
     StreamingInputCohort cohort(3);
     require(cohort.stream_allowed(0) && !cohort.stream_allowed(1), "cold compact input split an existing cohort");
     cohort.admit(0, 98, 10, true, 100); cohort.admit(1, 48, 11, false, 110);
@@ -3149,6 +3699,13 @@ void construction_histories()
     require(histories.reuse_external(demand, phase) == demand && !histories.find(phase, false) &&
         histories.memory_bytes() == demand_memory,
         "changed phase grant lost compatible CPU evidence or weakened ordinary worker isolation");
+    require(histories.execution(unobserved) == first && histories.execution(phase) == demand &&
+        phase.workers == 1 && !histories.find(phase, false),
+        "forecast grant normalization changed the caller's key or crossed RAM and scratch histories");
+    auto second = histories.find(unobserved);
+    require(second && second != first && histories.find(unobserved, false) == second &&
+        histories.execution(unobserved) == first && histories.find(context, false) == first,
+        "inserting a second grant changed the original normalized construction context");
     std::array<ConstructionContext, 8> incompatible{phase, phase, phase, phase, phase, phase, phase, phase};
     incompatible[0].scratch_drives = {"8:64"}; incompatible[1].drives.clear();
     incompatible[2].k = 20; incompatible[3].max_ram /= 2; incompatible[4].io_overlap = false;
@@ -3590,8 +4147,18 @@ void external_finish_grants(fs::path const& root, Members input, Config cfg)
             "joined durable packing transition did not return its released RAM grant");
         auto requested = engine.config; requested.workers = cfg.workers + 1;
         auto const retuned = engine.memory_for(requested, 2, true, false);
-        require(retuned < staging, "packing worker metadata reacquired the ordinary fallback envelope");
-        engine.set_workers(requested.workers, 2, true, retuned);
+        require(retuned > packing && retuned < staging, "packing worker metadata reacquired the ordinary fallback envelope");
+        std::promise<void> writer_done;
+        auto const active_writer = writer_done.get_future();
+        require(!packing_cpu_consumer(true, {}) && packing_cpu_consumer(false, {}) &&
+            packing_cpu_consumer(false, active_writer), "packing CPU demand miscounted a receiver or a local writer");
+        writer_done.set_value();
+        require(!packing_cpu_consumer(false, active_writer), "packing CPU demand retained a completed writer");
+        auto const workspace = engine.packing_workspace(2, true, staging, requested.workers);
+        require(workspace == retuned && engine.config.workers == cfg.workers &&
+            engine.packing_workspace(2, true, retuned - 1, requested.workers) == packing,
+            "packing did not retain the wider CPU grant within the previously admitted workspace");
+        engine.set_workers(requested.workers, 2, true, workspace);
         require(engine.memory_for(engine.config, 2, true, false) <= retuned,
             "packing worker retune reacquired an unrelated ordinary envelope");
         bool rejected = false;
@@ -3897,7 +4464,9 @@ void replot_save_diagnostics(fs::path const& root)
         structural.resources.native.verification_cpu_threads = 0;
         std::ostringstream resource_text; write_profile_json(resource_text, structural.resources);
         structural.review.resources_json = resource_text.str();
-        auto const bounded = replot_request(args, structural);
+        // Mapping previews use the reviewed resource grant before execution
+        // samples live RAM, which can be in use by other plotting jobs.
+        auto const bounded = replot_request(args, structural, false);
         require(bool(replot_mapping_capacity(structural.resources, structural.inventory, structural.review, bounded)) &&
             assess_replot_review(args, structural).feasible, "structural mapping required a migration proof grant");
         structural.review.verification = ReplotVerification{ReplotVerificationMode::sampled, 0, 2};
@@ -5454,6 +6023,156 @@ void farming_joint_forecasts(fs::path const& root)
     reject(options({excessive_path}), "joint assessment expanded a forecast beyond the file work bound");
 }
 
+void terminal_publications(fs::path const& directory)
+{
+    using group_grow::ConstructionCache;
+    using group_grow::PoolPublicationHistory;
+    using group_grow::TerminalPublication;
+    auto const kind = ConstructionCache::Kind::PoolPublication;
+    auto const key = stream_state::digest("paid width, concrete resources, authenticated path and physical writers");
+    auto wave = [&](unsigned age)
+    {
+        TerminalPublication w; w.key = key; w.started = 100;
+        w.peers = {{1, 100 - age}, {2, 100 - age}, {3, 100 - age}};
+        return w;
+    };
+    auto observe = [&](bool fresh, unsigned age, unsigned tail, unsigned peer_tail)
+    {
+        ConstructionCache cache(directory, kind); auto w = wave(age);
+        require(!w.publish(2, 110) && !w.publish(3, 112) && !w.publish(0, 100 + tail),
+            "incomplete terminal cohort supplied a durable publication");
+        require(w.publish(1, 100 + peer_tail), "complete terminal cohort lost its peer");
+        w.completed(cache, fresh);
+    };
+    PoolPublicationHistory controller;
+    PoolPublicationHistory::Shape shape{28, 2, 3, {}};
+    for (unsigned age : {10u, 12u}) { observe(false, age, 29, 16); observe(true, age, 18, 16); }
+    auto current = wave(11);
+    {
+        ConstructionCache cache(directory, kind); std::array<TerminalPublication::Range, 2> ranges;
+        auto const prior = current.choice(cache, &ranges);
+        require(prior && *prior && ranges[0].low == 29 && ranges[1].high == 18 &&
+            controller.final_group_encoded(shape, false, false, 1, 0, prior),
+            "earlier durable Fresh failed to improve a Packed terminal decision");
+        require(!wave(15).choice(cache), "unobserved peer phase reused terminal duration");
+        auto changed = current; changed.key = stream_state::digest("changed grant or writer");
+        require(!changed.choice(cache), "terminal timing crossed physical scope");
+        require(controller.begin(shape, {1, false, true}, 10), "Packed live publication failed to enroll");
+        controller.publish(3, 30, true);
+        require(controller.begin(shape, {1, true, true}, 31), "Fresh live publication failed to enroll");
+        controller.publish(3, 60, true);
+        require(!controller.final_group_encoded(shape, false, false, 1, 0, prior),
+            "dated evidence overrode a complete live pair");
+    }
+    for (unsigned i = 0; i < 24; ++i) observe(true, i % 2 ? 12 : 10, 18, 16);
+    { ConstructionCache cache(directory, kind);
+      require(current.choice(cache).value_or(false), "repeated winning publications evicted the other measured form"); }
+    for (unsigned age : {10u, 12u}) { observe(false, age, 29, 100); observe(true, age, 18, 100); }
+    { ConstructionCache cache(directory, kind);
+      require(!current.choice(cache), "a peer-dominated terminal finish claimed an improvement"); }
+    current.peers.clear(); current.key = stream_state::digest("subject-only");
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        {
+            ConstructionCache cache(directory, kind);
+            require(current.publish(0, 188), "missing subject-only Packed completion"); current.completed(cache, false);
+            require(current.publish(0, 200), "missing subject-only Fresh completion"); current.completed(cache, true);
+        }
+        ConstructionCache cache(directory, kind); auto const prior = current.choice(cache);
+        if (i < 3) require(!prior, "thin history displaced the incumbent inside its margin");
+        else
+        {
+            PoolPublicationHistory cold;
+            require(prior && !*prior && !cold.final_group_encoded(shape, true, true, 0, 0, prior),
+                "repeated measured Packed finishes failed to improve an ordinary Fresh decision");
+        }
+    }
+    auto const full = directory / "full"; std::array<std::string, 4> keys;
+    for (unsigned i = 0; i < keys.size(); ++i) keys[i] = stream_state::digest(std::to_string(i));
+    // The 48 worst-width records exceed the scalar cache's file bound. Every complete row carries
+    // its own four pairs of 64-bit peer phases under the terminal cache's independent bound.
+    std::array<uint64_t, 8> phases{}; phases.fill(UINT64_MAX - 10);
+    auto store = [&](unsigned first, unsigned end)
+    {
+        ConstructionCache cache(full, kind);
+        for (unsigned k = first; k < end; ++k) for (unsigned i = 0; i < 8; ++i)
+            for (bool fresh : {false, true}) cache.completed(keys[k], fresh, UINT64_MAX - i, phases);
+    };
+    store(0, 3);
+    auto const file = full / "pool-publication-v1";
+    require(fs::file_size(file) > 8192 && fs::file_size(file) < 16384, "worst-width terminal file lost its bounded rows");
+    {
+        ConstructionCache cache(full, kind);
+        for (unsigned k = 0; k < 3; ++k) for (bool fresh : {false, true})
+            require(cache.evidence(keys[k], fresh).samples == 8 && cache.phase_evidence(keys[k], fresh, 8).low_ns == phases.back(),
+                "a full terminal store lost a complete four-peer observation on reopen");
+    }
+    store(3, 4);
+    {
+        ConstructionCache cache(full, kind);
+        for (bool fresh : {false, true})
+            require(!cache.evidence(keys[0], fresh).samples && cache.evidence(keys[3], fresh).samples == 8 &&
+                cache.phase_evidence(keys[2], fresh, 8).samples == 8, "new contexts failed to replace the oldest complete observations");
+    }
+    std::ifstream input(file); std::string text((std::istreambuf_iterator<char>(input)), {}); input.close();
+    auto body = text.substr(65); body.erase(body.find_last_of(' ') + 1);
+    { std::ofstream truncated(file, std::ios::trunc); truncated << stream_state::digest(body) << '\n' << body; }
+    ConstructionCache interrupted(full, kind);
+    require(!interrupted.evidence(keys[1], true).samples, "a torn peer row supplied a partial durable cohort");
+}
+void cached_publications(fs::path const& root)
+{
+    using namespace grow_controller_test;
+    terminal_publications(root / "terminal-publications");
+    auto const directory = root / "publication-cache";
+    Arguments args; args.max_ram = 1024; group_grow::Identity plot; plot.header.k = 18; plot.header.strength = 2;
+    ExternalConfig external; external.scratch.push_back({"unused fixture path", 50});
+    auto const key = publication_cache_key("host/boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external);
+    auto const at = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    {
+        ConstructionCache first(directory); require(first.available(), "first private publication-cache session unavailable");
+        ConstructionCache competing(directory); require(!competing.available(), "concurrent construction cache was treated as a comparable run");
+        ConstructionCache routes(root / "cache-routes", ConstructionCache::Kind::Generation);
+        require(routes.available(), "generation evidence competed for the whole-publication cache lock");
+        routes.completed(key, true, 20, at); routes.completed(key, true, 22, at);
+        first.completed(key, false, 100, at); first.completed(key, false, 102, at); first.completed(key, true, 59, at);
+        require(!first.evidence(key, false).samples, "live evidence was counted again as a preceding invocation");
+    }
+    {
+        ConstructionCache second(directory);
+        ConstructionCache routes(root / "cache-routes", ConstructionCache::Kind::Generation);
+        require(routes.evidence(key, true, at).low_ns == 20 && fs::exists(root / "cache-routes/generation-v1"),
+            "the separate generation prior store lost its version or bounded samples");
+        require(second.evidence(key, false, at).samples == 2 && !second.evidence(key, true, at).samples,
+            "cross-run durable observations lost their mode or treated a lone trial as a comparison");
+        second.completed(key, true, 62, at);
+    }
+    {
+        ConstructionCache third(directory);
+        auto ram = third.evidence(key, false, at), scratch = third.evidence(key, true, at);
+        PublicationShape shape{3, 1};
+        auto choose = [&] { return choose_construction_mode(false, shape, shape, nullptr, nullptr, false, 0, 0, ram, scratch); };
+        auto const choice = choose();
+        require(choice.external && choice.reason == ConstructionModeReason::prior && choice.prior_oldest_utc == at && choice.prior_samples == 4,
+            "dated disjoint durable ranges failed to choose comparable external construction");
+        scratch.high_ns = 101;
+        require(!choose().external && choose().reason != ConstructionModeReason::prior, "overlapping prior ranges displaced the incumbent");
+        ++args.max_ram;
+        require(!third.evidence(publication_cache_key("host/boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external), false, at).samples &&
+            !third.evidence(key, false, at + 86401).samples && !third.evidence(key, false, at - 1).samples,
+            "a changed memory cap, past horizon or backward clock reused cached construction evidence");
+        --args.max_ram;
+        require(!third.evidence(publication_cache_key("other boot/dest/scratch", args, plot, 3, 1, 3, 1, 3, external), true).samples,
+            "construction evidence crossed a host or device identity boundary");
+    }
+    {
+        ConstructionCache changed(directory); changed.completed(key, false, 102, at);
+        std::ofstream broken(directory / "publication-v1", std::ios::trunc); broken << "incomplete";
+    }
+    ConstructionCache interrupted(directory);
+    require(interrupted.available() && !interrupted.evidence(key, false).samples, "damaged cache interrupted construction or supplied an estimate");
+}
 void farming_reader_scope()
 {
     using namespace grow_controller_test;
@@ -5478,6 +6197,21 @@ void farming_reader_scope()
     std::istringstream in(json.str()); auto const exported = read_farming_profile(in);
     require(exported.reader_calibration == profile.reader_calibration,
         "re-exported farming profile lost its reader calibration scope");
+    auto ranged_profile = profile;
+    ranged_profile.reader_calibration->sampled_min_members = 2; ranged_profile.reader_calibration->sampled_max_members = 7;
+    auto ranged = state; set_farming_state_profile(ranged, ranged_profile);
+    auto const ranged_text = farming_state_text(ranged);
+    require(farming_state_profile(parse_farming_state(ranged_text))->reader_calibration == ranged_profile.reader_calibration &&
+        farming_state_text(parse_farming_state(ranged_text)) == ranged_text && farming_state_text(restored) == text,
+        "versioned calibration scope changed saved membership, old provenance or recovery bytes");
+    std::ostringstream membership; print_farming_membership(membership, ranged, ranged.directories.front(), true);
+    require(membership.str().find("\"reader_calibration_coverage\":\"extrapolated\"") != std::string::npos,
+        "planned or admitted membership outside the reader sample range was presented without its extrapolation");
+    auto update = farming_update_snapshot(ranged);
+    for (size_t i = 0; i < update.directories.size(); ++i) update.directories[i] = fs::absolute("scope-" + std::to_string(i));
+    update.generation = 1; update.id = farming_update_id(update);
+    require(parse_farming_update(farming_update_text(update)).profile == ranged.profile_metadata,
+        "queued farming policy update discarded the reader's measured membership range");
     auto foreign = state; foreign.producer_build.assign(64, 'e');
     auto const foreign_text = farming_state_text(foreign);
     require(farming_state_text(parse_farming_state(foreign_text)) == foreign_text &&
@@ -6163,6 +6897,42 @@ void farming_preview_handoff(fs::path const& root)
     }
     auto planned = farming_run(options, nullptr, job);
     require(planned->feasible() && fs::is_empty(a) && fs::is_empty(b), "saving preparation wrote destination files");
+    {
+        // A saved partition can have a smaller request mailbox than the
+        // current planner would choose. Continuing within that grant must
+        // neither resize it nor consume its space for the next policy copy.
+        uint64_t const alignment = 4096;
+        auto before = planned->state;
+        before.revision = before.policy_revision = 2;
+        before.parent_digest.assign(64, 'a');
+        farming_record_parent(before, 1, before.parent_digest);
+        detach_farming_member(before, 1);
+        before.update_reserved_bytes = sum(farming_control_reservation(before, alignment),
+            farming_update_reservation(alignment, alignment));
+        auto const auxiliary = sum(sum(before.update_reserved_bytes, before.progress_reserved_bytes), before.owner_reserved_bytes);
+        before.manifest_reserved_bytes = sum(auxiliary, product(farming_update_aligned(
+            sum(farming_state_text(before).size(), 65 + 1024), alignment), 2));
+        FarmingJob saved = job; saved.saved = before; saved.digest = stream_state::digest(farming_state_text(before));
+        FarmingRun continued; continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.available = {1, 0}; continued.lanes.resize(2); continued.metadata = planned->metadata;
+        revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {});
+        require(continued.state.manifest_reserved_bytes == before.manifest_reserved_bytes &&
+            continued.state.update_reserved_bytes == before.update_reserved_bytes &&
+            continued.state.progress_reserved_bytes == before.progress_reserved_bytes &&
+            continued.state.owner_reserved_bytes == before.owner_reserved_bytes &&
+            farming_revision_fits(continued.state, sum(farming_state_text(continued.state).size(), 65)),
+            "independent policy continuation changed a saved metadata grant");
+
+        // Keep the refusal when the policy itself consumes the saved margin.
+        continued.state = before; ++continued.state.revision;
+        continued.state.parent_digest = saved.digest;
+        continued.state.manifest_reserved_bytes = auxiliary;
+        bool refused = false;
+        try { revise_farming_policy(options, saved, continued, {}, {}, {}, {}, alignment, {}); }
+        catch (std::exception const& error) { refused = std::string(error.what()).find("detached writer's saved grant") != std::string::npos; }
+        require(refused && fs::is_empty(a) && fs::is_empty(b), "oversized independent policy reached publication");
+    }
     {
         auto shared = options; shared.destination_temp = "on"; shared.save_plan = directory / "scratch-review.plan";
         auto source = farming_arguments(shared);
@@ -7846,8 +8616,10 @@ void farming_active_audit(fs::path const& root, Members input, Config cfg)
     // writer durably advances it and deletes a consumed segment. Recreate
     // that reader view without depending on thread or disk timing.
     std::optional<fs::path> segment;
+    // The first append writes contribution run 0 and a separate summary run.
+    // Directory enumeration order varies across runner filesystems.
     for (auto const& entry : fs::recursive_directory_iterator(scratch))
-        if (entry.path().filename().string().starts_with("run-")) { segment = entry.path(); break; }
+        if (entry.path().filename() == "run-0-0") { segment = entry.path(); break; }
     require(segment && fs::remove(*segment), "farming audit fixture has no external segment");
     farm.check(active);
     bool rejected = false;
@@ -7956,6 +8728,7 @@ int main(int argc, char** argv) try
     bool const prefetch_only = argc == 2 && std::string(argv[1]) == "--prefetch-only";
     bool const farming_audit_only = argc == 2 && std::string(argv[1]) == "--farming-audit-only";
     test_producer_options();
+    native_cpu_budget();
     controller_wakeups();
     test_destination_temporary();
     metadata_options();
@@ -8037,7 +8810,7 @@ int main(int argc, char** argv) try
         replot_publication_names(external_cleanup.root, input);
         farming_compatibility_format(external_cleanup.root);
         farming_joint_forecasts(external_cleanup.root);
-        farming_reader_scope();
+        farming_reader_scope(); cached_publications(external_cleanup.root);
         farming_legacy_format();
         farming_compact_format();
         farming_replica_staging(external_cleanup.root);
@@ -8080,7 +8853,7 @@ int main(int argc, char** argv) try
         farming_saved_reads(external_cleanup.root);
         farming_compatibility_format(external_cleanup.root);
         farming_joint_forecasts(external_cleanup.root);
-        farming_reader_scope();
+        farming_reader_scope(); cached_publications(external_cleanup.root);
         farming_legacy_format();
         farming_compact_format();
         farming_replica_staging(external_cleanup.root);

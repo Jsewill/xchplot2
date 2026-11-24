@@ -81,6 +81,8 @@ void saved_capacity(fs::path const& directory)
     require(pool.try_reserve_output(1, target, unit), "second output reservation failed"); pool.seal_recovery();
     require(!pool.try_reserve_output(0, target, 19 * unit, 5 * unit), "saved output reservation was silently reduced");
     require(!pool.grant(1, 6 * unit, 6 * unit, unit, 2), "saved scratch's remaining physical obligation was not retained");
+    require(pool.available_for_output(2, scratch, true) == pool.available_for_output(2, scratch),
+        "a future output counted preserved scratch as reclaimable capacity");
     rejected([&] { pool.cancel(0); }, "saved ownership could be cancelled before durable cleanup");
     pool.release_scratch_after_cleanup(0);
     auto next = pool.grant(1, 80 * unit, 80 * unit, unit, 2);
@@ -111,6 +113,8 @@ void saved_only_roots(fs::path const& directory)
     ExternalConfig saved{{{saved_root.directory, 20 * unit}}, unit, 2};
     std::array<uint64_t, 1> occupied{unit}; pool.restore(0, saved, occupied);
     std::array<fs::path, 1> allowed{enabled.directory}; pool.restrict_grants(allowed); pool.seal_recovery();
+    require(pool.offers_scratch(enabled.device.filesystem) && !pool.offers_scratch(saved_root.device.filesystem) &&
+        !pool.offers_scratch(target.device.filesystem), "queued outputs lent space outside the fresh scratch policy");
     require(pool.try_io(0).has_value(), "restricting fresh grants blocked saved scratch recovery");
     auto next = pool.grant(1, 20 * unit, unit, unit, 2, true);
     require(next && next->scratch.size() == 1 && next->scratch[0].directory == enabled.directory,
@@ -176,12 +180,17 @@ void topology(fs::path const& directory, bool nonrotating, bool unknown)
         "topology output reservations failed");
     require(!pool.try_reserve_output(4, first, UINT64_MAX), "inactive output fixture unexpectedly reserved capacity");
     ScratchPool const& view = pool;
-    require(!view.io_compatible(0, 1), "I/O compatibility preceded saved ownership admission");
+    require(!view.io_compatible(0, 1) && !view.target_io_compatible(second.device, 0),
+        "I/O compatibility preceded saved ownership admission");
     pool.seal_recovery();
     require(pool.grant(0, 30 * unit, 30 * unit, unit, 2).has_value() &&
         pool.grant(1, 30 * unit, 30 * unit, unit, 2).has_value(), "shared scratch quotas failed");
     auto const memory = pool.memory_bytes(), capacity = pool.available_for_output(0, first);
     bool const compatible = nonrotating && !unknown;
+    require(view.target_io_compatible(second.device, 0) == !unknown &&
+        !view.target_io_compatible(shared_destination.device, 0) && !view.target_io_compatible(scratch_destination.device, 0) &&
+        !view.target_io_compatible(second.device, 4) && !view.target_io_compatible(second.device, 5),
+        "a lane journal must exclude aliased, unbound or unknown drives and admit an independent target");
     require(view.io_compatible(0, 1) == compatible && view.io_compatible(1, 0) == compatible,
         "full I/O compatibility disagreed with shared scratch topology");
     require(!view.io_compatible(0, 2) && !view.io_compatible(2, 0) &&
@@ -471,6 +480,235 @@ void ssd_backlog(fs::path const& directory)
     require(io && !unknown.try_io(1), "backlog ranking weakened unknown-resource I/O exclusion");
     io.reset(); unknown.cancel(0); unknown.cancel(1);
 }
+void rotating_bandwidth(fs::path const& directory)
+{
+    std::vector<ScratchRoot> disks;
+    for (std::string name : {"a", "b", "c", "d"})
+    {
+        disks.push_back(root(directory / name, name, {name}));
+        disks.back().device.rotating = true;
+    }
+    auto first = root(directory / "e", "output-1", {"output-1"});
+    auto second = root(directory / "f", "output-2", {"output-2"});
+    ScratchPool probe(disks, 0);
+    require(probe.try_reserve_output(0, first, unit), "probe output reservation failed");
+    for (size_t i = 1; i < disks.size(); ++i)
+        require(probe.try_reserve_output(i, disks[i - 1], unit), "queued writer reservation failed");
+    probe.seal_recovery();
+    auto const room = probe.available_for_output(0, first);
+    auto const candidate = probe.grant(0, 16 * unit, 16 * unit, unit, 2, true, 4, unit, 1, 1, {}, true, true);
+    require(candidate && candidate->scratch.size() == 1 && candidate->scratch.front().directory == disks.back().directory &&
+        probe.scratch_devices(0).empty() && probe.available_for_output(0, first) == room &&
+        probe.scratch_devices(*candidate).front().drives == disks.back().device.drives,
+        "pricing an optional route claimed capacity or included an already queued writer in its stripe");
+    auto const commit = probe.grant(0, 16 * unit, 16 * unit, unit, 2, true, 4, unit, 4, 1, {}, false, true);
+    require(commit && commit->scratch.front().directory == candidate->scratch.front().directory &&
+        probe.try_io(1).has_value(), "the optional receiver stranded a ready writer after its checked grant");
+    require(!probe.grant(1, 120 * unit, 120 * unit, unit, 2, true, 4, unit, 4, 1, {}, true, true),
+        "a narrow optional grant occupied extra spindles to meet its capacity request");
+    auto observe = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+    ScratchPool pool(disks, 0); pool.set_io_governor(observe);
+    for (size_t i = 0; i < disks.size(); ++i) observe->observe_transfer(disks[i].device, (4 - i) * unit, unit);
+    require(pool.try_reserve_output(0, first, unit) && pool.try_reserve_output(1, second, unit), "HDD output admission failed");
+    pool.seal_recovery();
+    auto a = pool.grant(0, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 2);
+    auto b = pool.grant(1, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 1);
+    auto check = [&](ExternalConfig const& grant, size_t root, uint64_t bytes)
+    { return std::any_of(grant.scratch.begin(), grant.scratch.end(), [&](auto const& part)
+        { return part.directory == disks[root].directory && part.capacity_bytes == bytes; }); };
+    require(a && b && a->striped && b->striped && pool.io_compatible(0, 1) &&
+        check(*a, 0, 40 * unit) && check(*a, 3, 10 * unit) &&
+        check(*b, 1, 30 * unit) && check(*b, 2, 20 * unit),
+        "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
+    pool.cancel(0); pool.cancel(1);
+
+    // A measured successor must fit on a separate, sufficiently fast stripe
+    // while the original final writer still owns the shared output spindle.
+    for (auto [rate, demand, measured, split] : std::array<std::tuple<long double, uint64_t, bool, bool>, 4>{{
+        {2.L, 60 * unit, true, true}, {2.1L, 60 * unit, true, false},
+        {2.L, 210 * unit, true, false}, {2.L, 60 * unit, false, false}}})
+    {
+        ScratchPool adjacent(disks, 0);
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        adjacent.set_io_governor(rates);
+        if (measured) for (auto const& disk : disks) rates->observe_transfer(disk.device, unit, unit);
+        require(adjacent.try_reserve_output(0, first, unit) && adjacent.try_reserve_output(1, first, unit),
+            "adjacent output reservations did not fit");
+        adjacent.seal_recovery();
+        auto prior = adjacent.grant(0, demand, demand, unit, 2, true, 4, unit, 4, 1, {}, false, false, rate);
+        require(prior && prior->scratch.size() == (split ? 2 : 4), "successor stripe lost capacity or measured service");
+        if (!split) continue;
+        auto packing = adjacent.try_io(0);
+        auto incoming = adjacent.grant(1, demand, demand, unit, 2, true, 4, unit, 4, 1);
+        require(packing && incoming && incoming->scratch.size() == 2 && !adjacent.try_io(1) && adjacent.try_stage_io(1),
+            "disjoint successor input could not overlap packing with its target write still fenced");
+    }
+
+    ScratchPool rotating_owners(disks, 0);
+    require(rotating_owners.try_reserve_output(0, first, unit) && rotating_owners.try_reserve_output(1, second, unit) &&
+        rotating_owners.try_reserve_output(2, first, unit), "rotating output reservations failed");
+    rotating_owners.seal_recovery();
+    auto narrow = rotating_owners.grant(0, 30 * unit, 30 * unit, unit, 2);
+    auto replacement = rotating_owners.grant(1, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 1);
+    require(narrow && narrow->scratch.size() == 1 && replacement && replacement->scratch.size() == 2 &&
+        quota(*replacement) == 30 * unit && rotating_owners.io_compatible(0, 1),
+        "a replacement stripe took the next writer's share of the available HDDs");
+    rotating_owners.cancel(0); rotating_owners.cancel(1); rotating_owners.cancel(2);
+
+    auto writer = second; writer.device.rotating = true;
+    struct SuccessorCase { uint64_t demand; uint64_t writer_rate; bool free_target; };
+    for (auto [demand, writer_rate, free_target] : std::array<SuccessorCase, 3>{{
+        {30 * unit, 1, true}, {150 * unit, 1, false}, {30 * unit, 4, false}}})
+    {
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        ScratchPool tail(disks, 0); tail.set_io_governor(rates);
+        require(tail.try_reserve_output(0, first, unit) && tail.try_reserve_output(1, writer, unit) &&
+            tail.try_reserve_output(2, disks[1], 0), "queued successor outputs were not admitted");
+        for (auto const& disk : disks) rates->observe_transfer(disk.device, unit, unit);
+        rates->observe_transfer(writer.device, writer_rate * unit, unit);
+        tail.seal_recovery();
+        auto running = tail.grant(0, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 2);
+        auto stripe = tail.grant(1, demand, demand, unit, 2, false, 0, 0, 4, 1);
+        require(running && stripe && quota(*stripe) == demand && tail.io_compatible(0, 1) &&
+            tail.target_io_compatible(disks[1].device, 1) == free_target,
+            "a scratch stripe must free the next writer when enough capacity and bandwidth remain");
+    }
+
+    struct ReplacementCase { uint64_t room, spare_rate, writer_rate; bool free_target; };
+    for (auto [room, spare_rate, writer_rate, free_target] : std::array<ReplacementCase, 4>{{
+        {100 * unit, 3, 3, true}, {100 * unit, 4, 5, true},
+        {100 * unit, 3, 4, false}, {20 * unit, 3, 3, false}}})
+    {
+        auto roots = disks;
+        roots[2].available_bytes = room;
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        ScratchPool tail(roots, 0); tail.set_io_governor(rates);
+        require(tail.try_reserve_output(0, first, unit) && tail.try_reserve_output(1, writer, unit) &&
+            tail.try_reserve_output(2, roots[0], 0) && tail.try_reserve_output(3, roots[1], 0) &&
+            tail.try_reserve_output(4, roots[2], unit), "replacement scratch fixture output admission failed");
+        tail.seal_recovery();
+        tail.release_after_cleanup(4, unit);
+        auto running = tail.grant(0, 30 * unit, 30 * unit, unit, 2);
+        auto running_io = tail.try_io(0);
+        require(running && running_io && check(*running, 0, 30 * unit) && !tail.try_io(2),
+            "replacement scratch fixture did not block the earlier queued output");
+        rates->observe_transfer(roots[0].device, unit, unit);
+        rates->observe_transfer(roots[1].device, 4 * unit, unit);
+        rates->observe_transfer(roots[2].device, spare_rate * unit, unit);
+        rates->observe_transfer(roots[3].device, unit, unit);
+        rates->observe_transfer(writer.device, writer_rate * unit, unit);
+        auto stripe = tail.grant(1, 30 * unit, 30 * unit, unit, 2, false, 0, 0, 4, 1);
+        auto stripe_io = tail.try_io(1);
+        require(stripe && stripe_io && stripe->scratch.size() == 1 &&
+            check(*stripe, free_target ? 2 : 1, 30 * unit) && bool(tail.try_io(3)) == free_target,
+            "scratch failed to preserve a runnable output within the stripe bandwidth and capacity");
+    }
+
+    ScratchPool queued(disks, 0);
+    require(queued.try_reserve_output(0, first, unit) && queued.try_reserve_output(1, first, unit) &&
+        queued.try_reserve_output(2, disks.front(), unit), "queued physical output admission failed");
+    queued.seal_recovery();
+    auto parallel = queued.grant(0, 50 * unit, 50 * unit, unit, 2, false, 0, 0, 4, 2);
+    require(parallel && parallel->striped && queued.io_compatible(0, 2) && !queued.io_compatible(0, 1),
+        "a queued file on the same output took the scratch bandwidth of an independent writer");
+
+    ScratchPool farm(disks, 0);
+    for (size_t i = 0; i < disks.size(); ++i)
+        require(farm.try_reserve_output(i, disks[i], i ? 0 : 80 * unit), "farm output registration failed");
+    farm.seal_recovery();
+    auto paired = farm.grant(0, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 2);
+    require(paired && paired->scratch.size() == 1 && farm.io_compatible(0, 1),
+        "a second eligible output lost its independent writer or scratch bandwidth");
+    farm.release_scratch_after_cleanup(0);
+    auto scratch = farm.grant(0, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 1);
+    require(scratch && scratch->striped && scratch->scratch.size() == 3 &&
+        farm.available_for_output(1, disks[1]) == 80 * unit && farm.available_for_output(1, disks[1], true) == 100 * unit &&
+        !farm.io_compatible(0, 1) && !farm.try_reserve_output(1, disks[1], 100 * unit),
+        "idle output disks failed to lend scratch exclusively to a striped farm group");
+    farm.release_after_cleanup(0, unit);
+    require(farm.try_reserve_output(1, disks[1], 100 * unit), "cleaned scratch could not become a full output");
+    auto rotated = farm.grant(1, 60 * unit, 60 * unit, unit, 2, true, 0, 0, 4, 1);
+    require(rotated && rotated->scratch.size() == 3 && check(*rotated, 0, 20 * unit),
+        "a completed output could not contribute scratch to the next group");
+
+    for (auto const [limit, tight, readers] : {std::tuple{24u, false, 16u}, {6u, false, 6u}, {24u, true, 4u}})
+    {
+        Config work; work.memory_limit_bytes = 4ull << 30;
+        ScratchPool striped(disks, 0);
+        require(striped.try_reserve_output(0, first, unit), "striped reader fixture output admission failed");
+        striped.seal_recovery();
+        auto layout = [&](ExternalConfig& external)
+        {
+            if (tight)
+            {
+                auto serial = external; serial.striped = false;
+                work.memory_limit_bytes = std::max(
+                    ExternalEngine::phase_memory_bytes(26, work, serial, ExternalEngine::MemoryPhase::staging, UINT16_MAX),
+                    ExternalEngine::phase_memory_bytes(26, work, serial, ExternalEngine::MemoryPhase::packing));
+            }
+            return ExternalEngine::striped_reader_bytes(26, work, external);
+        };
+        auto grant = striped.grant(0, 80 * unit, 80 * unit, unit, 4, false, limit, 8 * work.window_bytes, 4, 1, layout);
+        require(grant && grant->striped && grant->scratch.size() == 4 && grant->packing_inputs == readers,
+            "striped run retention did not respect the admitted reader cache and membership limit");
+    }
+
+    auto alias = disks.front(); alias.directory = first.directory; alias.directory_inode = first.directory_inode;
+    alias.device.filesystem = "other-partition";
+    disks.push_back(alias);
+    ScratchPool alone(disks, 0);
+    require(alone.try_reserve_output(0, second, unit) && alone.try_reserve_output(1, second, unit), "queued HDD output admission failed");
+    alone.seal_recovery();
+    auto wide = alone.grant(0, 100 * unit, 100 * unit, unit, 2, true, 0, 0, 8, 1);
+    require(wide && wide->scratch.size() == 4 && quota(*wide) == 100 * unit,
+        "a queued owner stranded bandwidth or a partition multiplied one HDD");
+
+    using namespace std::chrono;
+    std::array<DiskIoGovernor::Counters, 2> counters{};
+    DiskIoGovernor shared([&](std::string const& name) { return std::optional{counters[name == "a" ? 0 : 1]}; });
+    std::array<StorageDevice, 2> pair{disks[0].device, disks[1].device};
+    for (auto const& device : pair) shared.register_device(device);
+    auto const begin = DiskIoGovernor::Clock::now(); shared.poll(begin);
+    counters[0].read_sectors = 200000; counters[0].busy_ms = 1000;
+    require(!shared.concurrent_bandwidth(pair, begin + seconds(1)), "an isolated drive supplied aggregate controller bandwidth");
+    counters[0].read_sectors += 100000; counters[0].busy_ms += 1000;
+    counters[1].write_sectors = 150000; counters[1].busy_ms = 1000;
+    require(std::abs(shared.concurrent_bandwidth(pair, begin + seconds(2)) - 250000 * 512.L / 1000000000) < 1e-15L,
+        "shared paths were priced at isolated rates despite concurrent block measurements");
+    counters[0].read_sectors += 100000; counters[0].busy_ms += 500;
+    auto const concurrent = shared.concurrent_bandwidth(pair, begin + seconds(3));
+    auto const available = shared.bandwidth(pair[0], begin + seconds(3));
+    auto const observed = shared.observed_bulk_bandwidth(pair[0].drives.front(), begin + seconds(3));
+    require(observed && observed->first >= observed->second && std::abs(observed->second - available) < 1e-15L &&
+        !shared.observed_bulk_bandwidth("unobserved"), "read-only disk telemetry disagreed with scheduler bandwidth");
+    require(concurrent > 0 && available < shared.bandwidth(pair[0], begin + seconds(5)),
+        "a partial foreign load failed to reserve its bandwidth or erased a joint measurement");
+
+    // Both disks complete our writes. A competing sequential reader on one
+    // of them cannot turn its extra sectors into bandwidth for this plot.
+    DiskIoGovernor competing([&](std::string const& name) { return std::optional{counters[name == "a" ? 0 : 1]}; });
+    for (auto const& device : pair) competing.register_device(device);
+    competing.poll(begin);
+    constexpr uint64_t mib = 1024 * 1024;
+    for (size_t i = 0; i < pair.size(); ++i)
+    {
+        competing.observe_transfer(pair[i], 16 * mib, 0, DiskIoGovernor::Transfer::write, begin + milliseconds(100));
+        counters[i].write_sectors += 16 * mib / 512;
+        counters[i].busy_ms += i ? 100 : 1000;
+    }
+    counters[0].read_sectors += 144 * mib / 512;
+    auto const busy = competing.bandwidth(pair[0], begin + seconds(1));
+    require(busy > 0 && busy < competing.bandwidth(pair[1], begin + seconds(1)) / 5,
+        "another reader's throughput was credited to an active scratch writer");
+    competing.observe_transfer(pair[1], 32 * mib, 0, DiskIoGovernor::Transfer::write, begin + milliseconds(1100));
+    competing.poll(begin + seconds(2));
+    counters[1].write_sectors += 32 * mib / 512; counters[1].busy_ms += 1000;
+    auto const writeback = competing.bandwidth(pair[1], begin + seconds(3));
+    competing.observe_transfer(pair[1], 32 * mib, 1000000, DiskIoGovernor::Transfer::flush, begin + milliseconds(3100));
+    counters[1].write_sectors += 32 * mib / 512; counters[1].busy_ms += 1000;
+    require(writeback > 0 && competing.bandwidth(pair[1], begin + seconds(4)) < writeback / 5,
+        "deferred own writeback or its flush hid a subsequent outside writer");
+}
 void disk_feedback(fs::path const& directory)
 {
     using Clock = DiskIoGovernor::Clock;
@@ -580,6 +818,45 @@ void disk_feedback(fs::path const& directory)
     for (size_t i = 0; i < 2 * live->status().drives; ++i) live->selected(b);
     require(live->routing_cost(a) < live->routing_cost(b), "a slow/contended physical drive was permanently starved");
     pool.cancel(0);
+
+    ra.device.rotating = rb.device.rotating = true;
+    std::vector<DiskIoGovernor::FarmingScope> scopes{{"first.log", {ra.device}}, {"other.log", {ra.device}}};
+    std::map<std::string, DiskIoGovernor::Counters> physical;
+    std::map<std::string, unsigned> reads;
+    auto scoped = std::make_shared<DiskIoGovernor>([&](std::string const& name)
+        { ++reads[name]; return std::optional{physical[name]}; }, 32, DiskIoGovernor::Mode::observed_farm, scopes);
+    auto const sampled = Clock::now();
+    FarmingServiceRecord late{sampled, 500000000, 1, 20, true};
+    scoped->record_farming_service(late, 1000000000, 0);
+    scoped->refresh_farming_sources(sampled);
+    ScratchPool choices({ra, rb}, 0); choices.set_io_governor(scoped);
+    require(choices.try_reserve_output(0, root(directory / "c", "target", {"target"}), unit), "scoped scratch output admission failed");
+    choices.seal_recovery();
+    scoped->poll(sampled);
+    for (size_t width : {1u, 2u})
+    {
+        auto chosen = choices.grant(0, 20 * unit, 20 * unit, unit, 2, false, 0, 0, width, 1, {}, true);
+        require(chosen && quota(*chosen) == 20 * unit && chosen->scratch.size() == 1 &&
+            chosen->scratch.front().directory == rb.directory, "new scratch did not prefer an equally eligible unpressured HDD");
+    }
+    // Both reader mappings share one physical sample. The unthrottled native
+    // write still contributes its submitted bytes exactly once.
+    constexpr uint64_t bulk = 16 * 1024 * 1024;
+    auto native = scoped->try_acquire(rb.device, bulk, sampled + milliseconds(100));
+    require(native && native->bytes() == bulk, "an unrelated HDD inherited another reader's transfer limit");
+    native->complete(bulk, 1000, sampled + milliseconds(100), DiskIoGovernor::Transfer::write);
+    physical["disk-b"].write_sectors += 2 * bulk / 512; physical["disk-b"].busy_ms = 1000;
+    scoped->poll(sampled + seconds(1));
+    auto const observed = scoped->observed_bulk_bandwidth("disk-b", sampled + seconds(1));
+    require(reads["disk-a"] == 2 && reads["disk-b"] == 2 && observed && observed->first > 0 &&
+        std::abs(observed->second / observed->first - .5L) < 1e-6L,
+        "multiple readers sampled a physical disk twice or lost an unrelated native transfer");
+    auto timely = late; timely.response_ns = 1000;
+    for (unsigned i = 0; i < 25; ++i) scoped->record_farming_service(timely, 1000000000, 0);
+    scoped->refresh_farming_sources(Clock::now());
+    auto recovered = choices.grant(0, 20 * unit, 20 * unit, unit, 2);
+    require(recovered && recovered->scratch.front().directory == ra.directory, "scratch ordering did not recover after timely lookups");
+    choices.cancel(0);
 
     DiskIoGovernor cancellable;
     auto held = cancellable.acquire(a, unit);
@@ -700,10 +977,30 @@ void nvme_topology()
     require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller namespaces were accepted");
 #endif
 }
+#ifdef _WIN32
+void windows_disk_identity()
+{
+    STORAGE_DEVICE_NUMBER_EX disk{};
+    disk.Size = disk.Version = sizeof(disk);
+    disk.DeviceType = FILE_DEVICE_DISK; disk.DeviceNumber = 3;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)).empty(), "missing disk GUID established a measurement identity");
+    disk.DeviceGuid.Data1 = 1;
+    auto const original = storage_detail::disk_guid(3, disk, sizeof(disk));
+    require(original.size() == 32, "Windows disk GUID missing from measurement identity");
+    ++disk.DeviceGuid.Data1;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)) != original,
+        "Windows disk number reuse retained the previous measurement identity");
+    require(storage_detail::disk_guid(4, disk, sizeof(disk)).empty() &&
+        storage_detail::disk_guid(3, disk, sizeof(disk) - 1).empty(), "mismatched or short Windows disk identity was accepted");
+    disk.DeviceNumber = MAXDWORD;
+    require(storage_detail::disk_guid(MAXDWORD, disk, sizeof(disk)).empty(), "an MPIO path established a physical disk identity");
+}
+#endif
 int main() try
 {
     nvme_topology();
 #ifdef _WIN32
+    windows_disk_identity();
     fs::path directory;
     std::random_device random;
     for (unsigned attempt = 0; attempt < 32; ++attempt)
@@ -724,7 +1021,8 @@ int main() try
     topology(directory, true, false); topology(directory, false, false); topology(directory, true, true);
     staged_topology(directory, true, false); staged_topology(directory, false, false); staged_topology(directory, true, true);
     staged_aliases(directory); saved_staging(directory); staged_distributed(directory);
-    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory); disk_feedback(directory);
+    distributed(directory); automatic_storage(directory); guards(directory); headroom(directory); many_owners(directory); ssd_backlog(directory);
+    rotating_bandwidth(directory); disk_feedback(directory);
     for (std::string const name : {"a", "b", "c", "d", "e", "f"})
         require(fs::is_empty(directory / name), "capacity discovery or admission wrote to a supplied directory");
     fs::remove_all(directory);

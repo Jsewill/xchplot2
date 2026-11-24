@@ -6,7 +6,7 @@ if(NOT DEFINED POS2_PR118_DIR)
     include(FetchContent)
     FetchContent_Declare(pos2_pr118
         GIT_REPOSITORY https://github.com/Chia-Network/pos2-chip
-        GIT_TAG ff89d3e61f4315311a7f975409a6433e67f699ff
+        GIT_TAG 077c692b51a32cde748e6a8f1ccefe5354c81fa8
         SOURCE_SUBDIR .no-cmakelists-here)
     FetchContent_MakeAvailable(pos2_pr118)
     set(POS2_PR118_DIR "${pos2_pr118_SOURCE_DIR}")
@@ -63,8 +63,6 @@ if(UNIX)
     endif()
 
     # Same-file construction uses the ordinary upstream v2 codec and reader.
-    # Transfer the CPU plotter's final vector instead of retaining a duplicate
-    # through return. This leaves room for a resident batch on smaller hosts.
     pos2_grow_prepare("${POS2_PR118_DIR}" grow_include)
     add_executable(pos2_pr118_grow "${XCHPLOT2_SOURCE_DIR}/src/host/GroupPlotter.cpp"
         "${XCHPLOT2_SOURCE_DIR}/tools/xchplot2/group_options.cpp" "${XCHPLOT2_SOURCE_DIR}/tools/xchplot2/group_reference.cpp" "${POS2_PR118_DIR}/src/pos/sha/sha256.c")
@@ -114,7 +112,7 @@ if(TARGET pos2_pr118_grow)
         target_link_libraries(${target} PRIVATE "${keygen_lib}" ${CMAKE_DL_LIBS} m)
     endforeach()
 endif()
-foreach(target pos2_pr118_grow_pool_owner_test pos2_pr118_grow_worker_test
+foreach(target pos2_pr118_grow_worker_host pos2_pr118_grow_pool_owner_test pos2_pr118_grow_worker_test
                pos2_pr118_grow_worker_client_test compute_compatibility_test)
     if(TARGET ${target})
         add_dependencies(${target} pos2_pr118_keygen)

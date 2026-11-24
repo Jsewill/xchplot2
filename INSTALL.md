@@ -476,8 +476,10 @@ runners do not validate GPU execution.
 ### Native SYCL
 
 The native Windows build is experimental and uses the standalone CMake
-executable. Cargo's dependency bootstrap remains Linux-specific. GPU plotting
-has not yet been qualified on Windows hardware.
+executable. Cargo's dependency bootstrap remains Linux-specific. On Windows 11,
+the Radeon RX 6700 XT produced k=28 plot groups that matched the CPU reference
+byte for byte and passed full-proof verification. See the
+[native Windows benchmarks](BENCHMARKS.md#native-windows-grouped-plotting).
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
 20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),

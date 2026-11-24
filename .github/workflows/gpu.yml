@@ -3,6 +3,23 @@ name: GPU hardware
 on:
   push:
     branches: [main]
+    paths:
+      - .github/workflows/gpu.yml
+      - .github/workflows/gpu-run.yml
+      - CMakeLists.txt
+      - cmake/**
+      - keygen-rs/Cargo.*
+      - keygen-rs/src/**
+      - keygen-rs/include/**
+      - src/host/**
+      - src/gpu/**
+      - tools/**
+      - contrib/pos2-*.patch
+      - contrib/cccl-arch-list.patch
+      - scripts/test/gpu-ci.py
+      - '!tools/xchplot2/*.rc'
+      - '!tools/xchplot2/*.manifest'
+      - '!tools/xchplot2/compute_service_windows.cpp'
   workflow_dispatch:
     inputs:
       suite:

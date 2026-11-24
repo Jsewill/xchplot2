@@ -439,9 +439,46 @@ public:
         size_ = count;
     }
     std::optional<std::array<uint8_t, 32>> digest_for(Members members) const;
+    // Pooled producers can finish out of order. Extend the same canonical SHA
+    // prefix once the next immutable member is available to its owner.
+    void append(MemberView member, std::function<void()> const& check_running)
+    {
+        group_tools::require(member.compact() && member.immutable_id(), "cannot cache an unsealed member");
+        auto state = start(member.size());
+        try
+        {
+            size_t offset = 0, chunk = 0;
+            update(state.get(), member, offset, chunk, member.size(), check_running);
+            commit(member.immutable_id(), std::move(state));
+        }
+        catch (...) { active_ = false; throw; }
+    }
 private:
     friend class CompactMemberBuilder;
     friend class CompactMemberReceiver;
+    friend std::array<uint8_t, 32> members_digest(uint8_t, Members, MemberBatchHash const*, std::function<void()> const&);
+    static void update(pos2_sha256_state* state, MemberView view, size_t& offset, size_t& chunk,
+                       size_t available, std::function<void()> const& check_running = {})
+    {
+        std::array<uint64_t, 512> values;
+        while (offset < available)
+        {
+            if (check_running) check_running();
+            size_t count = 0;
+            while (count < values.size() && offset < available)
+            {
+                while (view.boundary(chunk + 1) <= offset) ++chunk;
+                auto const region = view.region(chunk);
+                size_t const end = std::min({available, view.boundary(chunk + 1),
+                                            offset + values.size() - count});
+                size_t index = offset - view.boundary(chunk);
+                while (offset < end) { values[count++] = region[index++]; ++offset; }
+            }
+            group_tools::require(pos2_sha256_state_update(state,
+                reinterpret_cast<uint8_t const*>(values.data()), count * sizeof(uint64_t)) == POS2_OK,
+                "cannot hash incoming member fragments");
+        }
+    }
     State start(uint64_t count)
     {
         group_tools::require(!active_ && size_ < capacity_, "group hash builder capacity exceeded");
@@ -755,11 +792,16 @@ public:
             if (!tile.words.empty())
                 std::copy(tile.words.begin(), tile.words.end(), member_.packed_.get() + written_);
             written_ += tile.words.size();
-            if (hash_) hash_received();
+            if (hash_)
+            {
+                unsigned const width = member_.k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
+                size_t const available = std::min(member_.count_, written_ * 64 / width);
+                MemberBatchHash::update(hash_state_.get(), member_.view(), hashed_, hash_chunk_, available);
+            }
         }
         catch (...) { failed_ = true; throw; }
     }
-    Member finish()
+    Member finish(bool deltas_checked = false)
     {
         group_tools::require(started_ && !finished_ && !failed_ && written_ == member_.packed_words_,
                              "incomplete packed transfer");
@@ -774,7 +816,7 @@ public:
         // inspection. Packed words encode low fields only; the received chunk
         // boundaries provide their high fields. Check each region before
         // allowing codecs to rely on the validated-delta fast path.
-        if (!trust_validation_)
+        if (!trust_validation_ && !deltas_checked)
         {
             failed_ = true;
             auto const view = member_.view();
@@ -802,29 +844,6 @@ public:
         return std::move(member_);
     }
 private:
-    void hash_received()
-    {
-        unsigned const width = member_.k_ + PlotGroupFile::PROOFS_PER_CHUNK_BITS;
-        size_t const available = std::min(member_.count_, written_ * 64 / width);
-        std::array<uint64_t, 512> values;
-        auto const view = member_.view();
-        while (hashed_ < available)
-        {
-            size_t count = 0;
-            while (count < values.size() && hashed_ < available)
-            {
-                while (member_.boundaries_[hash_chunk_ + 1] <= hashed_) ++hash_chunk_;
-                auto const region = view.region(hash_chunk_);
-                size_t const end = std::min({available, member_.boundaries_[hash_chunk_ + 1],
-                                            hashed_ + values.size() - count});
-                size_t index = hashed_ - member_.boundaries_[hash_chunk_];
-                while (hashed_ < end) { values[count++] = region[index++]; ++hashed_; }
-            }
-            group_tools::require(pos2_sha256_state_update(hash_state_.get(),
-                reinterpret_cast<uint8_t const*>(values.data()), count * sizeof(uint64_t)) == POS2_OK,
-                "cannot hash incoming member fragments");
-        }
-    }
     Member member_;
     size_t written_ = 0, hashed_ = 0, hash_chunk_ = 0;
     bool started_ = false, finished_ = false, failed_ = false;
@@ -947,7 +966,21 @@ inline std::array<uint8_t, 32> members_digest(uint8_t k, Members members,
         catch (...) { reader.error = std::current_exception(); return -1; }
     };
     std::array<uint8_t, 32> result{};
-    int const status = pos2_sha256_stream(next, &reader, result.data());
+    int status;
+    if (hash && hash->size() && hash->size() < members.size() && hash->digest_for(members.subspan(0, hash->size())))
+    {
+        // Foreground CPU interrupted the producer between members. Resume the
+        // ordinary digest reader at the first member outside its sealed prefix.
+        reader.member = hash->size();
+        MemberBatchHash::State state(pos2_sha256_state_clone(hash->prefixes_[reader.member - 1].state.get()));
+        group_tools::require(bool(state), "cannot clone group hash state");
+        pos2_sha256_segment segment{};
+        while (next(&reader, &segment) == 1)
+            group_tools::require(pos2_sha256_state_update(state.get(), segment.data, segment.len) == POS2_OK,
+                "cannot hash incoming group members");
+        status = pos2_sha256_state_digest(state.get(), result.data());
+    }
+    else status = pos2_sha256_stream(next, &reader, result.data());
     if (reader.error) std::rethrow_exception(reader.error);
     group_tools::require(status == POS2_OK, "cannot hash incoming group members");
     return result;

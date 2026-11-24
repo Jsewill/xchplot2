@@ -114,11 +114,14 @@ struct ExternalConfig
     // It is not part of the persisted construction settings.
     std::shared_ptr<std::recursive_mutex> target_gate;
     std::shared_ptr<DiskIoGovernor> io_governor;
+    std::shared_ptr<DiskIoGovernor> bandwidth;
+    bool striped = false;
 };
 
 class ExternalEngine
 {
 public:
+    static constexpr size_t max_runs = 64;
     ExternalEngine(std::string path, Config config, ExternalConfig external,
                    bool resume = false, std::optional<Identity> initial = {});
     ~ExternalEngine();
@@ -185,6 +188,17 @@ public:
                                        MemoryPhase phase, uint16_t batch_members = 1);
     static uint64_t read_buffer_bytes(uint8_t k, Config const& config, ExternalConfig const& external);
     static uint64_t metadata_bytes(uint8_t k, ExternalConfig const& external);
+    static bool scratch_overlap(uint64_t window, ExternalConfig const& external)
+    {
+        return external.scratch.size() > 1 && external.scratch.size() <= max_runs &&
+            scratch_queue_bytes(external) <= window / 2;
+    }
+    static uint64_t striped_reader_bytes(uint8_t k, Config const& config, ExternalConfig const& external)
+    {
+        auto const cache = read_buffer_bytes(k, config, external);
+        if (config.io_overlap && scratch_overlap(config.window_bytes, external)) return cache - scratch_queue_bytes(external);
+        return std::min(cache, multiply(config.window_bytes, 8));
+    }
     uint64_t required_memory(uint16_t batch_members = 1, unsigned workers = 0) const
     {
         auto cfg = config_; if (workers) cfg.workers = workers;
@@ -257,14 +271,15 @@ public:
     // ownership header/alignment unit. Wide count bounds use ordinary input.
     static uint64_t input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound);
     std::unique_ptr<PreparedInput> prepare_input(uint16_t members, uint64_t fragment_bound);
-    AppendResult append(PreparedInput& input, uint16_t prefix = 0);
+    AppendResult append(PreparedInput& input, uint16_t prefix = 0, bool final = false);
     class ContributionInput;
     // Portable compressed member streams become ordinary owned runs only
     // after local validation, exact capacity admission and a durable append.
     static uint64_t contribution_input_memory_bytes(Config const& config, uint16_t members);
     static uint64_t contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound);
-    std::unique_ptr<ContributionInput> prepare_contributions(uint16_t members, uint64_t fragment_bound);
-    AppendResult append(ContributionInput& input, uint16_t prefix = 0);
+    std::unique_ptr<ContributionInput> prepare_contributions(uint16_t members, uint64_t fragment_bound,
+        uint64_t final_capacity = UINT64_MAX);
+    AppendResult append(ContributionInput& input, uint16_t prefix = 0, bool final = false);
     AppendResult append(Members members);
     // The caller retains the last batch through packing. Its digest and the
     // emitted frontier are durable; recovery regenerates only this batch.
@@ -306,9 +321,11 @@ private:
     };
     struct Packet { uint16_t first, count; uint32_t bytes; };
     static_assert(sizeof(Packet) == 8);
+    static uint64_t contribution_payload_bound(uint8_t k, uint16_t members, uint64_t symbols, uint64_t chunks);
+    static uint64_t contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound);
     struct Summary { ChunkSummary codec; uint64_t bytes = 0; };
     static constexpr uint64_t segment_header_bytes = 64;
-    static constexpr size_t max_runs = 64, max_roots = 1024;
+    static constexpr size_t max_roots = 1024;
     std::string path_, work_, token_;
     std::string producer_build_ = GROW_IDENTITY;
     bool legacy_checkpoint_ = false;
@@ -329,6 +346,11 @@ private:
     uint64_t next_id_ = 0, final_bound_ = 0, output_bytes_ = 0, packed_chunks_ = 0, contribution_bytes_ = 0;
     uint64_t checkpoint_ceiling_ = 0, packing_checkpoint_bytes_ = 0, checkpoint_tuning_changes_ = 0;
     std::vector<Root> roots_;
+    std::vector<StorageDevice> scratch_devices_;
+    std::vector<size_t> disk_lanes_;
+    std::vector<std::unique_ptr<OrderedWriter>> disk_workers_;
+    uint64_t queue_bytes_ = 0;
+    bool single_scratch_writeback_ = false;
     std::vector<Run> runs_;
     Run summary_run_, pending_summary_;
     std::array<uint8_t, 32> summary_digest_{};
@@ -355,7 +377,8 @@ private:
     PreparedInput* prepared_ = nullptr;
     ContributionInput* contributions_ = nullptr;
     AppendResult append_source(Members members, PreparedInput* input, uint16_t count,
-                               bool terminal = false, MemberBatchHash const* hash = nullptr);
+                               bool final = false, MemberBatchHash const* hash = nullptr);
+    void commit_runs(std::vector<Summary>& summaries, uint64_t peak, bool final, PhaseTimer& encoding);
     void discard_input(Run& run, bool refresh = false);
     bool staging_slot();
     uint64_t prepared_segments() const;
@@ -373,6 +396,20 @@ private:
         return std::min(limit, multiply(workers, per_worker));
     }
     static uint64_t descriptor_limit(ExternalConfig const& external);
+    static uint64_t scratch_queue_bytes(ExternalConfig const& external)
+    {
+        return grow_add(multiply(descriptor_limit(external), 4 * sizeof(size_t)),
+            multiply(external.scratch.size(), sizeof(OrderedWriter) + sizeof(Stats) + 1024 +
+                2 * max_runs * (sizeof(ExecutionIO) + sizeof(std::future<void>) + 256)));
+    }
+    void start_disk_workers(std::vector<size_t> groups, size_t lanes)
+    {
+        disk_lanes_ = std::move(groups); queue_bytes_ = scratch_queue_bytes(external_);
+        for (auto const& device : scratch_devices_)
+            if (external_.bandwidth) external_.bandwidth->register_device(device);
+        for (size_t i = 0; i < lanes; ++i)
+            disk_workers_.push_back(std::make_unique<OrderedWriter>([] {}));
+    }
     static uint64_t checkpoint_buffer_bytes(ExternalConfig const& external);
     static uint64_t phase_base_memory_bytes(uint8_t k, Config const& config, ExternalConfig const& external,
                                             MemoryPhase phase, uint16_t batch_members);
@@ -445,8 +482,17 @@ private:
     static void sync_directory(std::string const& path, external_detail::IOContext context = {"directory"});
     std::unique_lock<std::recursive_mutex> target_lock() const
     { return external_detail::target_lock(external_.target_gate, fd_, path_); }
+    DiskIoGovernor* io_limit() const
+    { return external_.io_governor && external_.io_governor->limits_io() ? external_.io_governor.get() : nullptr; }
     external_detail::IOContext io_context(char const* role, ExecutionIO* service = nullptr)
-    { return {role, &path_, service, external_.io_governor.get(), &config_}; }
+    { return {role, &path_, service, io_limit(), &config_}; }
+    template<class Counters, class Sample> static void add_io(Counters& to, Sample const& from)
+    {
+        to.read_bytes += from.read_bytes; to.written_bytes += from.written_bytes;
+        to.read_calls += from.read_calls; to.write_calls += from.write_calls; to.syncs += from.syncs;
+        to.read_ns += from.read_ns; to.write_ns += from.write_ns; to.sync_ns += from.sync_ns;
+    }
+    template<class Operation> void scratch_segments(Run& run, Operation operation);
     void check_paths() const;
     void sync_target();
     void read_target(uint64_t offset, std::span<uint8_t> bytes);
@@ -465,6 +511,7 @@ private:
                              ConstructionInspectionLimits const* inspection = nullptr, Config const* runtime = nullptr);
     void write_summary(std::span<Summary const> summaries);
     std::vector<Summary> take_summary();
+    void check_summary_source(Run const& run) const;
     bool reserve(Run& run, uint64_t bytes, char const* role = "contribution");
     void discard(Run const& run);
     void incoming_regions(Members members, uint64_t chunk, std::vector<size_t>& cursors,
@@ -521,6 +568,7 @@ inline void evict(int fd)
     (void)fd;
 #endif
 }
+
 inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats* stats = nullptr, IOContext context = {})
 {
     while (!bytes.empty())
@@ -537,7 +585,7 @@ inline void write(int fd, uint64_t offset, std::span<uint8_t const> bytes, Stats
         if (stats) { stats->write_ns += elapsed; ++stats->write_calls; }
         if (context.service) { context.service->write_ns += elapsed; ++context.service->write_calls; }
         trace.report(begin, end, n, error);
-        permit.complete(n > 0 ? uint64_t(n) : 0, elapsed);
+        permit.complete(n > 0 ? uint64_t(n) : 0, elapsed, end, DiskIoGovernor::Transfer::write);
         if (n < 0 && error == EINTR) continue;
         require(n > 0, "external construction write failed: " + std::string(std::strerror(error)));
         if (stats) stats->written_bytes += uint64_t(n);
@@ -909,7 +957,7 @@ inline ExternalEngine::BatchResources ExternalEngine::batch_resources() const
     for (auto const& run : runs_) bytes = grow_add(bytes, run.bytes);
     return {members_, runs_.size(), packet_count_, bytes, packing_source_bytes_, sizeof(Packet),
         external_.packing_inputs ? external_.packing_inputs : external_.fan_in,
-        read_buffer_bytes(identity_.header.k, config_, external_)};
+        read_buffer_bytes(identity_.header.k, config_, external_) - queue_bytes_};
 }
 inline uint64_t ExternalEngine::metadata_bytes(uint8_t k, ExternalConfig const& external)
 {
@@ -942,9 +990,9 @@ inline uint64_t ExternalEngine::phase_memory_bytes(uint8_t k, Config const& conf
 inline uint64_t ExternalEngine::read_buffer_bytes(uint8_t k, Config const& config, ExternalConfig const& external)
 {
     uint64_t const original = config.window_bytes;
-    if (external.packing_inputs <= external.fan_in) return original;
-    // A larger retained reader set must not turn sequential HDD reads into
-    // small refills. Like the merged engine, share up to eight I/O windows.
+    if (external.packing_inputs <= external.fan_in && !external.striped) return original;
+    // A larger retained reader set needs large sequential refills. The
+    // ordinary pool shares up to eight I/O windows across those readers.
     // Cache size is runtime workspace, not a checkpoint setting. Preserve
     // the original memory requirement when recovering a tightly budgeted job.
     // Use the largest staging descriptor window so the same cache bound is
@@ -953,7 +1001,16 @@ inline uint64_t ExternalEngine::read_buffer_bytes(uint8_t k, Config const& confi
         phase_base_memory_bytes(k, config, external, MemoryPhase::staging, UINT16_MAX),
         phase_base_memory_bytes(k, config, external, MemoryPhase::packing, 1));
     uint64_t const spare = config.memory_limit_bytes - std::min(config.memory_limit_bytes, base);
-    return grow_add(original, std::min(multiply(config.window_bytes, 7), spare));
+    uint64_t extra = multiply(original, 7);
+    if (external.striped && config.io_overlap)
+    {
+        // Keep two sequential extents per spindle in flight when the engine
+        // can afford them. Limit the cache's share of the common RAM grant.
+        uint64_t const target = std::min(multiply(original, std::min<uint64_t>(64, 4 * external.scratch.size())),
+            config.memory_limit_bytes / 8);
+        extra = grow_add(std::max(extra, target - std::min(target, original)), scratch_queue_bytes(external));
+    }
+    return grow_add(original, std::min(extra, spare));
 }
 inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const& config,
     ExternalConfig const& external, MemoryPhase phase, uint16_t batch_members)
@@ -969,8 +1026,8 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     // input record while rebuilding persistent metadata. Keep
     // the existing recovery/inspection admission of a record within one eighth
     // of the grant, including descriptor-vector capacity and parser temporaries.
-    // Staging owns one cached or operation-local candidate summary. Exact sizing retains
-    // one canonical size field; durable summaries remain in scratch.
+    // Staging owns one cached or operation-local candidate summary. Exact sizing
+    // counts canonical index bits in a scalar; durable summaries remain in scratch.
     uint64_t const metadata = multiply(checkpoint_buffer_bytes(external), 8);
     if (phase == MemoryPhase::publication) return metadata;
     uint64_t const digest_memory = member_digest_words * sizeof(uint64_t) + 4096;
@@ -995,8 +1052,7 @@ inline uint64_t ExternalEngine::phase_base_memory_bytes(uint8_t k, Config const&
     uint64_t const tasks = staging ? std::max({planning_window, multiply(lanes, contribution_window), packing_tasks}) : packing_tasks;
     return grow_add(grow_add(config.codec_bytes, ParallelEncoder::memory_bytes(config.workers, !config.cpu_scheduler)), grow_add(grow_add(grow_add(multiply(config.window_bytes, 2 * lanes), tasks), std::max(config.window_bytes, uint64_t(max_runs * sizeof(Packet)))),
         grow_add(grow_add(metadata, digest_memory),
-        // Exact admission retains the candidate summary and a bounded writer
-        // for one canonical size field, with payload and bit totals in scalars.
+        // Exact admission retains the candidate summary and counts index bits.
         grow_add(staging ? grow_add(multiply(PlotGroupFile::getChunkCountForK(k), sizeof(Summary)), sizeof(uint64_t)) : 0,
             grow_add(multiply(batch_members, sizeof(size_t) + sizeof(FragmentRegion)),
                 multiply(multiply(lanes, UINT16_MAX), sizeof(EncodedChunk)))))));
@@ -1102,16 +1158,20 @@ inline void ExternalEngine::read_summary(std::vector<Root> const& roots, std::st
     std::array<uint8_t, 32> actual{}; sha256_sum(&context, actual.data());
     require(position == run.bytes && actual == checksum, "external summary checksum or coverage changed");
 }
+inline void ExternalEngine::check_summary_source(Run const& run) const
+{
+    for (auto const& segment : run.segments)
+    {
+        config_.check_running();
+        require(bind_stamp(segment_path(run, segment), segment.stamp, segment.identity) == segment.stamp,
+            "external summary source changed");
+    }
+}
 inline std::vector<ExternalEngine::Summary> ExternalEngine::take_summary()
 {
     if (!summary_cache_.empty())
     {
-        for (auto const& segment : summary_run_.segments)
-        {
-            auto const path = segment_path(summary_run_, segment);
-            require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp,
-                "external cached summary changed");
-        }
+        check_summary_source(summary_run_);
         // The candidate owns this allocation until its checkpoint commits.
         // Rejection or failure discards it; a retry reloads the durable table.
         return std::exchange(summary_cache_, {});
@@ -1127,28 +1187,41 @@ inline void ExternalEngine::write_summary(std::span<Summary const> summaries)
     using namespace external_detail;
     require(phase_ == Phase::stage && members_ && !pending_summary_.bytes, "invalid external pending summary generation");
     require(summaries.size() == PlotGroupFile::getChunkCountForK(identity_.header.k), "external replacement summary coverage changed");
-    auto bytes = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(summaries.data()), summaries.size_bytes());
+    auto const bytes = std::span<uint8_t const>(reinterpret_cast<uint8_t const*>(summaries.data()), summaries.size_bytes());
     summary_digest_ = grow_digest(bytes, config_.cpu_scheduler.get());
-    for (auto& segment : pending_summary_.segments)
+    // Unequal grants can give adjacent segments different lengths. Map them
+    // to their immutable source bytes before independent disk writers start.
+    std::vector<size_t> offsets;
+    offsets.reserve(pending_summary_.segments.size());
+    size_t end = 0;
+    for (auto const& segment : pending_summary_.segments)
+    {
+        require(segment.ordinal == offsets.size() && segment.bytes <= bytes.size() - end,
+            "external pending summary coverage changed");
+        offsets.push_back(end); end += size_t(segment.bytes);
+    }
+    require(end == bytes.size(), "external summary exceeded its admitted reservation");
+    scratch_segments(pending_summary_, [&](Segment& segment, Stats* stats, ExecutionIO* service)
     {
         auto const path = segment_path(pending_summary_, segment);
         require(stamp(path) == segment.stamp, "external pending summary segment changed");
         Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
         require(file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
-            file_io::matches_durable_identity(file.fd, segment.identity)) && segment.bytes <= bytes.size(),
-            "external pending summary handle or coverage changed");
+            file_io::matches_durable_identity(file.fd, segment.identity)), "external pending summary handle changed");
+        auto const io = io_context("checkpoint_summary", service);
+        auto const payload = bytes.subspan(offsets[segment.ordinal], size_t(segment.bytes));
         for (uint64_t offset = 0; offset < segment.bytes;)
         {
             size_t const count = size_t(std::min(config_.window_bytes, segment.bytes - offset));
-            write(file.fd, segment_header_bytes + offset, bytes.subspan(size_t(offset), count), &stats_, io_context("checkpoint_summary", &execution_scratch_)); offset += count;
+            write(file.fd, segment_header_bytes + offset, payload.subspan(size_t(offset), count), stats, io); offset += count;
         }
-        external_detail::sync(file.fd, &stats_, io_context("checkpoint_summary", &execution_scratch_));
+        external_detail::sync(file.fd, stats, io);
         require(stamp(path).file == segment.stamp.file, "external written summary path was replaced");
-        segment.stamp = stamp(path); pending_summary_.bytes += segment.bytes; bytes = bytes.subspan(size_t(segment.bytes));
+        segment.stamp = stamp(path);
         if (config_.release_cache) external_detail::evict(file.fd);
-    }
-    require(bytes.empty(), "external summary exceeded its admitted reservation");
-    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
+        return false; // reserve() already made this directory entry durable.
+    });
+    pending_summary_.bytes = end;
     grow_failpoint("external-summary-flushed");
 }
 inline void ExternalEngine::save(std::string const& label, std::span<Summary const> summaries)
@@ -1544,6 +1617,19 @@ inline ExternalEngine::ExternalEngine(std::string path, Config config, ExternalC
         external_.io_governor->register_directory(file_io::native_path(path_).parent_path());
         for (auto const& grant : external_.scratch) external_.io_governor->register_directory(file_io::native_path(grant.directory));
     }
+    if (config_.io_overlap && scratch_overlap(config_.window_bytes, external_))
+    {
+        for (auto const& grant : external_.scratch)
+            scratch_devices_.push_back(storage_device(file_io::native_path(grant.directory)));
+        auto groups = writer_groups(scratch_devices_);
+        auto const lanes = *std::max_element(groups.begin(), groups.end()) + 1;
+        // Fund native queues, per-reader futures and segment index lists from
+        // the existing read window. A tightly budgeted resume stays serial.
+        if (lanes > 1 &&
+            std::all_of(scratch_devices_.begin(), scratch_devices_.end(), [](auto const& d) { return d.rotating; }))
+            start_disk_workers(std::move(groups), lanes);
+        else scratch_devices_.clear();
+    }
     {
         auto target_guard = target_lock();
         fd_ = publication::open(path_.c_str(), (resume ? 0 : file_io::create | file_io::exclusive) | file_io::read_write | file_io::close_on_exec | file_io::no_follow, config_.private_output, 0600);
@@ -1649,6 +1735,45 @@ inline void ExternalEngine::confirm_identity()
     orphans_.clear();
     { auto target_guard = target_lock(); sync_directory(work_, io_context("directory", &execution_destination_)); }
 }
+// A directory becomes durable after all of its changed entries. Independent
+// disks can reach that boundary together. All borrowed state drains before
+// the caller publishes a manifest or rolls back a partial reservation.
+template<class Operation> inline void ExternalEngine::scratch_segments(Run& run, Operation operation)
+{
+    if (disk_workers_.empty())
+    {
+        std::array<bool, max_roots> touched{};
+        for (auto& segment : run.segments)
+        {
+            if (operation(segment, &stats_, &execution_scratch_)) touched[segment.root] = true;
+        }
+        for (size_t i = 0; i < roots_.size(); ++i)
+            if (touched[i]) sync_directory(roots_[i].path, io_context("directory", &execution_scratch_));
+        return;
+    }
+    struct Batch { std::vector<size_t> indices; Stats stats; ExecutionIO io; std::future<void> pending; };
+    std::vector<Batch> batches(roots_.size());
+    for (size_t i = 0; i < run.segments.size(); ++i) batches[run.segments[i].root].indices.push_back(i);
+    struct Drain
+    {
+        std::vector<Batch>& batches;
+        ~Drain() { for (auto& batch : batches) if (batch.pending.valid()) batch.pending.wait(); }
+    } drain{batches};
+    for (size_t root = 0; root < roots_.size(); ++root)
+    {
+        auto& batch = batches[root];
+        if (batch.indices.empty()) continue;
+        batch.pending = disk_workers_[disk_lanes_[root]]->submit([&, root]
+        {
+            bool changed = false;
+            for (size_t index : batch.indices)
+                if (operation(run.segments[index], &batch.stats, &batch.io)) changed = true;
+            if (changed) sync_directory(roots_[root].path, io_context("directory", &batch.io));
+        }, true);
+    }
+    for (auto& batch : batches) if (batch.pending.valid())
+    { batch.pending.get(); add_io(stats_, batch.stats); add_io(execution_scratch_, batch.io); }
+}
 inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
 {
     check_paths(); std::vector<Segment> plan; auto remaining = bytes;
@@ -1659,10 +1784,27 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
     uint64_t const limit = descriptor_limit(external_);
     require(existing <= limit, "external live descriptors exceed metadata reservation");
     std::vector<uint64_t> used; for (auto const& root : roots_) used.push_back(root.used);
+    std::vector<long double> rates;
+    std::vector<uint64_t> assigned(disk_workers_.size());
+    if (!disk_workers_.empty())
+    {
+        rates.resize(disk_workers_.size());
+        if (external_.bandwidth) for (size_t i = 0; i < scratch_devices_.size(); ++i)
+        {
+            auto const rate = external_.bandwidth->bandwidth(scratch_devices_[i]);
+            auto& lane = rates[disk_lanes_[i]];
+            if (rate > 0 && (!lane || rate < lane)) lane = rate;
+        }
+        long double total = 0; size_t samples = 0;
+        for (auto rate : rates) if (rate > 0) { total += rate; ++samples; }
+        if (!samples && rates.size() == roots_.size()) rates.clear();
+        else for (auto& rate : rates) if (!rate) rate = samples ? total / samples : 1;
+    }
     size_t next_root = size_t(run.id % roots_.size());
     while (remaining)
     {
-        bool found = false;
+        size_t selected = roots_.size(); uint64_t selected_capacity = 0;
+        long double soonest = 0;
         for (size_t search = 0; search < roots_.size(); ++search)
         {
             size_t const index = (next_root + search) % roots_.size(); auto const& root = roots_[index];
@@ -1671,12 +1813,24 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             uint64_t const desired = std::min(external_.segment_bytes, aligned(grow_add(remaining, segment_header_bytes), root.alignment));
             uint64_t const capacity = std::min(available, desired / root.alignment * root.alignment);
             if (capacity <= segment_header_bytes) continue;
-            if (plan.size() >= limit - existing) return false;
-            uint64_t const n = std::min(remaining, capacity - segment_header_bytes);
-            plan.push_back({{uint32_t(index), uint32_t(plan.size()), capacity, n, {}}, {}});
-            used[index] += capacity; remaining -= n; next_root = (index + 1) % roots_.size(); found = true; break;
+            // A long new run gives each disk an extent to refresh its rate.
+            // Aliased roots share the same physical backlog.
+            long double finish = 0;
+            if (!rates.empty())
+            {
+                size_t const lane = disk_lanes_[index];
+                if (assigned[lane] || bytes / external_.segment_bytes < rates.size())
+                    finish = (assigned[lane] + static_cast<long double>(capacity)) / rates[lane];
+            }
+            if (selected == roots_.size() || finish < soonest)
+            { selected = index; selected_capacity = capacity; soonest = finish; }
+            if (rates.empty()) break;
         }
-        if (!found) return false;
+        if (selected == roots_.size() || plan.size() >= limit - existing) return false;
+        uint64_t const n = std::min(remaining, selected_capacity - segment_header_bytes);
+        plan.push_back({{uint32_t(selected), uint32_t(plan.size()), selected_capacity, n, {}}, {}});
+        if (!rates.empty()) assigned[disk_lanes_[selected]] += selected_capacity;
+        used[selected] += selected_capacity; remaining -= n; next_root = (selected + 1) % roots_.size();
     }
     run.segments = std::move(plan);
     // A crash before a segment's ownership header reaches disk can leave an
@@ -1693,26 +1847,26 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
         if (!occupied) break;
         require(run.id < UINT32_MAX - 1, "external run identities exhausted"); ++run.id;
     }
-    size_t charged = 0;
+    std::vector<uint8_t> charged(run.segments.size());
     try
     {
-        for (auto& segment : run.segments)
+        scratch_segments(run, [&](Segment& segment, Stats* stats, ExecutionIO* service)
         {
             auto const path = segment_path(run, segment);
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::create | file_io::exclusive | file_io::read_write | file_io::close_on_exec | file_io::no_follow, 0600));
             segment.stamp = stamp(path); // Preserve ownership even if the first write fails.
             segment.identity = capture_identity(file.fd, path, segment.stamp.file);
-            auto const header = segment_header(run, segment); external_detail::write(file.fd, 0, header, &stats_, io_context(role, &execution_scratch_));
-            external_detail::reserve_file(file.fd, segment.capacity, io_context(role, &execution_scratch_));
-            external_detail::sync(file.fd, &stats_, io_context(role, &execution_scratch_));
+            auto const header = segment_header(run, segment); external_detail::write(file.fd, 0, header, stats, io_context(role, service));
+            external_detail::reserve_file(file.fd, segment.capacity, io_context(role, service));
+            external_detail::sync(file.fd, stats, io_context(role, service));
             auto const current = stamp(path); require(current.file == segment.stamp.file && file_identity(file.fd) == current.file,
                 "external reservation path was replaced");
             require(!file_io::has_durable_identity(segment.identity) || file_io::matches_durable_identity(file.fd, segment.identity),
                 "external reservation native handle changed");
-            segment.stamp = current; roots_[segment.root].used += segment.capacity; ++charged;
+            segment.stamp = current; roots_[segment.root].used += segment.capacity; charged[segment.ordinal] = 1;
             roots_[segment.root].peak = std::max(roots_[segment.root].peak, roots_[segment.root].used);
-        }
-        for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
+            return true;
+        });
     }
     catch (...)
     {
@@ -1723,7 +1877,7 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
             auto const path = segment_path(run, segment);
             require(bind_identity(path, false, segment.stamp.file, segment.identity) == segment.stamp.file, "external reservation path was replaced");
             require(!file_io::unlink_file(path.c_str()), "cannot remove failed external reservation");
-            if (i < charged) roots_[segment.root].used -= segment.capacity;
+            if (charged[i]) roots_[segment.root].used -= segment.capacity;
         }
         run.segments.clear(); run.bytes = 0;
         for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
@@ -1734,18 +1888,26 @@ inline bool ExternalEngine::reserve(Run& run, uint64_t bytes, char const* role)
 inline void ExternalEngine::discard(Run const& run)
 {
     check_paths(); uint64_t end = 0;
+    std::array<bool, max_roots> changed{};
     for (auto const& segment : run.segments)
     {
         end += segment.bytes;
         std::string const path = segment_path(run, segment); file_io::Stat exists{};
         if (file_io::inspect_link(path.c_str(), &exists))
-        { require(errno == ENOENT && end <= run.consumed, "required external segment vanished"); continue; }
+        {
+            require(errno == ENOENT && end <= run.consumed, "required external segment vanished");
+            // A previous process may have stopped between unlink and the
+            // directory sync. Fence that directory before retiring its record.
+            if (!created_) changed[segment.root] = true;
+            continue;
+        }
         require(bind_stamp(path, segment.stamp, segment.identity) == segment.stamp, "external segment changed before reclamation");
         require(!file_io::unlink_file(path.c_str()), "cannot reclaim external segment");
         roots_[segment.root].used -= segment.capacity; stats_.reclaimed_bytes += segment.capacity;
-        grow_failpoint("external-segment-unlinked");
+        changed[segment.root] = true; grow_failpoint("external-segment-unlinked");
     }
-    for (auto const& root : roots_) sync_directory(root.path, io_context("directory", &execution_scratch_));
+    for (size_t i = 0; i < roots_.size(); ++i)
+        if (changed[i]) sync_directory(roots_[i].path, io_context("directory", &execution_scratch_));
 }
 class ExternalEngine::Writer
 {
@@ -1793,9 +1955,20 @@ public:
                     engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
                     file_io::matches_durable_identity(file_->fd, segment.identity)), "external output segment was replaced"); opened_ = segment_;
             }
-            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
+            auto const io = engine_.io_context(role_, &engine_.execution_scratch_);
+            external_detail::write(file_->fd, segment_header_bytes + position_, bytes.first(n), &engine_.stats_, io);
+            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
+                engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[segment.root], n, 0, DiskIoGovernor::Transfer::write);
             position_ += n; run_.bytes += n; bytes = bytes.subspan(n);
-            if (position_ == segment.bytes) { ++segment_; position_ = 0; }
+            if (position_ == segment.bytes)
+            {
+                // Start writeback while subsequent writes and receives run. finish()
+                // still verifies and synchronizes every completed extent.
+                if (!engine_.io_limit() && (!engine_.disk_workers_.empty() ||
+                    (gated_copy_ && engine_.contributions_ && engine_.single_scratch_writeback_)))
+                    file_io::start_writeback(file_->fd, 0, 0);
+                ++segment_; position_ = 0;
+            }
         }
     }
     template<class T> void value(T const& value)
@@ -1803,28 +1976,44 @@ public:
     void finish()
     {
         flush(); file_.reset();
-        uint64_t remaining = run_.bytes; std::vector<Segment> kept;
-        for (auto segment : run_.segments)
+        uint64_t remaining = run_.bytes;
+        for (auto& segment : run_.segments)
+        { segment.bytes = std::min(remaining, segment.bytes); remaining -= segment.bytes; }
+        require(!remaining, "external contribution length exceeds segments");
+        // A peer can fail after another disk has already unlinked an unused
+        // tail. Retry cleanup must visit only reservations we still own.
+        struct Released
+        {
+            Run& run;
+            ~Released() { std::erase_if(run.segments, [](Segment const& segment) { return !segment.capacity; }); }
+        } released{run_};
+        engine_.scratch_segments(run_, [&](Segment& segment, Stats* stats, ExecutionIO* service)
         {
             auto const path = engine_.segment_path(run_, segment);
             require(engine_.stamp(path).file == segment.stamp.file, "external written segment was replaced");
-            if (!remaining)
+            if (!segment.bytes)
             {
                 require(!file_io::unlink_file(path.c_str()), "cannot release unused external reservation");
-                engine_.roots_[segment.root].used -= segment.capacity; continue;
+                engine_.roots_[segment.root].used -= segment.capacity; segment.capacity = 0; return true;
             }
-            segment.bytes = std::min(remaining, segment.bytes); remaining -= segment.bytes;
             uint64_t const capacity = aligned(segment.bytes + segment_header_bytes, engine_.roots_[segment.root].alignment);
             external_detail::Descriptor file(file_io::open_file(path.c_str(), file_io::read_write | file_io::no_follow | file_io::close_on_exec));
             require(engine_.file_identity(file.fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
                 file_io::matches_durable_identity(file.fd, segment.identity)), "external completed segment handle was replaced");
-            require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution"); external_detail::sync(file.fd, &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
+            require(!file_io::resize_file(file.fd, file_io::Offset(capacity)), "cannot trim external contribution");
+            uint64_t const before = service->sync_ns;
+            auto const io = engine_.io_context(role_, service);
+            external_detail::sync(file.fd, stats, io);
+            if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
+                engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[segment.root], segment.bytes,
+                    service->sync_ns - before, DiskIoGovernor::Transfer::flush);
             engine_.roots_[segment.root].used -= segment.capacity - capacity; segment.capacity = capacity;
-            segment.stamp = engine_.stamp(path); kept.push_back(segment);
+            auto const stamp = engine_.stamp(path);
+            require(stamp.file == segment.stamp.file, "external completed segment was replaced");
+            segment.stamp = stamp;
             if (engine_.config_.release_cache) external_detail::evict(file.fd);
-        }
-        require(!remaining, "external contribution length exceeds segments"); run_.segments = std::move(kept);
-        for (auto const& root : engine_.roots_) sync_directory(root.path, engine_.io_context("directory", &engine_.execution_scratch_));
+            return false;
+        });
     }
 private:
     std::vector<uint8_t> buffer_;
@@ -1834,21 +2023,35 @@ private:
 class ExternalEngine::Reader
 {
 public:
+    static constexpr size_t minimum_prefetch_bytes = 2 * 1024 * 1024;
     Reader(ExternalEngine& engine, Run const& run, size_t active = 0, uint64_t start = UINT64_MAX,
            char const* role = "contribution", uint64_t* activity = nullptr, uint64_t buffer_bytes = 0)
         : engine_(engine), run_(run), position_(start == UINT64_MAX ? run.consumed : start), read_position_(position_), role_(role), activity_(activity),
-          buffer_(size_t(std::max<uint64_t>(sizeof(Packet), (buffer_bytes ? buffer_bytes : read_buffer_bytes(engine.identity_.header.k,
-              engine.config_, engine.external_)) / (active ? active : std::max<size_t>(1, engine.runs_.size())))))
+          buffer_(size_t(std::max<uint64_t>(sizeof(Packet), ((buffer_bytes ? buffer_bytes : read_buffer_bytes(engine.identity_.header.k,
+              engine.config_, engine.external_)) - engine.queue_bytes_) / (active ? active : std::max<size_t>(1, engine.runs_.size())))))
     {
         uint64_t skip = position_;
         while (segment_ < run_.segments.size() && skip >= run_.segments[segment_].bytes)
         { skip -= run_.segments[segment_].bytes; ++segment_; }
         offset_ = skip;
+        // A compact member cursor can stop in the middle of a shared run.
+        // Only packet streams own the whole remaining range. Queue contiguous
+        // extents into the existing cache and consume them in logical order.
+        if (!engine_.disk_workers_.empty() && !buffer_bytes && buffer_.size() >= minimum_prefetch_bytes)
+        {
+            block_ = size_t(std::min<uint64_t>(engine_.external_.segment_bytes, buffer_.size() / 2));
+            pending_.reads.resize(std::min(2 * engine_.disk_workers_.size(), buffer_.size() / block_));
+            read_ahead();
+        }
     }
+    void read_ahead() { prefetch(false); }
     uint64_t position() const { return position_; }
     uint64_t remaining() const { return run_.bytes - position_; }
     void checkpoint(uint64_t consumed)
-    { if (file_ && file_end_ <= consumed) { if (engine_.config_.release_cache) external_detail::evict(file_->fd); file_.reset(); opened_ = SIZE_MAX; } }
+    {
+        for (auto& read : pending_.reads) account(read);
+        if (file_ && file_end_ <= consumed) { if (engine_.config_.release_cache) external_detail::evict(file_->fd); file_.reset(); opened_ = SIZE_MAX; }
+    }
     void read(std::span<uint8_t> bytes)
     {
         require(bytes.size() <= remaining(), "external packet is truncated");
@@ -1856,8 +2059,19 @@ public:
         {
             if (buffer_begin_ == buffer_end_)
             {
-                buffer_begin_ = 0; buffer_end_ = size_t(std::min<uint64_t>(buffer_.size(), run_.bytes - read_position_));
-                require(buffer_end_, "external preread reached an unexpected end"); read_direct(std::span(buffer_).first(buffer_end_));
+                if (block_)
+                {
+                    if (buffer_end_) { first_ = (first_ + 1) % pending_.reads.size(); --queued_; }
+                    prefetch(!queued_);
+                    require(queued_, "external preread reached an unexpected end");
+                    auto& read = pending_.reads[first_]; account(read);
+                    buffer_begin_ = first_ * block_; buffer_end_ = buffer_begin_ + read.bytes;
+                }
+                else
+                {
+                    buffer_begin_ = 0; buffer_end_ = size_t(std::min<uint64_t>(buffer_.size(), run_.bytes - read_position_));
+                    require(buffer_end_, "external preread reached an unexpected end"); read_direct(std::span(buffer_).first(buffer_end_));
+                }
             }
             size_t const n = std::min(bytes.size(), buffer_end_ - buffer_begin_);
             std::memcpy(bytes.data(), buffer_.data() + buffer_begin_, n);
@@ -1871,6 +2085,61 @@ public:
             result.bytes > 1 && result.bytes <= remaining(), "invalid external packet member coverage or length"); return result;
     }
 private:
+    struct Pending
+    {
+        struct Read { size_t bytes = 0; ExecutionIO io; std::future<void> done; };
+        std::vector<Read> reads;
+        ~Pending() { for (auto& read : reads) if (read.done.valid()) read.done.wait(); }
+    };
+    void prefetch(bool needed)
+    {
+        while (queued_ < pending_.reads.size() && read_position_ < run_.bytes)
+        {
+            auto const& segment = run_.segments.at(segment_);
+            auto& worker = *engine_.disk_workers_[engine_.disk_lanes_[segment.root]];
+            if ((!needed || queued_) && !worker.has_room()) break;
+            size_t const slot = (first_ + queued_) % pending_.reads.size();
+            auto& read = pending_.reads[slot];
+            read.bytes = size_t(std::min<uint64_t>(block_, segment.bytes - offset_));
+            auto slice = std::span(buffer_).subspan(slot * block_, read.bytes);
+            read.done = worker.submit([this, &segment, offset = offset_, slice, &read]
+            {
+                engine_.config_.check_running();
+                auto file = open(segment);
+                transfer(file->fd, segment.root, offset, slice, nullptr, &read.io);
+            }, true);
+            ++queued_; advance(read.bytes, segment);
+        }
+    }
+    void account(Pending::Read& read)
+    {
+        if (!read.done.valid()) return;
+        read.done.get(); add_io(engine_.stats_, read.io); add_io(engine_.execution_scratch_, read.io);
+        read.io = {};
+    }
+    std::unique_ptr<external_detail::Descriptor> open(Segment const& segment) const
+    {
+        auto const path = engine_.segment_path(run_, segment);
+        auto file = std::make_unique<external_detail::Descriptor>(file_io::open_file(path.c_str(),
+            file_io::read_only | file_io::no_follow | file_io::close_on_exec));
+        require(engine_.stamp(path) == segment.stamp && engine_.file_identity(file->fd) == segment.stamp.file &&
+            (!file_io::has_durable_identity(segment.identity) || file_io::matches_durable_identity(file->fd, segment.identity)),
+            "external input segment changed");
+        return file;
+    }
+    void advance(size_t n, Segment const& segment)
+    {
+        offset_ += n; read_position_ += n;
+        if (offset_ == segment.bytes) { offset_ = 0; ++segment_; }
+    }
+    void transfer(int fd, size_t root, uint64_t offset, std::span<uint8_t> bytes, Stats* stats, ExecutionIO* service)
+    {
+        uint64_t const before = service->read_ns;
+        auto const io = engine_.io_context(role_, service);
+        external_detail::read(fd, segment_header_bytes + offset, bytes, stats, io);
+        if (!engine_.disk_workers_.empty() && engine_.external_.bandwidth && !io.governor)
+            engine_.external_.bandwidth->observe_transfer(engine_.scratch_devices_[root], bytes.size(), service->read_ns - before);
+    }
     void read_direct(std::span<uint8_t> bytes)
     {
         while (!bytes.empty())
@@ -1880,24 +2149,22 @@ private:
             size_t const n = size_t(std::min<uint64_t>(bytes.size(), segment.bytes - offset_));
             if (opened_ != segment_)
             {
-                file_ = std::make_unique<external_detail::Descriptor>(file_io::open_file(engine_.segment_path(run_, segment).c_str(), file_io::read_only | file_io::no_follow | file_io::close_on_exec));
-                require(engine_.stamp(engine_.segment_path(run_, segment)) == segment.stamp &&
-                    engine_.file_identity(file_->fd) == segment.stamp.file && (!file_io::has_durable_identity(segment.identity) ||
-                    file_io::matches_durable_identity(file_->fd, segment.identity)), "external input segment changed");
+                file_ = open(segment);
                 opened_ = segment_; file_end_ = read_position_ + segment.bytes - offset_;
             }
-            external_detail::read(file_->fd, segment_header_bytes + offset_, bytes.first(n), &engine_.stats_, engine_.io_context(role_, &engine_.execution_scratch_));
+            transfer(file_->fd, segment.root, offset_, bytes.first(n), &engine_.stats_, &engine_.execution_scratch_);
             if (activity_) *activity_ = grow_add(*activity_, n);
-            bytes = bytes.subspan(n); offset_ += n; read_position_ += n;
-            if (offset_ == segment.bytes) { offset_ = 0; ++segment_; }
+            bytes = bytes.subspan(n); advance(n, segment);
         }
     }
     ExternalEngine& engine_; Run const& run_;
     uint64_t position_ = 0, read_position_ = 0, offset_ = 0, file_end_ = 0;
     char const* role_; uint64_t* activity_;
     size_t segment_ = 0, opened_ = SIZE_MAX, buffer_begin_ = 0, buffer_end_ = 0;
+    size_t block_ = 0, first_ = 0, queued_ = 0;
     std::vector<uint8_t> buffer_;
     std::unique_ptr<external_detail::Descriptor> file_;
+    Pending pending_; // Drains before the buffer, including during construction failure.
 };
 // Independent network member streams may arrive in any member order. Each
 // stream is written to one owned provisional run, in chunk order, and all
@@ -1928,7 +2195,12 @@ public:
         for (auto const& segment : summary_.segments) bytes = grow_add(bytes, segment.capacity);
         return bytes;
     }
-    void append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
+    // The owner reads this after the receive or sizing task joins.
+    uint64_t rejected_final_bytes() const { return minimum_final_ > final_capacity_ ? minimum_final_ : 0; }
+    bool append_chunk(uint16_t member, uint64_t chunk, std::span<uint8_t const> bytes, uint16_t count = 1)
+    { return append_chunks(member, chunk, {&bytes, 1}, count); }
+    bool append_chunks(uint16_t member, uint64_t chunk,
+        std::span<std::span<uint8_t const> const> chunks, uint16_t count = 1)
     {
         std::lock_guard lock(mutex_);
         if (engine_) engine_->config_.check_running();
@@ -1936,25 +2208,74 @@ public:
             "invalid contribution input member");
         claim(member, count);
         auto& entry = members_[member];
-        require(!entry.failed && !entry.finished && chunk == entry.next && chunk < PlotGroupFile::getChunkCountForK(engine_->identity_.header.k),
+        auto const total = PlotGroupFile::getChunkCountForK(engine_->identity_.header.k);
+        require(!entry.failed && !entry.finished && chunk == entry.next && chunk < total &&
+            !chunks.empty() && chunks.size() <= total - chunk,
             "contribution input chunks must arrive once in order");
         entry.failed = true;
-        require(bytes.size() > 1 && bytes.size() <= UINT32_MAX && bytes.size() <= engine_->config_.window_bytes,
-            "contribution input exceeds its receive window");
-        auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, bytes.size(), 0);
-        require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
+        // Each chunk can extend its previous member as soon as that chunk
+        // has arrived. Record a contiguous prefix so a later sizing pass can
+        // seek directly to the first packet it still needs to inspect.
+        uint64_t const summary_limit = !candidate_.empty() && chunk == entry.summary_chunks ?
+            (member ? members_[members_[member - 1].owner].summary_chunks : total) : 0;
         {
             ThreadCpuTimer timing(engine_->contribution_cpu_);
-            validator_->prepare(work);
-            auto const inspected = validator_->inspect(chunk, bytes, count);
-            require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
-                "contribution input exceeds its admitted fragment count");
-            entry.symbols += inspected.summary.symbols;
+            auto const inspected_window = inspect_window(chunk, chunks, count);
+            CodecScheduler::Lease compute(engine_->config_.cpu_scheduler.get(), 1,
+                [&] { engine_->config_.check_running(); });
+            uint64_t ordinal = chunk;
+            for (auto const bytes : chunks)
+            {
+                engine_->config_.check_running();
+                auto const inspected = inspected_window.empty() ? inspect_chunk(ordinal, bytes, count) :
+                    inspected_window[size_t(ordinal - chunk)];
+                require(inspected.summary.symbols <= multiply(fragment_bound_, count) - entry.symbols,
+                    "contribution input exceeds its admitted fragment count");
+                entry.symbols += inspected.summary.symbols;
+                entry.smallest_symbols = std::min(entry.smallest_symbols, inspected.summary.symbols);
+                entry.largest_symbols = std::max(entry.largest_symbols, inspected.summary.symbols);
+                entry.largest_packet = std::max<uint64_t>(entry.largest_packet, bytes.size());
+                if (ordinal < summary_limit)
+                {
+                    ++entry.summary_chunks;
+                    entry.summary_bytes = grow_add(entry.summary_bytes, sizeof(Packet) + bytes.size());
+                    auto& summary = candidate_[size_t(ordinal)];
+                    auto const prior = final_capacity_ == UINT64_MAX ? 0 : minimum_chunk(summary);
+                    summary.codec = ChunkCodec::combine(engine_->identity_.header.k, summary.codec,
+                        inspected.summary, inspected.first, ordinal);
+                    summary.bytes = grow_add(summary.bytes, bytes.size());
+                    if (final_capacity_ != UINT64_MAX)
+                    {
+                        minimum_final_ = grow_add(minimum_final_ - prior, minimum_chunk(summary));
+                        if (rejected_final_bytes())
+                        {
+                            engine_->check_summary_source(engine_->summary_run_);
+                            return false;
+                        }
+                    }
+                }
+                ++ordinal;
+            }
         }
         if (!entry.writer) entry.writer = std::make_unique<Writer>(*engine_, entry.run, "contribution", true);
-        Packet const packet{uint16_t(frontier_ + member), count, uint32_t(bytes.size())};
-        entry.writer->value(packet); entry.writer->write(bytes);
-        ++entry.next; entry.failed = false;
+        // Copy complete packets under one CPU permit. Return it before any
+        // buffer flush, including a packet that straddles two disk writes.
+        std::optional<CodecScheduler::Lease> copying;
+        for (auto const bytes : chunks)
+        {
+            Packet const packet{uint16_t(frontier_ + member), count, uint32_t(bytes.size())};
+            if (sizeof(packet) + bytes.size() > entry.writer->room())
+            {
+                copying.reset();
+                entry.writer->value(packet); entry.writer->write(bytes);
+                continue;
+            }
+            if (!copying) copying.emplace(engine_->config_.cpu_scheduler.get());
+            entry.writer->value_unflushed(packet); entry.writer->write_unflushed(bytes);
+            if (!entry.writer->room()) { copying.reset(); entry.writer->flush(); }
+        }
+        entry.next += chunks.size(); entry.failed = false;
+        return true;
     }
     void finish_member(uint16_t member, uint16_t count = 1)
     {
@@ -1979,6 +2300,14 @@ public:
         for (uint16_t i = member; i < member + count; ++i)
             require(entry.count ? members_[i].owner == member :
                 members_[i].owner == i && !members_[i].count, "contribution reset overlaps another batch");
+        // A retry can replace already inspected chunks. Recover the candidate
+        // from the durable frontier and the surviving run bytes at append.
+        if (entry.summary_chunks)
+        {
+            std::vector<Summary>().swap(candidate_);
+            for (auto& slot : members_) slot.summary_chunks = slot.summary_bytes = 0;
+            if (final_capacity_ != UINT64_MAX) load_capacity_frontier();
+        }
         for (uint16_t i = member; i < member + count; ++i)
         {
             auto& slot = members_[i]; slot.writer.reset();
@@ -1994,7 +2323,7 @@ public:
             std::all_of(members_.begin(), members_.end(), [&](auto const& member)
             { auto const& owner = members_.at(member.owner); return owner.count && owner.finished && !owner.failed; }),
             "contribution input is incomplete");
-        validator_.reset(); sealed_ = true; grow_failpoint("external-contribution-input-sealed");
+        release_parallel_validator(); validator_.reset(); sealed_ = true; grow_failpoint("external-contribution-input-sealed");
     }
 private:
     friend class ExternalEngine;
@@ -2002,14 +2331,94 @@ private:
     {
         Run run;
         std::unique_ptr<Writer> writer;
-        uint64_t next = 0, symbols = 0;
+        uint64_t next = 0, symbols = 0, summary_chunks = 0, summary_bytes = 0;
+        uint64_t smallest_symbols = UINT64_MAX, largest_symbols = 0, largest_packet = 0;
         uint16_t owner = 0, count = 0;
         bool finished = false, failed = false;
     };
-    ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound)
-        : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), members_(count),
+    ContributionInput(ExternalEngine& engine, uint16_t count, uint64_t bound, uint64_t final_capacity)
+        : engine_(&engine), frontier_(engine.members_), fragment_bound_(bound), final_capacity_(final_capacity), members_(count),
+          scalar_budget_(engine.config_.codec_bytes),
           validator_(std::make_unique<ChunkCodec>(engine.identity_.header.k, engine.config_.codec_bytes, engine.config_.cpu_scheduler))
     { for (uint16_t member = 0; member < count; ++member) members_[member].owner = member; }
+    static size_t max_inspection_chunks(Config const& config)
+    {
+        if (!config.io_overlap || !config.cpu_scheduler || config.cpu_scheduler->workers() < 2) return 0;
+        return size_t(std::min<uint64_t>(fresh_group_window_chunks,
+            config.window_bytes / (sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection))));
+    }
+    void reset_validator(uint64_t bytes)
+    {
+        validator_.reset();
+        validator_ = std::make_unique<ChunkCodec>(engine_->identity_.header.k, bytes, engine_->config_.cpu_scheduler);
+        scalar_budget_ = bytes;
+    }
+    void release_parallel_validator()
+    {
+        if (parallel_validator_)
+        { engine_->contribution_cpu_.add(parallel_validator_->cpu_time()); parallel_validator_.reset(); }
+    }
+    uint64_t inspection_work(size_t size) const
+    {
+        require(size > 1 && size <= UINT32_MAX && size <= engine_->config_.window_bytes,
+            "contribution input exceeds its receive window");
+        auto const work = ChunkCodec::estimate_work(engine_->identity_.header.k, size, 0);
+        require(work <= engine_->config_.codec_bytes, "contribution validation exceeds codec budget");
+        return work;
+    }
+    ChunkCodec::Inspection inspect_chunk(uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t count)
+    {
+        auto const work = inspection_work(bytes.size());
+        if (!validator_ || work > scalar_budget_) { release_parallel_validator(); reset_validator(engine_->config_.codec_bytes); }
+        validator_->prepare(work);
+        return validator_->inspect(ordinal, bytes, count);
+    }
+    std::span<ChunkCodec::Inspection const> inspect_window(uint64_t first,
+        std::span<std::span<uint8_t const> const> chunks, uint16_t count)
+    {
+        auto const& cfg = engine_->config_;
+        auto const limit = max_inspection_chunks(cfg);
+        // Capacity probes can decline partway through a window. Small windows
+        // also cost less to inspect inline than to submit to the worker pool.
+        if (final_capacity_ != UINT64_MAX || chunks.size() < 64 || chunks.size() > limit ||
+            !cfg.cpu_scheduler->can_overlap()) return {};
+        auto const budget = cfg.codec_bytes / 2;
+        {
+            CodecScheduler::Lease compute(cfg.cpu_scheduler.get(), 1, [&] { cfg.check_running(); });
+            size_t largest = 0;
+            for (auto bytes : chunks) largest = std::max(largest, bytes.size());
+            auto const work = inspection_work(largest);
+            auto const lanes = unsigned(std::min<uint64_t>({cfg.cpu_scheduler->workers(),
+                chunks.size() / 32, budget / work}));
+            if (lanes < 2 || (parallel_validator_ && work > budget / parallel_validator_->workers())) return {};
+            if (!parallel_validator_)
+            {
+                reset_validator(cfg.codec_bytes - budget);
+                parallel_validator_ = std::make_unique<ParallelEncoder>(engine_->identity_.header.k, lanes, budget, cfg.cpu_scheduler);
+            }
+            inspection_tasks_.reserve(limit); inspected_.reserve(limit);
+            inspection_tasks_.clear();
+            for (auto bytes : chunks)
+            {
+                require(bytes.size() > 1, "contribution input exceeds its receive window");
+                inspection_tasks_.push_back({first++, bytes, count, {}});
+            }
+            inspected_.resize(chunks.size());
+        }
+        parallel_validator_->inspect(inspection_tasks_, inspected_);
+        return inspected_;
+    }
+    static uint64_t minimum_chunk(Summary const& summary)
+    { return summary.codec.symbols ? ChunkCodec::size_bounds(summary.codec).first : 0; }
+    void load_capacity_frontier()
+    {
+        candidate_ = engine_->take_summary();
+        // Appending a member preserves the previous delta stream and adds a
+        // nonnegative cost. Unseen chunks contribute only their durable lower
+        // bound. Omitting the index also keeps this valid for an ordinary file.
+        minimum_final_ = sizeof(Header) + engine_->identity_.memo.size();
+        for (auto const& summary : candidate_) minimum_final_ = grow_add(minimum_final_, minimum_chunk(summary));
+    }
     void reserve_group(uint16_t member, uint16_t count)
     {
         auto& entry = members_[member]; entry.failed = true;
@@ -2041,9 +2450,17 @@ private:
     ExternalEngine* engine_;
     uint16_t frontier_;
     uint64_t fragment_bound_;
+    uint64_t final_capacity_, minimum_final_ = 0;
     std::vector<MemberRecord> members_;
     Run summary_;
+    // The staging workspace holds one candidate in canonical member order
+    // for each chunk, even when the streams advance at different speeds.
+    std::vector<Summary> candidate_;
+    uint64_t scalar_budget_;
     std::unique_ptr<ChunkCodec> validator_;
+    std::unique_ptr<ParallelEncoder> parallel_validator_;
+    std::vector<ChunkInput> inspection_tasks_;
+    std::vector<ChunkCodec::Inspection> inspected_;
     mutable std::mutex mutex_;
     bool sealed_ = false;
 };
@@ -2258,7 +2675,7 @@ inline void ExternalEngine::release_prepared() noexcept
 inline void ExternalEngine::release_contributions() noexcept
 {
     auto* input = std::exchange(contributions_, nullptr); if (!input) return;
-    input->validator_.reset();
+    input->release_parallel_validator(); input->validator_.reset();
     for (auto& member : input->members_) member.writer.reset();
     try
     {
@@ -2274,22 +2691,51 @@ inline uint64_t ExternalEngine::contribution_input_memory_bytes(Config const& co
     // Codec scratch and the append's candidate summary use the existing
     // exclusive engine workspace. Concurrent producers additionally retain
     // one bounded writer each; their transport frames belong to the caller.
-    return grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec),
+    auto const chunks = ContributionInput::max_inspection_chunks(config);
+    auto inspection = multiply(chunks, sizeof(ChunkInput) + sizeof(ChunkCodec::Inspection));
+    if (chunks && config.cpu_scheduler->workers() > config.workers)
+    {
+        // Validation can borrow idle CPU permits while the destination's
+        // writers wait for disk. Its codecs still share the same byte budget.
+        auto const lanes = unsigned(std::min<size_t>(chunks / 32, config.cpu_scheduler->workers()));
+        if (lanes > config.workers) inspection = grow_add(inspection,
+            ParallelEncoder::memory_bytes(lanes) - ParallelEncoder::memory_bytes(config.workers));
+    }
+    return grow_add(grow_add(sizeof(ContributionInput) + sizeof(ChunkCodec), inspection),
         multiply(members, grow_add(config.window_bytes, sizeof(ContributionInput::MemberRecord) + sizeof(Writer))));
+}
+inline uint64_t ExternalEngine::contribution_payload_bound(uint8_t k, uint16_t members, uint64_t symbols, uint64_t chunks)
+{
+    // The ordered deltas span at most one range per member in each chunk.
+    // The fixed FSE table consumes at most 11 bits per symbol, plus two
+    // 11-bit states and one end bit (as in ChunkCodec::size_bounds).
+    uint64_t const range = 1ull << (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
+    uint64_t const threshold = 178ull << (k - 8);
+    uint64_t const unary = multiply(members, (range + threshold - 1) / threshold);
+    uint64_t const bits = grow_add(multiply(symbols, (k - 7) + 11), multiply(chunks, unary + 23));
+    // Round the two bitstreams independently and include the largest LEB prefix.
+    return grow_add(bits / 8, multiply(chunks, 2 + 10));
+}
+inline uint64_t ExternalEngine::contribution_run_bound(uint8_t k, uint16_t members, uint64_t fragment_bound)
+{
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    return grow_add(contribution_payload_bound(k, members, multiply(members, fragment_bound), chunks),
+        multiply(chunks, sizeof(Packet)));
 }
 inline uint64_t ExternalEngine::contribution_input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
 {
     require(k >= 18 && k <= 28 && !(k & 1) && members && members <= max_runs && fragment_bound && fragment_bound <= UINT32_MAX,
         "invalid contribution input bound");
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
-    uint64_t const member = grow_add(grow_add(multiply(fragment_bound, 9), fragment_bound / 128),
-        multiply(chunks, POS2_FSE_compressBound(0) + sizeof(Packet) + 11));
+    uint64_t const member = contribution_run_bound(k, 1, fragment_bound);
     return grow_add(multiply(members, member), multiply(chunks, sizeof(Summary)));
 }
-inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepare_contributions(uint16_t members, uint64_t fragment_bound)
+inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepare_contributions(uint16_t members,
+    uint64_t fragment_bound, uint64_t final_capacity)
 {
     require(confirmed_ && can_append() && !prepared_ && !contributions_ && members && members <= UINT16_MAX - members_,
         "contribution input requires an idle confirmed staging engine"); check_paths();
+    require(members == 1 || final_capacity == UINT64_MAX, "capacity probes require one contribution member");
     if (members > max_runs || !fragment_bound || fragment_bound > UINT32_MAX) return {};
     require(grow_add(required_memory(members), contribution_input_memory_bytes(config_, members)) <= config_.memory_limit_bytes,
         "contribution input exceeds memory budget");
@@ -2308,7 +2754,11 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
         }
         if (!merge_range(first, count)) return {};
     }
-    auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound));
+    auto input = std::unique_ptr<ContributionInput>(new ContributionInput(*this, members, fragment_bound, final_capacity));
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+    single_scratch_writeback_ = config_.io_overlap && !io_limit() && roots_.size() == 1 &&
+        storage_device(file_io::native_path(roots_.front().path)).rotating;
+#endif
     contributions_ = input.get();
     uint64_t const summary_bytes = multiply(PlotGroupFile::getChunkCountForK(identity_.header.k), sizeof(Summary));
     uint64_t const member_bytes = (contribution_input_scratch_bytes(identity_.header.k, members, fragment_bound) - summary_bytes) / members;
@@ -2322,22 +2772,21 @@ inline std::unique_ptr<ExternalEngine::ContributionInput> ExternalEngine::prepar
     input->summary_.id = next_id_; input->summary_.count = uint16_t(members_ + members);
     if (!reserve(input->summary_, summary_bytes, "checkpoint_summary")) return {};
     next_id_ = input->summary_.id + 1;
+    // A restored checkpoint may only have an on-disk summary. Leave that
+    // read to the admitted sizing pass on the destination writer.
+    if (final_capacity != UINT64_MAX) input->load_capacity_frontier();
+    else if (!members_ || !summary_cache_.empty()) input->candidate_ = take_summary();
     return input;
 }
 inline uint64_t ExternalEngine::input_scratch_bytes(uint8_t k, uint16_t members, uint64_t fragment_bound)
 {
     require(k >= 18 && k <= 28 && !(k & 1) && members && fragment_bound && fragment_bound <= UINT32_MAX,
         "invalid prepared input bound");
-    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k), symbols = multiply(members, fragment_bound);
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
     uint64_t const bits = multiply(fragment_bound, k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
     uint64_t const compact = multiply(members, grow_add(multiply(chunks + 1, sizeof(uint32_t)),
         multiply(bits / 64 + (bits % 64 != 0), sizeof(uint64_t))));
-    // Every valid delta has at most eight low bytes and one ANS symbol.
-    // FSE's per-chunk bound is n + (n >> 7) + 512; include prefix, packet and
-    // rounding per chunk. This preflight may decline in favor of exact ordinary
-    // append, but can never consume an unreserved generated member.
-    uint64_t const contribution = grow_add(grow_add(multiply(symbols, 9), symbols / 128),
-        multiply(chunks, grow_add(POS2_FSE_compressBound(0), sizeof(Packet) + 11)));
+    uint64_t const contribution = contribution_run_bound(k, members, fragment_bound);
     return grow_add(compact, grow_add(contribution, multiply(chunks, sizeof(Summary))));
 }
 inline bool ExternalEngine::staging_slot()
@@ -2503,20 +2952,20 @@ inline Result ExternalEngine::resume(Members members, MemberBatchHash const* has
     }
     pack(members); return finish();
 }
-inline AppendResult ExternalEngine::append(PreparedInput& input, uint16_t prefix)
+inline AppendResult ExternalEngine::append(PreparedInput& input, uint16_t prefix, bool final)
 {
     require(prepared_ == &input && input.engine_ == this && input.sealed_ && input.frontier_ == members_,
         "prepared input owner/frontier differs");
     uint16_t const count = prefix ? prefix : input.size();
     require(count && count <= input.size(), "invalid prepared input prefix");
-    try { return append_source({}, &input, count); }
+    try { return append_source({}, &input, count, final); }
     catch (InputWindowExceeded const&)
     {
         return {false, false, final_bound_, grow_add(final_bound_, metadata_bytes(identity_.header.k, external_)),
             "prepared final chunk exceeds input window budget", {}};
     }
 }
-inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t prefix)
+inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t prefix, bool final)
 {
     config_.check_running();
     std::lock_guard lock(input.mutex_);
@@ -2525,6 +2974,10 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     uint16_t const count = prefix ? prefix : input.size();
     require(count && count <= input.size() && count <= UINT16_MAX - members_, "invalid contribution input prefix");
     uint16_t records = 0;
+    uint8_t const k = identity_.header.k;
+    uint64_t const chunks = PlotGroupFile::getChunkCountForK(k);
+    uint64_t symbols = 0, smallest_symbols = 0, largest_symbols = 0, source_bound = 0;
+    bool needs_read = false;
     for (uint16_t member = 0; member < count; member += input.members_[member].count)
     {
         auto const& entry = input.members_[member];
@@ -2535,6 +2988,11 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         if (entry.count > count - member)
             return {false, false, final_bound_, grow_add(final_bound_, metadata_bytes(identity_.header.k, external_)),
                 "received prefix crosses a compute batch; regenerate its fitting members", {}};
+        symbols = grow_add(symbols, entry.symbols);
+        smallest_symbols = grow_add(smallest_symbols, entry.smallest_symbols);
+        largest_symbols = grow_add(largest_symbols, entry.largest_symbols);
+        source_bound = grow_add(source_bound, entry.largest_packet);
+        needs_read |= entry.summary_chunks < chunks;
         ++records;
     }
     require(grow_add(required_memory(count), contribution_input_memory_bytes(config_, input.size())) <= config_.memory_limit_bytes,
@@ -2542,27 +3000,95 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     check_paths(); ThreadCpuTimer cpu(contribution_owner_cpu_);
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
-    uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
-    auto summaries = take_summary();
+    ChunkIndexSize const index_size(after);
+    auto commit = [&](std::vector<Summary>& summaries, uint64_t bytes, uint64_t peak) -> AppendResult
+    {
+        require(pending_summary_.segments.empty() && runs_.size() + count <= max_runs,
+            "contribution append lost its reserved run slots");
+        planning.finish(); PhaseTimer encoding(stats_, WorkPhase::encode, config_.progress);
+        contribution_bytes_ = 0;
+        for (uint16_t member = 0; member < count; member += input.members_[member].count)
+        {
+            auto& run = input.members_[member].run;
+            contribution_bytes_ = grow_add(contribution_bytes_, run.bytes);
+            runs_.push_back(std::move(run)); run = {};
+        }
+        members_ = after; final_bound_ = bytes; packet_count_ = grow_add(packet_count_, records);
+        commit_runs(summaries, peak, final, encoding);
+        return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
+    };
+    // A fresh group that can pack directly needs no durable staging summary.
+    // Joining validated streams preserves the symbol count across each changed
+    // boundary delta. The totals bound the file and the per-stream extrema
+    // bound each chunk, regardless of the order of arrival.
+    auto const packing_inputs = external_.packing_inputs ? external_.packing_inputs : external_.fan_in;
+    if (needs_read && final && !members_ && count == input.size() && can_finish_with_members() &&
+        runs_.size() + records <= packing_inputs)
+    {
+        // Every symbol has k-7 low bits, plus at least one ANS byte and one
+        // length byte for the whole chunk.
+        uint64_t const least = multiply(smallest_symbols, k - 7) / 8 + 2;
+        uint64_t const largest = contribution_payload_bound(k, count, largest_symbols, 1);
+        uint64_t const bytes = grow_add(sizeof(Header) + identity_.memo.size(),
+            grow_add(contribution_payload_bound(k, count, symbols, chunks), multiply(chunks, sizeof(uint64_t))));
+        uint64_t const peak = grow_add(bytes, metadata_bytes(k, external_));
+        if (bytes <= input.final_capacity_ && peak <= config_.capacity_bytes &&
+            std::max(source_bound, largest) <= config_.window_bytes &&
+            ChunkCodec::estimate_work(k, source_bound, 0) <= config_.codec_bytes)
+        {
+            bool encodable = true;
+            try { index_size.bits(least); index_size.bits(largest); }
+            catch (UnencodableChunkSize const&) { encodable = false; }
+            if (encodable)
+            {
+                for (uint16_t member = 0; member < count; member += input.members_[member].count)
+                    check_summary_source(input.members_[member].run);
+                packing_source_bytes_ = source_bound;
+                std::vector<Summary> summaries;
+                std::vector<Summary>().swap(input.candidate_);
+                return commit(summaries, bytes, peak);
+            }
+        }
+    }
+    bool const cached = !input.candidate_.empty() && std::none_of(input.members_.begin() + count,
+        input.members_.end(), [](auto const& entry) { return entry.summary_chunks != 0; });
+    if (!cached) std::vector<Summary>().swap(input.candidate_);
+    else
+    {
+        check_summary_source(summary_run_);
+        for (uint16_t member = 0; member < count; member += input.members_[member].count)
+            if (input.members_[member].summary_chunks) check_summary_source(input.members_[member].run);
+    }
+    auto summaries = cached ? std::move(input.candidate_) : take_summary();
     auto codec = std::make_unique<ChunkCodec>(identity_.header.k, config_.codec_bytes, config_.cpu_scheduler);
     std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
     std::vector<EncodedChunk> parts; parts.reserve(UINT16_MAX);
     std::vector<Run const*> sources;
     std::vector<std::unique_ptr<Reader>> readers;
+    bool reuse_prefix = false;
     auto rewind = [&](bool all)
     {
         readers.clear(); sources.clear();
+        reuse_prefix = cached && !all;
         if (all) for (auto const& run : runs_) sources.push_back(&run);
         for (uint16_t member = 0; member < count; member += input.members_[member].count)
-            sources.push_back(&input.members_[member].run);
-        for (auto const* run : sources) readers.push_back(std::make_unique<Reader>(*this, *run, sources.size()));
+        {
+            auto const& entry = input.members_[member];
+            if (!reuse_prefix || entry.summary_chunks < chunks) sources.push_back(&entry.run);
+        }
+        for (auto const* run : sources)
+        {
+            uint64_t const start = reuse_prefix ? input.members_[run->first - members_].summary_bytes : UINT64_MAX;
+            readers.push_back(std::make_unique<Reader>(*this, *run, sources.size(), start));
+        }
     };
-    auto read_chunk = [&]()
+    auto read_chunk = [&](uint64_t chunk)
     {
         payload.clear(); parts.clear();
         for (size_t source = 0; source < sources.size(); ++source)
         {
             auto const& run = *sources[source];
+            if (reuse_prefix && chunk < input.members_[run.first - members_].summary_chunks) continue;
             for (uint32_t member = run.first; member < uint32_t(run.first) + run.count;)
             {
                 auto const packet = readers[source]->packet(uint16_t(member));
@@ -2581,7 +3107,7 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
     {
         config_.check_running();
-        if (!read_chunk()) { fits = false; break; }
+        if (!read_chunk(chunk)) { fits = false; break; }
         auto& summary = summaries[size_t(chunk)];
         for (auto const& part : parts)
         {
@@ -2595,69 +3121,55 @@ inline AppendResult ExternalEngine::append(ContributionInput& input, uint16_t pr
         if (!fits) break;
         auto const sizes = ChunkCodec::size_bounds(summary.codec);
         final_bound = grow_add(final_bound, sizes.second);
-        try { check_gsz_size(sizes.first, after); check_gsz_size(sizes.second, after); }
+        try { index_size.bits(sizes.first); index_size.bits(sizes.second); }
         catch (UnencodableChunkSize const&) { fits = false; }
         if (sizes.second > config_.window_bytes || summary.bytes > config_.window_bytes ||
             ChunkCodec::estimate_work(identity_.header.k, summary.bytes, 0) > config_.codec_bytes) fits = false;
     }
     final_bound = grow_add(final_bound, multiply(chunks, sizeof(uint64_t)));
     uint64_t peak = grow_add(final_bound, metadata_bytes(identity_.header.k, external_));
-    if (!fits || peak > config_.capacity_bytes)
+    if (!fits || peak > config_.capacity_bytes || final_bound > input.final_capacity_)
     {
         // Exact sizing can rescue a conservative bound, including the final
         // partial group. Inspect again while gathering the complete canonical
         // chunk so even a failed first scan leaves a complete candidate table.
         rewind(true); final_bound = sizeof(Header) + identity_.memo.size();
-        uint64_t index_bits = 0; BitWriter field; fits = true;
+        uint64_t index_bits = 0; fits = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
         {
             config_.check_running();
-            if (!read_chunk()) { fits = false; break; }
+            if (!read_chunk(chunk)) { fits = false; break; }
             uint64_t const work = ChunkCodec::estimate_work(identity_.header.k, payload.size(), 0);
             if (work > config_.codec_bytes) { fits = false; break; }
             codec->prepare(work);
             uint64_t bytes = 0;
-            try { bytes = codec->joined_size(chunk, parts); check_gsz_size(bytes, after); }
+            try { bytes = codec->joined_size(chunk, parts); index_bits = grow_add(index_bits, index_size.bits(bytes)); }
             catch (UnencodableChunkSize const&) { fits = false; break; }
             ++stats_.sized_chunks;
             if (bytes > config_.window_bytes) { fits = false; break; }
             summaries[size_t(chunk)] = {codec->summary(chunk, after), payload.size()};
             final_bound = grow_add(final_bound, bytes);
-            field.clear(); gsz_encode(std::span<uint64_t const>(&bytes, 1), after, field);
-            index_bits = grow_add(index_bits, field.bitCount());
         }
         final_bound = grow_add(final_bound, grow_add(index_bits, 7) / 8);
         peak = grow_add(final_bound, metadata_bytes(identity_.header.k, external_));
+        if (fits && final_bound > input.final_capacity_)
+        {
+            input.minimum_final_ = final_bound;
+            return {false, false, final_bound, peak, "received contributions exceed final output capacity", {}};
+        }
         if (!fits || peak > config_.capacity_bytes)
             return {false, false, final_bound, peak, "received contributions exceed exact capacity or codec/window budget", {}};
     }
     for (auto const& reader : readers) require(!reader->remaining(), "contribution input has trailing packets");
     readers.clear(); sources.clear(); codec.reset();
     std::vector<uint8_t>().swap(payload); std::vector<EncodedChunk>().swap(parts);
-    require(pending_summary_.segments.empty() && runs_.size() + count <= max_runs,
-        "contribution append lost its reserved run slots");
-    planning.finish(); PhaseTimer encoding(stats_, WorkPhase::encode, config_.progress);
-    pending_summary_ = std::move(input.summary_); input.summary_ = {}; pending_summary_.count = after;
-    contribution_bytes_ = 0;
-    for (uint16_t member = 0; member < count; member += input.members_[member].count)
-    {
-        auto& run = input.members_[member].run;
-        contribution_bytes_ = grow_add(contribution_bytes_, run.bytes);
-        runs_.push_back(std::move(run)); run = {};
-    }
-    members_ = after; final_bound_ = final_bound; packet_count_ = grow_add(packet_count_, records);
-    for (auto const& summary : summaries) packing_source_bytes_ = std::max(packing_source_bytes_, summary.bytes);
-    packing_work_ = ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, 0);
-    identity_.pending = true; identity_.target_members = members_; identity_.pending_peak_bytes = peak;
-    save("external-run", summaries); summary_cache_ = std::move(summaries);
-    release_contributions(); encoding.finish(); balance();
-    config_.check_running();
-    return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
+    return commit(summaries, final_bound, peak);
 }
 inline AppendResult ExternalEngine::append_source(Members members, PreparedInput* input, uint16_t count,
-                                                  bool terminal, MemberBatchHash const* hash)
+                                                  bool final, MemberBatchHash const* hash)
 {
     config_.check_running();
+    bool const terminal = final && !input;
     ThreadCpuTimer cpu(contribution_owner_cpu_);
     require(confirmed_ && can_append(), "external append requires confirmed staging phase"); check_paths();
     require(count && count <= UINT16_MAX - members_, "invalid external batch membership");
@@ -2674,6 +3186,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
             "external run limit needs more scratch; finish the committed prefix", {}};
     PhaseTimer planning(stats_, WorkPhase::plan, config_.progress);
     uint16_t const after = uint16_t(members_ + count);
+    ChunkIndexSize const index_size(after);
     uint64_t const chunks = PlotGroupFile::getChunkCountForK(identity_.header.k);
     auto summaries = take_summary();
     std::vector<size_t> cursors(count, 0);
@@ -2714,7 +3227,7 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         uint64_t const source_bytes = terminal ? summary.bytes : grow_add(summary.bytes, bounded);
         auto const sizes = ChunkCodec::size_bounds(summary.codec);
         final_bound = grow_add(final_bound, sizes.second);
-        try { check_gsz_size(sizes.first, after); check_gsz_size(sizes.second, after); }
+        try { index_size.bits(sizes.first); index_size.bits(sizes.second); }
         catch (UnencodableChunkSize const&) { fits = false; reason = "external canonical chunk index exceeds conservative admission"; }
         if (sizes.second > config_.window_bytes || source_bytes > config_.window_bytes ||
             ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? incoming_symbols : 0) > config_.codec_bytes ||
@@ -2783,7 +3296,6 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         if (final) for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
         std::vector<uint8_t> payload; payload.reserve(size_t(config_.window_bytes));
         std::vector<EncodedChunk> contributions; contributions.reserve(UINT16_MAX);
-        BitWriter field;
         uint64_t final_bytes = sizeof(Header) + identity_.memo.size(), index_bits = 0;
         contribution_bound = 0; bool buffers = true, encodable = true;
         for (uint64_t chunk = 0; chunk < chunks; ++chunk)
@@ -2814,19 +3326,14 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
                 {
                     final_size = contributions.empty() ? codec.encoded_size(chunk, {}, 0, regions) :
                         codec.joined_size(chunk, contributions, regions);
-                    check_gsz_size(final_size, after);
+                    index_bits = grow_add(index_bits, index_size.bits(final_size));
                     if (final_size > config_.window_bytes) buffers = false; ++stats_.sized_chunks;
                 }
                 if (!terminal) { bytes = codec.encoded_size(chunk, {}, 0, regions); ++stats_.sized_chunks; }
             }
             catch (UnencodableChunkSize const&) { encodable = false; break; }
             stats_.codec_ns += elapsed_ns(begin);
-            if (final)
-            {
-                final_bytes = grow_add(final_bytes, final_size);
-                field.clear(); gsz_encode(std::span<uint64_t const>(&final_size, 1), after, field);
-                index_bits = grow_add(index_bits, field.bitCount());
-            }
+            if (final) final_bytes = grow_add(final_bytes, final_size);
             uint64_t const source_bytes = terminal ? summaries[size_t(chunk)].bytes : grow_add(summaries[size_t(chunk)].bytes, bytes);
             if (source_bytes > config_.window_bytes ||
                 ChunkCodec::estimate_work(identity_.header.k, source_bytes, terminal ? symbols : 0) > config_.codec_bytes)
@@ -2994,20 +3501,33 @@ inline AppendResult ExternalEngine::append_source(Members members, PreparedInput
         output.finish(); grow_failpoint("external-contribution-flushed");
         contribution_driver_cpu_.add(driver_cpu); contribution_cpu_.add(driver_cpu); contribution_cpu_.add(encoder.cpu_time());
     }
-    if (input)
-    {
-        input_reader.reset();
-        pending_summary_ = std::move(input->summary_); input->summary_ = {}; pending_summary_.count = after;
-    }
+    input_reader.reset();
     contribution_bytes_ = incoming.bytes; runs_.push_back(std::move(incoming)); incoming = {}; members_ = after; final_bound_ = final_bound;
-    ++packet_count_; for (auto const& summary : summaries) packing_source_bytes_ = std::max(packing_source_bytes_, summary.bytes);
+    ++packet_count_; commit_runs(summaries, peak, final, encoding);
+    return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
+}
+inline void ExternalEngine::commit_runs(std::vector<Summary>& summaries, uint64_t peak, bool final, PhaseTimer& encoding)
+{
+    for (auto const& summary : summaries) packing_source_bytes_ = std::max(packing_source_bytes_, summary.bytes);
     packing_work_ = ChunkCodec::estimate_work(identity_.header.k, packing_source_bytes_, 0);
     identity_.pending = true; identity_.target_members = members_; identity_.pending_peak_bytes = peak;
-    save("external-run", summaries); summary_cache_ = std::move(summaries);
-    if (input) release_prepared();
-    encoding.finish(); balance();
+    // All incoming runs are synced. A fixed final batch that already fits
+    // the packer's reader set can commit them in the packing checkpoint.
+    // The previous staging summary remains authoritative until that rename.
+    auto const readers = external_.packing_inputs ? external_.packing_inputs : external_.fan_in;
+    bool const pack = final && can_finish_with_members() && runs_.size() <= readers;
+    if (!pack)
+    {
+        auto* reservation = prepared_ ? &prepared_->summary_ : contributions_ ? &contributions_->summary_ : nullptr;
+        if (reservation) { pending_summary_ = std::exchange(*reservation, Run{}); pending_summary_.count = members_; }
+        save("external-run", summaries); summary_cache_ = std::move(summaries);
+    }
+    if (prepared_) release_prepared();
+    if (contributions_) release_contributions();
+    encoding.finish();
+    if (pack) { std::vector<Summary>().swap(summaries); start_packing(); }
+    else balance();
     config_.check_running();
-    return {true, true, final_bound_, peak, {}, {final_bound_, peak, peak - final_bound_, members_}};
 }
 inline bool ExternalEngine::merge_range(size_t first, size_t count)
 {
@@ -3132,6 +3652,35 @@ inline void ExternalEngine::pack(Members members)
         require(!file_io::resize_file(fd_, file_io::Offset(output_bytes_)), "cannot discard uncommitted external output tail");
         external_detail::reserve_file(fd_, final_bound_, io_context("final_output", &execution_destination_));
     }
+    bool const overlap = config_.io_overlap && packing_work_ <= config_.codec_bytes / 2;
+    bool output_overlap = overlap;
+    size_t writeback_window = 0;
+    if (output_overlap)
+    {
+        auto const target = storage_device(file_io::native_path(path_).parent_path());
+        for (auto const& root : roots_)
+        {
+            auto const source = storage_device(file_io::native_path(root.path));
+            if (!external_detail::independent_packing_io(target, {&source, 1})) { output_overlap = false; break; }
+            // One scratch spindle can refill its readers while the codec and
+            // independent output run. Fund its queue from the shared cache.
+            if (roots_.size() == 1 && runs_.size() > 1 && disk_workers_.empty() &&
+                source.rotating && target.rotating && !io_limit())
+            {
+                auto const queues = scratch_queue_bytes(external_);
+                if (queues <= config_.window_bytes / 2 &&
+                    (read_buffer_bytes(identity_.header.k, config_, external_) - queues) / runs_.size() >= Reader::minimum_prefetch_bytes)
+                { scratch_devices_.push_back(source); start_disk_workers({0}, 1); }
+            }
+        }
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE)
+        if (output_overlap && target.rotating && !io_limit())
+        {
+            auto const page = file_io::page_size();
+            if (page > 0) writeback_window = size_t(config_.window_bytes) / size_t(page) * size_t(page);
+        }
+#endif
+    }
     std::vector<std::unique_ptr<Reader>> readers;
     for (auto const& run : runs_) readers.push_back(std::make_unique<Reader>(*this, run));
     stats_.max_active_runs = std::max<uint64_t>(stats_.max_active_runs, readers.size());
@@ -3140,7 +3689,6 @@ inline void ExternalEngine::pack(Members members)
         runs_.size() * sizeof(uint64_t) + members.size() * sizeof(FragmentRegion);
     uint64_t const limit = std::min({chunks, uint64_t(65536), config_.window_bytes / std::max(uint64_t(1), packing_source_bytes_),
         uint64_t(UINT16_MAX) / std::max(uint64_t(1), packet_count_), std::max<uint64_t>(1, config_.window_bytes / task_bytes)});
-    bool const overlap = config_.io_overlap && packing_work_ <= config_.codec_bytes / 2;
     uint64_t const budget = overlap ? config_.codec_bytes / 2 : config_.codec_bytes;
     unsigned const workers = unsigned(std::max<uint64_t>(1, std::min({uint64_t(config_.workers),
         budget / packing_work_, limit})));
@@ -3176,16 +3724,6 @@ inline void ExternalEngine::pack(Members members)
     }
     std::vector<size_t> released_segments(runs_.size(), 0); std::vector<uint64_t> released_bytes(runs_.size(), 0);
     std::vector<uint8_t> output_window; output_window.reserve(size_t(config_.window_bytes));
-    bool output_overlap = overlap;
-    if (output_overlap)
-    {
-        auto const target = storage_device(file_io::native_path(path_).parent_path());
-        for (auto const& root : roots_)
-        {
-            auto const source = storage_device(file_io::native_path(root.path));
-            if (!external_detail::independent_packing_io(target, {&source, 1})) { output_overlap = false; break; }
-        }
-    }
     std::vector<uint8_t> writing_window;
     if (output_overlap) writing_window.reserve(size_t(config_.window_bytes));
     Stats output_stats;
@@ -3220,6 +3758,10 @@ inline void ExternalEngine::pack(Members members)
                 {
                     ThreadCpuTimer cpu(output_cpu);
                     auto target_guard = target_lock(); external_detail::write(fd_, offset, writing_window, &output_stats, io_context("final_output", &output_service));
+                    // Keep the output spindle writing while the next chunks
+                    // are packed. The checkpoint still syncs data and index.
+                    if (writeback_window && !io_limit() && (offset + writing_window.size()) % writeback_window == 0)
+                        file_io::start_writeback(fd_, offset, writing_window.size());
                 });
             }
             else { write_target(window_offset, output_window); output_window.clear(); }
@@ -3228,9 +3770,17 @@ inline void ExternalEngine::pack(Members members)
     };
     auto emit = [&](std::span<uint8_t const> bytes)
     {
-        if (bytes.size() > output_window.capacity() - output_window.size()) flush_output();
-        require(bytes.size() <= output_window.capacity(), "external canonical chunk exceeds output window");
-        output_window.insert(output_window.end(), bytes.begin(), bytes.end()); output_bytes_ += bytes.size();
+        while (!bytes.empty())
+        {
+            // After a short checkpoint flush, align the next writeback to
+            // file offsets. Other targets can simply fill the whole buffer.
+            size_t const room = writeback_window ? size_t(writeback_window - output_bytes_ % writeback_window) :
+                size_t(config_.window_bytes) - output_window.size();
+            size_t const n = std::min(room, bytes.size());
+            output_window.insert(output_window.end(), bytes.begin(), bytes.begin() + n);
+            output_bytes_ += n; bytes = bytes.subspan(n);
+            if (n == room) flush_output();
+        }
     };
     uint64_t committed = output_bytes_;
     PackingCheckpointHistory checkpoint_history;
@@ -3296,6 +3846,9 @@ inline void ExternalEngine::pack(Members members)
         config_.check_running();
         auto& payload = window.payload; auto& contributions = window.contributions;
         auto& tasks = window.tasks; auto& frontiers = window.frontiers;
+        // A busy spindle can defer a preread. Retry while gathering the next
+        // window, before its reader exhausts the data already in memory.
+        if (!disk_workers_.empty()) for (auto& reader : readers) reader->read_ahead();
         payload.clear(); contributions.clear(); tasks.clear(); frontiers.clear(); window.regions.clear();
         window.first = first;
         uint64_t const count = std::min<uint64_t>(window_chunks, chunks - first);
@@ -3357,17 +3910,31 @@ inline void ExternalEngine::pack(Members members)
         stats_.codec_ns += current->codec_ns; stats_.encode_chunks += current->tasks.size();
         for (auto const& block : current->blocks)
         {
-            size_t offset = 0;
-            for (size_t i = block.begin; i < block.end; ++i)
+            size_t offset = 0, i = block.begin;
+            while (i < block.end)
             {
-                uint64_t const bytes = current->lengths[i]; require(bytes <= block.bytes.size() - offset, "external packed block changed length");
-                emit(block.bytes.subspan(offset, size_t(bytes))); offset += size_t(bytes);
-                gsz_encode(std::span<uint64_t const>(&bytes, 1), members_, index_bits);
+                // Emit contiguous codec output together. Stop on the exact
+                // checkpoint chunk and allow up to one 64-bit index field per
+                // chunk within the existing index and output windows.
+                size_t const first = i;
+                auto const fields = std::max<uint64_t>(1, (packing_index_bytes(config_) - index_bits.asBytes().size()) / sizeof(uint64_t));
+                size_t const end = i + std::min<uint64_t>(block.end - i, fields);
+                uint64_t const checkpoint_room = packing_checkpoint_bytes() - (output_bytes_ - committed);
+                size_t bytes = 0;
+                do
+                {
+                    uint64_t const length = current->lengths[i];
+                    require(length <= block.bytes.size() - offset - bytes, "external packed block changed length");
+                    require(length <= config_.window_bytes, "external canonical chunk exceeds output window");
+                    bytes += size_t(length); ++i;
+                } while (i < end && bytes < checkpoint_room);
+                emit(block.bytes.subspan(offset, bytes)); offset += bytes;
+                gsz_encode(std::span(current->lengths).subspan(first, i - first), members_, index_bits);
                 if (index_bits.asBytes().size() >= packing_index_bytes(config_)) { drain_output(); flush_index(false); }
-                packed_chunks_ = current->first + i + 1;
+                packed_chunks_ = current->first + i;
                 if (output_bytes_ - committed >= packing_checkpoint_bytes() || packed_chunks_ == chunks)
                 {
-                    checkpoint(std::span<uint64_t const>(current->frontiers).subspan(i * runs_.size(), runs_.size()));
+                    checkpoint(std::span<uint64_t const>(current->frontiers).subspan((i - 1) * runs_.size(), runs_.size()));
                     if (current->tasks.size() > workers && packed_chunks_ < current->next) grow_failpoint("external-pack-window-checkpoint");
                 }
             }
@@ -3450,6 +4017,7 @@ inline Result ExternalEngine::finish()
         completed_ = stamp(publication::path(path_)); phase_ = Phase::done; save("external-published");
         sync_directory(file_io::path_text(file_io::native_path(path_).parent_path()), io_context("directory", &execution_destination_));
     }
+    disk_workers_.clear(); scratch_devices_.clear(); disk_lanes_.clear(); queue_bytes_ = 0;
     cleanup();
     if (!runs_.empty())
     {

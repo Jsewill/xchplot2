@@ -52,6 +52,7 @@ int main() try
     check(roundtrip.native.compute_workers.front().reservation.size() == 3 && roundtrip.native.compute_services.size() == 2,
         "whole compute service scope was lost on profile roundtrip");
     WorkerTaskAdmission task; task.worker.identity = worker.tls_identity; task.worker.instance = "current-executor-instance";
+    task.worker.hardware.host = worker.host; task.worker.hardware.partition = {1, 2, 512, 0};
     task.worker.capacity = {1, 2, 384, 0}; task.worker.baseline_host_bytes = 128;
     task.owner_identity = n.compute_owner_identity; task.owner_id = "actual-client-owner"; task.broker_identity = n.compute_broker_identity;
     task.task.kind = pool::Kind::GenerateCpu; task.task.k = 18; task.task.strength = 2; task.task.work_units = 1; task.task.resources = {1, 1, 128, 0};
@@ -67,6 +68,9 @@ int main() try
     changed = task; changed.owner_identity = std::string(64, 'b'); rejects([&] { admit(changed); });
     changed = task; changed.broker_identity = std::string(64, 'b'); rejects([&] { admit(changed); });
     changed = task; changed.worker.instance.clear(); rejects([&] { admit(changed); });
+    changed = task; changed.worker.hardware.host = "different-host"; rejects([&] { admit(changed); });
+    changed = task; changed.worker.hardware.partition.host_bytes = 513; rejects([&] { admit(changed); });
+    changed = task; changed.worker.hardware.partition.cpu_threads = 2; rejects([&] { admit(changed); });
     changed = task; changed.worker.capacity.cpu_threads = 2; rejects([&] { admit(changed); });
     changed = task; changed.worker.capacity.slots = 3; rejects([&] { admit(changed); });
     changed = task; changed.worker.baseline_host_bytes = 129; rejects([&] { admit(changed); });
@@ -126,7 +130,10 @@ int main() try
     rejects([&] { Stage stage; bind_native_stage(gpu_profile, unbound_local_request, 0, stage, true, false); });
     auto gpu_task = task; gpu_task.task.kind = pool::Kind::GenerateGpu; gpu_task.task.resources.gpu_bytes = 100;
     gpu_task.worker.capacity.gpu_bytes = gpu_task.worker.active.gpu_bytes = 100;
+    gpu_task.worker.hardware.partition.gpu_bytes = 100; gpu_task.worker.hardware.gpu_identity = "pci:0000:01:00.0";
     require_compute_task(gpu_profile, gpu_task, 512, 256, "gpu");
+    gpu_task.worker.hardware.gpu_identity = "pci:0000:02:00.0";
+    rejects([&] { require_compute_task(gpu_profile, gpu_task, 512, 256, "gpu"); });
     auto local_gpu = gpu_profile;
     auto& local_worker = local_gpu.native.compute_workers.front(); local_worker.host = "owner";
     local_worker.gpu_identity = "host:owner/pci:0000:01:00.0";

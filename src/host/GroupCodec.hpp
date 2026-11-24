@@ -30,7 +30,15 @@ struct CpuTime
 };
 inline std::optional<uint64_t> thread_cpu_nanoseconds()
 {
-#ifdef CLOCK_THREAD_CPUTIME_ID
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetThreadTimes(::GetCurrentThread(), &created, &exited, &kernel, &user)) return {};
+    auto ticks = [](FILETIME time) { return (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+    uint64_t const kernel_ticks = ticks(kernel), user_ticks = ticks(user);
+    constexpr uint64_t max_ticks = UINT64_MAX / 100; // FILETIME counts 100 ns intervals.
+    if (kernel_ticks <= max_ticks && user_ticks <= max_ticks - kernel_ticks)
+        return (kernel_ticks + user_ticks) * 100;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
     struct timespec value{};
     if (!::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) && value.tv_sec >= 0 && value.tv_nsec >= 0 &&
         uint64_t(value.tv_sec) <= (UINT64_MAX - uint64_t(value.tv_nsec)) / 1000000000ull)
@@ -115,6 +123,17 @@ public:
             current_permits_ = permits_;
             lock.unlock(); owner_->compute_.notify_all();
         }
+        // Optional preparation uses one idle permit, leaving another for
+        // foreground work. A queued codec job or waiter always goes first.
+        Lease(CodecScheduler& owner, std::try_to_lock_t)
+            : owner_(nullptr), previous_(current_), permits_(1), previous_permits_(current_permits_)
+        {
+            if (!owner.can_overlap() || owner.threads_.empty()) return;
+            std::lock_guard lock(owner.mutex_);
+            if (owner.first_waiter_ || owner.queued_ || owner.workers() - owner.active_ < 2) return;
+            ++owner.active_; current_ = owner_ = &owner; current_permits_ = 1;
+        }
+        explicit operator bool() const { return owner_ != nullptr; }
         ~Lease()
         {
             if (!owner_) return;
@@ -158,6 +177,7 @@ public:
     CodecScheduler(CodecScheduler const&) = delete;
     CodecScheduler& operator=(CodecScheduler const&) = delete;
     unsigned workers() const { return unsigned(jobs_.size()); }
+    bool can_overlap() const { return workers() > 1 && !current_; }
 
     std::future<void> submit(std::function<void()> operation)
     {
@@ -216,21 +236,57 @@ struct UnencodableChunkSize : std::runtime_error
     UnencodableChunkSize() : std::runtime_error("unencodable group chunk size") {}
 };
 
-inline void check_gsz_size(uint64_t size, uint16_t members)
+class ChunkIndexSize
 {
-    group_tools::require(members != 0 && size != 0 && size <= uint64_t(INT64_MAX),
-                         "invalid group chunk size");
-    uint64_t const expected = gsz_expected_for_g(members);
-    uint64_t const magnitude = size < expected ? expected - size : size - expected;
-    auto const rice = uint32_t(gsz_rice_k_for_g(members));
-    if ((magnitude >> rice) + rice + 2 > 64) throw UnencodableChunkSize();
-}
+public:
+    explicit ChunkIndexSize(uint16_t members)
+        : expected_(gsz_expected_for_g(members)), rice_(uint32_t(gsz_rice_k_for_g(members)))
+    { group_tools::require(members != 0, "invalid group chunk size"); }
+
+    uint32_t bits(uint64_t size) const
+    {
+        group_tools::require(size && size <= uint64_t(INT64_MAX), "invalid group chunk size");
+        uint64_t const length = quotient(size) + rice_ + 2;
+        if (length > 64) throw UnencodableChunkSize();
+        return uint32_t(length);
+    }
+    uint64_t bytes(std::span<uint64_t const> sizes) const
+    {
+        group_tools::require(sizes.size() <= UINT64_MAX / 64, "group index length overflow");
+        if (sizes.empty()) return 0;
+        // The Rice parameter and the sign and stop bits are shared. The two
+        // extreme sizes bound every code, so check them once after summing.
+        uint64_t total = sizes.size() * uint64_t(rice_ + 2), low = UINT64_MAX, high = 0;
+        for (auto size : sizes)
+        {
+            low = std::min(low, size); high = std::max(high, size);
+            total += quotient(size);
+        }
+        bits(low); bits(high);
+        return total / 8 + (total % 8 != 0);
+    }
+private:
+    uint64_t quotient(uint64_t size) const
+    {
+        // Use the canonical encoder's unsigned magnitude, including when
+        // bytes() has yet to validate the extrema of the input.
+        uint64_t const delta = size - expected_, sign = delta >> 63;
+        return ((delta ^ (0 - sign)) + sign) >> rice_;
+    }
+    uint64_t expected_;
+    uint32_t rice_;
+};
+
+inline void check_gsz_size(uint64_t size, uint16_t members)
+{ (void)ChunkIndexSize(members).bits(size); }
 
 struct EncodedChunk
 {
     std::span<uint8_t const> bytes;
     uint16_t members;
 };
+
+inline constexpr size_t fresh_group_window_chunks = 1024;
 
 struct ChunkInput
 {
@@ -595,16 +651,26 @@ private:
         group_tools::require(new_members.size() <= UINT16_MAX - members, "invalid group membership");
         uint16_t const old_members = uint16_t(members);
         high_.size = 0; low_.size = 0;
-        size_t bit_count = 0;
-        uint64_t const range = range_per_chunk(), start = ordinal * range;
-        uint64_t previous = start;
-        members = 0;
-        for (auto const& contribution : contributions)
+        auto decode_part = [&](EncodedChunk const& contribution)
         {
-            size_t const first_symbol = high_.size;
             auto const decoded = decode(ordinal, contribution.bytes, contribution.members, nullptr, nullptr, true);
             group_tools::require(decoded.bytes == contribution.bytes.size(), "group contribution has trailing data");
             check_gsz_size(decoded.bytes, contribution.members);
+            return decoded;
+        };
+        // The leading contribution already starts at the canonical chunk
+        // origin. Only the following contributions need a new first delta.
+        auto const& first = contributions.front();
+        auto const prefix = decode_part(first);
+        size_t bit_count = prefix.low_bits;
+        if (!size_only) copy_low(first.bytes.subspan(prefix.low_offset));
+        uint64_t previous = prefix.last;
+        uint64_t const range = range_per_chunk();
+        members = first.members;
+        for (auto const& contribution : contributions.subspan(1))
+        {
+            size_t const first_symbol = high_.size;
+            auto const decoded = decode_part(contribution);
             uint64_t const delta = decoded.first + uint64_t(members) * range - previous;
             size_t const width = delta_width(delta);
             group_tools::require(decoded.low_bits >= decoded.first_bits &&
@@ -623,6 +689,7 @@ private:
             previous = decoded.last + uint64_t(members) * range;
             members += contribution.members;
         }
+        if (new_members.empty()) return finish_encode(old_members, bit_count, previous, size_only);
         size_t symbols = high_.size, total_bits = bit_count;
         (void)visit_deltas(k_, ordinal, old_members, new_members, previous, true,
             [&](uint64_t delta)
@@ -670,11 +737,7 @@ private:
             group_tools::require(old.bytes == old_chunk.size(), "old chunk has trailing data");
             previous = old.last;
             bit_count = old.low_bits;
-            if (!size_only)
-            {
-                resize(low_, bytes_for_bits(bit_count));
-                std::memcpy(low_.data.get(), old_chunk.data() + old.low_offset, low_.size);
-            }
+            if (!size_only) copy_low(old_chunk.subspan(old.low_offset));
         }
 
         size_t symbols = high_.size;
@@ -711,7 +774,7 @@ private:
             {
                 if (size_only)
                 {
-                    high_.data[high_.size++] = uint8_t((delta % (178ull << (k_ - 8))) >> (k_ - 8));
+                    high_.data[high_.size++] = uint8_t((delta >> (k_ - 8)) % 178);
                     bit_count += delta_width(delta);
                 }
                 else append_delta(delta, bit_count);
@@ -871,7 +934,7 @@ private:
     }
     static uint32_t delta_width(uint8_t k, uint64_t delta)
     {
-        uint64_t const quotient = delta / (178ull << (k - 8));
+        uint64_t const quotient = (delta >> (k - 8)) / 178;
         group_tools::require(quotient + 1 + k - 8 <= 64, "unencodable group fragment delta");
         return uint32_t(quotient + 1 + k - 8);
     }
@@ -896,14 +959,17 @@ private:
         if (bit_count & 7) low_.data[bit_count >> 3] &= uint8_t((1u << (bit_count & 7)) - 1);
         for (size_t i = bytes_for_bits(bit_count); i < low_.size; ++i) low_.data[i] = 0;
     }
+    void copy_low(std::span<uint8_t const> bytes)
+    {
+        resize(low_, bytes.size());
+        std::memcpy(low_.data.get(), bytes.data(), bytes.size());
+    }
     void append_low_delta(uint64_t delta, size_t& bit_count)
     {
-        uint64_t const threshold = 178ull << (k_ - 8);
-        uint64_t const quotient = delta / threshold;
-        uint64_t const remainder = delta % threshold;
-        uint64_t value = (((1ull << quotient) - 1) << (k_ - 8))
-            | (remainder & ((1ull << (k_ - 8)) - 1));
+        uint32_t const low_bits = k_ - 8;
         uint32_t const width = delta_width(delta);
+        uint32_t const quotient = width - low_bits - 1;
+        uint64_t const value = (((1ull << quotient) - 1) << low_bits) | (delta & ((1ull << low_bits) - 1));
         append_low_word(value, width, bit_count);
     }
     void append_low_word(uint64_t value, uint32_t width, size_t& bit_count)
@@ -913,8 +979,11 @@ private:
         size_t const byte = bit_count >> 3;
         uint32_t const shift = uint32_t(bit_count & 7);
         auto const tail = low_.span().subspan(byte);
-        uint64_t const word = load_word(tail) | (value << shift);
-        std::memcpy(low_.data.get() + byte, &word, std::min(tail.size(), sizeof(word)));
+        // Appends are ordered. Only the low bits of this first byte belong
+        // to an earlier field. The following bytes can be written directly.
+        uint64_t const word = (tail.front() & ((1u << shift) - 1)) | (value << shift);
+        if (tail.size() >= sizeof(word)) std::memcpy(low_.data.get() + byte, &word, sizeof(word));
+        else std::memcpy(low_.data.get() + byte, &word, tail.size());
         if (width > 64 - shift) low_.data[byte + 8] |= uint8_t(value >> (64 - shift));
         bit_count += width;
     }
@@ -984,54 +1053,59 @@ private:
         uint64_t const range = range_per_chunk();
         uint64_t const start = ordinal * range;
         uint64_t const end = start + uint64_t(members) * range;
+        uint32_t const width = k_ - 8;
+        uint64_t const mask = (1ull << width) - 1, modulus = 178ull << width;
         uint64_t previous = start;
         uint64_t first = 0;
         size_t first_bits = 0;
-        uint64_t region = 0;
+        uint64_t region_end = start + range;
         if (boundaries) boundaries->push_back(fragments->size());
         for (size_t i = 0; i < count; ++i)
         {
             uint8_t const symbol = high_.data[begin + i];
             group_tools::require(symbol < 178, "invalid group high symbol");
             auto [word, available] = peek();
-            uint32_t const width = k_ - 8;
             group_tools::require(available >= width, "truncated group low bits");
-            uint64_t const remainder = (uint64_t(symbol) << width) | (word & ((1ull << width) - 1));
+            uint64_t const remainder = (uint64_t(symbol) << width) | (word & mask);
             word >>= width;
             available -= width;
-            bit_count += width;
-            uint64_t quotient = 0;
-            for (;;)
+            uint32_t quotient = std::countr_one(word);
+            if (quotient < available)
+                bit_count += width + quotient + 1;
+            else
             {
-                // As in upstream BitReader, scan a whole unary field at once.
-                // Padding outside the input cannot act as its terminating zero.
-                uint32_t const ones = std::min(uint32_t(std::countr_one(word)), available);
-                quotient += ones;
-                bit_count += ones;
-                group_tools::require(quotient + 1 + k_ - 8 <= 64, "invalid group unary field");
-                if (ones < available) { ++bit_count; break; }
-                auto const next = peek();
-                word = next.first;
-                available = next.second;
+                // A field can cross a loaded word. Padding beyond the input
+                // cannot supply its terminating zero.
+                quotient = available;
+                bit_count += width + available;
+                for (;;)
+                {
+                    auto const next = peek();
+                    auto const ones = std::min(uint32_t(std::countr_one(next.first)), next.second);
+                    quotient += ones; bit_count += ones;
+                    group_tools::require(width + quotient + 1 <= 64, "invalid group unary field");
+                    if (ones < next.second) { ++bit_count; break; }
+                }
             }
-            uint64_t const delta = quotient * (178ull << (k_ - 8)) + remainder;
+            uint64_t const delta = quotient * modulus + remainder;
             group_tools::require(delta < end - previous && (i == 0 || delta != 0),
                                  "out-of-range or duplicate group delta");
             previous += delta;
             if (!i) { first = previous; first_bits = bit_count; }
-            uint64_t const member = (previous - start) / range;
-            group_tools::require(member == region || (i != 0 && member == region + 1),
-                                 "group member chunk is empty");
+            if (previous >= region_end)
+            {
+                group_tools::require(i != 0 && previous - region_end < range, "group member chunk is empty");
+                region_end += range;
+                if (boundaries) boundaries->push_back(fragments->size());
+            }
             if (fragments)
             {
-                if (member != region) boundaries->push_back(fragments->size());
                 group_tools::require(fragments->size() < fragments->capacity(), "decoded group exceeds fragment workspace");
-                fragments->push_back(previous - member * range);
+                fragments->push_back(start + (previous - (region_end - range)));
             }
             if (visit) (*visit)(previous);
-            region = member;
         }
-        group_tools::require(region + 1 == members, "group member chunk is empty");
+        group_tools::require(region_end == end, "group member chunk is empty");
         size_t const low_size = bytes_for_bits(bit_count);
         if (bit_count & 7)
             group_tools::require((low[low_size - 1] >> (bit_count & 7)) == 0,
@@ -1118,9 +1192,9 @@ public:
     // all tasks are drained before propagating any failure, as in the writer.
     std::span<EncodedBlock const> encode(std::span<ChunkInput const> chunks,
                                         std::span<uint64_t> sizes, bool retain_previous = false,
-                                        std::span<ChunkSummary> summaries = {})
+                                        std::span<ChunkSummary> summaries = {}, size_t max_workers = SIZE_MAX)
     {
-        return run(chunks, sizes, retain_previous, false, summaries);
+        return run(chunks, sizes, retain_previous, false, summaries, false, {}, max_workers);
     }
 
     void measure(std::span<ChunkInput const> chunks, std::span<uint64_t> sizes,
@@ -1137,10 +1211,19 @@ public:
         (void)run(chunks, {}, false, false, summaries, true);
     }
 
+    // Ordered inspections also retain the first decoded value for joining
+    // the received member's summary to the owner's existing chunk.
+    void inspect(std::span<ChunkInput const> chunks, std::span<ChunkCodec::Inspection> inspected)
+    {
+        group_tools::require(inspected.size() == chunks.size(), "codec inspection output mismatch");
+        (void)run(chunks, {}, false, false, {}, true, inspected);
+    }
+
 private:
     std::span<EncodedBlock const> run(std::span<ChunkInput const> chunks,
                                     std::span<uint64_t> sizes, bool retain_previous, bool size_only,
-                                    std::span<ChunkSummary> summaries = {}, bool summary_only = false)
+                                    std::span<ChunkSummary> summaries = {}, bool summary_only = false,
+                                    std::span<ChunkCodec::Inspection> inspected = {}, size_t max_workers = SIZE_MAX)
     {
         std::lock_guard run(run_mutex_);
         group_tools::require(summary_only || sizes.size() == chunks.size(), "codec size output mismatch");
@@ -1180,7 +1263,8 @@ private:
         std::chrono::steady_clock::time_point submitted;
         if (remote_ && !size_only && !summary_only)
             submitted = std::chrono::steady_clock::now();
-        size_t const count = std::min(chunks.size(), codecs_.size());
+        group_tools::require(max_workers, "group encoding requires a CPU worker");
+        size_t const count = std::min({chunks.size(), codecs_.size(), max_workers});
         size_t const per_task = chunks.size() / count + (chunks.size() % count != 0);
         if (retain_previous) for (auto& codec : codecs_) codec->next_window();
         for (size_t task = 0, begin = 0; begin < chunks.size(); ++task, begin += per_task)
@@ -1189,7 +1273,12 @@ private:
             uint64_t estimate = ChunkCodec::estimate_base();
             for (size_t i = begin; i < end; ++i)
             {
-                if (summary_only) continue;
+                if (summary_only)
+                {
+                    if (!chunks[i].old_chunk.empty())
+                        estimate = std::max(estimate, ChunkCodec::estimate_work(k_, chunks[i].old_chunk.size(), 0));
+                    continue;
+                }
                 uint64_t incoming = 0;
                 for (size_t member_index = 0; member_index < chunks[i].new_members.size(); ++member_index)
                 {
@@ -1212,7 +1301,7 @@ private:
                 group_tools::require(chunk <= UINT64_MAX - estimate, "group window estimate overflow");
                 estimate += chunk;
             }
-            if (!summary_only) codecs_[task]->prepare(estimate);
+            if (!summary_only || estimate > ChunkCodec::estimate_base()) codecs_[task]->prepare(estimate);
             if (!summary_only) blocks_.push_back({begin, end, {}});
         }
         std::vector<std::future<void>> pending;
@@ -1245,7 +1334,16 @@ private:
                     auto const& chunk = chunks[i];
                     if (summary_only)
                     {
-                        group_tools::require(chunk.old_chunk.empty() && !chunk.old_members && chunk.contributions.empty(),
+                        if (!chunk.old_chunk.empty())
+                        {
+                            group_tools::require(chunk.old_members && chunk.new_members.empty() && chunk.contributions.empty(),
+                                "invalid encoded summary input");
+                            auto const result = codec.inspect(chunk.ordinal, chunk.old_chunk, chunk.old_members);
+                            if (inspected.empty()) summaries[i] = result.summary;
+                            else inspected[i] = result;
+                            continue;
+                        }
+                        group_tools::require(inspected.empty() && !chunk.old_members && chunk.contributions.empty(),
                                              "fresh summary has old group input");
                         summaries[i] = ChunkCodec::fresh_summary(k_, chunk.ordinal, chunk.new_members);
                         continue;

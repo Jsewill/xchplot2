@@ -40,7 +40,7 @@ def main():
                        "--out", output, "--farmer-pk", farmer,
                        f"--pool-{mode}", "42" * 32 if mode == "ph" else farmer,
                        "--seed", seed, "--k", 18, "--strength", strength,
-                       "--meta-group", meta, "--group-size", count, "--plot-index", base,
+                       "--collection", meta, "--group-size", count, "--plot-index", base,
                        "--devices", args.devices, "--tier", args.tier]
             result = run(command)
             assert all(f"PASS group member={base + i} " in result.stdout for i in range(count))
@@ -55,7 +55,7 @@ def main():
                 assert raw_dir.stat().st_mode & 0o777 == 0o700
                 assert all(path.stat().st_mode & 0o777 == 0o600
                            for path in [output, job_path, *raw, raw_dir / "batch.tsv", raw_dir / "group.inputs"])
-            run(command + ["--resume"])
+            run(command + ["--resume", "--meta-group", meta])
             assert digest(output) == group_hash
             assert all((digest(path), path.stat().st_mtime_ns) == before[path] for path in raw)
             run(command + ["--testnet"], False)

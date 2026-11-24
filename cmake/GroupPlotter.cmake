@@ -1,35 +1,11 @@
-# Shared CPU ownership patch and source provenance for both grow builds.
+# Shared reference headers and source provenance for both grow builds.
 # Construction and farming compatibility use their explicit saved identities;
 # legacy checkpoints and plans retain their original exact-build guards.
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/ComputeWorker.cmake")
 
 function(pos2_grow_prepare upstream_dir output_include)
-    set(grow_dir "${CMAKE_CURRENT_BINARY_DIR}/pos2-grow")
-    get_filename_component(repo_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
-    set(patch "${repo_dir}/contrib/pos2-plotter-output-move.patch")
-    # Relative AES includes need the complete platform-patched header tree,
-    # matching the ordinary plotter's ARM overlay.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-        file(COPY "${upstream_dir}/src/" DESTINATION "${grow_dir}")
-        execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
-            "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-            "${GIT_EXECUTABLE}" apply --ignore-space-change "${repo_dir}/contrib/pos2-arm-cuda.patch"
-            WORKING_DIRECTORY "${grow_dir}" COMMAND_ERROR_IS_FATAL ANY)
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-            "${repo_dir}/contrib/pos2-arm-cuda.patch")
-    endif()
-    configure_file("${upstream_dir}/src/plot/Plotter.hpp"
-        "${grow_dir}/plot/Plotter.hpp" COPYONLY)
-    execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=GIT_DIR --unset=GIT_WORK_TREE
-        "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
-        "${GIT_EXECUTABLE}" apply --ignore-space-change "${patch}"
-        WORKING_DIRECTORY "${grow_dir}" COMMAND_ERROR_IS_FATAL ANY)
-    file(STRINGS "${grow_dir}/plot/Plotter.hpp" move_marker
-        REGEX "^#define GROW_MOVE_PLOTTER_OUTPUT 1$")
-    if(NOT move_marker)
-        message(FATAL_ERROR "CPU output ownership patch was not applied; grow RAM model would be invalid")
-    endif()
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${patch}")
+    pos2_worker_prepare("${upstream_dir}" grow_dir)
     set(${output_include} "${grow_dir}" PARENT_SCOPE)
 endfunction()
 
@@ -51,28 +27,29 @@ function(pos2_grow_identity target upstream_dir)
         string(APPEND identity "upstream/${name}:${digest}\n")
     endforeach()
     set(local_sources)
-    foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupComputeSettings.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
+    foreach(name CpuPlotMemory.hpp CpuTables.hpp GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupConstructionCache.hpp GroupDashboard.hpp GroupDashboardFeed.hpp GroupHardwareTelemetry.hpp GroupFarmService.hpp GroupComputeSettings.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
-                 GroupScratch.hpp GroupWriter.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
+                 GroupScratch.hpp GroupWriter.hpp GroupCheckpointPolicy.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
                  GroupFarmPreview.hpp GroupFarmUpdate.hpp GroupFarmProgress.hpp GroupFarmControlState.hpp GroupFarmControl.hpp GroupFarmOwner.hpp GroupFarmMembership.hpp GroupFarmMetadata.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp
-                 GroupCheckpoint.hpp GroupConstructionIdentity.hpp GroupFormat.hpp GroupFile.hpp GroupPublication.hpp GroupNativeIdentity.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp)
+                 GroupCheckpoint.hpp GroupConstructionIdentity.hpp GroupFormat.hpp GroupFile.hpp GroupPublication.hpp GroupNativeIdentity.hpp WindowsFile.hpp Random.hpp Json.hpp Utf8.hpp ComputeThreads.hpp)
         list(APPEND local_sources "${host_dir}/${name}")
     endforeach()
     list(APPEND local_sources "${repo_dir}/tools/xchplot2/group_options.cpp"
         "${repo_dir}/tools/xchplot2/group_commands.cpp" "${repo_dir}/tools/xchplot2/group_commands.hpp"
         "${repo_dir}/tools/xchplot2/device_options.hpp"
         "${repo_dir}/contrib/pos2-plotter-output-move.patch"
+        "${repo_dir}/contrib/pos2-worker-thread-limit.patch"
+        "${repo_dir}/cmake/ComputeWorker.cmake"
         "${repo_dir}/cmake/GroupPlotter.cmake")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         list(APPEND local_sources "${repo_dir}/contrib/pos2-arm-cuda.patch")
     endif()
     if(grow_NETWORK OR XCHPLOT2_BUILD_GROUP_POOL)
         foreach(name ComputeNetwork.hpp ComputeNetwork.cpp ComputePool.hpp ComputePool.cpp
-                     ComputeWorker.hpp ComputeWorker.cpp ComputeCompatibility.cpp ComputeThreads.hpp NumaTopology.hpp NumaTopology.cpp GroupRemoteCodec.hpp GroupFarmComputeResources.hpp)
+                     ComputeWorker.hpp ComputeWorker.cpp ComputeCompatibility.cpp NumaTopology.hpp NumaTopology.cpp GroupRemoteCodec.hpp GroupFarmComputeResources.hpp)
             list(APPEND local_sources "${host_dir}/${name}")
         endforeach()
-        list(APPEND local_sources "${repo_dir}/cmake/ComputeWorker.cmake"
-            "${repo_dir}/contrib/pos2-worker-thread-limit.patch" "${repo_dir}/cmake/ComputePool.cmake")
+        list(APPEND local_sources "${repo_dir}/cmake/ComputePool.cmake")
         string(APPEND identity "network-compute:1\n")
     endif()
     file(GLOB_RECURSE keygen_sources CONFIGURE_DEPENDS "${repo_dir}/keygen-rs/src/*.rs")

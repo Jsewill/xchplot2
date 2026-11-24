@@ -288,11 +288,27 @@ void synthetic()
 
 void summaries()
 {
-    for (uint16_t members : {uint16_t(1), uint16_t(64), uint16_t(UINT16_MAX)})
+    for (uint16_t members : {uint16_t(1), uint16_t(3), uint16_t(64), uint16_t(UINT16_MAX)})
     {
         uint64_t const expected = gsz_expected_for_g(members);
         unsigned const rice = unsigned(gsz_rice_k_for_g(members));
         uint64_t const magnitude = (uint64_t(63 - rice) << rice) - 1;
+        ChunkIndexSize const sizing(members);
+        std::vector<uint64_t> sizes{expected, expected + 1, expected - 1, expected + magnitude,
+            expected - std::min(expected - 1, magnitude)};
+        BitWriter index;
+        uint64_t bits = 0;
+        for (size_t i = 0; i < sizes.size(); ++i)
+        {
+            gsz_encode(std::span(sizes).subspan(i, 1), members, index);
+            bits += sizing.bits(sizes[i]);
+            require(bits == index.bitCount() && sizing.bytes(std::span(sizes).first(i + 1)) == index.asBytes().size(),
+                "exact index size differs from the canonical encoder");
+        }
+        require(!sizing.bytes({}), "empty index has a nonzero length");
+        sizes[1] = 0; rejects([&] { (void)sizing.bytes(sizes); });
+        sizes[1] = expected + magnitude + 1; rejects([&] { (void)sizing.bytes(sizes); });
+        sizes[1] = UINT64_MAX; rejects([&] { (void)sizing.bytes(sizes); });
         check_gsz_size(expected + magnitude, members);
         rejects([&] { check_gsz_size(expected + magnitude + 1, members); });
         if (expected > magnitude + 1)
@@ -966,6 +982,13 @@ void batch_hashing()
     require(hash.digest_for(members) == std::optional(framed_digest(std::span(raw).first(2))) &&
             hash.digest_for(Members(members).subspan(0, 1)) == first_digest,
             "batch hash did not preserve full and reduced prefixes");
+    MemberBatchHash received(2);
+    received.append(members[0].view(), {});
+    rejects([&] { received.append(members[1].view(), [] { throw std::runtime_error("cancelled"); }); });
+    require(received.size() == 1 && received.digest_for(Members(members).subspan(0, 1)) == first_digest,
+            "interrupted receive hashing changed the committed prefix");
+    received.append(members[1].view(), {});
+    require(received.digest_for(members) == hash.digest_for(members), "received and generated batch digests differ");
     require(!hash.digest_for(std::span(raw).first(2)), "mutable raw data reused an immutable hash");
     std::array<Member, 2> borrowed{Member::borrowed(raw[0]), Member::borrowed(raw[1])};
     require(!hash.digest_for(borrowed), "borrowed raw data reused an immutable hash");
@@ -1055,9 +1078,16 @@ void adaptive_overlap()
         engine.apply(*fresh, first);
         require(engine.stats().encode_chunks == chunks && !engine.stats().overlap_windows,
                 "large chunk did not use a single bounded serial encoding pass");
+        auto const before = engine.stats();
         auto append = engine.plan(second);
         require(append.accepted, "subsequent smaller operation was not admitted");
+        auto const retained = engine.stats().encode_chunks - before.encode_chunks;
+        auto const sized = engine.stats().sized_chunks - before.sized_chunks;
+        require(retained && sized && retained + sized == chunks,
+                "exact planning did not size each preceding chunk and encode its final window");
         engine.apply(append, second);
+        require(engine.stats().encode_chunks - before.encode_chunks == chunks,
+                "append encoded its retained planning window again");
         require(bool(engine.stats().overlap_windows) == overlap,
                 "smaller operation did not restore requested overlap");
     }
@@ -1192,7 +1222,67 @@ void indexed_members()
             offset += count;
         }
     }
-    for (auto const* path : {"/serial.gplot", "/staged.gplot"})
+    {
+        std::ifstream input(name + "/fresh.gplot", std::ios::binary);
+        std::vector<uint8_t> file((std::istreambuf_iterator<char>(input)), {});
+        Header header; std::memcpy(&header, file.data(), sizeof(header));
+        size_t const start = sizeof(header) + header.memo_length;
+        auto payload = std::span<uint8_t const>(file).subspan(start, header.chunk_index_offset - start);
+        ChunkCodec codec(k, config.codec_bytes);
+        std::vector<std::span<uint8_t const>> encoded;
+        size_t largest = 0;
+        while (!payload.empty())
+        {
+            auto const length = codec.scan(encoded.size(), payload, header.group_size);
+            encoded.push_back(payload.first(length)); payload = payload.subspan(length);
+            largest = std::max(largest, length);
+        }
+        uint64_t bound = 0; for (auto const& member : members) bound = std::max<uint64_t>(bound, member.size());
+        auto cfg = config; cfg.checkpoint_bytes = 8192;
+        for (bool interrupt : {false, true})
+        {
+            auto const path = name + (interrupt ? "/stream-resumed.gplot" : "/stream.gplot");
+            {
+                Engine engine(path, cfg, false, identity); engine.confirm_identity();
+                auto refused = engine.append_fresh_stream(header.group_size, bound, [&](auto const& begin, auto const&)
+                {
+                    require(!begin(cfg.capacity_bytes, cfg.window_bytes + 1, framed_digest(members)),
+                        "oversized streamed chunk bypassed ordinary window admission");
+                });
+                require(!refused && !engine.identity().pending && std::filesystem::file_size(path) == 0,
+                    "declined fresh manifest changed the destination");
+                auto receive = [&](auto const& begin, auto const& append)
+                {
+                    require(begin(header.chunk_index_offset - start, largest, framed_digest(members)), "stream admission failed");
+                    for (size_t i = 0; i < encoded.size(); ++i)
+                    {
+                        if (interrupt && i == encoded.size() / 2)
+                        {
+                            // A frame containing a valid chunk at a wrong ordinal must
+                            // leave the previous ordinary checkpoint recoverable.
+                            append(i + 1, std::span(encoded).subspan(i, 1));
+                            throw std::logic_error("unordered stream was accepted");
+                        }
+                        append(i, std::span(encoded).subspan(i, 1));
+                    }
+                };
+                if (interrupt)
+                {
+                    rejects([&] { (void)engine.append_fresh_stream(header.group_size, bound, receive); });
+                    require(engine.identity().pending && engine.stats().checkpoints > 1, "partial stream lost its durable prefix");
+                }
+                else require(engine.append_fresh_stream(header.group_size, bound, receive)->accepted, "fresh stream did not finish");
+            }
+            if (interrupt)
+            {
+                Engine engine(path, cfg, true); engine.confirm_identity();
+                auto changed = members; ++changed.front().front();
+                rejects([&] { engine.resume(changed); });
+                engine.resume(members);
+            }
+        }
+    }
+    for (auto const* path : {"/serial.gplot", "/staged.gplot", "/stream.gplot", "/stream-resumed.gplot"})
     {
         std::ifstream fresh(name + "/fresh.gplot", std::ios::binary);
         std::ifstream staged(name + path, std::ios::binary);

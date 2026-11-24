@@ -10,7 +10,7 @@ inline bool is_group_command(std::string_view command)
 }
 inline unsigned group_option_values(std::string_view option)
 {
-    if (option == "--relocate") return 2;
+    if (option == "--relocate" || option == "--harvester-log") return 2;
     if (option == "--" || !option.starts_with('-') || option == "--resume" || option == "-r" ||
         option == "--no-resume" || option == "--plan-only" || option == "--no-plan-only" ||
         option == "--metadata-only" || option == "--no-metadata-only" ||
@@ -23,7 +23,7 @@ inline unsigned group_option_values(std::string_view option)
         option == "--calibrate" || option == "--no-calibrate" || option == "--calibration-worker" || option == "--replot-proof-worker" || option == "--replot-structure-worker" ||
         option == "--json" || option == "--no-json" || option == "--quiet" || option == "--no-quiet" ||
         option == "-q" || option == "--verbose" || option == "--no-verbose" || option == "-v" ||
-        option == "--progress" || option == "--no-progress" || option == "--help" || option == "--help-all" || option == "-h" ||
+        option == "--tui" || option == "--no-tui" || option == "--progress" || option == "--no-progress" || option == "--help" || option == "--help-all" || option == "-h" ||
         option == "--extend" || option == "--no-extend" || option == "--update" || option == "--no-update" ||
         option == "--cancel-update" || option == "--no-cancel-update" ||
         option == "--policy-only" || option == "--no-policy-only" || option == "--upgrade-job" || option == "--no-upgrade-job" ||
@@ -36,10 +36,11 @@ inline bool group_path_list_option(std::string_view option)
 }
 GroupOptions parse_group_options(int argc, char** argv, std::string_view command = {});
 GroupOptions group_batch_options(BatchOptions const&, std::vector<std::string> const&);
-int run_group_command(std::string_view command, std::vector<std::string> const&);
+int run_group_command(std::string_view command, std::vector<std::string> const&, std::chrono::steady_clock::time_point started);
 int run_compute_broker(int argc, char** argv);
 int run_compute_worker(int argc, char** argv);
 int run_compute_setup(int argc, char** argv);
+int run_compute_firewall(int argc, char** argv);
 int run_compute_membership(int argc, char** argv);
 int run_compute_status(int argc, char** argv);
 int run_compute_service(int argc, char** argv);

@@ -131,6 +131,14 @@ void test_fits_without_spilling()
     check_eq(r.pinned_slots, kSlots, "fits: drain slots untouched");
     check_eq(r.resident, kTinyNeed, "fits: peak unchanged");
     check(r.meets_budget, "fits: budget met");
+
+    auto in = tiny_at(kTinyNeed + kGiB);
+    in.force_t1_meta = true;
+    auto const forced = pos2gpu::plan_host_ram_spill(in);
+    check(forced.tables.h_t1_meta, "fits: legacy T1 meta override needs disk");
+    check_eq(forced.spilled_bytes, kTable8, "fits: only the forced table needs space");
+    in.tier_tiny = false;
+    check(!pos2gpu::plan_host_ram_spill(in).tables.any(), "fits: other tiers ignore the T1 meta override");
 }
 
 // ---- largest-first, and stop as soon as the budget is met ------------------

@@ -4,6 +4,7 @@
 #include "host/GroupFarmUpdate.hpp"
 #include "host/Random.hpp"
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -272,7 +273,7 @@ inline void check_farming_owner_allowance(FarmingMetadataDirectory const& metada
 struct FarmingOwnerHealth
 {
     std::string status = "not-observed", instance, host, control_digest, last_state;
-    uint64_t heartbeat_at_ms = 0, heartbeat_sequence = 0;
+    uint64_t heartbeat_at_ms = 0, heartbeat_sequence = 0, local_pid = 0, local_process_start = 0;
     bool checked = false, lock_held = false, local_process_proven = false, heartbeat_current = false;
 };
 inline FarmingOwnerHealth observe_farming_owner(FarmingMetadataDirectory const& metadata, FarmingState const& state,
@@ -298,6 +299,11 @@ inline FarmingOwnerHealth observe_farming_owner(FarmingMetadataDirectory const& 
     handle = farm::inventory_detail::Handle{};
     result.checked = true; result.instance = owner.instance; result.host = owner.host;
     result.local_process_proven = !relocated && result.lock_held && local_process(owner, saved.stamp);
+    if (result.local_process_proven)
+    {
+        result.local_pid = owner.pid;
+        std::from_chars(owner.process_start.data(), owner.process_start.data() + owner.process_start.size(), result.local_process_start);
+    }
     auto const heartbeat_path = metadata.path / heartbeat_filename;
     if (farm_metadata_detail::present(heartbeat_path))
     {

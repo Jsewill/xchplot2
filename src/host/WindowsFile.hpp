@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -120,8 +121,28 @@ inline void create_private_directory(std::filesystem::path const& path)
 
 inline void move_private_path(std::filesystem::path const& source, std::filesystem::path const& destination, bool replace)
 {
-    if (!::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0)))
-        throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "publish private storage: " + destination.string());
+    if (::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0))) return;
+    DWORD error = ::GetLastError();
+    if (replace && error == ERROR_ACCESS_DENIED)
+    {
+        // Classic replacement refuses even a reader that shares DELETE.
+        // POSIX rename preserves its old handle and still enforces sharing,
+        // the destination ACL and the read-only attribute.
+        auto const name = std::filesystem::absolute(destination).native();
+        std::vector<unsigned char> buffer(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
+        auto info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+        DWORD const flags = 1u | 2u; // FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
+        std::memcpy(info, &flags, sizeof(flags)); // older SDKs expose only the ReplaceIfExists union member
+        info->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
+        std::memcpy(info->FileName, name.data(), info->FileNameLength);
+        HANDLE file = create_private_file_handle(source, GENERIC_WRITE | DELETE, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH);
+        bool const renamed = ::SetFileInformationByHandle(file, FILE_INFO_BY_HANDLE_CLASS(22), info, DWORD(buffer.size()));
+        bool const flushed = renamed && ::FlushFileBuffers(file);
+        error = ::GetLastError();
+        ::CloseHandle(file);
+        if (flushed) return;
+    }
+    throw std::system_error(static_cast<int>(error), std::system_category(), "publish private storage: " + destination.string());
 }
 
 inline int create_private_temp(std::string& path, DWORD flags = 0)

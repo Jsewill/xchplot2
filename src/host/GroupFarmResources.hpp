@@ -2,6 +2,7 @@
 // our admission gate; declarations are reservations, not hardware qualification.
 #pragma once
 #include "host/GroupHarvesterProfile.hpp"
+#include <array>
 #include <memory>
 #include <set>
 #ifdef _WIN32
@@ -13,7 +14,7 @@
 #include <time.h>
 #endif
 
-namespace group_grow { class WorkerIdentityReservation; }
+namespace group_grow { struct WorkerIdentityReservation; }
 namespace group_grow::farm
 {
 using Clock = std::chrono::steady_clock;
@@ -146,6 +147,7 @@ struct NativeRequest
     uint64_t compute_offer_ram_bytes = 0, compute_offer_cpu_threads = 0, compute_offer_gpu_bytes = 0;
     std::string compute_offer_backend;
     std::string compute_offer_identity;
+    std::string compute_offer_gpu_identity;
     bool compute_offer_owned = false;
     std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
     std::vector<std::string> output_resources, scratch_resources, source_resources;
@@ -215,6 +217,13 @@ inline uint64_t multiply(uint64_t a, uint64_t b)
 { require(!a || b <= UINT64_MAX / a, "mixed farm resource product overflow"); return a * b; }
 inline bool memory(ResourceKind kind)
 { return kind == ResourceKind::host_memory || kind == ResourceKind::gpu_memory; }
+inline bool adaptive_cpu_sharing(Profile const& profile, uint64_t lanes)
+{
+    // Small hosts share the controller, capped producer and health probe.
+    // Enrolled compute adds a broker and a separately capped executor; keep
+    // that minimum service set runnable under the same live pressure gate.
+    return profile.adaptive && lanes <= (profile.native.compute_owner_identity.empty() ? 3u : 5u);
+}
 inline char const* name(ResourceKind kind)
 {
     switch (kind)
@@ -923,10 +932,7 @@ inline Assessment assess_stage(AssessmentPreparation const& preparation, Stage c
             result.conditional_shared_service = result.conditional_shared_service || m.required_units > m.request_units;
         }
         uint64_t occupied = memory(m.kind) ? add(m.resident_units, m.transient_units) : add(m.reserved_units, required);
-        // Small hosts cannot dedicate separate cores to the controller,
-        // capped producer and health probe. The automatic policy time-shares
-        // that inherited set and relies on its live farming/pressure gate.
-        if (profile.adaptive && m.kind == ResourceKind::cpu && m.capacity <= 3)
+        if (m.kind == ResourceKind::cpu && adaptive_cpu_sharing(profile, m.capacity))
             occupied = std::min(occupied, m.capacity);
         m.occupied_units = occupied;
         if (occupied > m.capacity && (!profile.adaptive || r.capacity_known)) fail(result, "capacity-exceeded:" + m.resource);
@@ -2361,10 +2367,8 @@ inline std::optional<uint64_t> process_cpu_ns(HANDLE process = ::GetCurrentProce
 }
 inline std::optional<uint64_t> private_working_set(HANDLE process = ::GetCurrentProcess())
 {
-    // PROCESS_MEMORY_COUNTERS_EX2 is supported by the Windows releases with
-    // the September 2023 cumulative update. Keep its documented layout here
-    // because older SDKs expose only EX. An older OS that fills only EX leaves
-    // the sentinel unchanged and cannot grant resident-memory credit.
+    // Older SDKs expose only PROCESS_MEMORY_COUNTERS_EX. Detect whether PSAPI
+    // actually wrote the EX2 private working set before granting any credit.
     struct Counters
     {
         PROCESS_MEMORY_COUNTERS_EX base;
@@ -2372,10 +2376,34 @@ inline std::optional<uint64_t> private_working_set(HANDLE process = ::GetCurrent
         ULONG64 shared_commit;
     } value{};
     value.base.cb = sizeof(value); value.private_working_set = SIZE_MAX;
-    if (!::K32GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&value), sizeof(value)) ||
-        value.private_working_set == SIZE_MAX || value.private_working_set > value.base.WorkingSetSize ||
-        value.private_working_set > value.base.PrivateUsage) return {};
-    return uint64_t(value.private_working_set);
+    auto resident = [](SIZE_T bytes, SIZE_T working, SIZE_T committed) -> std::optional<uint64_t>
+    {
+        if (bytes == SIZE_MAX || bytes > working || bytes > committed) return {};
+        return uint64_t(bytes);
+    };
+    if (::K32GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&value), sizeof(value)) &&
+        value.private_working_set != SIZE_MAX)
+        return resident(value.private_working_set, value.base.WorkingSetSize, value.base.PrivateUsage);
+
+    // Server 2022 can expose only EX through PSAPI. The WDK's VM_COUNTERS_EX2
+    // includes the same private resident byte count in one fixed-size query
+    // against the held process, independent of its working set or farm size.
+    struct VmCounters
+    {
+        SIZE_T peak_virtual, virtual_size;
+        ULONG page_faults;
+        SIZE_T peak_working_set, working_set, peak_paged_pool, paged_pool, peak_nonpaged_pool, nonpaged_pool;
+        SIZE_T pagefile, peak_pagefile, private_commit, private_working_set;
+        ULONG64 shared_commit;
+    } vm{};
+    vm.private_working_set = SIZE_MAX;
+    using Query = decltype(&::NtQueryInformationProcess);
+    auto const module = ::GetModuleHandleW(L"ntdll.dll");
+    auto const query = module ? reinterpret_cast<Query>(::GetProcAddress(module, "NtQueryInformationProcess")) : nullptr;
+    constexpr auto process_vm_counters = PROCESSINFOCLASS(3);
+    ULONG returned = 0;
+    if (!query || query(process, process_vm_counters, &vm, sizeof(vm), &returned) < 0 || returned != sizeof(vm)) return {};
+    return resident(vm.private_working_set, vm.working_set, vm.private_commit);
 }
 inline bool process_affinity_within(DWORD_PTR allowed)
 {

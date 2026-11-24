@@ -19,7 +19,7 @@ void command_usage(std::string_view command)
 {
     if (command == "status")
     {
-        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--watch] [--inspect] [--live]\n";
+        std::cout << "Usage: xchplot2 status [DIR | PLAN | --manifest FILE] [--tui] [--watch] [--inspect] [--live]\n";
         return;
     }
     if (command == "pause" || command == "drain" || command == "resume" || command == "retire")
@@ -61,6 +61,8 @@ void command_help_all(std::string_view command)
     if (command == "plan") std::cout <<
         "  --alternative NAMES      review assessed resource changes, or capacity alone\n"
         "  --upgrade-job            review additional space for a stopped job's recovery records\n";
+    if (command == "fill" || command == "plan") std::cout <<
+        "  --harvester-log DIR FILE  bind a forwarded harvester log to a destination (repeatable)\n";
     if (command != "grow") std::cout <<
         "  --paths-from FILE        literal destination paths, one per line; - reads stdin\n"
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"
@@ -108,7 +110,8 @@ void command_help_all(std::string_view command)
         "  --relocate OLD NEW       move a saved destination; NEW locates the job, OLD must be offline\n";
     std::cout <<
         "  -k, --k N                 default 28 for farming; even 18..26 for testing\n"
-        "  -s, --strength N          default 2\n";
+        "  -s, --strength N          default 2\n"
+        "  -g, --collection N        collection number (0..255)\n";
     if (command == "grow") std::cout <<
         "  --max-members N           total members in the existing file\n"
         "  -r, --resume              recover interrupted work before growing (always enabled)\n";
@@ -142,7 +145,7 @@ void command_help_all(std::string_view command)
         "  --construction auto|incremental|staged|merged|external\n"
         "  --member-storage compact|raw  temporary member storage format\n"
         "  --window-bytes N          I/O window size in bytes\n"
-        "  --checkpoint-bytes N      target bytes between recovery checkpoints\n"
+        "  --checkpoint-bytes SIZE|auto  bytes between recovery checkpoints (default auto)\n"
         "  --io-overlap on|off --generation-overlap auto|on|off --cache-release on|off\n";
     if (command != "grow") std::cout <<
         "  --harvester local|FILE    use this harvester or import its saved profile\n"
@@ -170,6 +173,7 @@ void command_help_all(std::string_view command)
         "  --compute-broker HOST:PORT --compute-owner-id ID\n"
         "  --compute-ca FILE --compute-cert FILE --compute-key FILE\n"
         "  --compute-inflight N --compute-codec-ram auto|N\n"
+        "  --compute-output auto|packed|encoded --compute-writers auto|N\n"
         "  --compute-timeout-ms N --compute-socket-timeout-ms N --compute-frame-bytes N\n"
         "  --compute-listen HOST:PORT --compute-advertise HOST:PORT\n"
         "  --compute-offer-ram N --compute-offer-cpus N --compute-offer-vram N\n"
@@ -177,6 +181,7 @@ void command_help_all(std::string_view command)
         "  --json                    machine-readable plan/metrics on stdout\n"
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions, construction details and metrics\n"
+        "  --tui                     show the live dashboard and helper onboarding\n"
         "  --progress / --no-progress  force aggregate progress on or off\n";
     std::cout << "Construction recovery requires compatible checkpoint format, algorithm and\n"
         "native representation. Legacy checkpoints need their original build.\n";
@@ -196,6 +201,7 @@ void command_help(std::string_view command, bool all)
         std::cout << "Read saved farm progress through any destination in the job, a plan, or its manifest.\n"
             "Without a selector, use the current destination directory.\n\n"
             "  --watch                  refresh until interrupted\n"
+            "  --tui                    watch in an interactive dashboard (q closes)\n"
             "  --inspect                scan outputs and check recovery checkpoints\n"
             "  --live                   query shared compute and migration service readiness\n"
             "  --timeout-ms N           total live query time in milliseconds, 100..60000; default 5000\n"
@@ -302,6 +308,7 @@ void command_help(std::string_view command, bool all)
         "                           End path lists with another option or -- before positional destinations.\n"
         "  -k, --k N                 plot size, default 28\n"
         "  -s, --strength N          plot strength, default 2\n"
+        "  -g, --collection N        collection number (0..255)\n"
         "  --group-members auto|N    automatic layout or a member limit per file\n"
         "  --capacity-bytes SIZE     budget per filesystem, e.g. 500G\n"
         "  --leave-free SIZE         leave this space free, default 64M; also --headroom-bytes\n"
@@ -309,6 +316,7 @@ void command_help(std::string_view command, bool all)
         "  --json                    machine-readable output\n"
         "  -q, --quiet               suppress informational summaries\n"
         "  -v, --verbose             show assumptions and construction details\n"
+        "  --tui                     show the live dashboard and helper onboarding\n"
         "  --progress / --no-progress  force aggregate progress on or off\n"
         "\nk28 is the farming size; smaller sizes are for testing.\n"
         "Estimates cover this job and use assumed service costs.\n"
@@ -350,14 +358,14 @@ pos2gpu::GroupOptions pos2gpu::group_batch_options(pos2gpu::BatchOptions const& 
     if (options.skip_existing) tokens.emplace_back("--resume");
     if (options.quiet) tokens.emplace_back("--quiet");
     if (options.verbose) tokens.emplace_back("--verbose");
-    tokens.emplace_back(options.progress ? "--progress" : "--no-progress");
+    tokens.emplace_back(options.tui ? "--tui" : options.progress ? "--progress" : "--no-progress");
     tokens.insert(tokens.end(), extra.begin(), extra.end());
     auto args = command_arguments("plot", std::move(tokens));
     args.report_metrics = false;
     return args;
 }
 
-int pos2gpu::run_group_command(std::string_view command, std::vector<std::string> const& tokens)
+int pos2gpu::run_group_command(std::string_view command, std::vector<std::string> const& tokens, std::chrono::steady_clock::time_point started)
 {
     for (size_t i = 0; i < tokens.size(); ++i)
     {
@@ -367,7 +375,12 @@ int pos2gpu::run_group_command(std::string_view command, std::vector<std::string
         { command_help(command, token == "--help-all"); return 0; }
         i += pos2gpu::group_option_values(token);
     }
-    try { return run_group(command_arguments(command, tokens)); }
+    try
+    {
+        auto args = command_arguments(command, tokens);
+        args.command_started = started;
+        return run_group(args);
+    }
     catch (std::exception const& error)
     { std::cerr << '[' << command << "] FAILED: " << error.what() << '\n'; return 2; }
 }

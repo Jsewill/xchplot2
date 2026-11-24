@@ -1,7 +1,4 @@
 #include "host/ComputeIdentity.hpp"
-#include <openssl/pem.h>
-#include <openssl/rand.h>
-#include <openssl/x509v3.h>
 #ifdef _WIN32
 #include "host/WindowsFile.hpp"
 #else
@@ -12,6 +9,10 @@
 #include <sys/file.h>
 #include <unistd.h>
 #endif
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <array>
 #include <algorithm>
 #include <cerrno>
@@ -101,12 +102,14 @@ void write_private(fs::path const& path, std::span<uint8_t const> bytes)
 }
 void write_private(fs::path const& path, std::string const& value)
 { write_private(path, {reinterpret_cast<uint8_t const*>(value.data()), value.size()}); }
-std::string read_private(fs::path const& path)
+constexpr uint32_t private_file_limit = 1048576;
+std::string read_private(fs::path const& path, bool allow_missing = false)
 {
 #ifdef _WIN32
+    if (allow_missing && !fs::exists(path)) return {};
     File file{pos2gpu::create_private_file_handle(path, GENERIC_READ, OPEN_EXISTING)};
     LARGE_INTEGER size{};
-    require(::GetFileSizeEx(file.fd, &size) && size.QuadPart > 0 && size.QuadPart <= 1048576,
+    require(::GetFileSizeEx(file.fd, &size) && size.QuadPart > 0 && size.QuadPart <= private_file_limit,
         "private pool files must contain at most 1 MiB");
     std::string result(size_t(size.QuadPart), '\0'); size_t position = 0;
     while (position < result.size())
@@ -118,9 +121,10 @@ std::string read_private(fs::path const& path)
     return result;
 #else
     File file{::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (allow_missing && file.fd < 0 && !fs::exists(path)) return {};
     struct stat status{};
     require(file.fd >= 0 && !::fstat(file.fd, &status) && S_ISREG(status.st_mode) &&
-        status.st_uid == ::geteuid() && !(status.st_mode & 0077) && status.st_size > 0 && status.st_size <= 1048576,
+        status.st_uid == ::geteuid() && !(status.st_mode & 0077) && status.st_size > 0 && status.st_size <= private_file_limit,
         "pool files must be owned by this user, private (mode 600), and at most 1 MiB");
     std::string result(size_t(status.st_size), '\0'); size_t position = 0;
     while (position < result.size())
@@ -198,9 +202,10 @@ Identity issue(std::string const& node, Identity const* authority = nullptr, EVP
         X509_set_pubkey(result.cert.get(), public_key ? public_key : result.key.get()) == 1, "cannot prepare pool identity");
     if (authority && ASN1_TIME_compare(X509_get0_notAfter(result.cert.get()), X509_get0_notAfter(authority->cert.get())) > 0)
         require(X509_set1_notAfter(result.cert.get(), X509_get0_notAfter(authority->cert.get())) == 1, "cannot bound node certificate by pool authority validity");
-    auto subject = X509_get_subject_name(result.cert.get());
-    require(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-        reinterpret_cast<unsigned char const*>(node.c_str()), -1, -1, 0) == 1, "cannot name pool certificate");
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject(X509_NAME_new(), X509_NAME_free);
+    require(subject && X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC,
+        reinterpret_cast<unsigned char const*>(node.c_str()), -1, -1, 0) == 1 &&
+        X509_set_subject_name(result.cert.get(), subject.get()) == 1, "cannot name pool certificate");
     auto issuer = authority ? authority->cert.get() : result.cert.get();
     auto signing_key = authority ? authority->key.get() : result.key.get();
     require(X509_set_issuer_name(result.cert.get(), X509_get_subject_name(issuer)) == 1, "cannot set pool issuer");
@@ -229,6 +234,7 @@ void validate_defaults(ComputeDefaults const& value)
 {
     if (!value.broker.empty()) (void)parse_endpoint(value.broker);
     require(value.cpus <= 1024 && value.max_brokers && value.max_brokers <= 4096 &&
+        value.broker_port && (!value.worker_port || value.worker_port != value.broker_port) &&
         (value.backend == "auto" || value.backend == "cpu" || value.backend == "gpu"),
         "invalid saved compute resources");
     require(value.interfaces.size() <= 32, "too many compute network interfaces");
@@ -245,9 +251,10 @@ std::string profile(std::string const& name, std::string const& node, ComputeDef
 {
     validate_name(name); validate_node(node); validate_defaults(defaults);
     std::ostringstream output;
-    output << "xchplot2-compute-2\n" << std::quoted(name) << ' ' << node << '\n'
+    output << "xchplot2-compute-3\n" << std::quoted(name) << ' ' << node << '\n'
         << std::quoted(defaults.broker) << ' ' << defaults.cpus << ' ' << defaults.host_bytes << ' '
-        << defaults.gpu_bytes << ' ' << defaults.backend << ' ' << defaults.discovery << ' ' << defaults.max_brokers << '\n';
+        << defaults.gpu_bytes << ' ' << defaults.backend << ' ' << defaults.discovery << ' ' << defaults.max_brokers
+        << ' ' << defaults.broker_port << ' ' << defaults.worker_port << '\n';
     for (auto const& item : defaults.interfaces) output << std::quoted(item) << '\n';
     return output.str();
 }
@@ -360,16 +367,30 @@ void sign_policy(Policy& policy, Identity const& authority)
 }
 std::string credential_text(fs::path const& directory)
 {
-    if (fs::exists(directory / "credentials.pem")) return read_private(directory / "credentials.pem");
+    auto credentials = read_private(directory / "credentials.pem", true);
+    if (!credentials.empty()) return credentials;
     return read_private(directory / "cert.pem") + read_private(directory / "key.pem");
 }
-Policy saved_policy(fs::path const& directory, X509* ca)
+std::string_view policy_text(std::string const& text)
 {
-    auto text = credential_text(directory); auto position = text.find(policy_marker);
+    auto position = text.find(policy_marker);
     if (position == text.npos) return {};
     auto encoded = std::string_view(text).substr(position + sizeof(policy_marker) - 1);
     require(!encoded.empty() && encoded.back() == '\n', "invalid saved pool policy"); encoded.remove_suffix(1);
-    return decode_policy(unhex(encoded), ca);
+    return encoded;
+}
+Policy saved_policy(fs::path const& directory, X509* ca)
+{
+    auto credentials = credential_text(directory);
+    return decode_policy(unhex(policy_text(credentials)), ca);
+}
+void check_member(Policy const& policy, std::string const& node, std::string const& certificate)
+{
+    validate_node(node);
+    auto found = std::lower_bound(policy.members.begin(), policy.members.end(), node,
+        [](PoolMember const& member, std::string const& id) { return member.node_id < id; });
+    require(found == policy.members.end() || found->node_id != node || (!found->revoked && found->certificate == certificate),
+        "pool member or certificate has been revoked");
 }
 Identity saved_identity(fs::path const& directory)
 {
@@ -549,8 +570,10 @@ std::optional<PoolIdentity> load_pool(fs::path const& directory)
     auto& defaults = result.defaults;
     require(bool(input >> version >> std::quoted(result.name) >> result.node_id >> std::quoted(defaults.broker)
         >> defaults.cpus >> defaults.host_bytes >> defaults.gpu_bytes >> defaults.backend >> defaults.discovery) &&
-        (version == "xchplot2-compute-1" || version == "xchplot2-compute-2"), "invalid saved pool profile");
-    if (version == "xchplot2-compute-2") require(bool(input >> defaults.max_brokers), "invalid saved compute broker limit");
+        (version == "xchplot2-compute-1" || version == "xchplot2-compute-2" || version == "xchplot2-compute-3"), "invalid saved pool profile");
+    if (version != "xchplot2-compute-1") require(bool(input >> defaults.max_brokers), "invalid saved compute broker limit");
+    if (version == "xchplot2-compute-3")
+        require(bool(input >> defaults.broker_port >> defaults.worker_port), "invalid saved compute listener ports");
     input >> std::ws;
     while (input.peek() != std::char_traits<char>::eof())
     {
@@ -589,7 +612,7 @@ void invite_pool(PoolIdentity const& pool, fs::path const& invitation, std::stri
     output.bytes(policy.encoded); auto local = saved_identity(pool.directory); save_credentials(pool.directory, local, policy);
     export_private(invitation, output.data());
 }
-PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory)
+PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory, bool reuse_matching)
 {
     auto encoded = read_private(invitation);
     Reader input({reinterpret_cast<uint8_t const*>(encoded.data()), encoded.size()});
@@ -603,9 +626,29 @@ PoolIdentity join_pool(fs::path const& invitation, fs::path const& directory)
     auto member = std::find_if(policy.members.begin(), policy.members.end(), [&](auto const& value) { return value.node_id == node; });
     require(!policy.generation || (member != policy.members.end() && !member->revoked && member->certificate == fingerprint(identity.cert.get())),
         "invitation is not an active member of its signed policy");
+    if (reuse_matching)
+        if (auto saved = load_pool(directory))
+        {
+            require(saved->pool_id == fingerprint(ca.get()) && saved->node_id == node,
+                "invitation differs from this machine's saved compute enrollment");
+            return std::move(*saved);
+        }
     return publish(directory, name, node, ca_text, identity, {}, policy);
 }
 void validate_compute_defaults(ComputeDefaults const& defaults) { validate_defaults(defaults); }
+bool load_bundled_tls_identity(TlsOptions const& options, SSL_CTX* context)
+{
+    if (options.membership_directory.empty() || options.cert_file != options.key_file) return false;
+    auto const path = path_from_text(options.cert_file);
+    if (path != path_from_text(options.membership_directory) / "credentials.pem") return false;
+    // A renewal publishes the node's certificate and key in one file. Use the
+    // same private, delete-sharing snapshot for both halves of the TLS identity.
+    auto const text = read_private(path);
+    auto cert = read_certificate(text); auto key = read_key(text);
+    require(SSL_CTX_use_cert_and_key(context, cert.get(), key.get(), nullptr, 1) == 1,
+        "cannot load matching network TLS certificate and key");
+    return true;
+}
 void configure_pool(PoolIdentity const& pool, ComputeDefaults const& defaults)
 {
     auto encoded = profile(pool.name, pool.node_id, defaults);
@@ -681,12 +724,31 @@ void accept_pool_policy(std::string const& directory, std::span<uint8_t const> e
     if (incoming.generation == current.generation) return;
     auto identity = saved_identity(saved); save_credentials(saved, identity, incoming);
 }
+ChannelMembership::ChannelMembership(std::string const& directory, Peer remote, Peer local)
+    : directory_(path_from_text(directory)), peers_{std::move(remote), std::move(local)} {}
+uint64_t ChannelMembership::cache_bytes()
+{
+    // One public CA, the signed policy in hex, and its wire representation.
+    return private_file_limit + 3 * policy_limit;
+}
+void ChannelMembership::check()
+{
+    auto authority = read_private(directory_ / "ca.pem"); auto credentials = credential_text(directory_);
+    auto text = policy_text(credentials);
+    if (authority == authority_pem_ && text == policy_text_) return;
+    auto ca = read_certificate(authority); auto policy = decode_policy(unhex(text), ca.get());
+    for (auto const& [node, certificate] : peers_) check_member(policy, node, certificate);
+    // Only retain public data. A differently formatted CA is still accepted
+    // by the usual PEM reader and simply misses the canonical-byte fast path.
+    auto public_ca = authority == pem(ca.get()) ? std::move(authority) : std::string{};
+    std::string public_policy(text);
+    encoded_ = std::move(policy.encoded);
+    authority_pem_ = std::move(public_ca); policy_text_ = std::move(public_policy);
+}
 void check_pool_peer(std::string const& directory, std::string const& node, std::string const& certificate)
 {
-    auto saved = path_from_text(directory);
-    validate_node(node); auto ca = read_certificate(read_private(saved / "ca.pem")); auto policy = saved_policy(saved, ca.get());
-    auto found = std::find_if(policy.members.begin(), policy.members.end(), [&](auto const& value) { return value.node_id == node; });
-    require(found == policy.members.end() || (!found->revoked && found->certificate == certificate), "pool member or certificate has been revoked");
+    auto saved = path_from_text(directory); auto ca = read_certificate(read_private(saved / "ca.pem"));
+    check_member(saved_policy(saved, ca.get()), node, certificate);
 }
 void export_pool_policy(PoolIdentity const& pool, fs::path const& destination)
 {

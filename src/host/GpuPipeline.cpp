@@ -17,6 +17,7 @@
 #include "host/TempFile.hpp"   // P1 host-RAM disk-offload (XCHPLOT2_SPILL_T1META)
 #include "host/SpillCoverage.hpp"  // spill read guard — see header
 #include "host/SpillEngine.hpp"   // SpillEngine / SpillBuffer — see header
+#include "host/GpuCleanup.hpp"
 #include "host/HostGuard.hpp"      // pinned-host redzones — see header
 
 #include "gpu/AesGpu.cuh"
@@ -51,7 +52,6 @@
 #include <deque>
 #include <set>          // SpillEngine's out-of-order completion set
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -90,7 +90,7 @@ struct StreamingStats {
     // GB of pinned host memory per failure, starving peer workers.
     // Buffers owned by the caller (scratch fields / HostPinnedPool) are
     // never tracked here.
-    std::unordered_set<void*> host_ptrs;
+    std::unordered_map<void*, size_t> host_ptrs;
     bool        verbose = false;
     char const* phase   = "(init)";
 
@@ -99,16 +99,12 @@ struct StreamingStats {
     // succeeded), this dtor releases the still-live device and pinned-
     // host buffers instead of leaking them across batch iterations.
     ~StreamingStats() {
-        if (sizes.empty() && host_ptrs.empty()) return;
-        auto& q = sycl_backend::queue();
-        for (auto& [ptr, _bytes] : sizes) {
-            if (ptr) sycl::free(ptr, q);
-        }
-        sizes.clear();
-        for (void* ptr : host_ptrs) {
-            if (ptr) sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), q);
-        }
-        host_ptrs.clear();
+        for (auto const& [ptr, bytes] : sizes)
+            release_gpu_memory("streaming device allocation", bytes, &GpuCleanupCharges::device,
+                [&] { sycl::free(ptr, sycl_backend::queue()); });
+        for (auto const& [ptr, bytes] : host_ptrs)
+            release_gpu_memory("streaming pinned allocation", bytes, &GpuCleanupCharges::host,
+                [&] { sycl::free(pos2gpu::host_guard_disarm(ptr, "~StreamingStats"), sycl_backend::queue()); });
     }
 };
 
@@ -203,7 +199,7 @@ inline void* s_malloc_host_raw(StreamingStats& s, size_t bytes,
             std::string("sycl::malloc_host(") + what + ") failed");
     }
     p = pos2gpu::host_guard_arm(p, bytes, what);
-    s.host_ptrs.insert(p);
+    s.host_ptrs.emplace(p, bytes + 2 * pad);
     return p;
 }
 
@@ -219,30 +215,30 @@ inline T* s_malloc_host(StreamingStats& s, size_t bytes,
 inline void s_free_host(StreamingStats& s, void* p, sycl::queue& q)
 {
     if (!p) return;
-    s.host_ptrs.erase(p);
+    auto const owned = s.host_ptrs.extract(p);
     // Checks the redzones and hands back the real base to free. A no-op
     // returning `p` unchanged when the guard is off or never armed it.
-    sycl::free(pos2gpu::host_guard_disarm(p, "s_free_host"), q);
+    checked_gpu_free(owned ? owned.mapped() : 0, &GpuCleanupCharges::host,
+        [&] { sycl::free(pos2gpu::host_guard_disarm(p, "s_free_host"), q); });
 }
 
 template <typename T>
 inline void s_free(StreamingStats& s, T*& ptr)
 {
     if (!ptr) return;
-    void* raw = static_cast<void*>(ptr);
-    auto it = s.sizes.find(raw);
-    if (it != s.sizes.end()) {
-        s.live -= it->second;
+    void* raw = static_cast<void*>(std::exchange(ptr, nullptr));
+    auto const owned = s.sizes.extract(raw);
+    if (owned) {
+        s.live -= owned.mapped();
         if (s.verbose) {
             std::fprintf(stderr,
                 "[stream %-8s] -%7.2f MB  %-20s  live=%8.2f  peak=%8.2f\n",
-                s.phase, it->second / 1048576.0, "(free)",
+                s.phase, owned.mapped() / 1048576.0, "(free)",
                 s.live / 1048576.0, s.peak / 1048576.0);
         }
-        s.sizes.erase(it);
     }
-    sycl::free(raw, sycl_backend::queue());
-    ptr = nullptr;
+    checked_gpu_free(owned ? owned.mapped() : 0, &GpuCleanupCharges::device,
+        [&] { sycl::free(raw, sycl_backend::queue()); });
 }
 
 // ---------------------------------------------------------------------
@@ -309,10 +305,13 @@ inline bool spill_announce(bool quiet, std::atomic<bool>& announced)
 // path is theoretically more compatible than the AOT spoof but has
 // been observed to miscompile the matcher). Only the OOM further down
 // was visible before this check.
-inline void validate_t1_count(uint64_t t1_count, int k)
+inline void validate_t1_count(uint64_t t1_count, int k, sycl::queue& q)
 {
     uint64_t const min_plausible = (1ULL << k) >> 6;
     if (t1_count >= min_plausible) return;
+    // The counter copy has completed. An event wait alone does not dispatch
+    // its asynchronous errors to the queue handler.
+    q.throw_asynchronous();
 
     // Did the kernels run at all? A device that faulted mid-run reaches this
     // check with the same t1_count == 0 as a device that miscompiled the
@@ -320,29 +319,16 @@ inline void validate_t1_count(uint64_t t1_count, int k)
     // problem the parity tests cannot reproduce, the other is exactly what
     // they exist to catch. The async error count decides it.
     if (unsigned const n = async_error_count(); n > 0) {
-        std::string const first = first_async_error();
-        throw std::runtime_error(
-            "T1 match produced " + std::to_string(t1_count) + " entries, and " +
-            std::to_string(n) + " asynchronous backend error(s) were reported "
-            "during the run. The kernels did not compute a wrong answer — they "
-            "did not execute. This is a driver or device fault, NOT a codegen "
-            "or parity problem, and the parity tests will not reproduce it.\n"
-            "  First backend error: " + first + "\n"
-            "  Reading Level Zero codes: 0x70000001 (ze:1879048193) is "
-            "DEVICE_LOST and is the ROOT event. The 0x70000003 "
-            "(ze:1879048195) OUT_OF_DEVICE_MEMORY storm that follows it is a "
-            "dead context reporting on every subsequent call — it is not a "
-            "memory shortage, and chasing it wastes time.\n"
-            "  DEVICE_LOST part-way through a run usually means a kernel "
-            "outran the GPU's job/preemption timeout and the driver reset the "
-            "engine. Check `dmesg` for xe/i915 reset or hangcheck lines. On "
-            "the Xe driver the limit is "
-            "/sys/class/drm/card*/device/tile0/gt0/engines/*/job_timeout_ms "
-            "(and preempt_timeout_us); i915 uses "
-            "i915.enable_hangcheck / preempt_timeout_ms. Re-running at a "
-            "smaller k shortens every kernel and is the fastest way to confirm "
-            "the diagnosis: if a small k completes and k=28 does not, it is "
-            "the timeout, not the code.");
+        auto const loss = async_device_loss();
+        auto message = "T1 match produced " + std::to_string(t1_count) + " entries after " +
+            std::to_string(n) + " asynchronous backend error(s). First error: " + first_async_error();
+        if (!loss.empty())
+        {
+            message += "\nDevice loss: " + loss;
+            if (lost_gpu_backend(loss) == "level_zero")
+                message += "\nOn Linux, check the xe or i915 kernel log for an engine reset.";
+        }
+        throw std::runtime_error(message);
     }
 
     throw std::runtime_error(
@@ -394,7 +380,8 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
                                         GpuBufferPool& pool,
                                         int pinned_index,
                                         GpuFragmentSink const* sink,
-                                        GpuDeviceFragmentOutput const* device_output)
+                                        GpuDeviceFragmentOutput const* device_output,
+                                        std::function<void()> const& acquire_pinned = {})
 {
 
     sycl::queue& q = sycl_backend::queue();
@@ -475,11 +462,24 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // on single-plot runs (only slot 0 gets allocated). See
     // GpuBufferPool::ensure_pinned header comment for rationale.
     uint64_t*       h_pinned_t3    = sink || device_output ? nullptr : pool.ensure_pinned(pinned_index);
-    // T1/T2/T3 match kernels report 0 scratch bytes, but some CUDA paths
-    // reject a nullptr d_temp_storage with cudaErrorInvalidArgument even
-    // when bytes==0. Point them at d_sort_scratch (idle during match) to
-    // give the kernel a valid non-null handle.
-    void*           d_match_temp   = pool.d_sort_scratch;
+    // Match preparation uses the idle radix-sort scratch for coarse and fine
+    // offsets. A deeper index shortens scattered searches in the sorted table.
+    void* d_match_temp = pool.d_sort_scratch;
+    size_t match_bytes = pool.sort_scratch_bytes;
+    auto index_bits = [&](auto const& params, void* spare, size_t spare_bytes)
+    {
+        uint64_t const buckets = uint64_t(1) << (params.num_section_bits + params.num_match_key_bits);
+        d_match_temp = pool.d_sort_scratch; match_bytes = pool.sort_scratch_bytes;
+        // Some sort backends need little scratch. The Xs sort destination and
+        // the later permutation indices are idle during their respective matches.
+        if ((2 * buckets + 2) * sizeof(uint64_t) > match_bytes)
+        { d_match_temp = spare; match_bytes = spare_bytes; }
+        uint64_t const words = std::min<uint64_t>(match_bytes, 8u << 20) / sizeof(uint64_t);
+        int const desired = std::min(params.num_match_target_bits - 1, std::max(8, params.num_match_target_bits - 8));
+        int bits = 0;
+        while (bits < desired && buckets + 2 + (buckets << (bits + 1)) <= words) ++bits;
+        return bits;
+    };
 
     // Sort key/val arrays alias d_storage. Safe because Xs is fully consumed
     // by T1 match (stream-synchronised) before we enter T1 sort.
@@ -591,17 +591,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
 
     // ---------- Phase T1 ----------
     auto t1p = make_t1_params(cfg.k, cfg.strength);
-    size_t t1_temp_bytes = 0;
-    launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
-                          nullptr, nullptr, d_count, cap,
-                          nullptr, &t1_temp_bytes, q);
-    // The queue is out-of-order: wait so the counter zeroing can't be
-    // scheduled after the match kernel that increments it.
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t1p.fine_bits = index_bits(t1p, pool.d_pair_b, pool.pair_b_bytes);
     int p_t1 = begin_phase("T1 match");
     launch_t1_match(cfg.plot_id.data(), t1p, d_xs, total_xs,
                           d_t1_meta, d_t1_mi, d_count, cap,
-                          d_match_temp, &t1_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t1);
 
     // No explicit sync: the next cudaMemcpy (non-async, default stream)
@@ -609,7 +603,7 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     uint64_t t1_count = 0;
     q.memcpy(&t1_count, d_count, sizeof(uint64_t)).wait();
     if (t1_count > cap) throw std::runtime_error("T1 overflow");
-    validate_t1_count(t1_count, cfg.k);
+    validate_t1_count(t1_count, cfg.k, q);
 
 
     // Sort T1 by match_info (low k bits). d_storage is now repurposed
@@ -635,15 +629,11 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // No AoS struct anymore — saves 33 % of sorted-T1 bandwidth on both the
     // permute write and the match-kernel hot path.
     auto t2p = make_t2_params(cfg.k, cfg.strength);
-    size_t t2_temp_bytes = 0;
-    launch_t2_match(cfg.plot_id.data(), t2p, nullptr, nullptr, t1_count,
-                          nullptr, nullptr, nullptr, d_count, cap,
-                          nullptr, &t2_temp_bytes, q);
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t2p.fine_bits = index_bits(t2p, d_vals_in, 2 * cap * sizeof(uint32_t));
     int p_t2 = begin_phase("T2 match");
     launch_t2_match(cfg.plot_id.data(), t2p, d_t1_meta_sorted, d_keys_out, t1_count,
                           d_t2_meta, d_t2_mi, d_t2_xbits, d_count, cap,
-                          d_match_temp, &t2_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t2);
 
     uint64_t t2_count = 0;
@@ -672,19 +662,13 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     // d_keys_out now holds the T2 sorted match_info (T1's was overwritten by
     // the T2 sort above) — pass as the slim stream for binary search in T3.
     auto t3p = make_t3_params(cfg.k, cfg.strength);
-    size_t t3_temp_bytes = 0;
-    launch_t3_match(cfg.plot_id.data(), t3p,
-                          d_t2_meta_sorted, d_t2_xbits_sorted,
-                          nullptr, t2_count,
-                          d_t3, d_count, cap,
-                          nullptr, &t3_temp_bytes, q);
-    q.memset(d_count, 0, sizeof(uint64_t)).wait();
+    t3p.fine_bits = index_bits(t3p, d_vals_in, 2 * cap * sizeof(uint32_t));
     int p_t3 = begin_phase("T3 match + Feistel");
     launch_t3_match(cfg.plot_id.data(), t3p,
                           d_t2_meta_sorted, d_t2_xbits_sorted,
                           d_keys_out, t2_count,
                           d_t3, d_count, cap,
-                          d_match_temp, &t3_temp_bytes, q);
+                          d_match_temp, &match_bytes, q);
     end_phase(p_t3);
 
     uint64_t t3_count = 0;
@@ -709,6 +693,13 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
     end_phase(p_t3_sort);
 
     // ---------- D2H ----------
+    // Only the D2H writes this host slot. Its prior consumer can keep
+    // reading while the next member generates and sorts on the device.
+    if (acquire_pinned) {
+        int const wait = begin_phase("pinned output wait");
+        acquire_pinned();
+        end_phase(wait);
+    }
     int p_d2h = begin_phase("D2H copy T3 fragments (pinned)");
     GpuPipelineResult result;
     result.t1_count = t1_count;
@@ -721,9 +712,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
         q.wait_and_throw();
     } else if (sink) {
         drain_fragment_sink(q, d_frags_out, t3_count, false, *sink);
-    } else if (t3_count > 0) {
-        q.memcpy(h_pinned_t3, d_frags_out, sizeof(uint64_t) * t3_count);
-        q.wait();
+    } else {
+        if (t3_count) q.memcpy(h_pinned_t3, d_frags_out, sizeof(uint64_t) * t3_count);
+        q.wait_and_throw();
     }
     end_phase(p_d2h);
 
@@ -755,9 +746,9 @@ GpuPipelineResult run_gpu_pipeline_impl(GpuPipelineConfig const& cfg,
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
                                    GpuBufferPool& pool,
-                                   int pinned_index)
+                                   int pinned_index, std::function<void()> const& acquire_pinned)
 {
-    return run_gpu_pipeline_impl(cfg, pool, pinned_index, nullptr, nullptr);
+    return run_gpu_pipeline_impl(cfg, pool, pinned_index, nullptr, nullptr, acquire_pinned);
 }
 
 GpuPipelineResult run_gpu_pipeline(GpuPipelineConfig const& cfg,
@@ -1639,7 +1630,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "[t1-debug] plain post-launch t1_count=%llu\n",
                 (unsigned long long)t1_count);
         }
-        validate_t1_count(t1_count, cfg.k);
+        validate_t1_count(t1_count, cfg.k, q);
 
         s_free(stats, d_t1_match_temp);
         s_free(stats, d_xs);
@@ -2066,7 +2057,7 @@ GpuPipelineResult run_gpu_pipeline_streaming_impl(
                 "[t1-debug] sliced post-launch t1_count=%llu (sum across %u sections)\n",
                 (unsigned long long)t1_count, t1_num_sections);
         }
-        validate_t1_count(t1_count, cfg.k);
+        validate_t1_count(t1_count, cfg.k, q);
 
         s_free(stats, d_t1_meta_stage);
         s_free(stats, d_t1_mi_stage);

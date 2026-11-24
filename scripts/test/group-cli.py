@@ -177,6 +177,17 @@ def replot_rpc_fixture(args):
     print(json.dumps({"success": True, **result}))
 
 
+def available_cpu_node(devices):
+    nodes = re.findall(r"\[(cpu\d+)\]", devices)
+    if len(nodes) > 1 and hasattr(os, "sched_getaffinity"):
+        cpu = min(os.sched_getaffinity(0))
+        for node in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"):
+            selector = "cpu" + node.name[4:]
+            if selector in nodes:
+                return selector
+    return nodes[0]
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -327,6 +338,99 @@ def snapshot(root, *, observations=True):
 
 def private_record(directory, name):
     return directory / ".xchplot2" / name
+
+
+def check_dashboard(binary, root):
+    directory = root / "dashboard farm"
+    directory.mkdir()
+    runtime = ["--compute", "off", "-d", "cpu", "-M", "512M", "-j", "1"]
+    def command(name, *args):
+        return [str(binary), name, "--config", os.devnull, str(directory), *map(str, args)]
+
+    limits = ["-f", FARMER, "--pool-ph", POOL, "--seed", SEED, "-k", "18",
+              "--group-members", "2", "--max-groups", "1", "--max-total-members", "2",
+              "--capacity-bytes", "32M", "--leave-free", "0"]
+    result = subprocess.run(command("fill", *limits, *runtime, "--tui", "--json"),
+                            capture_output=True, check=True, timeout=90)
+    metrics = json.loads(result.stdout.splitlines()[-1])
+    assert b"\x1b" not in result.stdout + result.stderr
+    assert metrics["new_durable_members"] == 2 and metrics["inherited_members"] == 0, metrics
+    assert 0 < metrics["first_new_publication_seconds"] <= metrics["last_new_publication_seconds"]
+    assert metrics["seconds_per_new_durable_member"] > 0
+    assert metrics["elapsed_seconds"] >= metrics["last_new_publication_seconds"]
+    assert abs(metrics["elapsed_seconds_per_new_durable_member"] * 2 - metrics["elapsed_seconds"]) < 0.000002
+    result = subprocess.run(command("fill", "-r", *runtime, "--json"),
+                            capture_output=True, check=True, timeout=90)
+    metrics = json.loads(result.stdout.splitlines()[-1])
+    assert metrics["new_durable_members"] == 0 and metrics["inherited_members"] == 2, metrics
+    assert metrics["elapsed_seconds"] > 0 and metrics["elapsed_seconds_per_new_durable_member"] is None
+    assert all(metrics[name] is None for name in ("first_new_publication_seconds", "last_new_publication_seconds",
+                                                   "seconds_per_new_durable_member"))
+
+    private = root / "dashboard private publication"
+    private.mkdir()
+    fill = [str(binary), "fill", "--config", os.devnull, str(private)]
+    interrupted = subprocess.run([*fill, *limits, *runtime, "--construction", "staged", "--quiet"],
+                                 capture_output=True, timeout=90, env=dict(os.environ, XCHPLOT2_GROW_FAILPOINT="publication-ready"))
+    assert interrupted.returncode == 86 and len(list(private.glob("*.gplot.partial"))) == 1, interrupted.stderr
+    result = subprocess.run([*fill, "--resume", *runtime, "--construction", "staged", "--json"],
+                            capture_output=True, check=True, timeout=90)
+    recovered = json.loads(result.stdout.splitlines()[-1])
+    assert recovered["new_durable_members"] == 2 and recovered["inherited_members"] == 0, recovered
+
+    if sys.platform != "linux":
+        return
+    import fcntl
+    import pty
+    import select
+    import termios
+    before = snapshot(directory)
+    primary, terminal = pty.openpty()
+    initial = termios.tcgetattr(terminal)
+    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
+    def foreground():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(command("status", "--tui"), stdin=terminal, stderr=terminal,
+                               stdout=subprocess.PIPE, env={**os.environ, "TERM": "xterm"},
+                               preexec_fn=foreground)
+    try:
+        def until(marker):
+            received = bytearray()
+            deadline = time.monotonic() + 15
+            while marker not in received:
+                left = deadline - time.monotonic()
+                assert left > 0 and select.select([primary], [], [], left)[0], (marker, bytes(received))
+                received.extend(os.read(primary, 8192))
+            return received
+
+        assert b"\x1b[?1049h" in until(b"2 saved members")
+        os.write(primary, b"?")
+        until(b"Dashboard help")
+        os.write(primary, b"a")
+        until(b"xchplot2 compute setup helper.invite")
+        os.write(primary, b"3")
+        until(b"[Workers]")
+        fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        os.write(primary, b"\t")
+        until(b"Decisions   Tab to change view")
+        os.write(primary, b"/absent-worker\n")
+        until(b"No matching rows")
+        os.write(primary, b"/\n")
+        os.write(primary, b"q")
+        until(b"\x1b[?1049l")
+        stdout, _ = process.communicate(timeout=15)
+        assert process.returncode == 0 and not stdout, (process.returncode, stdout)
+        assert termios.tcgetattr(terminal) == initial
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=15)
+        os.close(primary)
+        os.close(terminal)
+    assert snapshot(directory) == before, "dashboard changed a saved farm"
+    print("PASS durable member accounting, redirected output, terminal navigation, resize and read-only detach", flush=True)
 
 
 def replot_artifacts(directory, job_id):
@@ -647,6 +751,8 @@ def check_farm_membership_lifecycle(run, command, verify, root):
             run("fill", survivor, *runtime, "--quiet")
             current = json.loads(run("plan", "--metadata-only", "--manifest", private_record(survivor, "grow-farm.plan"), "--json").stdout)
             assert current["revision"] > previous_revision and current["required_destinations"] == 1
+            for field in ("manifest_reserved_bytes", "update_reserved_bytes", "progress_reserved_bytes", "owner_reserved_bytes"):
+                assert current[field] == metadata[field], "independent continuation changed a saved metadata grant"
             previous_revision = current["revision"]
             retained = next(item for item in current["destinations"] if item["directory"] == str(member))
             assert retained["membership"] == "detached" and retained["retained_obligation"]
@@ -995,7 +1101,9 @@ def check_farm_updates(run, command, verify, root):
     assert not list(progressing.glob("*.gplot"))
     assert header(active)[3] < 3
     progress_review = root / "progress-tolerant.plan"
-    run("plan", progressing, "--save-plan", progress_review, "--json")
+    private_forecast = json.loads(run("plan", progressing, "--save-plan", progress_review, "--json").stdout)["completion_forecast"]
+    assert private_forecast["remaining_members"] == 3
+    assert 0 < header(active)[3] <= private_forecast["committed_remaining_members"] <= 3
     assert progress_review.read_text(encoding="utf-8").startswith("ordinary-group-farming-preview-v2\n")
     run("fill", "-r", progressing, *runtime, "--quiet")
     active = active.with_suffix("")
@@ -1103,14 +1211,18 @@ def check_farm_returning_drives(run, command, verify, root):
         first, second, offline = (directory / name for name in ("a", "b", "a-offline"))
         first.mkdir()
         second.mkdir()
+        logs = ["--harvester-log", first, directory / "first reader.log",
+                "--harvester-log", second, directory / "second reader.log"]
+        placeholder = dynamic or os.name == "nt"
         create = ["fill", first, second, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED,
                   "-k", 18, "--group-members", 4, "--max-groups", 2, "--max-total-members", 8,
-                  "--farming-max-eligible-groups", 8, "--capacity-bytes", "64M", "--leave-free", 0, *runtime]
+                  "--farming-max-eligible-groups", 8, "--capacity-bytes", "64M", "--leave-free", 0, *runtime, *logs]
         if not dynamic:
             run(*create, point="initialized", code=86)
             first.rename(offline)
-            first.mkdir()
-            create = ["fill", second, *runtime]
+            if placeholder:
+                first.mkdir()
+            create = ["fill", second, *runtime, *logs]
         log = directory / "coordinator.log"
         with log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(command(*create), stdout=output, stderr=subprocess.STDOUT)
@@ -1144,9 +1256,13 @@ def check_farm_returning_drives(run, command, verify, root):
                 assert process.poll() is None, log.read_text(encoding="utf-8")
                 assert private_record(offline, "grow-farm.plan").read_bytes() == old_plan
                 assert private_record(second, "grow-farm.plan").read_bytes() == old_plan, "offline progress rewrote the global policy"
-                assert not list(first.iterdir()), "replacement mountpoint was modified"
+                if placeholder:
+                    assert not list(first.iterdir()), "replacement mountpoint was modified"
+                else:
+                    assert not first.exists(), "missing mountpoint was recreated"
                 assert [header(path)[3] for path in sorted(second.glob("*.gplot"))] == [4, 4]
-                first.rmdir()
+                if placeholder:
+                    first.rmdir()
                 offline.rename(first)
                 assert process.wait(timeout=180) == 0, log.read_text(encoding="utf-8")
             finally:
@@ -1163,15 +1279,62 @@ def check_farm_returning_drives(run, command, verify, root):
     print("PASS missing and returning destinations preserve policy, healthy progress, identity and full proofs", flush=True)
 
 
+def check_empty_capacity_probe(run, root, keys, construction):
+    # An older external writer can leave its retired, empty private target at
+    # the first unused grant after a capacity stop. Preserve and guard it on
+    # resume without charging a pending group or counting a publication.
+    probe_dirs = [root / "probe capacity a", root / "probe capacity b"]
+    probe_scratch = root / "probe scratch"
+    for directory in [*probe_dirs, probe_scratch]:
+        directory.mkdir()
+    probe_options = ["-k", 18, *construction, "--construction", "external", "--compute", "off",
+                     "--batch-members", 1, "--group-members", 3, "--max-groups", 3,
+                     "--max-total-members", 9, "--capacity-bytes", 7000000, "--temp-dir", probe_scratch,
+                     "--temp-capacity-bytes", "64M", "-M", "2G", "--json"]
+    run("fill", *probe_dirs, *probe_options, *keys, "--seed", SEED)
+    before = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"]
+    closed = before[0]
+    assert closed["reason"] == "capacity" and closed["completed_files"] < closed["allocation_grant_files"]
+    placeholder = probe_dirs[0] / f"grow-group-{closed['completed_files']:020d}.gplot.partial"
+    if not placeholder.exists():
+        placeholder.touch()
+    stamp = placeholder.stat()
+    assert stamp.st_size == 0
+    run("plan", "--resume", probe_dirs[0], "--json")
+    resumed = json.loads(run("fill", "--resume", *probe_dirs, *probe_options).stdout.splitlines()[-1])
+    after = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"]
+    assert resumed["generated_members"] == 0
+    assert [(item["completed_files"], item["completed_members"], item["pending_files"]) for item in after] == [
+        (item["completed_files"], item["completed_members"], 0) for item in before]
+    assert placeholder.stat().st_ino == stamp.st_ino and placeholder.stat().st_size == 0
+    run("plan", probe_dirs[0], "--capacity-bytes", "16M", "--json")
+    unexpected = probe_dirs[0] / f"grow-group-{closed['allocation_grant_files']:020d}.gplot.partial"
+    unexpected.touch(exist_ok=False)
+    run("plan", "--resume", probe_dirs[0], "--json", code=2)
+    assert unexpected.stat().st_size == 0
+    unexpected.unlink()
+    placeholder.write_bytes(b"occupied")
+    run("plan", "--resume", probe_dirs[0], "--json", code=2)
+    assert placeholder.read_bytes() == b"occupied"
+    placeholder.write_bytes(b"")
+    run("retire", probe_dirs[0], "--destination", probe_dirs[0], "--quiet")
+    retired = json.loads(run("status", probe_dirs[0], "--inspect", "--json").stdout)["destinations"][0]
+    assert retired["detached_reclaimed"] and retired["completed_members"] == closed["completed_members"]
+    assert not placeholder.exists()
+    print("PASS capacity-stop recovery, occupied target refusal and retirement of the withdrawn probe", flush=True)
+
+
 def check(binary, root, reference=None):
     counter = 0
 
     def command(*args):
         return [str(binary), str(args[0]), "--config", os.devnull, *map(str, args[1:])]
 
-    def run(*args, code=0, point=None, input=None, cwd=None, timeout=180):
+    def run(*args, code=0, point=None, input=None, cwd=None, timeout=180, environment=None):
         nonlocal counter
         env = dict(os.environ)
+        if environment:
+            env.update(environment)
         env.pop("XCHPLOT2_GROW_FAILPOINT", None)
         if point:
             env["XCHPLOT2_GROW_FAILPOINT"] = point
@@ -1192,6 +1355,32 @@ def check(binary, root, reference=None):
     construction = ["-d", "cpu", "-M", "512M", "-j", 2,
                     "--window-bytes", "64K", "--checkpoint-bytes", "64K",
                     "--capacity-bytes", "64M", "--headroom-bytes", 0]
+    forecast_cache = root / "forecast cache"
+    forecast_env = {("LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME"): str(forecast_cache)}
+    forecast_args = ["--compute", "off", *construction, "-k", 18, "--group-members", 1, "--json"]
+    def forecast_rows(*args):
+        return [json.loads(line) for line in run(*args, environment=forecast_env).stdout.splitlines() if line.startswith("{")]
+    for attempt in range(3):
+        directory = root / f"forecast {attempt}"
+        directory.mkdir()
+        limits = ["--max-groups", 2, "--max-total-members", 2]
+        preview = forecast_rows("plan", directory, *forecast_args, *limits)[0]["completion_forecast"]
+        assert forecast_rows("fill", "--plan-only", directory, *forecast_args, *limits)[0]["completion_forecast"] == preview
+        assert preview["remaining_members"] == preview["remaining_member_limit"] == 2
+        if attempt == 0:
+            assert preview["seconds"] is None and not forecast_cache.exists()
+        else:
+            assert preview["source"] == "previous-fills" and preview["seconds_per_durable_member"] > 0
+            assert preview["construction_history"]["auto"]["samples"] == attempt
+        if attempt == 2:
+            assert 0 < preview["seconds_low"] <= preview["seconds"] <= preview["seconds_high"]
+            longer = forecast_rows("plan", directory, *forecast_args, "--max-groups", 4, "--max-total-members", 4)
+            assert longer[0]["completion_forecast"]["source"] == "previous-fills-scaled-by-member-count"
+            break
+        finished = forecast_rows("fill", directory, *keys, *forecast_args, *limits)[-1]
+        assert finished["new_durable_members"] == 2 and finished["completion_forecast"]["seconds"] == 0
+        resumed = forecast_rows("fill", "--resume", directory, *forecast_args)[-1]
+        assert resumed["new_durable_members"] == 0 and resumed["inherited_members"] == 2
     for subcommand in [("plan",), ("plot",), ("fill",), ("status",), ("pause",), ("drain",), ("resume",), ("retire",), ("grow",), ("batch",),
                        ("bench",), ("test",), ("verify",), ("devices",), ("parity-check",),
                        ("compute",), ("compute", "broker"), ("compute", "worker"),
@@ -1312,6 +1501,15 @@ def check(binary, root, reference=None):
     filled = json.loads(run("fill", *options, "--plan-only", "--json").stdout)
     assert planned == filled and planned["feasible"]
     assert len(planned["destinations"]) == 2 and all(d["files"] == 2 for d in planned["destinations"])
+    logs = ["--harvester-log", preview, root / "first missing.log",
+            "--harvester-log", preview_peer, root / "second missing.log"]
+    mapped = json.loads(run("plan", *options, *logs, "--json").stdout)
+    assert mapped == json.loads(run("fill", *options, *logs, "--plan-only", "--json").stdout) and mapped["feasible"]
+    saved = run("plan", *options, *logs, "--save-plan", root / "reader bindings.plan").stdout
+    guidance = next(line for line in saved.splitlines() if line.startswith("Next: "))
+    assert guidance.count("--harvester-log") == 2 and all(str(path) in guidance for path in logs[1::3] + logs[2::3])
+    outside = run("plan", *options, "--harvester-log", root, root / "first missing.log", code=2)
+    assert "outside the reviewed fill" in outside.stderr
     assert (snapshot(preview), snapshot(preview_peer)) == before, "preview created or changed files"
     if os.name != "nt":
         native = root / os.fsdecode(b"native-byte-\xff")
@@ -1380,6 +1578,7 @@ def check(binary, root, reference=None):
     concise = run("plan", *options).stdout
     detailed = run("plan", *options, "-v").stdout
     assert len(concise) < len(detailed) and "--harvester" in concise
+    assert "Membership:" not in concise and "Membership:" in detailed
     assert "k18 (test only)" in concise
     assert run("plan", *options, "--progress").stdout == concise
     assert run("plan", *options, "-v", "--no-progress").stdout == detailed
@@ -1403,6 +1602,14 @@ def check(binary, root, reference=None):
     review_b.mkdir()
     review_options = [review_a, review_b, *options[2:]]
     review_before = snapshot(review_a), snapshot(review_b)
+    constrained = [*review_options, "--harvester", "local", "--chia-root", chia_root,
+                   "--chia-executable", root / "missing-chia", "--farming-memory-bytes", "1K", "--json"]
+    forecast = json.loads(run("plan", *constrained, code=2).stdout)
+    refused = run("fill", *constrained, *keys, "--compute", "off", code=2)
+    assert not forecast["feasible"] and forecast["required_reader_memory_bytes"] > forecast["memory_bytes"]
+    assert forecast["infeasibility_reason"] in refused.stderr and "inspect plan" in refused.stderr
+    assert json.loads(refused.stdout)["infeasibility_reason"] == forecast["infeasibility_reason"]
+    assert (snapshot(review_a), snapshot(review_b)) == review_before
     reviewed = json.loads(run("plan", *review_options, "--harvester", profile_file, "--save-plan", review, "--json").stdout)
     assert reviewed["farming_profile"] == reviewed_profile
     assert review.is_file() and SEED not in review.read_text(encoding="utf-8")
@@ -1505,10 +1712,23 @@ def check(binary, root, reference=None):
                                 "--save-profile", calibrated_file, "--json", "--", calibration_plot).stdout)
     assert json.loads(calibrated_file.read_text(encoding="utf-8")) == calibrated
     assert calibrated["reader_calibration"] and not calibrated["hardware_qualified"]
+    members = header(calibration_plot)[3]
+    assert calibrated["sampled_members"] == {"min": members, "max": members}
+    measured = calibrated["files"][0]["observations"]
+    distinct = measured["phases"]["distinct_lookup"]
+    assert distinct["calls"] == 2 and distinct["logical_requested_bytes"] > 0
+    assert measured["latency"]["retained_distinct"]["max_ns"] == distinct["max_wall_ns"]
+    for latency in measured["latency"].values():
+        assert 0 < latency["p50_ns"] <= latency["p95_ns"] == latency["p99_ns"] == latency["max_ns"]
     calibrated_profile = calibrated["farming_profile"]
     scope = calibrated_profile["reader_calibration"]
-    assert calibrated_profile["schema_version"] == 2 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
+    assert calibrated_profile["schema_version"] == 3 and (scope["k"], scope["strength"]) == header(calibration_plot)[1:3]
+    assert scope["sampled_members"] == calibrated["sampled_members"]
     assert scope["reader"] == calibrated_profile["reader"] and scope["method"] == "pos2-group-reference-reader-gsz-1"
+    for phase in (measured["phases"]["retained_lookup"], distinct):
+        if phase["cpu_measured"]:
+            modeled_ns = calibrated_profile["chain_seconds_per_member"] * members * 1e9
+            assert round(modeled_ns) >= phase["max_cpu_ns"] * scope["margin"]
     assert scope["host_name"] and scope["captured_at"]
     assert scope["host_name"] != reviewed_profile["host_name"] and scope["captured_at"] != reviewed_profile["captured_at"]
     for field in ("source", "captured_at", "host_name", "chia_version", "config_status", "inventory_status",
@@ -1559,13 +1779,18 @@ def check(binary, root, reference=None):
     capacity_path, = capacity_dir.glob("*.gplot")
     assert header(capacity_path)[3] == capacity_metrics["members"] == 8
     assert capacity_metrics["stop_reason"] == "capacity"
+    assert capacity_metrics["completion_forecast"]["source"] == "complete"
+    assert capacity_metrics["completion_forecast"]["remaining_members"] == 0
     assert capacity_metrics["peak_file_bytes"] <= capacity_metrics["capacity_bytes"]
     completed = snapshot(capacity_dir, observations=False)
     resumed = run("fill", "-r", *capacity_options, "--json")
-    assert json.loads(resumed.stdout.splitlines()[-1])["generated_members"] == 0
+    resumed_metrics = json.loads(resumed.stdout.splitlines()[-1])
+    assert resumed_metrics["generated_members"] == 0 and resumed_metrics["completion_forecast"]["seconds"] == 0
     assert snapshot(capacity_dir, observations=False) == completed, "completed capacity fill retried or changed files"
     verify(capacity_path)
     print("PASS compression top-up, window-limited sealing and unchanged resume", flush=True)
+
+    check_empty_capacity_probe(run, root, keys, construction)
 
     output = root / "grouped files"
     plot = ["plot", "-k", 18, "-n", 2, *keys, "-o", output,
@@ -1610,6 +1835,13 @@ def check(binary, root, reference=None):
     ordinary_one = Path(ordinary_result.stdout.strip())
     assert not ordinary_result.stderr
     assert digest(grouped_one) == digest(ordinary_one)
+    ordinary_job, = single.glob("xchplot2-job-*.tsv")
+    unused_pool = root / "unused compute state"
+    run("batch", ordinary_job, "--resume", "--devices", "cpu", "--compute", "off",
+        "--compute-directory", unused_pool, "--quiet")
+    assert not unused_pool.exists() and digest(ordinary_one) == digest(grouped_one)
+    invalid = run("batch", ordinary_job, "--compute", "invalid", code=2)
+    assert "--compute requires auto or off" in invalid.stderr
     if reference:
         group, k, strength, count, meta, memo = header(paths[0])
         fragments = root / "reference fragments"
@@ -1634,16 +1866,19 @@ def check(binary, root, reference=None):
     expected = None
     scratch = root / "engine scratch"
     scratch.mkdir()
-    for mode, point in (("incremental", "initialized"), ("staged", "stage-run-committed"),
+    for mode, point in (("incremental", "initialized"), ("incremental", "direct-target-partial"), ("staged", "stage-run-committed"),
                         ("merged", "merge-index-flushed"), ("external", "external-header-flushed")):
-        engine = ["plot", "-k", 18, *keys, "-S", SEED, "-o", root / (mode + " recovered"),
+        directory = root / (point + " recovered")
+        engine = ["plot", "-k", 18, *keys, "-S", SEED, "-o", directory,
                   "--group-members", 3, "--batch-members", 2, "--construction", mode,
                   *construction, "-t", scratch, "--temp-capacity-bytes", "256M", "--quiet"]
+        if point == "direct-target-partial":
+            # The fresh two-member payload fits in one coalesced Windows output buffer.
+            engine[engine.index("--window-bytes") + 1] = "16M"
         run(*engine, point=point, code=86)
-        directory = root / (mode + " recovered")
         assert not list(directory.glob("*.gplot")), "unfinished group has a public filename"
         partial, = directory.glob("*.gplot.partial")
-        if mode == "incremental":
+        if point == "initialized":
             # A competing final name must neither replace nor hide either file.
             final = partial.with_suffix("")
             final.write_bytes(b"occupied publication")
@@ -1688,6 +1923,20 @@ def check(binary, root, reference=None):
             assert not list(directory.glob("*.partial"))
     print("PASS resident final batch recovery, changed batch cap and further growth", flush=True)
 
+    fixed = root / "fixed cohort packing"
+    fixed.mkdir()
+    fixed_options = ["--compute", "off", "--construction", "external", "--batch-members", 2,
+                     "-t", scratch, "--temp-capacity-bytes", "256M", *construction]
+    run("fill", fixed, "-k", 18, *keys, "-S", SEED, "--group-members", 3, "--max-groups", 1,
+        "--max-total-members", 3, *fixed_options, "--quiet", point="external-pack-initialized-after-checkpoint", code=86)
+    checkpoint, = fixed.glob("*.external/checkpoint")
+    assert b"/terminal-1" in checkpoint.read_bytes() and not list(fixed.glob("*.gplot"))
+    run("fill", fixed, "--resume", *fixed_options, "--quiet")
+    recovered, = fixed.glob("*.gplot")
+    assert header(recovered)[3] == 3
+    verify(recovered)
+    print("PASS fixed farming cohort resumes its resident final batch", flush=True)
+
     # The final payload is durable before publication. A crash on either side
     # of the rename must resume without exposing a prefix or changing bytes.
     for mode in ("incremental", "staged", "merged", "external"):
@@ -1711,7 +1960,7 @@ def check(binary, root, reference=None):
 
     # Explicit NUMA and mixed local selectors share the bounded executor path,
     # without changing plot identity or requiring enrollment/listeners.
-    cpu = re.search(r"\[(cpu\d+)\]", devices).group(1)
+    cpu = available_cpu_node(devices)
     selectors = [cpu]
     gpu = re.search(r"^\s*\[(\d+)\].*MiB VRAM", devices, re.MULTILINE)
     if gpu:
@@ -1731,11 +1980,29 @@ def check(binary, root, reference=None):
     local_before = snapshot(preview), snapshot(preview_peer)
     local_plan = json.loads(run("plan", *options, "--devices", cpu, "--json").stdout)
     assert local_plan["feasible"] and local_plan["devices_requested"] == cpu
+    assert not local_plan["completion_forecast"]["pool_capacity_unconfirmed"]
     assert (snapshot(preview), snapshot(preview_peer)) == local_before
     run("plan", *options, "--devices", cpu, "--compute-broker", "127.0.0.1:1", code=2)
+    run("plan", *options, "--devices", cpu, "--compute-ca", root / "missing CA", code=2)
     run("plan", *options, "--devices", cpu, "--compute-local", "off", code=2)
     print("PASS local device selection, shared limits, staged recovery and ordinary byte parity", flush=True)
 
+    combined, successive = root / "combined.gplot", root / "successive.gplot"
+    for copy in (combined, successive):
+        with grouped_one.open("rb") as source, copy.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        shutil.copymode(grouped_one, copy)
+    report = json.loads(run("grow", combined, "--max-members", 3, *construction, "--json").stdout)
+    assert report["batches"] == 1 and report["generated_members"] == report["max_batch_members"] == 2, report
+    assert report["new_durable_members"] == 2 and report["inherited_members"] == 1, report
+    for target in (2, 3):
+        run("grow", successive, "--max-members", target, *construction)
+    group_id, k, strength, _, meta, memo = header(grouped_one)
+    manifest = root / "fresh-three.tsv"
+    manifest.write_text(f'{k} {strength} 0 {meta} gplot-v2-grouped {group_id} "{memo}" '
+                        f'{json.dumps(str(root), ensure_ascii=False)} "fresh-three.gplot" 3\n', encoding="utf-8")
+    run("batch", manifest, *construction)
+    assert digest(combined) == digest(successive) == digest(root / "fresh-three.gplot")
     run("grow", grouped_one, "--max-members", 3, *construction, point="publication-hidden", code=86)
     assert not grouped_one.exists() and Path(str(grouped_one) + ".partial").is_file()
     concise_grow = run("grow", grouped_one, "--max-members", 3, *construction)
@@ -1936,6 +2203,8 @@ def check(binary, root, reference=None):
     streamed = json.loads(run("plan", "--paths0-from", "-", "--json", input=f"{a}\0{b}\0").stdout)
     assert selected == streamed and len(selected["destinations"]) == 2
     run("plan", "--paths-from", "-", input="", code=2)
+    excessive = run("plan", a, "--paths-from", "-", input=(str(b) + "\n") * 1024, code=2)
+    assert "too many destinations" in excessive.stderr
     print("PASS private replicated jobs, path lists and keyless recovery from any member", flush=True)
 
     # Publication precedes opening the compute connection. Preserve that saved
@@ -2539,15 +2808,27 @@ def check_replot(binary, root, reference=None):
     queue_log = directory / "queue waiting.log"
 
     def queue_status():
-        return json.loads(run("status", queue_review, "--json", code=0 if queue_dirs[0].exists() else 2).stdout)
+        result = run("status", queue_review, "--json", code=0 if queue_dirs[0].exists() else 2)
+        assert result.stdout, ("migration queue status returned no JSON", result.returncode, result.stderr)
+        return json.loads(result.stdout)
 
     def await_queue(process, predicate, timeout=120):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             assert process.poll() is None, queue_log.read_text(encoding="utf-8")
-            value = queue_status()
-            if predicate(value):
-                return value
+            try:
+                value = queue_status()
+            except AssertionError as error:
+                # A running coordinator can invalidate all bounded snapshot
+                # attempts. Keep polling only for that explicit retry result.
+                if not any(message in str(error) for message in (
+                        "cannot obtain a stable migration status snapshot; retry --status",
+                        "migration progress changed during the bounded read-only status snapshot; retry --status")):
+                    raise
+                value = str(error)
+            else:
+                if predicate(value):
+                    return value
             time.sleep(0.2)
         raise AssertionError(("migration state did not converge", value, queue_log.read_text(encoding="utf-8")))
 
@@ -3925,7 +4206,10 @@ def check_replot(binary, root, reference=None):
                                   "--save-profile", saved_compute_file, "--json").stdout)
     continued = shlex.split(compute_setup["next_command"])[1:]
     continued[continued.index("--save-plan") + 1] = str(compute_review)
-    reviewed_compute = json.loads(run(*continued, "--json").stdout)
+    cpu_node = available_cpu_node(run("devices").stdout)
+    conflict = run(*continued, "--devices", cpu_node, "--compute-local", "off", "--json", code=2)
+    assert "conflicts with selected local devices" in conflict.stderr and not compute_review.exists()
+    reviewed_compute = json.loads(run(*continued, "--devices", cpu_node, "--json").stdout)
     assert reviewed_compute["feasible"] and reviewed_compute["native_request"]["compute_enabled"] and snapshot(compute_farm) == before
     assert str(membership) not in compute_review.read_text(), "portable review contains private compute connection settings"
     raised_offer = list(compute_options)
@@ -3945,6 +4229,7 @@ def check_replot(binary, root, reference=None):
     assert "infeasible under the current execution binding" in refusal.stdout + refusal.stderr
     assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
     execute = shlex.split(reviewed_compute["next_command"])[1:]
+    assert execute[execute.index("--devices") + 1] == cpu_node
     assert "--reclaim-before-bytes" not in execute, "execution command repeated a saved review selection"
     run(*execute, *keys, point="replot-local-bindings-durable", code=86)
     assert not private_record(compute_farm, "grow-replot.plan").exists()
@@ -3959,7 +4244,7 @@ def check_replot(binary, root, reference=None):
     run("fill", compute_review, *keys, point="replot-journal-all-staged", code=86)
     # Resume from the private local binding with neither the reusable profile
     # nor any compute flags, even though enrollment is outside the default path.
-    run("fill", compute_review, point="replot-replacement-verified", code=86)
+    run("fill", compute_review, "--devices", cpu_node, point="replot-replacement-verified", code=86)
     run("fill", compute_review)
     compute_final = Path(reviewed_compute["batches"][0]["path"])
     assert not compute_source.exists() and header(compute_final)[3] == 2
@@ -4004,7 +4289,7 @@ def check_replot(binary, root, reference=None):
     automatic_setup = json.loads(run("plan", *automatic_options, "--save-profile", automatic_file, "--json").stdout)
     assert not automatic_setup["resource_preparation"]["missing"], automatic_setup["resource_preparation"]
     run("fill", *automatic_options, *keys, point="replot-job-prepared", code=86)
-    run("fill", automatic_compute)
+    run("fill", automatic_compute, "--devices", cpu_node)
     automatic_output, = automatic_compute.glob("*.plot2")
     assert not (automatic_compute / "legacy.plot").exists()
     run("verify", automatic_output, "--full", "--trials", 100)
@@ -4021,6 +4306,11 @@ def check_compute(binary, root):
     broker_port, worker_port = pool.port(), pool.port()
     endpoint, worker_endpoint = f"127.0.0.1:{broker_port}", f"127.0.0.1:{worker_port}"
     processes = []
+
+    def verify(path, trials):
+        result = pool.run([binary, "verify", path, "--full", "--trials", trials, "--config", os.devnull])
+        proof = re.search(r"(\d+) full proofs validated", (result.stdout + result.stderr).lower())
+        assert proof and int(proof[1]) > 0
 
     def start(args, name):
         process = pool.Process([binary, *args, "--config", os.devnull], root / (name + ".log"))
@@ -4039,30 +4329,147 @@ def check_compute(binary, root):
                         "--generation-threads", 1, "--backend", "cpu"], "worker")
         pool.wait_listener(worker, worker_port)
         common = ["plot", "-k", 18, "-n", 1, "-f", FARMER, "--pool-ph", POOL,
-                  "--group-members", 3, "--batch-members", 2, "--backend", "cpu",
-                  "--construction", "staged", "--max-host-ram", "512M", "--workers", 2,
+                  "--group-members", 3, "--backend", "cpu", "--max-host-ram", "512M", "--workers", 2,
                   "--window-bytes", "64K", "--checkpoint-bytes", "64K", "--quiet"]
+        staged = [*common, "--construction", "staged", "--batch-members", 2]
         owners = []
         for owner in ("owner-a", "owner-b"):
             cert, key = identities[owner]
             network = ["--compute-broker", endpoint, "--compute-owner-id", owner,
                        "--compute-ca", ca, "--compute-cert", cert, "--compute-key", key,
                        "--compute-inflight", 2, "--compute-codec-ram", 0, "--compute-timeout-ms", 120000]
-            owners.append((owner, start([*common, "-S", SEED, "-o", root / owner, *network], owner)))
+            owners.append((owner, network, start([*staged, "-S", SEED, "-o", root / owner, *network], owner)))
         paths = []
-        for owner, process in owners:
+        for owner, network, process in owners:
             path = Path(process.finish().strip())
             assert path.is_file() and header(path)[3] == 3
             paths.append(path)
             scoped = hashlib.sha256(b"xchplot2-pool-storage-owner-v1" + bytes.fromhex(SEED) + owner.encode()).hexdigest()
-            result = pool.run([binary, *common, "-S", scoped, "-o", root / (owner + "-local"), "--config", os.devnull])
+            result = pool.run([binary, *staged, "-S", scoped, "-o", root / (owner + "-local"), "--config", os.devnull])
             local = Path(result.stdout.strip())
             assert digest(local) == digest(path), "remote group differs from local construction"
-            result = pool.run([binary, "verify", path, "--full", "--trials", 100, "--config", os.devnull])
-            proof = re.search(r"(\d+) full proofs validated", (result.stdout + result.stderr).lower())
-            assert proof and int(proof[1]) > 0
+            verify(path, 100)
         assert header(paths[0])[0] != header(paths[1])[0], "owners reused a group identity"
         print("PASS two simultaneous plotting owners share one compute worker, byte parity and full proofs", flush=True)
+        fresh = [binary, *common, "--construction", "incremental", "--batch-members", 3,
+                 "-S", SEED, "-o", root / "remote recovered", *network, "--config", os.devnull]
+        pool.run(fresh, point="direct-committed", code=86)
+        recovered = Path(pool.run([*fresh, "--resume"]).stdout.strip())
+        assert digest(recovered) == digest(local), "recovered packed batch differs from local construction"
+        print("PASS interrupted packed compute batch recovers to the ordinary group bytes", flush=True)
+        baseline, destination, scratch = (root / name for name in ("capacity reference", "remote capacity", "remote scratch"))
+        for directory in (baseline, destination, scratch):
+            directory.mkdir()
+        options = ["-k", 22, "-f", FARMER, "--pool-ph", POOL, "--group-members", 1, "--leave-free", 0,
+                   "--construction", "external", "--temp-dir", scratch, "--temp-capacity-bytes", "128M",
+                   "--window-bytes", "64K", "--checkpoint-bytes", "64K", "-M", "1G", "-j", 2,
+                   "--backend", "cpu", "--json", "--config", os.devnull]
+        pool.run([binary, "fill", baseline, *options, "--seed", scoped, "--compute", "off",
+                  "--capacity-bytes", "64M", "--max-groups", 1, "--max-total-members", 1])
+        reference, = baseline.rglob("*.gplot")
+        result = pool.run([binary, "fill", destination, *options, "--seed", SEED, *network, "--compute-local", "off",
+                           "--capacity-bytes", reference.stat().st_size * 3 // 2, "--max-groups", 2, "--max-total-members", 2])
+        report = json.loads(result.stdout.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == report["pool_partial_capacity_probes"] == 1, report
+        plot, = destination.rglob("*.gplot")
+        assert digest(plot) == digest(reference)
+        print("PASS remote capacity probes preserve the published prefix across group rollover", flush=True)
+        # A remote worker can fill the next group's RAM pocket while the only
+        # destination is writing. Every successor still enters the ordinary writer.
+        series = ["-k", 22, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED, "--group-members", 1,
+                  "--batch-members", 1, "--leave-free", 0, "--max-groups", 3, "--max-total-members", 3,
+                  "--capacity-bytes", "192M", "--destination-temp", "off", "--construction", "incremental",
+                  "--window-bytes", "64K", "--checkpoint-bytes", "64K", "-M", "1G", "-j", 2,
+                  "--compute-output", "packed", "--backend", "cpu", "--compute-local", "off", *network,
+                  "--json", "--config", os.devnull]
+        def intervals(log, phase):
+            return [(int(begin), int(end)) for begin, end in
+                    re.findall(r"phase=" + phase + r" [^\n]*?begin_ns=(\d+) end_ns=(\d+)", log)]
+
+        hashes = []
+        for name, overrides in (("serial", ["--generation-overlap", "off"]), ("overlap", [])):
+            target = root / ("ram-series-" + name)
+            target.mkdir()
+            process = pool.Process([binary, "fill", target, *series, *overrides], root / (target.name + ".log"),
+                                   extra_env={"POS2GPU_PHASE_TIMING": "1"})
+            processes.append(process)
+            log = process.finish()
+            report = json.loads(log.splitlines()[-1])
+            assert report["members"] == report["generated_members"] == report["pool_packed_members"] == 3
+            paths = sorted(target.rglob("*.gplot"))
+            assert len(paths) == 3
+            hashes.append([digest(path) for path in paths])
+            writes, publications, receives = (intervals(log, phase) for phase in ("fresh_payload", "publish", "ram_successor_receive"))
+            assert len(writes) == len(publications) == 3
+            assert all(writes[i][1] <= publications[i][0] <= publications[i][1] <= writes[i + 1][0] for i in range(2))
+            if name == "overlap":
+                assert receives and report["generation_overlap_members"] == len(receives)
+                assert any(start <= receiving < end for start, end in writes for receiving, _ in receives)
+                assert report["peak_modeled_bytes"] <= 1 << 30 and report["scratch_peak_bytes"] == 0
+                for path in paths:
+                    verify(path, 100)
+            else:
+                assert not receives and not report["generation_overlap_members"]
+        assert hashes[0] == hashes[1], "prefetched RAM successors differ from ordinary publication"
+        print("PASS authenticated RAM successor generation overlaps ordered single-destination writes with byte parity", flush=True)
+        peers = [root / ("ram-peer-" + str(i)) for i in range(2)]
+        for peer in peers:
+            peer.mkdir()
+        reference_peers = [root / ("ram-peer-reference-" + str(i)) for i in range(2)]
+        for peer in reference_peers:
+            peer.mkdir()
+        pool.run([binary, "fill", *reference_peers, *series, "--generation-overlap", "off"])
+        process = pool.Process([binary, "fill", *peers, *series], root / "ram-peers.log", extra_env={"POS2GPU_PHASE_TIMING": "1"})
+        processes.append(process)
+        log = process.finish()
+        report = json.loads(log.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == report["pool_packed_members"] == 6
+        assert report["peak_modeled_bytes"] <= 1 << 30 and report["scratch_peak_bytes"] == 0
+        # The fixture's two directories share one physical writer. Both ready
+        # lanes must have a foreground grant before either gets its next group.
+        assert report["destinations"] == report["peak_active_destinations"] == 2 and report["writer_groups"] == 1
+        grants = [row for row in log.splitlines() if row.startswith("[grow-controller-timing] phase=grant ")]
+        assert len(grants) == 6 and all(any(peer.name in row for row in grants[:2]) for peer in peers)
+        writes, publications = [], []
+        for peer, reference_peer in zip(peers, reference_peers):
+            lane = "\n".join(row for row in log.splitlines() if peer.name in row)
+            writes.append(intervals(lane, "fresh_payload"))
+            publications.append(intervals(lane, "publish"))
+            assert len(writes[-1]) == len(publications[-1]) == 3
+            assert all(writes[-1][i][1] <= publications[-1][i][0] <= publications[-1][i][1] <= writes[-1][i + 1][0]
+                       for i in range(2))
+            outputs, ordinary = sorted(peer.glob("*.gplot")), sorted(reference_peer.glob("*.gplot"))
+            assert len(outputs) == len(ordinary) == 3
+            for path, reference_path in zip(outputs, ordinary):
+                assert digest(path) == digest(reference_path)
+                verify(path, 100)
+        # A fast writer may have no measured service left when the other lane
+        # relinquishes its receive slot. Any optional input still belongs to
+        # the interval between the start of its predecessor and its own write.
+        receives = re.findall(r"phase=ram_successor_receive owner=(\d+) begin_ns=(\d+) end_ns=(\d+)", log)
+        assert report["generation_overlap_members"] == len(receives)
+        for owner, begin, end in receives:
+            assert int(owner) < len(peers)
+            lane = writes[int(owner)]
+            assert any(lane[i][0] <= int(begin) < int(end) <= lane[i + 1][0] for i in range(len(lane) - 1))
+        limited = root / "ram-limited"
+        limited.mkdir()
+        result = pool.run([binary, "fill", limited, *series, "-M", "120M", "--max-groups", 2, "--max-total-members", 2])
+        report = json.loads(result.stdout.splitlines()[-1])
+        assert report["members"] == report["generated_members"] == 2 and report["peak_modeled_bytes"] <= 120 << 20
+        assert not report["generation_overlap_batches"] and not report["generation_overlap_members"]
+        print("PASS ready peer priority, ordered RAM successors on busy lanes and constrained-RAM fallback", flush=True)
+        wide = common.copy()
+        wide[wide.index("--group-members") + 1] = 65
+        wide[wide.index("--max-host-ram") + 1] = "1G"
+        wide[wide.index("--window-bytes") + 1] = "1M"
+        wide[wide.index("--checkpoint-bytes") + 1] = "32M"
+        path = Path(pool.run([binary, *wide, "--construction", "external", "--temp-dir", scratch,
+                              "--batch-members", 65, "-S", SEED, "-o", root / "wide contributions",
+                              *network, "--compute-local", "off", "--config", os.devnull], timeout=360).stdout.strip())
+        assert header(path)[3] == 65
+        verify(path, 16)
+        print("PASS external compute groups spanning the contribution run limit", flush=True)
     finally:
         for process in reversed(processes):
             process.stop()
@@ -4144,6 +4551,11 @@ def check_automatic_compute(binary, root):
         for name in states:
             run(name, "compute", "configure", "--interface", "lo", "--backend", "cpu",
                 "--cpus", 1, "--host-bytes", "512M")
+        # A saved listener must also work when concurrent jobs share one executor.
+        with socket.socket() as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            worker_port = port_socket.getsockname()[1]
+        run("first", "compute", "configure", "--worker-port", worker_port)
         refused = run("worker", "compute", "worker", "--max-brokers", 128, code=1)
         assert "reduce --max-brokers or increase --host-bytes" in refused.stderr, refused
         run("worker", "compute", "configure", "--max-brokers", 16)
@@ -4167,7 +4579,8 @@ def check_automatic_compute(binary, root):
         assert all(snapshot(states[name]) == saved for name, saved in before.items()), "saved review started compute services"
 
         # No worker or dedicated broker is running: a normal plot still works.
-        made = run("first", *plot, "--max-host-ram", "512M", "-S", SEED, "-o", directory / "local")
+        made = run("first", *plot, "--max-host-ram", "512M", "--checkpoint-bytes", "auto",
+                   "-S", SEED, "-o", directory / "local")
         output = Path(made.stdout.strip())
         assert output.is_file() and header(output)[3] == 1 and not made.stderr
         profile = (states["first"] / "xchplot2/compute/profile").read_text(encoding="utf-8").splitlines()
@@ -4198,17 +4611,61 @@ def check_automatic_compute(binary, root):
             run("first", "verify", path, "--full", "--trials", 100)
         print("PASS worker arrival and one worker shared by two automatic brokers", flush=True)
 
+        mixed = directory / "mixed local and enrolled fill"
+        mixed.mkdir()
+        mixed_plan = directory / "mixed.plan"
+        cpu_node = available_cpu_node(run("first", "devices").stdout)
+        mixed_limits = list(limits)
+        mixed_limits[mixed_limits.index("--devices") + 1] = cpu_node
+        review = run("first", "plan", mixed, *plan_options[1:], "--devices", cpu_node, "--save-plan", mixed_plan)
+        assert json.loads(review.stdout)["devices_requested"] == cpu_node and not list(mixed.iterdir())
+        made = run("first", "fill", "--from-plan", mixed_plan, *keys, "-S", SEED, *mixed_limits)
+        mixed_paths = [Path(line) for line in made.stdout.splitlines() if line.endswith(".gplot")]
+        assert sorted(map(digest, mixed_paths)) == sorted(map(digest, fill_paths))
+        print("PASS selected local NUMA and enrolled helper fill with matching CPU bytes", flush=True)
+
         # A saved dedicated broker replaces the per-job broker.
         with socket.socket() as port_socket:
             port_socket.bind(("127.0.0.1", 0))
             port = port_socket.getsockname()[1]
         broker, broker_log = start("first", "dedicated-broker", "compute", "broker", "--listen", f"127.0.0.1:{port}",
                                    "--worker-ms", 3000, "--lease-ms", 3000)
-        run("second", "compute", "configure", "--broker", f"127.0.0.1:{port}")
+        # A remote-only owner with a dedicated broker needs no LAN discovery.
+        run("second", "compute", "configure", "--broker", f"127.0.0.1:{port}",
+            "--interface", f"xch-no-if-{port}")
         result = run("second", *plot, "--compute-local", "off", "-o", directory / "dedicated", "--no-quiet", "-v")
         assert "Using broker 127.0.0.1:" in result.stderr and "Automatic broker" not in result.stderr
+        assert "LAN discovery" not in result.stderr, result.stderr
+        run("second", "compute", "configure", "--interface", "lo")
         assert Path(result.stdout.strip()).is_file()
         assert broker.poll() is None, broker_log.read_text(encoding="utf-8")
+        # Compare the two forms on the same already connected worker.
+        output_limits = [*limits, "--no-quiet", "--json", "-k", 18, "--construction", "incremental",
+                         "--compute-local", "off", "--group-members", 2, "--max-total-members", 2,
+                         "--max-groups", 1, "--capacity-bytes", "32M", "--leave-free", 0]
+        for form in ("packed", "encoded"):
+            target = directory / ("output " + form)
+            target.mkdir()
+            made = run("second", "fill", target, *output_limits, "--compute-output", form, *keys, "-S", SEED)
+            metrics = json.loads(made.stdout.splitlines()[-1])
+            assert metrics["new_durable_members"] == 2
+            if form == "encoded":
+                assert metrics["pool_fresh_groups"] == 1, metrics
+            else:
+                assert metrics["pool_packed_members"] == 2, metrics
+        preview = directory / "output comparison"
+        preview.mkdir()
+        prediction = json.loads(run("second", "plan", preview, *output_limits).stdout)["completion_forecast"]
+        outputs = prediction["incremental_worker_output_history"]
+        assert all(outputs[form]["samples"] >= 1 and outputs[form]["fast_seconds_per_member"] > 0 for form in ("packed", "encoded"))
+        assert prediction["source"] == "observed-worker-output-range", prediction
+        assert 0 < prediction["seconds_low"] <= prediction["seconds"] <= prediction["seconds_high"], prediction
+        changed = run("second", "plan", preview, *output_limits, "--compute-timeout-ms", 30000)
+        other = json.loads(changed.stdout)["completion_forecast"]["incremental_worker_output_history"]
+        assert all(not other[form]["samples"] for form in ("packed", "encoded")), other
+        assert not list(preview.iterdir())
+        print("PASS pooled preflight compares completed encoded-group and packed-member fills", flush=True)
+
         explicit = [*plot, "--compute-owner-id", "storage-test", "--compute-local", "off",
                     "-S", SEED, "-o", directory / "explicit-owner"]
         owned = Path(run("second", *explicit).stdout.strip())
@@ -4288,6 +4745,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix="xchplot2 group é-", dir=args.scratch.resolve()) as work:
             os.environ["XDG_CONFIG_HOME"] = str(Path(work) / "empty-compute-settings")
             os.environ["XDG_STATE_HOME"] = str(Path(work) / "migration-state")
+            os.environ["XDG_CACHE_HOME"] = str(Path(work) / "performance-cache")
+            check_dashboard(args.binary.resolve(), Path(work))
             check(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)
             if sys.platform == "linux":
                 check_replot(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)

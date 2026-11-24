@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -55,15 +56,8 @@ public:
     template <class T>
     T* ensure(std::string_view name, std::uint64_t n)
     {
-        Slot& slot = slots_[std::string(name)];
-        std::size_t const bytes = static_cast<std::size_t>(n) * sizeof(T);
-        if (slot.bytes < bytes) {
-            if (slot.ptr) sycl::free(slot.ptr, *q_);
-            slot.ptr   = bytes == 0 ? nullptr
-                                    : sycl::malloc_device(bytes, *q_);
-            slot.bytes = bytes;
-        }
-        return static_cast<T*>(slot.ptr);
+        return static_cast<T*>(
+            ensure_bytes(name, static_cast<std::size_t>(n) * sizeof(T)));
     }
 
     // Untyped variant for the match-prepare scratch (sycl::malloc_device
@@ -73,8 +67,10 @@ public:
         Slot& slot = slots_[std::string(name)];
         if (slot.bytes < bytes) {
             if (slot.ptr) sycl::free(slot.ptr, *q_);
-            slot.ptr   = bytes == 0 ? nullptr
-                                    : sycl::malloc_device(bytes, *q_);
+            slot = {};
+            slot.ptr = sycl::malloc_device(bytes, *q_);
+            if (!slot.ptr) throw std::runtime_error(
+                "sycl::malloc_device(" + std::string(name) + ") failed");
             slot.bytes = bytes;
         }
         return slot.ptr;
@@ -98,11 +94,11 @@ public:
         Slot& slot = host_slots_[std::string(name)];
         if (slot.bytes < bytes) {
             if (slot.ptr) sycl::free(slot.ptr, *q_);
-            if (bytes != 0) {
-                host_pinned_reserve_check(bytes, std::string(name).c_str());
-            }
-            slot.ptr   = bytes == 0 ? nullptr
-                                    : sycl::malloc_host(bytes, *q_);
+            slot = {};
+            host_pinned_reserve_check(bytes, std::string(name).c_str());
+            slot.ptr = sycl::malloc_host(bytes, *q_);
+            if (!slot.ptr) throw std::runtime_error(
+                "sycl::malloc_host(" + std::string(name) + ") failed");
             slot.bytes = bytes;
         }
         return slot.ptr;

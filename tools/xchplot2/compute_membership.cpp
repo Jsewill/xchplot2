@@ -50,7 +50,7 @@ int pos2gpu::run_compute_membership(int argc, char** argv)
         output.validate();
         auto expected = command == "members" ? 0 : command == "renew-sign" ? 2 : 1;
         require(arguments.size() == size_t(expected), "incorrect compute membership arguments; use --help");
-        auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute init or compute join");
+        auto identity = pool::load_pool(directory); require(bool(identity), "shared compute is not configured; use compute setup on a plotting host or compute setup INVITATION on a helper");
         if (command == "members")
         {
             if (output.details()) std::cout << "Policy generation: " << identity->policy_generation << '\n';
