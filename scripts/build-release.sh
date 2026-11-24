@@ -5,11 +5,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 llvm=${XCHPLOT2_RELEASE_LLVM:-20}
 arch=$(uname -m)
 libdir=/usr/lib/"$arch"-linux-gnu
-cxx=/usr/bin/g++
+cuda_host_cxx=/usr/bin/g++
 components=core,cuda,hip
 architectures='50-real;52-real;60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120'
 if [[ $arch == aarch64 ]]; then
-    cxx=/usr/bin/g++-11
+    # NVCC 12.9 needs these NEON headers. Host C++ uses the system libstdc++.
+    cuda_host_cxx=/usr/bin/g++-11
     components+=,ocl
     architectures=$(nvcc --list-gpu-arch | awk '
         /^compute_[0-9]+$/ {
@@ -126,7 +127,7 @@ cargo about generate --locked --fail \
     --manifest-path keygen-rs/Cargo.toml --target "$arch-unknown-linux-gnu" \
     --output-file "$licenses/rust.txt" ci/release/licenses.hbs
 cmake -S . -B "$build_dir" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx" -DCMAKE_CUDA_HOST_COMPILER="$cxx" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_HOST_COMPILER="$cuda_host_cxx" \
     -DACPP_TARGETS=generic -DXCHPLOT2_BUILD_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES="$architectures" \
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
