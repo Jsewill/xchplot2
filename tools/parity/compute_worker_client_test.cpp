@@ -1025,6 +1025,76 @@ void network_deadlines()
     }
 }
 
+void failed_gpu_generation()
+{
+    pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "failed-gpu-ca");
+    auto first = pool_test::issue(directory.path, "failed-gpu", &ca), second = pool_test::issue(directory.path, "healthy-cpu", &ca);
+    auto tls = pool_test::tls(ca, first); tls.timeout_ms = 3000;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls; RunningBroker broker(options);
+    pool::Listener peer({"127.0.0.1", 0}, tls); pool::BrokerClient control(broker.server.endpoint(), tls);
+    pool::WorkerOffer offer; offer.endpoint = peer.endpoint(); offer.instance = pool::random_token();
+    offer.compatibility = worker_compatibility(); offer.capabilities = pool::capability(pool::Kind::GenerateGpu);
+    offer.capacity = {1, 1, uint64_t(256) << 20, 1024};
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, offer.capacity, offer.capacity.host_bytes, 1}};
+    control.register_worker(offer);
+    WorkerConfig good; good.tls = pool_test::tls(ca, second); good.broker = broker.server.endpoint(); good.listen = {"127.0.0.1", 0};
+    good.capacity = {1, 1, uint64_t(256) << 20, 0}; good.available_resources = [cap=good.capacity](unsigned) { return cap; };
+    WorkerService healthy(good);
+    std::array<std::array<uint8_t, 32>, 1> ids{}; ids.front()[0] = 17;
+    std::vector<std::vector<uint8_t>> expected;
+    healthy.contributions_local(18, 2, ids, [&](auto, auto bytes, auto) { expected.emplace_back(bytes.begin(), bytes.end()); });
+    std::string const error = "T1 match produced 0 entries (expected ~2^18 = 262144 for k=18)";
+    auto report = [&](bool partial, bool join)
+    {
+        return std::async(std::launch::async, [&, partial, join]
+        {
+            auto channel = peer.accept(5000); require(bool(channel), "GPU fixture did not receive work");
+            auto frame = channel.receive(); pool::Reader body(frame.payload); auto lease = pool::read_lease(body);
+            require(frame.type == pool::Message::Work && control.begin(lease, channel.peer_identity()), "GPU fixture was not assigned its lease");
+            if (join)
+            {
+                healthy.start();
+                auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                while (!healthy.status().healthy_brokers && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                require(healthy.status().healthy_brokers, "alternate CPU worker did not register");
+            }
+            if (partial)
+            {
+                pool::Writer chunk(tls.max_frame_bytes); chunk.u8(uint8_t(worker_detail::DataKind::Contributions));
+                chunk.u64(0); chunk.u16(1); chunk.bytes(expected.front()); channel.send(pool::Message::Data, chunk.data());
+            }
+            pool::Writer out(tls.max_frame_bytes); out.u8(uint8_t(worker_detail::WorkerError::Permanent)); out.string(error);
+            control.finish(lease); channel.send(pool::Message::Error, out.data());
+        });
+    };
+    WorkerClientConfig config; config.broker = broker.server.endpoint(); config.tls = tls; config.owner_id = "gpu-failure-owner";
+    config.generation_kind = pool::Kind::GenerateAny; config.task_timeout_ms = 5000;
+    WorkerClient client(config);
+    for (bool partial : {false, true})
+    {
+        auto gpu = report(partial, false); size_t chunks = 0; bool rejected = false;
+        try { client.contributions(18, 2, ids, [&](auto, auto, auto) { ++chunks; }); }
+        catch (WorkerGenerationFailed const& failure)
+        { rejected = std::string_view(failure.what()).find(error) != std::string_view::npos &&
+            std::string_view(failure.what()).find(offer.instance) != std::string_view::npos; }
+        gpu.get();
+        require(rejected && chunks == size_t(partial), "a sole faulty GPU lost its diagnostic or replayed a partially delivered generation");
+    }
+    auto gpu = report(false, true); size_t delivered = 0;
+    client.contributions(18, 2, ids, [&](auto ordinal, auto bytes, auto members)
+    {
+        require(ordinal == delivered && members == 1 && std::ranges::equal(bytes, expected.at(delivered)),
+            "alternate worker changed or repeated the member contribution");
+        ++delivered;
+    }, {}, WorkerTaskIdentity("fixed-gpu-failure"));
+    gpu.get();
+    auto const jobs = control.status({pool::StatusSection::Jobs});
+    require(delivered == expected.size() && std::any_of(jobs.job_records.begin(), jobs.job_records.end(), [&](auto const& job)
+        { return job.worker_instance == healthy.status().instance && job.attempt == 2; }),
+        "GPU generation did not finish on a different worker under the same task identity");
+}
+
 void independent_receivers()
 {
     pool_test::Directory directory;
@@ -2288,7 +2358,7 @@ void status_inspection()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); confirmed_generation_prior(); live_generation_routes(); network_deadlines(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); automatic_pool_growth(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); confirmed_generation_prior(); live_generation_routes(); network_deadlines(); failed_gpu_generation(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); automatic_pool_growth(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

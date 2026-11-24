@@ -3012,9 +3012,100 @@ void independent_terminal_dispatch()
 
 }
 
+void farm_scale_execution()
+{
+    using namespace grow_controller_test;
+    std::vector<ExecutionLane> lanes(1024);
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& lane = lanes[i];
+        lane.destination = i; lane.members = 1;
+        lane.work.destination = lane.work.destination_bytes = 1; lane.work.batches = 1; lane.work.known = true;
+    }
+    // Put the expensive writer beyond the terminal order search's mask.
+    // Independent disks can overlap; aliases owe the sum, even when every
+    // logical destination can receive. A measured joint rate also covers
+    // output traffic in the absence of any scratch files.
+    lanes.back().work.destination = 4096;
+    auto estimate = [&](long double shared = 0)
+    { return pipeline_execution_estimate(lanes, 32, 2, 1, lanes.size(), true, 0, lanes.size() - 1, shared); };
+    auto independent = estimate();
+    require(independent.known && independent.remaining_members == lanes.size() && independent.target_release >= 4096 &&
+        independent.limit == ExecutionLimit::disk, "a late physical writer disappeared from the farm forecast");
+    auto joint = estimate(.125L);
+    require(joint.known && joint.completion >= lanes.size() / .125L && joint.limit == ExecutionLimit::shared_storage,
+        "an observed shared storage ceiling was multiplied by destination count");
+    for (auto& lane : lanes) lane.destination = 0;
+    auto aliases = estimate();
+    require(aliases.completion == 4096 + lanes.size() - 1 && aliases.completion > independent.completion,
+        "physical aliases created independent farm-scale writer service");
+    lanes.back().work.known = false;
+    auto partial = estimate();
+    require(!partial.known && partial.unmeasured == 1 && partial.remaining_members == aliases.remaining_members &&
+        partial.lower_bound == aliases.lower_bound, "unmeasured late service erased measured physical work");
+    ConstructionForecast rewrite; rewrite.members = 2; rewrite.batches = 1;
+    rewrite.incremental.read = rewrite.incremental.write = 10; rewrite.incremental.syncs = 1;
+    ConstructionHistory history; ConstructionSample sample;
+    sample.elapsed_ns = 100; sample.written_bytes = 10; sample.write_ns = 20;
+    sample.cpu_measured = sample.serial_cpu_measured = true; sample.codec_bytes = 10;
+    history.add(sample);
+    auto priced = construction_execution_work(rewrite, history, 1, false);
+    require(!priced.known && priced.missing == missing_destination && priced.destination == sample.write_ns,
+        "a fresh write supplied unobserved prefix read or sync performance");
+    sample.read_bytes = 10; sample.read_ns = 30; sample.syncs = 1; sample.sync_ns = 40;
+    history.add(sample); priced = construction_execution_work(rewrite, history, 1, false);
+    require(priced.known && priced.destination == sample.read_ns + sample.write_ns + sample.sync_ns,
+        "matched output observations did not cover growth through sync");
+
+    lanes.resize(2);
+    lanes[0].destination = 0; lanes[0].work.destination = 4;
+    lanes[1].destination = 1; lanes[1].work.destination = 2;
+    auto future = lanes[0]; future.predecessor = 0; future.work = {}; future.members = 20000;
+    future.work.add_files(lanes[0].work, future.members); lanes.push_back(future);
+    auto const no_loan = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true, 0, 1);
+    // The first writer borrows the second HDD. Return it at the first
+    // publication so the other owner can start before the long rollover tail.
+    lanes[0].scratch = {{1, 1, 0, true}}; lanes[0].committed = true;
+    auto const loan = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true, 0, 1);
+    require(loan.known && loan.rollover_members == future.members && loan.remaining_members == future.members + 2 &&
+        std::fabs(loan.completion - 4 * (future.members + 1)) < 1e-7L && loan.target_release == no_loan.target_release + 4,
+        "a borrowed future destination lost its release boundary or its repeated publication cost");
+    lanes[2].work.known = lanes[0].work.known = false;
+    auto unknown = pipeline_execution_estimate(lanes, 2, 2, 1, 3, true);
+    require(!unknown.known && unknown.unmeasured == 1 && unknown.rollover_members == future.members,
+        "incomplete evidence on one writer became several unknown destinations or hid future files");
+
+    FarmingRun farm; farm.state.fixed_extent = true; farm.lanes.resize(1); farm.state.directories.resize(1);
+    auto& directory = farm.state.directories[0]; auto& layout = directory.layout;
+    layout.total_members = 133; layout.files = 34; layout.group_members = 4; layout.fixed_members = true; layout.meta_slots = 4;
+    Arguments args;
+    auto saved = farm.construction_rollovers(args, 0, 4);
+    require(saved.next.members == 4 && saved.next.meta == layout.meta(1) && saved.members == layout.total_members - 4 &&
+        !saved.open && !saved.unmeasured_members, "fixed farm horizon lost its terminal partial or collection schedule");
+    args.max_groups = 4; args.max_total_members = 13;
+    saved = farm.construction_rollovers(args, 0, 4);
+    require(saved.members == 9, "farm horizon exceeded the member limit inside its last file");
+    farm.state.capacity_fill = true; directory.extents = {3, 1, 2, 3, 4, 1}; args.max_total_members = 64;
+    saved = farm.construction_rollovers(args, 0, 3);
+    require(saved.members == 6 && saved.next.members == 1 && !saved.open,
+        "farm horizon replaced admitted extents with uniform groups or exceeded its file cap");
+    args.max_groups = 64;
+    require(farm.construction_rollovers(args, 0, 3).open, "unused capacity beyond admitted extents appeared fixed");
+    farm.lanes[0].ordinal = directory.extents.size(); farm.lanes[0].completed_members = 14;
+    auto waiting = farm.construction_rollovers(args, 0, 0);
+    require(waiting.open && !waiting.members && !waiting.next.members,
+        "an ungranted farm extent counted the preceding publication twice");
+    args.max_total_members = farm.lanes[0].completed_members;
+    require(!farm.construction_rollovers(args, 0, 0).open, "a limit-complete farm still waited for another extent");
+    args.max_total_members = 64;
+    directory.control = "draining";
+    require(!farm.construction_rollovers(args, 0, 3).members, "draining a writer still priced unstarted rollovers");
+}
+
 void execution_planning()
 {
     using namespace grow_controller_test;
+    farm_scale_execution();
     // Independent small oracle: enumerate every integer start for the two
     // writes after serial generation, rejecting overlapping shared writers.
     // Fixed orders let us check incumbent commitments as well as the optimum.
@@ -3079,6 +3170,9 @@ void execution_planning()
     for (unsigned i = 0; i < 8; ++i) generation.add(4, 400);
     generation.add(1, 10000);
     require(generation.member_ns() == 100, "generation history lost its bounded robust rate");
+    generation.add(2, 1000, 22, 2);
+    require(generation.member_ns(22, 2) == 500 && !generation.member_ns(28, 2) && !generation.member_ns(22, 3),
+        "a changed farm cohort inherited an incompatible local generation rate");
     std::vector<ExecutionLane> lanes;
     for (size_t i = 0; i < 60; ++i)
     {
@@ -3608,6 +3702,10 @@ void construction_histories()
     require(histories.execution(unobserved) == first && histories.execution(phase) == demand &&
         phase.workers == 1 && !histories.find(phase, false),
         "forecast grant normalization changed the caller's key or crossed RAM and scratch histories");
+    auto second = histories.find(unobserved);
+    require(second && second != first && histories.find(unobserved, false) == second &&
+        histories.execution(unobserved) == first && histories.find(context, false) == first,
+        "inserting a second grant changed the original normalized construction context");
     std::array<ConstructionContext, 8> incompatible{phase, phase, phase, phase, phase, phase, phase, phase};
     incompatible[0].scratch_drives = {"8:64"}; incompatible[1].drives.clear();
     incompatible[2].k = 20; incompatible[3].max_ram /= 2; incompatible[4].io_overlap = false;

@@ -150,8 +150,30 @@ With `--harvester local`, an ordinary fill can use fresh completions from
 the selected local reader to reduce new HDD work when lookups approach the
 configured deadline. This operates with the dashboard open or closed.
 The Farm view shows when normal disk concurrency is available and when the
-controller is limiting I/O. A remote harvester or missing local log leaves
-live lookup pressure unknown.
+controller is limiting I/O.
+
+When another host farms a disk shared with the fill owner, forward that
+reader's Chia log to a regular file readable on the owner. Bind it to the
+affected fill destination with `--harvester-log DIR FILE`. Repeat the option
+for each destination and reader. Each file must contain one reader's
+messages with timestamps in the owner's local time. The Farm view shows a
+separate 30-second lookup window for each file. A slow reader can defer
+new work on its bound destinations and pace external-construction HDD I/O
+on those filesystems and their known physical aliases.
+Independent readers can continue work on separate drives. Known SSD
+transfers keep their ordinary concurrency.
+
+Combine these bindings with `--harvester local` when the owner also farms.
+The local reader covers fill storage that shares a filesystem or physical
+drive with an accessible plot directory in its Chia configuration. An
+explicit binding can also name its configured log. The owner skips records
+already present at startup or rotation. A quiet or missing log leaves lookup
+pressure unknown. `--harvester PROFILE` supplies planning inputs.
+Use the same bindings for `plan`, `fill --plan-only` and execution, including
+when resuming a job. The fill command printed after saving a plan includes
+the forwarded log bindings. A preview checks the destination declarations
+without opening the logs. If a bound HDD goes offline, other available
+destinations can continue.
 
 Quiet mode suppresses automatic progress and plotting summaries. Explicit
 `--progress` still enables progress; `--no-progress` does not disable verbose
@@ -225,20 +247,30 @@ whole-job serialization.
 Ordinary grouped plotting, filling and growth accept the same `--devices`
 selectors as batch plotting: `cpu`, `cpu0`, `gpu`, `gpu0`, `all`, and comma
 combinations such as `gpu0:tiny,cpu0`. Repeated selectors are deduplicated.
-Multiple selected devices and explicit CPU NUMA selectors use private local executors under one `--workers`
-CPU budget and `--max-host-ram` budget. The producers share three quarters
-of the RAM under one admission limit. The remainder covers receiving and
-construction. The owner accounts for each device's available slots and VRAM,
-the current batch, observed delivery times and work already assigned when
-choosing a producer. These explicit local executors need no pool
-enrollment or network listener and cannot be combined with shared compute
-connection/offer options. Repeat the device selection when resuming; it is an
-execution choice, separate from saved plot identities and farming policy.
+Multiple selected devices and explicit CPU NUMA selectors share one local
+`--workers` and `--max-host-ram` budget. With shared compute enabled,
+enrolled helpers can join or leave during the fill. A queued packed or
+encoded member can use a free selected device while helpers are busy. The
+local devices serve this job privately. Use `--compute off` to run them
+without contacting the pool.
+
+By default, the selected devices share three quarters of the RAM remaining
+after any automatic broker/session reservation. Lower saved offer limits
+and explicit CPU, RAM, VRAM and slot caps also apply. Receiving, construction
+and optional remote encoding use the remaining budget. Local devices share
+their partition across active jobs, retained buffers and GPU recovery. If a
+background worker already holds this machine's enrollment, use its offered
+resources or stop that worker before selecting private devices for the job.
+Repeat the device selection when resuming.
 
 Single local CPU/GPU selection and `--backend auto` retain automatic shared
 compute when enrolled; automatic local GPU selection can fall back to CPU.
-Migration still requires its reviewed single-producer resources: select
-`--backend cpu` or `--devices gpuN`. `--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
+Migration uses the backend and authenticated worker reservations in its
+review. CPU generation can use the selected NUMA nodes within the same
+reviewed CPU grant. A GPU list must include the reviewed physical GPU.
+The local executor uses that card and its selected tier. Additional
+reviewed workers can supply remote compute.
+`--cpu-workers`, sharding, pipeline strategies, `--continue-on-error`,
 and `--max-host-ram min` belong to the single-member batch engine. Use
 `--compute off` to keep that engine for ordinary plotting after enrolling a
 machine in shared compute.
@@ -274,6 +306,35 @@ resource details; `--json` emits the machine-readable report. An infeasible
 layout reports its reason and exits unsuccessfully. `--help` shows the common workflow;
 `--help-all` includes recovery, tuning and shared-compute options.
 
+The construction forecast estimates time through the last durable publication.
+It shows the expected remaining members, sealed commitments and any upper
+member limit. Open fills can finish with a different member count as encoded
+sizes and available capacity become known. When enough completed files of the
+same group size are available, the forecast also shows how many members would
+fit at their observed sizes. An unavailable destination or a pause can leave
+the completion time open.
+
+The preview reads recent completed fills for the selected host, storage
+layout, plot shape and execution settings. One comparable run supplies a point
+estimate. Repeats supply an observed range in seconds per newly durable
+member. For a different job length with the same drive and group layout, the
+projection retains the time to the first file and scales the remaining
+publications. Missing measurements are shown as unmeasured. The current pool
+and its grants are checked during execution. Use `-v` to compare observed
+construction policies or look at `completion_forecast` in JSON.
+For pooled incremental construction, the preview also compares whole fills
+that received only packed members with those that received only complete
+encoded groups on the same layout. If automatic worker output has no matching
+fill of its own, those two measurements supply an observed time range.
+
+During a fill, Overview updates the same forecast from durable publications
+and from a measured schedule covering the remaining work. Its limiting resource
+can identify generation and delivery, owner encoding, a physical disk, shared
+storage bandwidth or previously committed work. A range based on earlier fills
+describes observed variation at the displayed member count. If a predicted
+publication takes longer, Overview keeps the remaining members visible and
+waits for a fresh timing observation.
+
 To execute a reviewed layout, save a plan without private plot keys:
 
 ```bash
@@ -303,9 +364,12 @@ With no directories, `plan` lists candidate mounted data volumes with available
 space and detected media type. It excludes system mounts, RAM filesystems,
 read-only volumes and unsupported filesystems. These are suggestions; select
 the intended directories explicitly before filling them.
-One command accepts up to 1,024 destination directories. Directories on the
-same filesystem share its available capacity; adding another directory there
-does not add disk space.
+Ordinary `plan` and `fill` accept up to 1,024 destination directories in one
+job. Positional paths and nonempty entries from all path lists share that
+limit. Drive and configuration discovery also limit the combined selection
+to 1,024 distinct directories. A plain directory is one destination. Use
+`--discover-drives` to include eligible mounts beneath it. Directories on
+one filesystem share the available capacity.
 
 Use `--paths-from FILE` for one literal path per line, including paths with
 spaces. Blank lines are ignored; paths resolve from the current working
@@ -716,8 +780,13 @@ merging and external contributions according to available RAM and scratch.
 `--construction auto` is the default. When RAM and scratch both fit, the
 owner compares feasible grants at the same RAM cap using available evidence
 through publication. The forecast accounts for occupied scratch disks,
-pending receipts, codec workers and the final writer. Missing observations
-can still give a lower bound. The Decisions view shows the reason for an
+pending receipts, codec workers and the final writer. It includes later groups
+on each destination, when its current writer can release scratch, and which
+destinations share physical disks. Shared storage bandwidth comes from
+concurrent observations across the drives involved. Missing observations
+can still give a lower bound. When both modes fit and the current schedule
+has gaps, automatic selection can use repeated comparable whole fills with
+the same worker allocation. The Decisions view shows the reason for an
 admission and the resources it holds. Use `--construction incremental`,
 `staged`, `merged` or `external` to select a specific method.
 `--batch-members N` bounds construction batches independently of the
@@ -1212,6 +1281,9 @@ reject them. Existing schema 1 profiles retain their reviewed-envelope behavior.
 
 A fresh replot scan includes directories from the selected reader configurations
 and adds explicit destinations, path-list files and `--discover-drives` results.
+Recursive inventory and fresh replot scans accept up to 128 inventory roots.
+They traverse subdirectories on the root's filesystem. Supply mounted child
+filesystems as separate roots.
 `--discover-farm` enables configuration discovery for ordinary `plan`/`fill` or
 `plan --inventory`; `--no-discover-farm` limits a replot scan to supplied roots.
 Use `--farm-config /path/to/config.yaml /other/reader/root` to include several
@@ -2216,6 +2288,15 @@ xchplot2 compute configure --cpus 4 --host-bytes 8G --gpu-bytes 4G
 xchplot2 compute status
 ```
 
+On a helper that also farms, run `xchplot2 compute worker --harvester local`.
+`--chia-root DIR` selects its local Chia configuration. The worker holds new
+tasks while its recent lookup p95 reaches half the farming deadline. The
+default deadline is eight seconds and `--farming-deadline-ms N` sets another.
+Fast zero-eligible challenges are excluded from this pressure estimate.
+Accepted tasks finish. Each broker sees that worker as paused, and the
+worker's foreground output shows the lookup pressure. When the tail recovers
+or observations expire, the worker returns to its configured admission state.
+
 On Windows and Linux, a compute worker that detects a lost GPU withdraws its
 GPU capacity while continuing CPU and codec work. Its next GPU offer requires
 a small generation in a fresh process to match the CPU reference. Recovery
@@ -2455,6 +2536,7 @@ Old ordinary manifests continue to use their original engine; use
 
 `--compute off` disables automatic sharing for a plotting command.
 `--compute-local off` uses pool workers without offering local capacity.
+Omit explicit private NUMA or multi-device selectors for remote-only work.
 `--compute-broker HOST:PORT` overrides the saved broker for one job.
 Advanced direct connections can still supply `--compute-owner-id`,
 `--compute-ca`, `--compute-cert` and `--compute-key`; the broker and worker
@@ -2483,6 +2565,10 @@ If the connection breaks during execution, the owner can retry on another
 eligible worker as soon as it reports the lost transfer. The broker keeps
 the original worker's resources reserved until it finishes or its lease
 expires. Only the current attempt can deliver the result.
+If a helper reports zero T1 matches before sending any plot data, the owner
+can retry the same member or batch once on another available executor. If
+that retry has no available executor, the error names the failing worker
+and instance. The original task deadline still applies.
 
 `--compute-frame-bytes SIZE` bounds each transport frame. Local offer overrides
 are `--compute-offer-cpus`, `--compute-offer-ram`, `--compute-offer-vram`,
@@ -2537,8 +2623,15 @@ measured width. As drives finish or become available, it can reuse the
 fastest measured combination that still fits. When
 the worker slots for whole-group streams are occupied, another destination
 can receive packed members and assemble them on the storage host.
-When the disk I/O governor reports farming pressure, the planner limits
-new pooled HDD work to one active destination and suspends writer trials.
+When several HDDs can write independently, the owner can compare how long
+workers take to deliver packed members and complete encoded groups. It can
+also use timings from comparable completed fills. When the timings favor
+complete groups, independent writers can receive them concurrently. Without
+those timings, it can try one encoded group while a second worker and writer
+handle packed members. If a worker cannot take the whole group immediately,
+the writer can receive packed members without waiting for that worker.
+When disk I/O is slowing farming, the planner limits new pooled work on
+the affected HDDs and suspends writer trials there.
 `--compute-writers N` requests up to N active pooled HDD destinations for
 a repeatable comparison. The default is `auto`. The plotting JSON includes
 the peak active destinations, packed members streamed to scratch, fresh

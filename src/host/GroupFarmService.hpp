@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace group_grow
 {
@@ -20,6 +21,8 @@ struct FarmingServiceWindow
     uint64_t completions = 0, eligible_completions = 0, zero_eligible_completions = 0, loaded_plots = 0;
     uint64_t p50_ns = 0, p95_ns = 0, max_ns = 0, missed_deadline = 0, age_ms = 0, started_before_window = 0;
     bool counts_known = false, deadline_known = false, incomplete = false, log_observed = false;
+    std::optional<bool> lookup_pressure;
+    std::chrono::steady_clock::time_point feedback_expires{};
 };
 class FarmingServiceHistory
 {
@@ -47,6 +50,7 @@ public:
         result.log_observed = log_seen_ != Clock::time_point{} && log_seen_ >= first;
         Clock::time_point last{};
         bool counts = true, deadlines = true;
+        uint64_t feedback = 0, slow = 0;
         for (std::size_t i = 0; i < count_; ++i)
         {
             auto const& entry = recent_[i]; auto const& value = entry.record;
@@ -61,6 +65,18 @@ public:
             else counts = false;
             if (!entry.deadline_ns) deadlines = false;
             else if (value.response_ns > entry.deadline_ns) ++result.missed_deadline;
+            // Fast empty challenges do not establish spare lookup capacity.
+            // Slow completions still provide evidence with absent or zero counts.
+            if (entry.deadline_ns)
+            {
+                bool const late = value.response_ns >= entry.deadline_ns / 2;
+                if (late || (value.counts_known && value.eligible))
+                {
+                    auto const expires = value.at + std::chrono::seconds(30);
+                    if (!feedback || expires < result.feedback_expires) result.feedback_expires = expires;
+                    ++feedback; slow += late;
+                }
+            }
             if (value.at >= last) { last = value.at; result.loaded_plots = value.loaded; }
         }
         if (!result.completions) return result;
@@ -70,6 +86,7 @@ public:
         result.p50_ns = elapsed[(50 * result.completions - 1) / 100];
         result.p95_ns = elapsed[(95 * result.completions - 1) / 100];
         result.max_ns = elapsed[result.completions - 1];
+        if (feedback) result.lookup_pressure = slow > feedback / 20; // nearest-rank p95 at half the deadline
         return result;
     }
 };

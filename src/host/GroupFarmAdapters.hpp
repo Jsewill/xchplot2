@@ -1088,7 +1088,7 @@ public:
 };
 } // namespace adapter_detail
 
-// Optional tuning observations from the explicitly selected local reader.
+// Optional tuning observations from a selected reader's local or forwarded log.
 // Read newly appended complete records only. A log is not service readiness,
 // resource capacity or a deadline guarantee; absent/stale formats stay unknown.
 // The supported message is emitted after real signage-point lookups finish:
@@ -1100,7 +1100,10 @@ public:
     static constexpr uint64_t memory_bytes = 8 * 1024 * 1024;
     static uint64_t memory_bound(size_t readers)
     { return resource_detail::add(memory_bytes, resource_detail::multiply(readers, 4 * 65536)); }
-    explicit FarmingLogSampler(HarvesterAdapterOptions const& options, bool require_local_rpc = false)
+    explicit FarmingLogSampler(std::filesystem::path forwarded) : path_(std::move(forwarded))
+    { inventory_detail::bounded_text(file_io::path_text(path_)); }
+    explicit FarmingLogSampler(HarvesterAdapterOptions const& options, bool require_local_rpc = false,
+        std::vector<std::string>* configured_directories = nullptr)
     {
         try
         {
@@ -1125,7 +1128,15 @@ public:
             path_ = (path.is_absolute() ? path : options.root / path).lexically_normal();
             inventory_detail::bounded_text(file_io::path_text(path_));
             config_ = config; config_stamp_ = stamp;
-            config_identity_ = adapter_detail::retirement_config(contents, memory_bytes / 2).identity;
+            auto parsed = adapter_detail::retirement_config(contents, memory_bytes / 2);
+            config_identity_ = std::move(parsed.identity);
+            if (configured_directories)
+            {
+                *configured_directories = std::move(parsed.directories);
+                // In a mixed job the configured directory set establishes
+                // which local disks may respond to this reader's pressure.
+                config_digest_ = stream_state::digest(contents);
+            }
         }
         catch (std::exception const&) { path_.clear(); }
     }
@@ -1146,18 +1157,20 @@ public:
         };
         try
         {
-            auto const configuration = stream_state::stamp(config_);
-            if (configuration != config_stamp_)
+            if (!config_.empty())
             {
-                // The existing retirement identity excludes only the plot
-                // directory list. Authorized directory retirement must not
-                // disable otherwise unchanged reader telemetry indefinitely.
-                if (config_identity_.empty() || configuration.bytes > 1024 * 1024) return unavailable();
-                std::ifstream input(config_); if (!input) return unavailable();
-                auto contents = profile_detail::read_text(input, 1024 * 1024);
-                if (adapter_detail::retirement_config(contents, memory_bytes / 2).identity != config_identity_ ||
-                    stream_state::stamp(config_) != configuration) return unavailable();
-                config_stamp_ = configuration;
+                auto const configuration = stream_state::stamp(config_);
+                if (configuration != config_stamp_)
+                {
+                    // Directory retirement preserves the selected reader and log.
+                    if (config_identity_.empty() || configuration.bytes > 1024 * 1024) return unavailable();
+                    std::ifstream input(config_); if (!input) return unavailable();
+                    auto contents = profile_detail::read_text(input, 1024 * 1024);
+                    if ((!config_digest_.empty() && stream_state::digest(contents) != config_digest_) ||
+                        adapter_detail::retirement_config(contents, memory_bytes / 2).identity != config_identity_ ||
+                        stream_state::stamp(config_) != configuration) return unavailable();
+                    config_stamp_ = configuration;
+                }
             }
             file_io::Stat named{};
             if (file_io::inspect_link(path_, &named) || !file_io::is_regular(named.st_mode) || named.st_size < 0) return unavailable();
@@ -1261,37 +1274,38 @@ public:
 private:
     std::filesystem::path path_, config_;
     stream_state::Stamp config_stamp_;
-    std::string config_identity_;
+    std::string config_identity_, config_digest_;
     std::optional<std::pair<uint64_t, uint64_t>> identity_;
     uint64_t offset_ = 0;
     std::string partial_;
     Clock::time_point polled_{}, began_{};
 };
 
-// An ordinary fill owner can observe its explicitly selected local reader.
+// An ordinary fill owner can observe its selected reader.
 // The scheduler and every dashboard share these observations.
 class LocalFarmingService
 {
 public:
-    std::shared_ptr<DiskIoGovernor> const governor = std::make_shared<DiskIoGovernor>(
-        DiskIoGovernor::sample_device, 4096, DiskIoGovernor::Mode::observed_farm);
+    std::shared_ptr<DiskIoGovernor> const governor;
 private:
     using Clock = FarmingLogSampler::Clock;
-    FarmingLogSampler sampler_;
+    std::vector<FarmingLogSampler> samplers_;
     uint64_t deadline_ns_;
     std::jthread thread_;
-    LocalFarmingService(std::filesystem::path const& root, uint64_t deadline_ns)
-        : sampler_([&] { HarvesterAdapterOptions options; options.root = profile_detail::chia_root(root); return options; }(), true),
-          deadline_ns_(deadline_ns) {}
+    LocalFarmingService(std::vector<FarmingLogSampler> samplers, uint64_t deadline_ns, std::vector<DiskIoGovernor::FarmingScope> scopes)
+        : governor(std::make_shared<DiskIoGovernor>(DiskIoGovernor::sample_device, 4096,
+              DiskIoGovernor::Mode::observed_farm, std::move(scopes))), samplers_(std::move(samplers)), deadline_ns_(deadline_ns) {}
     bool sample()
     {
         bool seen = false;
         std::optional<FarmingServiceRecord> slowest;
-        sampler_.sample(Clock::now(), std::chrono::system_clock::now(), [&](FarmingServiceRecord const& record)
+        auto const now = Clock::now();
+        auto const wall = std::chrono::system_clock::now();
+        for (size_t i = 0; i < samplers_.size(); ++i) samplers_[i].sample(now, wall, [&](FarmingServiceRecord const& record)
         {
-            governor->record_farming_service(record, deadline_ns_);
+            governor->record_farming_service(record, deadline_ns_, i);
             seen |= record.log_seen;
-            if (record.log_seen || record.gap) return;
+            if (governor->scoped() || record.log_seen || record.gap) return;
             // A fast zero-eligible completion cannot demonstrate spare I/O
             // capacity for an eligible lookup. A slow response can still
             // signal pressure, even when the reader omits the eligible count.
@@ -1299,17 +1313,60 @@ private:
                 if (!slowest || record.response_ns >= slowest->response_ns) slowest = record;
         });
         if (slowest) governor->observe_farming(slowest->response_ns, deadline_ns_, false, slowest->at);
+        if (governor->scoped()) governor->refresh_farming_sources(now);
         return seen;
     }
 public:
-    static uint64_t memory_bound() { return FarmingLogSampler::memory_bound(1) + sizeof(LocalFarmingService); }
-    static std::unique_ptr<LocalFarmingService> start(std::filesystem::path const& root, uint64_t deadline_ns, uint64_t grant) noexcept
+    static uint64_t memory_bound(size_t readers = 1) { return FarmingLogSampler::memory_bound(readers) + sizeof(LocalFarmingService); }
+    uint64_t memory_bytes() const { return memory_bound(samplers_.size()); }
+    static std::unique_ptr<LocalFarmingService> start(std::optional<std::filesystem::path> const& local_root, uint64_t deadline_ns,
+        uint64_t grant, std::vector<DiskIoGovernor::FarmingScope> scopes = {}, std::span<StorageDevice const> destinations = {}) noexcept
     {
         try
         {
-            if (grant < memory_bound() + DiskIoGovernor::initial_memory_bytes()) return {};
-            std::unique_ptr<LocalFarmingService> result(new LocalFarmingService(root, deadline_ns));
-            if (result->sampler_.path().empty() || !result->sample()) return {};
+            bool const scoped = !scopes.empty();
+            if (grant < memory_bound(scopes.size() + size_t(local_root.has_value())) + DiskIoGovernor::initial_memory_bytes()) return {};
+            std::optional<FarmingLogSampler> local;
+            if (local_root)
+            {
+                HarvesterAdapterOptions options; options.root = profile_detail::chia_root(*local_root);
+                std::vector<std::string> directories;
+                local.emplace(options, true, scoped ? &directories : nullptr);
+                if (local->path().empty() && !scoped) return {};
+                if (local && scoped)
+                {
+                    auto source = std::find_if(scopes.begin(), scopes.end(), [&](auto const& s) { return s.log == local->path(); });
+                    if (source == scopes.end()) source = scopes.insert(scopes.end(), {local->path(), {}});
+                    for (auto const& name : directories)
+                    {
+                        auto path = file_io::native_path(name); std::error_code error;
+                        if (!std::filesystem::is_directory(path, error)) continue;
+                        StorageDevice device;
+                        try { device = storage_device(path); }
+                        catch (std::runtime_error const&) { continue; } // Other configured directories may still have proven coverage.
+                        for (auto const& candidate : destinations)
+                            if (DiskIoGovernor::shares_storage(device, candidate) &&
+                                std::none_of(source->devices.begin(), source->devices.end(), [&](auto const& saved)
+                                    { return saved.filesystem == candidate.filesystem && saved.drives == candidate.drives; }))
+                                source->devices.push_back(candidate);
+                    }
+                }
+            }
+            std::vector<FarmingLogSampler> samplers;
+            if (scoped)
+            {
+                samplers.reserve(scopes.size());
+                for (auto const& scope : scopes)
+                {
+                    if (local && local->path() == scope.log) samplers.push_back(std::move(*local));
+                    else samplers.emplace_back(scope.log);
+                }
+            }
+            else if (local) samplers.push_back(std::move(*local));
+            if (samplers.empty()) return {};
+            std::unique_ptr<LocalFarmingService> result(new LocalFarmingService(std::move(samplers), deadline_ns, std::move(scopes)));
+            if (result->governor->memory_bytes() > grant - result->memory_bytes()) return {};
+            if (!result->sample() && !scoped) return {};
             result->thread_ = std::jthread([service = result.get()](std::stop_token stop)
             {
                 try

@@ -76,6 +76,17 @@ inline void write_group_compute_settings(std::ostream& out, GroupOptions const& 
     }
     out << "}}";
 }
+inline void restore_group_compute_request(GroupOptions& args)
+{
+    group_grow::profile_detail::profile_require(!args.compute_session && !args.compute_worker_reservation,
+        "cannot change compute settings in an active session");
+    if (!args.compute_requested) return;
+    static_cast<GroupComputeOptions&>(args) = *args.compute_requested;
+    group_grow::profile_detail::profile_require(args.compute_reserved_ram <= UINT64_MAX - args.max_ram, "compute RAM partition overflow");
+    args.max_ram += args.compute_reserved_ram; args.compute_reserved_ram = 0;
+    args.backend = args.compute_requested_backend; args.compute_requested.reset();
+    args.local_compute = false;
+}
 inline bool apply_group_compute_settings(GroupOptions& args, group_grow::profile_detail::Json const& document)
 {
     using namespace group_grow::profile_detail;
@@ -104,14 +115,7 @@ inline bool apply_group_compute_settings(GroupOptions& args, group_grow::profile
     for (auto const& [key, value] : args.compute_settings)
         profile_require(set_group_compute_setting(selected, key, value), "unknown explicit compute setting");
     if (selected.compute_settings == args.compute_settings) return false;
-    profile_require(!args.compute_session && !args.compute_worker_reservation, "cannot change compute settings in an active session");
-    if (args.compute_requested)
-    {
-        static_cast<GroupComputeOptions&>(args) = *args.compute_requested;
-        profile_require(args.compute_reserved_ram <= UINT64_MAX - args.max_ram, "compute RAM partition overflow");
-        args.max_ram += args.compute_reserved_ram; args.compute_reserved_ram = 0;
-        args.backend = args.compute_requested_backend; args.compute_requested.reset();
-    }
+    restore_group_compute_request(args);
     // Clear inherited fields suppressed by an explicit off selection too.
     static_cast<GroupComputeOptions&>(args) = static_cast<GroupComputeOptions const&>(selected);
     args.compute_settings.clear();

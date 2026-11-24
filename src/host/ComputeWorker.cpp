@@ -7,6 +7,7 @@
 #include "host/ComputeThreads.hpp"
 #include "host/CpuTables.hpp"
 #include "host/GroupFarmResources.hpp"
+#include "host/GroupFarmAdapters.hpp"
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
 #include "plot/Plotter.hpp"
 #include "gpu/SyclDeviceList.hpp"
@@ -182,6 +183,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 struct PackedRouteChanged : WorkerTaskDeclined {};
+struct FailedGpuGeneration : WorkerGenerationFailed
+{
+    std::string worker, instance;
+    FailedGpuGeneration(pool::Lease const& lease, std::string const& reason)
+        : WorkerGenerationFailed("compute worker " + lease.worker_identity + " instance " + lease.worker_instance + ": " + reason),
+          worker(lease.worker_identity), instance(lease.worker_instance) {}
+};
 // The signed shape was valid when issued. The same logical job can retry
 // this worker after its refreshed profile has reached the broker.
 struct GenerationCapacityChanged : pool::UnsupportedResources { using UnsupportedResources::UnsupportedResources; };
@@ -200,7 +208,8 @@ WorkerError error_kind(std::exception const& error)
     if (dynamic_cast<pool::StaleLease const*>(&error)) return WorkerError::Stale;
     return WorkerError::Permanent;
 }
-[[noreturn]] void throw_worker_error(std::span<uint8_t const> payload, std::string* diagnostic = nullptr)
+[[noreturn]] void throw_worker_error(std::span<uint8_t const> payload, std::string* diagnostic = nullptr,
+    pool::Lease const* gpu = nullptr, bool unstarted_output = false)
 {
     pool::Reader input(payload); auto code = WorkerError(input.u8()); auto message = input.string(); input.finish();
     if (diagnostic) *diagnostic = pool::worker_diagnostic(message);
@@ -208,6 +217,14 @@ WorkerError error_kind(std::exception const& error)
     if (code == WorkerError::Transport) throw pool::TransientTransport("compute worker: " + message);
     if (code == WorkerError::Stale) throw pool::StaleLease("compute worker: " + message);
     require(code == WorkerError::Permanent, "invalid compute worker error code");
+    // Released helpers report this GPU integrity guard through the permanent
+    // error frame. No candidate output from that attempt can be accepted.
+    if (gpu && message.starts_with("T1 match produced 0 entries "))
+    {
+        FailedGpuGeneration failure(*gpu, message);
+        if (unstarted_output) throw failure;
+        throw WorkerGenerationFailed(failure.what());
+    }
     throw std::runtime_error("compute worker: " + message);
 }
 
@@ -222,9 +239,10 @@ uint64_t broker_registration_bytes()
 }
 uint64_t service_overhead(WorkerConfig const& config, size_t brokers)
 {
+    auto const observations = config.local_harvester ? farm::FarmingLogSampler::memory_bound(1) : 0;
     return add(add(multiply(2 * config.capacity.slots + 2, pool::Channel::memory_bytes(config.tls.max_frame_bytes)),
         multiply(2 * config.capacity.slots, config.tls.max_frame_bytes)),
-        add(add(mib, multiply(brokers, broker_registration_bytes())), CodecScheduler::memory_bytes(config.capacity.cpu_threads)));
+        add(add(add(mib, observations), multiply(brokers, broker_registration_bytes())), CodecScheduler::memory_bytes(config.capacity.cpu_threads)));
 }
 std::chrono::milliseconds control_grace(pool::TlsOptions const& tls)
 { return std::chrono::milliseconds(std::min(100u, tls.timeout_ms)); }
@@ -252,6 +270,13 @@ uint64_t boundary_bytes(uint8_t k)
 // owner holds its charged output, but never holds a CPU permit while sending it.
 class ResourceSampler
 {
+    struct Harvester
+    {
+        farm::FarmingLogSampler log;
+        uint64_t deadline_ns;
+        FarmingServiceHistory history;
+    };
+    std::unique_ptr<Harvester> harvester_;
     farm::Profile profile_;
     farm::LocalPressureSampler sampler_;
     std::mutex mutex_;
@@ -268,6 +293,24 @@ public:
         auto memory = cpu; memory.id = "ram"; memory.kind = farm::ResourceKind::host_memory;
         memory.capacity = profile_detail::physical_memory(); memory.capacity_known = memory.capacity != 0;
         profile_.resources = {std::move(cpu), std::move(memory)};
+    }
+    void select_harvester(std::filesystem::path const& root, unsigned deadline_ms)
+    {
+        farm::HarvesterAdapterOptions options; options.root = profile_detail::chia_root(root);
+        farm::FarmingLogSampler log(options, true);
+        if (log.path().empty()) return;
+        auto const deadline = deadline_ms ? uint64_t(deadline_ms) * 1000000 : uint64_t(FarmingConfig{}.deadline_seconds * 1e9L);
+        harvester_ = std::make_unique<Harvester>(Harvester{std::move(log), deadline, {}});
+        (void)farming_pressure(); // Establish the live append cursor before offering work.
+    }
+    std::optional<bool> farming_pressure()
+    {
+        if (!harvester_) return {};
+        std::lock_guard lock(mutex_);
+        auto& reader = *harvester_; auto const now = Clock::now();
+        reader.log.sample(now, std::chrono::system_clock::now(),
+            [&](FarmingServiceRecord const& record) { reader.history.add(record, reader.deadline_ns); });
+        return reader.history.window(now).lookup_pressure;
     }
     pool::Resources sample(uint32_t active_cpu)
     {
@@ -990,6 +1033,7 @@ struct WorkerService::Impl
             [this] { return !config.available_resources && !config.cpu_scheduler && !config.admit_start && !config.host_reservation ?
                 resource_sampler.owned_host_bytes() : 0; });
         service_baseline = baseline;
+        if (config.local_harvester) resource_sampler.select_harvester(*config.local_harvester, config.farming_deadline_ms);
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (config.backend != "cpu")
         {
@@ -1073,13 +1117,19 @@ struct WorkerService::Impl
 
     struct AdmissionRefused : pool::TransientTransport
     { AdmissionRefused() : pool::TransientTransport("worker is not accepting new work") {} };
+    pool::WorkerAdmission effective_admission(std::optional<bool> farming_pressure) const
+    {
+        return admission == pool::WorkerAdmission::Accepting && farming_pressure.value_or(false) ?
+            pool::WorkerAdmission::Paused : admission;
+    }
     class Acceptance
     {
     public:
         explicit Acceptance(Impl& owner) : owner_(owner)
         {
+            auto const pressure = owner_.resource_sampler.farming_pressure();
             std::lock_guard lock(owner_.admission_mutex);
-            if (owner_.admission != pool::WorkerAdmission::Accepting || owner_.stopping.load())
+            if (owner_.effective_admission(pressure) != pool::WorkerAdmission::Accepting || owner_.stopping.load())
                 throw AdmissionRefused();
             ++owner_.accepted_tasks;
         }
@@ -1116,7 +1166,8 @@ struct WorkerService::Impl
         auto const memory = budget->active(); auto const cpu = offered_cpu.active();
         value.active = {cpu.first, memory.second, memory.first, gpu_active.load()};
         value.waiting_cpu = cpu.second; value.baseline_host_bytes = budget->baseline();
-        { std::lock_guard lock(admission_mutex); value.admission = admission; value.accepted_tasks = accepted_tasks; }
+        value.farming_pressure = resource_sampler.farming_pressure();
+        { std::lock_guard lock(admission_mutex); value.admission = effective_admission(value.farming_pressure); value.accepted_tasks = accepted_tasks; }
         { std::lock_guard lock(brokers_mutex); value.known_brokers = brokers.size(); value.deferred_brokers = deferred_brokers;
           for (auto const& broker : brokers) value.healthy_brokers += broker->healthy; }
         value.broker_limit = config.max_brokers; value.broker_transport_bytes = broker_transport_bytes;
@@ -1244,8 +1295,9 @@ struct WorkerService::Impl
             if (control.begin(lease, owner, &awaiting_admission)) return;
             if (!awaiting_admission) throw pool::StaleLease("worker rejected stale lease");
             {
+                auto const pressure = resource_sampler.farming_pressure();
                 std::lock_guard lock(admission_mutex);
-                if (admission != pool::WorkerAdmission::Accepting)
+                if (effective_admission(pressure) != pool::WorkerAdmission::Accepting)
                     throw AdmissionRefused();
             }
             // A delayed pause can reach the broker after local resume. Let
@@ -2260,8 +2312,11 @@ struct WorkerService::Impl
                 {
                     affinity.emplace();
                     if (!pos2gpu::pin_thread_to_cpus(config.cpu_affinity))
+                    {
+                        if (config.require_cpu_affinity) throw WorkerAdmissionRejected("cannot bind the reviewed worker to the selected CPU nodes");
                         std::fprintf(stderr, "Compute CPU worker could not pin to CPUs %s; running unpinned\n",
                             pos2gpu::format_cpu_list(config.cpu_affinity).c_str());
+                    }
                 }
                 owned.reserve(ids.size());
                 for (auto const& id : ids)
@@ -2697,7 +2752,8 @@ struct WorkerService::Impl
             if (profile.tier == "pool") value.independent_k_mask |= 1u << k;
 #endif
         if (gpu_enabled) value.capabilities |= pool::capability(pool::Kind::GenerateGpu);
-        { std::lock_guard lock(admission_mutex); value.admission = admission; }
+        auto const pressure = resource_sampler.farming_pressure();
+        { std::lock_guard lock(admission_mutex); value.admission = effective_admission(pressure); }
         value.min_k = 18; value.max_k = 28; value.hardware = hardware(); return value;
     }
     void start()
@@ -4272,7 +4328,8 @@ struct WorkerClient::Impl
         };
     }
     void generate_private(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
-        WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink, WorkerCancellation cancel)
+        WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink, WorkerCancellation cancel,
+        std::unique_ptr<WorkerLocalGrant> grant = {})
     {
         auto const begin = Clock::now(); auto selected_at = begin, first_output = Clock::time_point{};
         WorkerTaskObservation value; value.local_direct = true;
@@ -4289,8 +4346,8 @@ struct WorkerClient::Impl
         auto output = [&] { if (first_output == Clock::time_point{}) first_output = Clock::now(); };
         try
         {
-            auto grant = config.acquire_private_generation ? config.acquire_private_generation(k, strength, unsigned(ids.size()),
-                packed_sink ? GenerationOutput::Packed : GenerationOutput::Contributions, cancel) : nullptr;
+            if (!grant && config.acquire_private_generation) grant = config.acquire_private_generation(k, strength, unsigned(ids.size()),
+                packed_sink ? GenerationOutput::Packed : GenerationOutput::Contributions, cancel, true);
             auto local = config.acquire_private_generation ? nullptr : local_service();
             auto* service = grant ? grant->service : local.get();
             require(service, "local-only compute executor is unavailable");
@@ -4405,7 +4462,8 @@ struct WorkerClient::Impl
         {
             if (frame.type == pool::Message::Error)
             {
-                try { throw_worker_error(frame.payload, impl.config.generation_failed || phase_timing() ? &worker_error : nullptr); }
+                try { throw_worker_error(frame.payload, impl.config.generation_failed || phase_timing() ? &worker_error : nullptr,
+                    lease.task.kind == pool::Kind::GenerateGpu ? &lease : nullptr, first_output == Clock::time_point{}); }
                 catch (pool::TransientTransport const&)
                 {
                     // An authenticated temporary refusal (for example, a full
@@ -4458,7 +4516,9 @@ struct WorkerClient::Impl
     std::unique_ptr<Connection> connect(pool::Kind kind, uint8_t k, uint8_t strength, uint64_t work_units,
                                       uint64_t host_bytes, Operation operation, WorkerTaskIdentity identity,
                                       WorkerCancellation cancel, WorkerTaskOptions const& options = {},
-                                      uint32_t chunk_count = 0, uint64_t max_output_bytes = 0, bool independent = false)
+                                      uint32_t chunk_count = 0, uint64_t max_output_bytes = 0, bool independent = false,
+                                      std::unique_ptr<WorkerLocalGrant>* private_grant = nullptr,
+                                      FailedGpuGeneration const* failed_gpu = nullptr)
     {
         auto const begin = Clock::now();
         auto control = broker.with_deadline(cancel.deadline);
@@ -4499,9 +4559,36 @@ struct WorkerClient::Impl
             {
                 // The publication was priced on an immediately available lane.
                 if (options.publication) { declined = true; throw WorkerPublicationChanged(); }
+                if (options.immediate_fresh && !failed_gpu) { declined = true; throw WorkerTaskDeclined(); }
+                if (private_grant)
+                {
+                    // No worker owns this queued broker request. Withdraw it
+                    // before passing the same plot identities to a private lane.
+                    *private_grant = config.acquire_private_generation(k, strength, unsigned(work_units),
+                        task.generation_output, cancel, false);
+                    if (*private_grant)
+                    {
+                        try { cleanup_control().cancel(session, task.task_id, task.attempt); }
+                        catch (pool::TransientTransport const&) {} // Unstarted grants expire at the broker.
+                        return {};
+                    }
+                }
+                if (failed_gpu) throw WorkerGenerationFailed(failed_gpu->what());
                 if (operation != Operation::Encode && Clock::now() >= next_hint)
                 {
                     auto const current = capacity(k, strength, cancel.deadline);
+                    if (config.acquire_private_generation && !current.slots)
+                    {
+                        if (operation == Operation::Fresh) { declined = true; throw WorkerTaskDeclined(); }
+                        if (options.packed_route) { declined = true; throw PackedRouteChanged(); }
+                        if (independent) throw pool::UnsupportedResources("no pooled GPU is available for independent contributions");
+                        if (private_grant && work_units > 1 && config.private_generation_capacity)
+                        {
+                            auto const local = config.private_generation_capacity(k, strength);
+                            if (local.slots && local.batch < work_units)
+                                throw pool::UnsupportedResources("only a smaller batch fits the remaining local devices");
+                        }
+                    }
                     if (work_units > 1 && (current.slots || !current.control_ns))
                     {
                         pool::BrokerClient::GenerationAvailability availability;
@@ -4570,6 +4657,8 @@ struct WorkerClient::Impl
                 cancel.check();
             }
             if (config.selected) config.selected(connection->observation());
+            if (failed_gpu && lease->worker_identity == failed_gpu->worker && lease->worker_instance == failed_gpu->instance)
+                throw WorkerGenerationFailed(failed_gpu->what());
             if (options.publication && (!options.publication->matches(*lease) || connection->local_direct)) throw WorkerPublicationChanged();
             if (options.packed_route && !options.packed_route->matches(*lease)) throw PackedRouteChanged();
             if (options.selected && !options.selected(connection->observation())) throw WorkerTaskDeclined();
@@ -4606,7 +4695,7 @@ struct WorkerClient::Impl
                   WorkerPackedSink const& packed_sink, WorkerContributionSink const& contribution_sink,
                   WorkerCancellation cancel, WorkerTaskIdentity identity,
                   WorkerContributionWindowSink const& contribution_window, WorkerFreshManifest const& manifest, bool independent,
-                  WorkerTaskOptions const& options)
+                  WorkerTaskOptions const& options, FailedGpuGeneration const* failed_gpu)
     {
         cancel = cancellation(cancel); auto const count_bound = fragment_count_bound(k, strength);
         require(!ids.empty() && ids.size() <= pool::max_generation_batch_members &&
@@ -4616,8 +4705,26 @@ struct WorkerClient::Impl
         uint64_t const expected_chunks = chunks_per_group * (independent ? ids.size() : 1);
         uint64_t const host = worker_cpu_task_bytes(k, strength, members_per_chunk, config.max_task_bytes, config.generation_threads);
         auto const operation = packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions;
-        auto connection = connect(independent ? pool::Kind::GenerateGpu : config.generation_kind, k, strength, ids.size(), host,
-            operation, identity, cancel, options, 0, 0, independent);
+        bool const may_use_private = config.acquire_private_generation && !manifest && !independent && !options.packed_route && !options.publication;
+        std::unique_ptr<WorkerLocalGrant> private_grant;
+        std::unique_ptr<Connection> connection;
+        try
+        {
+            connection = connect(independent ? pool::Kind::GenerateGpu : config.generation_kind, k, strength, ids.size(), host,
+                operation, identity, cancel, options, 0, 0, independent, may_use_private ? &private_grant : nullptr, failed_gpu);
+        }
+        catch (pool::TransientTransport const&)
+        {
+            // No Work frame or output has crossed the data connection yet.
+            if (!may_use_private) throw;
+            private_grant = config.acquire_private_generation(k, strength, unsigned(ids.size()), generation_output(operation), cancel, false);
+            if (!private_grant) throw;
+        }
+        if (private_grant)
+        {
+            generate_private(k, strength, ids, packed_sink, contribution_sink, cancel, std::move(private_grant));
+            return false;
+        }
         uint64_t next_chunk = 0;
         bool received_manifest = false;
         auto check_contribution = [&](uint64_t ordinal, uint16_t members, std::span<uint8_t const> bytes)
@@ -4880,9 +4987,18 @@ struct WorkerClient::Impl
         if (config.local_only && manifest) throw WorkerTaskDeclined();
         if (config.local_only) { generate_private(k, strength, ids, packed_sink, contribution_sink, cancel); return false; }
         if (identity.task_id.empty()) identity.task_id = pool::random_token();
+        std::optional<FailedGpuGeneration> failed_gpu;
         for (unsigned failed = 0;; ++failed)
         {
-            try { return generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window, manifest, independent, options); }
+            try { return generate_once(k, strength, ids, packed_sink, contribution_sink, cancel, identity, contribution_window,
+                manifest, independent, options, failed_gpu ? &*failed_gpu : nullptr); }
+            catch (FailedGpuGeneration const& error)
+            {
+                // Abandon fences this instance for the same job and attempt
+                // sequence. Take one immediately available alternative.
+                if (failed_gpu) throw;
+                failed_gpu = error; cancel.check();
+            }
             catch (pool::UnsupportedResources const&)
             {
                 // A refused batch may need a different shape. Its owner must
@@ -4992,8 +5108,8 @@ WorkerClient::WorkerClient(WorkerClientConfig config) : impl_(std::make_unique<I
 WorkerClient::~WorkerClient() = default;
 bool WorkerClient::local_available() const
 {
-    if (impl_->config.local_only) return impl_->config.local_service || impl_->config.local_service_provider ||
-        impl_->config.acquire_private_generation;
+    if (impl_->config.acquire_private_generation) return true;
+    if (impl_->config.local_only) return impl_->config.local_service || impl_->config.local_service_provider;
     return bool(impl_->local_service());
 }
 bool WorkerClient::generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& id,
@@ -5055,7 +5171,7 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
 void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> ids,
     WorkerContributionSink const& sink, WorkerCancellation cancel, WorkerTaskIdentity identity,
     WorkerContributionWindowSink const& window, WorkerFreshManifest const& manifest, bool independent, bool coalesce_singletons,
-    Clock::time_point other_work_until, bool fresh_read_ahead)
+    Clock::time_point other_work_until, bool fresh_read_ahead, bool immediate_fresh)
 {
     if (independent)
     {
@@ -5073,6 +5189,7 @@ void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::arr
         }
     }
     WorkerTaskOptions options; options.other_work_until = other_work_until; options.fresh_read_ahead = fresh_read_ahead;
+    options.immediate_fresh = manifest && immediate_fresh;
     if (manifest) options.publication = impl_->publication_for(ids, true);
     if (manifest && ids.size() > 1)
         options.selected = [&](auto const& assigned)
@@ -5257,10 +5374,16 @@ std::shared_ptr<WorkerPublication> WorkerClient::publication_route(uint8_t k, ui
     }
     catch (...) { return {}; } // No optional observation can delay a real lease past its normal deadline.
 }
-WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength) const
+WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength, bool include_private) const
 {
-    if (impl_->config.private_generation_capacity) return impl_->config.private_generation_capacity(k, strength);
-    return impl_->capacity(k, strength);
+    auto result = impl_->capacity(k, strength);
+    if (include_private && impl_->config.private_generation_capacity)
+    {
+        auto const local = impl_->config.private_generation_capacity(k, strength);
+        result.batch = std::max(result.batch, local.batch);
+        result.slots += local.slots;
+    }
+    return result;
 }
 WorkerGenerationCapacity WorkerClient::Impl::capacity(uint8_t k, uint8_t strength, Clock::time_point deadline,
                                                       pool::Lease const* assigned)

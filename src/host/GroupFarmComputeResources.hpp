@@ -65,7 +65,9 @@ inline ResourcePreparation prepare_compute_resources(Profile& profile, pos2gpu::
             [&](auto const& saved) { return saved.tls_identity == worker.identity; });
         if (found != profile.native.compute_workers.end())
         {
-            if (found->host != worker.host || worker.cpus > found->cpu_threads || worker.slots > found->slots ||
+            if (found->host != worker.host || (worker.gpu_bytes && (worker.gpu_identity.empty() ||
+                found->gpu_identity != "host:" + worker.host + '/' + worker.gpu_identity)) ||
+                worker.cpus > found->cpu_threads || worker.slots > found->slots ||
                 worker.host_bytes > found->host_bytes || worker.gpu_bytes > found->gpu_bytes || worker.standing_host_bytes > found->standing_host_bytes)
                 preparation.missing.push_back({"compute", path, "The current worker binding or partition exceeds the saved scope; refresh its resource profile before using it."});
             continue;
@@ -147,8 +149,12 @@ inline void require_compute_task(Profile const& profile, WorkerTaskAdmission con
         task.resources.host_bytes <= worker.host_bytes - status.baseline_host_bytes && task.resources.gpu_bytes <= worker.gpu_bytes,
         "compute task grant exceeds its reviewed executor capacity");
     auto const& configured = status.hardware.partition;
-    if (configured.cpu_threads)
-        reject(task.resources.cpu_threads <= configured.cpu_threads && task.resources.slots <= configured.slots &&
+    reject(status.hardware.host == worker.host && configured.cpu_threads && configured.cpu_threads <= worker.cpu_threads &&
+            configured.slots && configured.slots <= worker.slots && configured.host_bytes <= worker.host_bytes &&
+            configured.gpu_bytes <= worker.gpu_bytes && (!configured.gpu_bytes || (!status.hardware.gpu_identity.empty() &&
+                worker.gpu_identity == "host:" + worker.host + '/' + status.hardware.gpu_identity)),
+        "compute executor physical host, GPU or configured partition differs from its reviewed whole-service reservation");
+    reject(task.resources.cpu_threads <= configured.cpu_threads && task.resources.slots <= configured.slots &&
             configured.host_bytes > status.baseline_host_bytes && task.resources.host_bytes <= configured.host_bytes - status.baseline_host_bytes &&
             task.resources.gpu_bytes <= configured.gpu_bytes, "compute task grant exceeds its authenticated configured executor capacity");
     if (task.kind == pool::Kind::Pack)

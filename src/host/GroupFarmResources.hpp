@@ -147,6 +147,7 @@ struct NativeRequest
     uint64_t compute_offer_ram_bytes = 0, compute_offer_cpu_threads = 0, compute_offer_gpu_bytes = 0;
     std::string compute_offer_backend;
     std::string compute_offer_identity;
+    std::string compute_offer_gpu_identity;
     bool compute_offer_owned = false;
     std::shared_ptr<group_grow::WorkerIdentityReservation> compute_worker_reservation;
     std::vector<std::string> output_resources, scratch_resources, source_resources;

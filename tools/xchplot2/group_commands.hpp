@@ -10,7 +10,7 @@ inline bool is_group_command(std::string_view command)
 }
 inline unsigned group_option_values(std::string_view option)
 {
-    if (option == "--relocate") return 2;
+    if (option == "--relocate" || option == "--harvester-log") return 2;
     if (option == "--" || !option.starts_with('-') || option == "--resume" || option == "-r" ||
         option == "--no-resume" || option == "--plan-only" || option == "--no-plan-only" ||
         option == "--metadata-only" || option == "--no-metadata-only" ||

@@ -1253,6 +1253,73 @@ void farming_log(fs::path const& directory)
         incident.max_ns == 8820000000 && !local->governor->limits_io(steady_clock::now() + seconds(31)),
         "ordinary eligible deadline miss did not back off the I/O governor or stale pressure persisted");
     local.reset();
+    StorageDevice shared{"shared", {"disk-a"}}, alias{"alias", {"disk-a"}}, unrelated{"other", {"disk-b"}}, unknown;
+    auto forwarded = LocalFarmingService::start({}, 8000000000, grant + 65536, {{log, {shared}}});
+    require(forwarded && forwarded->governor->scoped() && !forwarded->governor->limits_io(),
+        "forwarded log replayed a record from before subscription");
+    write(record("8.00000", wall - minutes(2)) + quick);
+    wait_for([&] { return forwarded->governor->farming_service().completions == 1; });
+    require(!forwarded->governor->farming_service().lookup_pressure && !forwarded->governor->limits_io(),
+        "stale or fast zero-eligible shared lookups became live pressure");
+    write(record("4.50000") + record("0.02000"));
+    wait_for([&] { return forwarded->governor->limits_io(); });
+    auto const& io = *forwarded->governor;
+    require(io.farming_service().lookup_pressure == true && io.pressured(&alias) && !io.pressured() && !io.pressured(&unrelated) &&
+        io.covers(StorageDevice{shared.filesystem, {}}) && !io.covers(unknown),
+        "forwarded tail pressure spread beyond its associated hardware");
+    constexpr size_t transfer = 8 * 1024 * 1024;
+    auto permit = forwarded->governor->acquire(shared, transfer);
+    auto independent = forwarded->governor->try_acquire(unrelated, transfer);
+    require(permit.bytes() < transfer && independent && independent->bytes() == transfer &&
+        !forwarded->governor->try_acquire(alias, transfer), "forwarded pressure blocked unrelated I/O or missed a physical alias");
+    permit.complete(0, 0);
+    require(!io.farming_service(steady_clock::now() + seconds(31)).lookup_pressure &&
+        !io.limits_io(steady_clock::now() + seconds(31)), "stale forwarded lookups continued limiting I/O");
+    forwarded.reset();
+    auto const second = directory / "logs/other.log", missing = directory / "logs/absent.log";
+    { std::ofstream out(second); out << record("9.00000"); }
+    StorageDevice other_shared{"remote", {}}, other_alias{other_shared.filesystem, {}}, unbound{"quiet", {}};
+    auto multi = LocalFarmingService::start({}, 8000000000, grant + 2 * 1024 * 1024,
+        {{log, {shared}}, {second, {other_shared}}, {missing, {unbound}}});
+    require(multi && multi->governor->farming_sources() == 3 && !multi->governor->limits_io(),
+        "multiple forwarded files replayed old completions");
+    auto& scoped = *multi->governor;
+    write(record("5.00000"));
+    wait_for([&] { return scoped.pressured(&shared); });
+    require(!scoped.pressured(&other_shared) && !scoped.pressured(&unbound) &&
+        !scoped.farming_service(steady_clock::now(), 2).log_observed, "missing or quiet reader inherited pressure");
+    { std::ofstream out(second, std::ios::app); out << record("4.50000") << record("0.02000"); }
+    wait_for([&] { return scoped.pressured(&other_alias); });
+    auto first_io = scoped.try_acquire(shared, transfer), second_io = scoped.try_acquire(other_shared, transfer);
+    require(first_io && second_io && first_io->bytes() < transfer && second_io->bytes() < transfer &&
+        !scoped.try_acquire(alias, transfer) && !scoped.try_acquire(other_alias, transfer) &&
+        scoped.try_acquire(unbound, transfer)->bytes() == transfer, "different readers shared a limit or aliases bypassed one");
+    first_io->complete(0, 0); second_io->complete(0, 0);
+    std::string timely;
+    for (unsigned i = 0; i < 25; ++i) timely += record("0.02000");
+    write(timely);
+    wait_for([&] { return !scoped.pressured(&shared); });
+    require(scoped.farming_service().lookup_pressure == false && scoped.pressured(&other_shared) &&
+        scoped.try_acquire(alias, transfer)->bytes() == transfer && !scoped.pressured(),
+        "one reader's recovery changed a separate reader's active hardware limit");
+    multi.reset();
+    // Mix an installed local reader with another host. Only configured local
+    // storage and the explicitly bound remote storage have lookup evidence.
+    auto mixed_settings = settings;
+    mixed_settings.replace(mixed_settings.find("plot_directories: []"), std::string("plot_directories: []").size(),
+        "plot_directories:\n    - " + file_io::path_text(directory));
+    { std::ofstream out(config); out << mixed_settings; }
+    auto const local_storage = storage_device(directory);
+    std::array<StorageDevice, 2> targets{local_storage, other_shared};
+    auto mixed = LocalFarmingService::start(directory, 8000000000, grant + 1024 * 1024, {{second, {other_shared}}}, targets);
+    require(mixed && mixed->governor->farming_sources() == 2 && !mixed->governor->limits_io(), "mixed monitor failed to bind both readers");
+    write(record("5.00000"));
+    StorageDevice const local_mount{local_storage.filesystem, {}};
+    wait_for([&] { return mixed->governor->pressured(&local_mount); });
+    require(!mixed->governor->pressured(&other_shared) && !mixed->governor->pressured(&unbound),
+        "an installed local reader spilled pressure into a remote destination");
+    mixed.reset();
+    { std::ofstream out(config); out << settings; }
     require(!sampler.sample(begin, wall), "historical farming log was accepted as a current observation");
     write(record("0.25000", wall));
     require(sampler.sample(begin + seconds(1), wall) == 250000000, "fresh completed farming lookup time was not observed");

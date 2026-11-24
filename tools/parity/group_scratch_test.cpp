@@ -819,6 +819,45 @@ void disk_feedback(fs::path const& directory)
     require(live->routing_cost(a) < live->routing_cost(b), "a slow/contended physical drive was permanently starved");
     pool.cancel(0);
 
+    ra.device.rotating = rb.device.rotating = true;
+    std::vector<DiskIoGovernor::FarmingScope> scopes{{"first.log", {ra.device}}, {"other.log", {ra.device}}};
+    std::map<std::string, DiskIoGovernor::Counters> physical;
+    std::map<std::string, unsigned> reads;
+    auto scoped = std::make_shared<DiskIoGovernor>([&](std::string const& name)
+        { ++reads[name]; return std::optional{physical[name]}; }, 32, DiskIoGovernor::Mode::observed_farm, scopes);
+    auto const sampled = Clock::now();
+    FarmingServiceRecord late{sampled, 500000000, 1, 20, true};
+    scoped->record_farming_service(late, 1000000000, 0);
+    scoped->refresh_farming_sources(sampled);
+    ScratchPool choices({ra, rb}, 0); choices.set_io_governor(scoped);
+    require(choices.try_reserve_output(0, root(directory / "c", "target", {"target"}), unit), "scoped scratch output admission failed");
+    choices.seal_recovery();
+    scoped->poll(sampled);
+    for (size_t width : {1u, 2u})
+    {
+        auto chosen = choices.grant(0, 20 * unit, 20 * unit, unit, 2, false, 0, 0, width, 1, {}, true);
+        require(chosen && quota(*chosen) == 20 * unit && chosen->scratch.size() == 1 &&
+            chosen->scratch.front().directory == rb.directory, "new scratch did not prefer an equally eligible unpressured HDD");
+    }
+    // Both reader mappings share one physical sample. The unthrottled native
+    // write still contributes its submitted bytes exactly once.
+    constexpr uint64_t bulk = 16 * 1024 * 1024;
+    auto native = scoped->try_acquire(rb.device, bulk, sampled + milliseconds(100));
+    require(native && native->bytes() == bulk, "an unrelated HDD inherited another reader's transfer limit");
+    native->complete(bulk, 1000, sampled + milliseconds(100), DiskIoGovernor::Transfer::write);
+    physical["disk-b"].write_sectors += 2 * bulk / 512; physical["disk-b"].busy_ms = 1000;
+    scoped->poll(sampled + seconds(1));
+    auto const observed = scoped->observed_bulk_bandwidth("disk-b", sampled + seconds(1));
+    require(reads["disk-a"] == 2 && reads["disk-b"] == 2 && observed && observed->first > 0 &&
+        std::abs(observed->second / observed->first - .5L) < 1e-6L,
+        "multiple readers sampled a physical disk twice or lost an unrelated native transfer");
+    auto timely = late; timely.response_ns = 1000;
+    for (unsigned i = 0; i < 25; ++i) scoped->record_farming_service(timely, 1000000000, 0);
+    scoped->refresh_farming_sources(Clock::now());
+    auto recovered = choices.grant(0, 20 * unit, 20 * unit, unit, 2);
+    require(recovered && recovered->scratch.front().directory == ra.directory, "scratch ordering did not recover after timely lookups");
+    choices.cancel(0);
+
     DiskIoGovernor cancellable;
     auto held = cancellable.acquire(a, unit);
     std::atomic<bool> cancel{false}; std::promise<void> waiting; bool signalled = false;

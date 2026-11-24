@@ -61,6 +61,8 @@ void command_help_all(std::string_view command)
     if (command == "plan") std::cout <<
         "  --alternative NAMES      review assessed resource changes, or capacity alone\n"
         "  --upgrade-job            review additional space for a stopped job's recovery records\n";
+    if (command == "fill" || command == "plan") std::cout <<
+        "  --harvester-log DIR FILE  bind a forwarded harvester log to a destination (repeatable)\n";
     if (command != "grow") std::cout <<
         "  --paths-from FILE        literal destination paths, one per line; - reads stdin\n"
         "  --paths0-from FILE       NUL-delimited destination paths; - reads stdin\n"

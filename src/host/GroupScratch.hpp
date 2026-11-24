@@ -80,6 +80,13 @@ public:
         }
     }
     std::shared_ptr<DiskIoGovernor> bandwidth_feedback() const { return bandwidth_; }
+    uint64_t storage_snapshot_bytes() const
+    {
+        std::lock_guard lock(mutex_);
+        uint64_t bytes = 0;
+        for (auto const& root : roots_) bytes = grow_add(bytes, group_grow::storage_snapshot_bytes(root.value.device));
+        return bytes;
+    }
     void bind_runtime(ExternalConfig& external) const
     { external.io_governor = io_governor_; external.bandwidth = bandwidth_; }
     bool offers_scratch(std::string const& filesystem) const
@@ -292,13 +299,18 @@ public:
             // Keep SSD positions and their established backlog ranking. HDD
             // capacity still comes from this ledger; live feedback orders only
             // otherwise eligible physical roots, including periodic probes.
-            std::vector<size_t> rotating;
-            for (auto index : order) if (!roots_[index].value.device.nonrotating) rotating.push_back(index);
-            std::vector<long double> costs(roots_.size());
-            for (auto index : rotating) costs[index] = io_governor_->routing_cost(roots_[index].value.device);
+            std::vector<size_t> rotating, positions;
+            std::vector<std::pair<bool, long double>> costs(roots_.size());
+            for (size_t i = 0; i < order.size(); ++i)
+            {
+                auto const index = order[i]; auto const& device = roots_[index].value.device;
+                if (device.nonrotating) continue;
+                bool const pressured = io_governor_->scoped() && io_governor_->pressured(&device);
+                costs[index] = {pressured, !io_governor_->scoped() || pressured ? io_governor_->routing_cost(device) : 0.L};
+                positions.push_back(i); rotating.push_back(index);
+            }
             std::stable_sort(rotating.begin(), rotating.end(), [&](size_t a, size_t b) { return costs[a] < costs[b]; });
-            size_t next = 0;
-            for (auto& index : order) if (!roots_[index].value.device.nonrotating) index = rotating[next++];
+            for (size_t i = 0; i < positions.size(); ++i) order[positions[i]] = rotating[i];
         }
         if (spare_spindle)
         {
@@ -561,7 +573,7 @@ private:
     std::vector<std::pair<size_t, uint64_t>> rotating_shares(uint64_t owner, StorageDevice const& destination,
         std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots, long double successor_rate) const
     {
-        struct Candidate { size_t root; uint64_t room; long double rate; };
+        struct Candidate { size_t root; uint64_t room; long double rate; bool lookup_pressure; };
         std::vector<Candidate> disks;
         size_t waiting = 1;
         std::vector<size_t> outputs;
@@ -592,7 +604,8 @@ private:
                 { return overlap(root.value.device, roots_[output].value.device); }) ||
                 std::any_of(disks.begin(), disks.end(), [&](Candidate const& other)
                 { return roots_[other.root].filesystem == root.filesystem || overlap(roots_[other.root].value.device, root.value.device); })) continue;
-            disks.push_back({i, grant_room(i), bandwidth_ ? bandwidth_->bandwidth(root.value.device) : 0});
+            disks.push_back({i, grant_room(i), bandwidth_ ? bandwidth_->bandwidth(root.value.device) : 0,
+                io_governor_ && io_governor_->scoped() && io_governor_->pressured(&root.value.device)});
         }
         // The output already has sequential writes of its own. Use it for
         // scratch only when the dedicated disks cannot supply the grant.
@@ -601,6 +614,9 @@ private:
             dedicated += std::min(desired - dedicated, disk.room);
         if (dedicated >= desired) std::erase_if(disks, [&](Candidate const& disk)
             { return overlap(destination, roots_[disk.root].value.device); });
+        uint64_t timely_room = 0;
+        for (auto const& disk : disks) if (!disk.lookup_pressure) timely_room += std::min(desired - timely_room, disk.room);
+        if (timely_room == desired) std::erase_if(disks, [](auto const& disk) { return disk.lookup_pressure; });
         // Give unmeasured roots an equal first trial. A slow/busy root
         // with a measured rate gets correspondingly less work.
         long double total_rate = 0; size_t measured = 0;

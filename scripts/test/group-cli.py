@@ -177,6 +177,17 @@ def replot_rpc_fixture(args):
     print(json.dumps({"success": True, **result}))
 
 
+def available_cpu_node(devices):
+    nodes = re.findall(r"\[(cpu\d+)\]", devices)
+    if len(nodes) > 1 and hasattr(os, "sched_getaffinity"):
+        cpu = min(os.sched_getaffinity(0))
+        for node in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"):
+            selector = "cpu" + node.name[4:]
+            if selector in nodes:
+                return selector
+    return nodes[0]
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -1090,7 +1101,9 @@ def check_farm_updates(run, command, verify, root):
     assert not list(progressing.glob("*.gplot"))
     assert header(active)[3] < 3
     progress_review = root / "progress-tolerant.plan"
-    run("plan", progressing, "--save-plan", progress_review, "--json")
+    private_forecast = json.loads(run("plan", progressing, "--save-plan", progress_review, "--json").stdout)["completion_forecast"]
+    assert private_forecast["remaining_members"] == 3
+    assert 0 < header(active)[3] <= private_forecast["committed_remaining_members"] <= 3
     assert progress_review.read_text(encoding="utf-8").startswith("ordinary-group-farming-preview-v2\n")
     run("fill", "-r", progressing, *runtime, "--quiet")
     active = active.with_suffix("")
@@ -1198,14 +1211,18 @@ def check_farm_returning_drives(run, command, verify, root):
         first, second, offline = (directory / name for name in ("a", "b", "a-offline"))
         first.mkdir()
         second.mkdir()
+        logs = ["--harvester-log", first, directory / "first reader.log",
+                "--harvester-log", second, directory / "second reader.log"]
+        placeholder = dynamic or os.name == "nt"
         create = ["fill", first, second, "-f", FARMER, "--pool-ph", POOL, "--seed", SEED,
                   "-k", 18, "--group-members", 4, "--max-groups", 2, "--max-total-members", 8,
-                  "--farming-max-eligible-groups", 8, "--capacity-bytes", "64M", "--leave-free", 0, *runtime]
+                  "--farming-max-eligible-groups", 8, "--capacity-bytes", "64M", "--leave-free", 0, *runtime, *logs]
         if not dynamic:
             run(*create, point="initialized", code=86)
             first.rename(offline)
-            first.mkdir()
-            create = ["fill", second, *runtime]
+            if placeholder:
+                first.mkdir()
+            create = ["fill", second, *runtime, *logs]
         log = directory / "coordinator.log"
         with log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(command(*create), stdout=output, stderr=subprocess.STDOUT)
@@ -1239,9 +1256,13 @@ def check_farm_returning_drives(run, command, verify, root):
                 assert process.poll() is None, log.read_text(encoding="utf-8")
                 assert private_record(offline, "grow-farm.plan").read_bytes() == old_plan
                 assert private_record(second, "grow-farm.plan").read_bytes() == old_plan, "offline progress rewrote the global policy"
-                assert not list(first.iterdir()), "replacement mountpoint was modified"
+                if placeholder:
+                    assert not list(first.iterdir()), "replacement mountpoint was modified"
+                else:
+                    assert not first.exists(), "missing mountpoint was recreated"
                 assert [header(path)[3] for path in sorted(second.glob("*.gplot"))] == [4, 4]
-                first.rmdir()
+                if placeholder:
+                    first.rmdir()
                 offline.rename(first)
                 assert process.wait(timeout=180) == 0, log.read_text(encoding="utf-8")
             finally:
@@ -1309,9 +1330,11 @@ def check(binary, root, reference=None):
     def command(*args):
         return [str(binary), str(args[0]), "--config", os.devnull, *map(str, args[1:])]
 
-    def run(*args, code=0, point=None, input=None, cwd=None, timeout=180):
+    def run(*args, code=0, point=None, input=None, cwd=None, timeout=180, environment=None):
         nonlocal counter
         env = dict(os.environ)
+        if environment:
+            env.update(environment)
         env.pop("XCHPLOT2_GROW_FAILPOINT", None)
         if point:
             env["XCHPLOT2_GROW_FAILPOINT"] = point
@@ -1332,6 +1355,32 @@ def check(binary, root, reference=None):
     construction = ["-d", "cpu", "-M", "512M", "-j", 2,
                     "--window-bytes", "64K", "--checkpoint-bytes", "64K",
                     "--capacity-bytes", "64M", "--headroom-bytes", 0]
+    forecast_cache = root / "forecast cache"
+    forecast_env = {("LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME"): str(forecast_cache)}
+    forecast_args = ["--compute", "off", *construction, "-k", 18, "--group-members", 1, "--json"]
+    def forecast_rows(*args):
+        return [json.loads(line) for line in run(*args, environment=forecast_env).stdout.splitlines() if line.startswith("{")]
+    for attempt in range(3):
+        directory = root / f"forecast {attempt}"
+        directory.mkdir()
+        limits = ["--max-groups", 2, "--max-total-members", 2]
+        preview = forecast_rows("plan", directory, *forecast_args, *limits)[0]["completion_forecast"]
+        assert forecast_rows("fill", "--plan-only", directory, *forecast_args, *limits)[0]["completion_forecast"] == preview
+        assert preview["remaining_members"] == preview["remaining_member_limit"] == 2
+        if attempt == 0:
+            assert preview["seconds"] is None and not forecast_cache.exists()
+        else:
+            assert preview["source"] == "previous-fills" and preview["seconds_per_durable_member"] > 0
+            assert preview["construction_history"]["auto"]["samples"] == attempt
+        if attempt == 2:
+            assert 0 < preview["seconds_low"] <= preview["seconds"] <= preview["seconds_high"]
+            longer = forecast_rows("plan", directory, *forecast_args, "--max-groups", 4, "--max-total-members", 4)
+            assert longer[0]["completion_forecast"]["source"] == "previous-fills-scaled-by-member-count"
+            break
+        finished = forecast_rows("fill", directory, *keys, *forecast_args, *limits)[-1]
+        assert finished["new_durable_members"] == 2 and finished["completion_forecast"]["seconds"] == 0
+        resumed = forecast_rows("fill", "--resume", directory, *forecast_args)[-1]
+        assert resumed["new_durable_members"] == 0 and resumed["inherited_members"] == 2
     for subcommand in [("plan",), ("plot",), ("fill",), ("status",), ("pause",), ("drain",), ("resume",), ("retire",), ("grow",), ("batch",),
                        ("bench",), ("test",), ("verify",), ("devices",), ("parity-check",),
                        ("compute",), ("compute", "broker"), ("compute", "worker"),
@@ -1452,6 +1501,15 @@ def check(binary, root, reference=None):
     filled = json.loads(run("fill", *options, "--plan-only", "--json").stdout)
     assert planned == filled and planned["feasible"]
     assert len(planned["destinations"]) == 2 and all(d["files"] == 2 for d in planned["destinations"])
+    logs = ["--harvester-log", preview, root / "first missing.log",
+            "--harvester-log", preview_peer, root / "second missing.log"]
+    mapped = json.loads(run("plan", *options, *logs, "--json").stdout)
+    assert mapped == json.loads(run("fill", *options, *logs, "--plan-only", "--json").stdout) and mapped["feasible"]
+    saved = run("plan", *options, *logs, "--save-plan", root / "reader bindings.plan").stdout
+    guidance = next(line for line in saved.splitlines() if line.startswith("Next: "))
+    assert guidance.count("--harvester-log") == 2 and all(str(path) in guidance for path in logs[1::3] + logs[2::3])
+    outside = run("plan", *options, "--harvester-log", root, root / "first missing.log", code=2)
+    assert "outside the reviewed fill" in outside.stderr
     assert (snapshot(preview), snapshot(preview_peer)) == before, "preview created or changed files"
     if os.name != "nt":
         native = root / os.fsdecode(b"native-byte-\xff")
@@ -1721,10 +1779,13 @@ def check(binary, root, reference=None):
     capacity_path, = capacity_dir.glob("*.gplot")
     assert header(capacity_path)[3] == capacity_metrics["members"] == 8
     assert capacity_metrics["stop_reason"] == "capacity"
+    assert capacity_metrics["completion_forecast"]["source"] == "complete"
+    assert capacity_metrics["completion_forecast"]["remaining_members"] == 0
     assert capacity_metrics["peak_file_bytes"] <= capacity_metrics["capacity_bytes"]
     completed = snapshot(capacity_dir, observations=False)
     resumed = run("fill", "-r", *capacity_options, "--json")
-    assert json.loads(resumed.stdout.splitlines()[-1])["generated_members"] == 0
+    resumed_metrics = json.loads(resumed.stdout.splitlines()[-1])
+    assert resumed_metrics["generated_members"] == 0 and resumed_metrics["completion_forecast"]["seconds"] == 0
     assert snapshot(capacity_dir, observations=False) == completed, "completed capacity fill retried or changed files"
     verify(capacity_path)
     print("PASS compression top-up, window-limited sealing and unchanged resume", flush=True)
@@ -1899,7 +1960,7 @@ def check(binary, root, reference=None):
 
     # Explicit NUMA and mixed local selectors share the bounded executor path,
     # without changing plot identity or requiring enrollment/listeners.
-    cpu = re.search(r"\[(cpu\d+)\]", devices).group(1)
+    cpu = available_cpu_node(devices)
     selectors = [cpu]
     gpu = re.search(r"^\s*\[(\d+)\].*MiB VRAM", devices, re.MULTILINE)
     if gpu:
@@ -1919,8 +1980,10 @@ def check(binary, root, reference=None):
     local_before = snapshot(preview), snapshot(preview_peer)
     local_plan = json.loads(run("plan", *options, "--devices", cpu, "--json").stdout)
     assert local_plan["feasible"] and local_plan["devices_requested"] == cpu
+    assert not local_plan["completion_forecast"]["pool_capacity_unconfirmed"]
     assert (snapshot(preview), snapshot(preview_peer)) == local_before
     run("plan", *options, "--devices", cpu, "--compute-broker", "127.0.0.1:1", code=2)
+    run("plan", *options, "--devices", cpu, "--compute-ca", root / "missing CA", code=2)
     run("plan", *options, "--devices", cpu, "--compute-local", "off", code=2)
     print("PASS local device selection, shared limits, staged recovery and ordinary byte parity", flush=True)
 
@@ -2140,6 +2203,8 @@ def check(binary, root, reference=None):
     streamed = json.loads(run("plan", "--paths0-from", "-", "--json", input=f"{a}\0{b}\0").stdout)
     assert selected == streamed and len(selected["destinations"]) == 2
     run("plan", "--paths-from", "-", input="", code=2)
+    excessive = run("plan", a, "--paths-from", "-", input=(str(b) + "\n") * 1024, code=2)
+    assert "too many destinations" in excessive.stderr
     print("PASS private replicated jobs, path lists and keyless recovery from any member", flush=True)
 
     # Publication precedes opening the compute connection. Preserve that saved
@@ -4141,7 +4206,10 @@ def check_replot(binary, root, reference=None):
                                   "--save-profile", saved_compute_file, "--json").stdout)
     continued = shlex.split(compute_setup["next_command"])[1:]
     continued[continued.index("--save-plan") + 1] = str(compute_review)
-    reviewed_compute = json.loads(run(*continued, "--json").stdout)
+    cpu_node = available_cpu_node(run("devices").stdout)
+    conflict = run(*continued, "--devices", cpu_node, "--compute-local", "off", "--json", code=2)
+    assert "conflicts with selected local devices" in conflict.stderr and not compute_review.exists()
+    reviewed_compute = json.loads(run(*continued, "--devices", cpu_node, "--json").stdout)
     assert reviewed_compute["feasible"] and reviewed_compute["native_request"]["compute_enabled"] and snapshot(compute_farm) == before
     assert str(membership) not in compute_review.read_text(), "portable review contains private compute connection settings"
     raised_offer = list(compute_options)
@@ -4161,6 +4229,7 @@ def check_replot(binary, root, reference=None):
     assert "infeasible under the current execution binding" in refusal.stdout + refusal.stderr
     assert snapshot(compute_farm) == before and not private_record(compute_farm, "grow-replot.plan").exists(), "bad local offer claimed a source before executor admission"
     execute = shlex.split(reviewed_compute["next_command"])[1:]
+    assert execute[execute.index("--devices") + 1] == cpu_node
     assert "--reclaim-before-bytes" not in execute, "execution command repeated a saved review selection"
     run(*execute, *keys, point="replot-local-bindings-durable", code=86)
     assert not private_record(compute_farm, "grow-replot.plan").exists()
@@ -4175,7 +4244,7 @@ def check_replot(binary, root, reference=None):
     run("fill", compute_review, *keys, point="replot-journal-all-staged", code=86)
     # Resume from the private local binding with neither the reusable profile
     # nor any compute flags, even though enrollment is outside the default path.
-    run("fill", compute_review, point="replot-replacement-verified", code=86)
+    run("fill", compute_review, "--devices", cpu_node, point="replot-replacement-verified", code=86)
     run("fill", compute_review)
     compute_final = Path(reviewed_compute["batches"][0]["path"])
     assert not compute_source.exists() and header(compute_final)[3] == 2
@@ -4220,7 +4289,7 @@ def check_replot(binary, root, reference=None):
     automatic_setup = json.loads(run("plan", *automatic_options, "--save-profile", automatic_file, "--json").stdout)
     assert not automatic_setup["resource_preparation"]["missing"], automatic_setup["resource_preparation"]
     run("fill", *automatic_options, *keys, point="replot-job-prepared", code=86)
-    run("fill", automatic_compute)
+    run("fill", automatic_compute, "--devices", cpu_node)
     automatic_output, = automatic_compute.glob("*.plot2")
     assert not (automatic_compute / "legacy.plot").exists()
     run("verify", automatic_output, "--full", "--trials", 100)
@@ -4542,6 +4611,19 @@ def check_automatic_compute(binary, root):
             run("first", "verify", path, "--full", "--trials", 100)
         print("PASS worker arrival and one worker shared by two automatic brokers", flush=True)
 
+        mixed = directory / "mixed local and enrolled fill"
+        mixed.mkdir()
+        mixed_plan = directory / "mixed.plan"
+        cpu_node = available_cpu_node(run("first", "devices").stdout)
+        mixed_limits = list(limits)
+        mixed_limits[mixed_limits.index("--devices") + 1] = cpu_node
+        review = run("first", "plan", mixed, *plan_options[1:], "--devices", cpu_node, "--save-plan", mixed_plan)
+        assert json.loads(review.stdout)["devices_requested"] == cpu_node and not list(mixed.iterdir())
+        made = run("first", "fill", "--from-plan", mixed_plan, *keys, "-S", SEED, *mixed_limits)
+        mixed_paths = [Path(line) for line in made.stdout.splitlines() if line.endswith(".gplot")]
+        assert sorted(map(digest, mixed_paths)) == sorted(map(digest, fill_paths))
+        print("PASS selected local NUMA and enrolled helper fill with matching CPU bytes", flush=True)
+
         # A saved dedicated broker replaces the per-job broker.
         with socket.socket() as port_socket:
             port_socket.bind(("127.0.0.1", 0))
@@ -4557,6 +4639,33 @@ def check_automatic_compute(binary, root):
         run("second", "compute", "configure", "--interface", "lo")
         assert Path(result.stdout.strip()).is_file()
         assert broker.poll() is None, broker_log.read_text(encoding="utf-8")
+        # Compare the two forms on the same already connected worker.
+        output_limits = [*limits, "--no-quiet", "--json", "-k", 18, "--construction", "incremental",
+                         "--compute-local", "off", "--group-members", 2, "--max-total-members", 2,
+                         "--max-groups", 1, "--capacity-bytes", "32M", "--leave-free", 0]
+        for form in ("packed", "encoded"):
+            target = directory / ("output " + form)
+            target.mkdir()
+            made = run("second", "fill", target, *output_limits, "--compute-output", form, *keys, "-S", SEED)
+            metrics = json.loads(made.stdout.splitlines()[-1])
+            assert metrics["new_durable_members"] == 2
+            if form == "encoded":
+                assert metrics["pool_fresh_groups"] == 1, metrics
+            else:
+                assert metrics["pool_packed_members"] == 2, metrics
+        preview = directory / "output comparison"
+        preview.mkdir()
+        prediction = json.loads(run("second", "plan", preview, *output_limits).stdout)["completion_forecast"]
+        outputs = prediction["incremental_worker_output_history"]
+        assert all(outputs[form]["samples"] >= 1 and outputs[form]["fast_seconds_per_member"] > 0 for form in ("packed", "encoded"))
+        assert prediction["source"] == "observed-worker-output-range", prediction
+        assert 0 < prediction["seconds_low"] <= prediction["seconds"] <= prediction["seconds_high"], prediction
+        changed = run("second", "plan", preview, *output_limits, "--compute-timeout-ms", 30000)
+        other = json.loads(changed.stdout)["completion_forecast"]["incremental_worker_output_history"]
+        assert all(not other[form]["samples"] for form in ("packed", "encoded")), other
+        assert not list(preview.iterdir())
+        print("PASS pooled preflight compares completed encoded-group and packed-member fills", flush=True)
+
         explicit = [*plot, "--compute-owner-id", "storage-test", "--compute-local", "off",
                     "-S", SEED, "-o", directory / "explicit-owner"]
         owned = Path(run("second", *explicit).stdout.strip())

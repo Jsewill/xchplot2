@@ -11,6 +11,20 @@ Demand memory(uint64_t amount)
 { Demand d; d.resource = "ram"; d.transient_units = amount; d.bounded = true; return d; }
 int main() try
 {
+    {
+        std::vector<pos2gpu::GpuDeviceInfo> devices(3);
+        for (size_t i = 0; i < devices.size(); ++i)
+        { devices[i].id = i; devices[i].physical_identity = "pci-fixture-" + std::to_string(i); devices[i].auto_dispatchable = true; }
+        pos2gpu::GroupOptions selected; selected.replot_gpu_devices = {{0, "tiny", {}}, {2, "compact", {}}};
+        bind_replot_gpu(selected, devices, [&](auto const& physical) { return physical == devices[2].physical_identity; });
+        require(selected.device == 2 && selected.tier == "compact", "migration lost its reviewed GPU or selected tier");
+        rejects([&] { bind_replot_gpu(selected, devices, [&](auto const& physical) { return physical == devices[1].physical_identity; }); },
+            "migration ran on an unselected physical GPU");
+        bool waiting = false;
+        try { bind_replot_gpu(selected, devices, [](auto const&) { return false; }); }
+        catch (ReplotResourcesUnavailable const&) { waiting = true; }
+        require(waiting, "a missing reviewed GPU became spare compute on another card");
+    }
     auto const host = profile_detail::host_name(); auto const cpus = profile_detail::logical_cpus();
     require(!host.empty() && cpus, "fixture cannot identify actual execution host/affinity");
     auto const directory = fs::temp_directory_path() / ("xchplot2-replot-resources-" + std::to_string(Clock::now().time_since_epoch().count()));

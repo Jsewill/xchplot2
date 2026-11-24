@@ -6,6 +6,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <memory>
 
@@ -184,6 +185,11 @@ public:
     WorkerTaskDeclined() : std::runtime_error("optional compute task declined for selected worker") {}
 };
 class WorkerPublicationChanged : public WorkerTaskDeclined {};
+class WorkerGenerationFailed : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 struct WorkerTaskOptions
 {
     std::function<bool(WorkerTaskObservation const&)> selected;
@@ -195,6 +201,7 @@ struct WorkerTaskOptions
     std::chrono::steady_clock::time_point other_work_until{};
     WorkerPackedRoute const* packed_route = nullptr;
     bool fresh_read_ahead = true;
+    bool immediate_fresh = false;
     std::shared_ptr<WorkerPublication> publication;
 };
 class WorkerAlreadyRunning : public std::runtime_error
@@ -233,6 +240,7 @@ struct WorkerConfig
     // Optional CPU/NUMA selection. CPU generation restores the caller's mask
     // after scoped pinning; GPU runtime/codec threads keep their own policy.
     std::vector<int> cpu_affinity;
+    bool require_cpu_affinity = false;
     unsigned generation_threads = 0, max_batch_members = 4, max_window_chunks = pool::default_max_codec_chunks;
     unsigned task_timeout_ms = 3600000;
     // Codec input/output windows and count-derived initial-contribution scratch.
@@ -252,6 +260,8 @@ struct WorkerConfig
     // argument is this executor's currently held lanes; memory is fresh free
     // headroom before its outstanding modeled allocations are charged.
     std::function<pool::Resources(uint32_t)> available_resources;
+    std::optional<std::filesystem::path> local_harvester;
+    unsigned farming_deadline_ms = 0;
 };
 
 enum class WorkerControl : uint8_t { Pause = 1, Drain, Resume };
@@ -270,6 +280,7 @@ struct WorkerStatus
     bool broker_saturated = false;
     std::string gpu_recovery;
     pool::WorkerHardware hardware;
+    std::optional<bool> farming_pressure;
 };
 struct WorkerTaskAdmission
 {
@@ -379,8 +390,10 @@ struct WorkerClientConfig
     // The embedding owner keeps the service alive through every client call.
     WorkerService* local_service = nullptr;
     std::function<std::shared_ptr<WorkerService>()> local_service_provider;
+    // A queued broker request may take an immediately available private grant.
+    // Local-only work and explicit outage fallback can wait for a grant.
     std::function<std::unique_ptr<WorkerLocalGrant>(uint8_t, uint8_t, unsigned, pool::GenerationOutput,
-        WorkerCancellation const&)> acquire_private_generation;
+        WorkerCancellation const&, bool wait)> acquire_private_generation;
     std::function<WorkerGenerationCapacity(uint8_t, uint8_t)> private_generation_capacity;
     std::function<void(WorkerTaskObservation const&)> observe;
     std::function<void(WorkerTaskObservation const&, std::string_view)> generation_failed;
@@ -428,7 +441,7 @@ public:
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
         WorkerContributionWindowSink const& = {}, WorkerFreshManifest const& = {}, bool independent = false,
         bool coalesce_singletons = true, std::chrono::steady_clock::time_point other_work_until = {},
-        bool fresh_read_ahead = true);
+        bool fresh_read_ahead = true, bool immediate_fresh = false);
     // Zero means all members were delivered. A positive width releases the
     // unstarted lease for independent delivery of that prefix and its remainder.
     unsigned try_contributions(uint8_t k, uint8_t strength,
@@ -451,7 +464,8 @@ public:
     uint64_t max_task_bytes() const;
     std::shared_ptr<WorkerPublication> publication_route(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> ids) const;
-    WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
+    // Remote-only formats query broker capacity without private generation slots.
+    WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength, bool include_private = true) const;
     // Recheck a previously withdrawn batch against a complete signed price at its exact width.
     std::optional<WorkerPackedRoute> priced_packed_route(uint8_t k, uint8_t strength, unsigned width,
         WorkerCancellation cancel) const;

@@ -844,6 +844,16 @@ int main(int argc, char** argv)
     assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
+    auto const forwarded = dir / "forwarded harvester.log", second = other / "reader.log";
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only",
+        "--harvester-log", dir.string(), forwarded.string(), "--harvester-log", other.string(), second.string()}) == 0);
+    assert(last_group_options.harvester_logs == (decltype(last_group_options.harvester_logs){{dir, forwarded}, {other, second}}) &&
+        !last_group_options.farming_profile);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.harvester_logs.size() == 1);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--plan-only", "--harvester", "local",
+        "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.farming_detect_local && last_group_options.harvester_logs.size() == 1);
     auto const argfile = dir / "group.args";
     put(argfile, "--group-members 3\n--max-host-ram 768M\n");
     assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);

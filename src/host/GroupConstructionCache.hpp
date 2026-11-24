@@ -10,7 +10,8 @@ namespace group_grow
 class ConstructionCache
 {
 public:
-    enum class Kind { Publication, Generation, PoolPublication };
+    enum class Kind { Publication, Generation, PoolPublication, Fill };
+    enum class Access { read_write, read_only };
 private:
     using Clock = std::chrono::system_clock;
     struct Sample { std::string key; bool external; uint64_t at, elapsed; std::vector<uint64_t> phases; };
@@ -18,8 +19,15 @@ private:
     static constexpr size_t max_phases = 8; // age and total service of up to four committed peers
     static constexpr uint64_t lifetime = 24 * 60 * 60;
     Kind kind_;
-    char const* filename() const { return kind_ == Kind::PoolPublication ? "pool-publication-v1" : kind_ == Kind::Publication ? "publication-v1" : "generation-v1"; }
-    char const* format() const { return kind_ == Kind::PoolPublication ? "xchplot2-pool-publication-v1" : kind_ == Kind::Publication ? "xchplot2-publication-v1" : "xchplot2-generation-v1"; }
+    struct File { char const* folder; char const* name; char const* format; };
+    static constexpr std::array<File, 4> files{{
+        {"publications", "publication-v1", "xchplot2-publication-v1"},
+        {"compute-performance", "generation-v1", "xchplot2-generation-v1"},
+        {"pool-publications", "pool-publication-v1", "xchplot2-pool-publication-v1"},
+        {"fill-performance", "fill-v1", "xchplot2-fill-v1"},
+    }};
+    char const* filename() const { return files[size_t(kind_)].name; }
+    char const* format() const { return files[size_t(kind_)].format; }
     std::filesystem::path directory_;
     std::optional<farm::inventory_detail::RootHandle> root_;
     std::optional<stream_state::WorkLock> lock_;
@@ -34,7 +42,7 @@ private:
     void append(std::vector<Sample>& values, Sample value) const
     {
         auto drop = values.end();
-        if (kind_ == Kind::PoolPublication)
+        if (kind_ == Kind::PoolPublication || kind_ == Kind::Fill)
         {
             // Keep up to eight whole observations of each form. A long series
             // of winners never displaces its opposing form or tears a peer row.
@@ -59,7 +67,8 @@ private:
         auto const path = directory_ / filename();
         file_io::Stat info{};
         if (file_io::inspect_link(path, &info)) return;
-        if (!file_io::is_regular(info.st_mode) || info.st_nlink != 1 || info.st_size <= 65 || info.st_size > (kind_ == Kind::PoolPublication ? 16384 : 8192)) return;
+        auto const max_bytes = kind_ == Kind::PoolPublication || kind_ == Kind::Fill ? 16384 : 8192;
+        if (!file_io::is_regular(info.st_mode) || info.st_nlink != 1 || info.st_size <= 65 || info.st_size > max_bytes) return;
         farm::inventory_detail::Handle file(file_io::open_file(path, file_io::read_only | file_io::no_follow | file_io::close_on_exec));
         auto const opened = farm::inventory_detail::stat(file);
         if (opened.st_dev != info.st_dev || opened.st_ino != info.st_ino || opened.st_size != info.st_size) return;
@@ -79,7 +88,7 @@ private:
         {
             Sample s{};
             if (!(input >> s.key >> s.external >> s.at >> s.elapsed) || !valid(s.key) || !s.elapsed) return;
-            if (kind_ == Kind::PoolPublication)
+            if (kind_ == Kind::PoolPublication || kind_ == Kind::Fill)
             {
                 size_t phases = 0;
                 if (!(input >> phases) || phases > max_phases || phases % 2) return;
@@ -93,7 +102,7 @@ private:
 public:
     static std::filesystem::path location(Kind kind = Kind::Publication)
     {
-        auto const folder = kind == Kind::PoolPublication ? "pool-publications" : kind == Kind::Publication ? "publications" : "compute-performance";
+        auto const folder = files[size_t(kind)].folder;
 #ifdef _WIN32
         if (auto path = ::_wgetenv(L"LOCALAPPDATA"); path && *path) return std::filesystem::path(path) / L"xchplot2" / L"cache" / folder;
 #else
@@ -102,22 +111,31 @@ public:
 #endif
         return {};
     }
-    explicit ConstructionCache(std::filesystem::path directory, Kind kind = Kind::Publication) noexcept : kind_(kind)
+    explicit ConstructionCache(std::filesystem::path directory, Kind kind = Kind::Publication,
+                               Access access = Access::read_write) noexcept : kind_(kind)
     {
         try
         {
             if (!directory.is_absolute()) return;
-            std::filesystem::create_directories(directory.parent_path());
+            if (access == Access::read_write) std::filesystem::create_directories(directory.parent_path());
             farm::inventory_detail::RootHandle parent(directory.parent_path());
-            if (file_io::make_directory(directory, 0700) && errno != EEXIST) return;
+            if (access == Access::read_write && file_io::make_directory(directory, 0700) && errno != EEXIST) return;
             root_.emplace(directory); farm_metadata_detail::private_directory(parent, *root_);
             directory_ = std::move(directory);
+            if (access == Access::read_only)
+            {
+                // Publications are atomically replaced. A preview takes no
+                // writer lock and can safely discard a concurrently changed sample.
+                auto const before = observed(); load();
+                if (before != observed()) prior_.clear();
+                return;
+            }
             // A competing invoking process stays cold. A crash releases the
             // OS lock and the atomic replacement preserves the preceding file.
             lock_.emplace(directory_); observed_ = observed(); load();
             if (observed_ != observed()) lock_.reset();
         }
-        catch (...) { lock_.reset(); }
+        catch (...) { lock_.reset(); prior_.clear(); }
     }
     ConstructionCache(ConstructionCache const&) = delete;
     ConstructionCache& operator=(ConstructionCache const&) = delete;
@@ -141,7 +159,31 @@ public:
             result.low_ns = std::min(result.low_ns, elapsed); result.high_ns = std::max(result.high_ns, elapsed);
             result.oldest_utc = std::min(result.oldest_utc, i->at); ++result.samples;
         }
-        return result.samples >= 2 ? result : ConstructionPrior{};
+        return result.samples >= (kind_ == Kind::Fill ? 1u : 2u) ? result : ConstructionPrior{};
+    }
+    // Retain startup and the last drain when scaling a completed sequence of
+    // otherwise comparable publications. A single publication gives no rate
+    // for subsequent groups. Return nanoseconds per member at the new size.
+    ConstructionPrior fill_evidence(std::string const& key, bool external, uint64_t members, uint64_t at = now()) const
+    {
+        ConstructionPrior result;
+        if (!members || kind_ != Kind::Fill) return result;
+        for (auto i = prior_.rbegin(); i != prior_.rend() && result.samples < 8; ++i)
+        {
+            if (i->key != key || i->external != external || !fresh(*i, at) || i->phases.size() != 4) continue;
+            auto const first_count = i->phases[0], last_count = i->phases[1];
+            auto const first_ns = i->phases[2], last_ns = i->phases[3];
+            if (last_count <= first_count || members < first_count || last_ns <= first_ns) continue;
+            auto const elapsed = first_ns + static_cast<long double>(last_ns - first_ns) *
+                (members - first_count) / (last_count - first_count);
+            auto const per_member = elapsed / members;
+            if (per_member >= static_cast<long double>(UINT64_MAX)) continue;
+            auto const ns = uint64_t(std::max(1.L, per_member));
+            if (!result.samples) { result.low_ns = ns; result.oldest_utc = i->at; }
+            result.low_ns = std::min(result.low_ns, ns); result.high_ns = std::max(result.high_ns, ns);
+            result.oldest_utc = std::min(result.oldest_utc, i->at); ++result.samples;
+        }
+        return result;
     }
     void completed(std::string const& key, bool external, uint64_t elapsed, uint64_t at = now()) noexcept
     { completed(key, external, elapsed, {}, at); }
@@ -163,7 +205,7 @@ public:
             for (auto const& s : prior_)
             {
                 out << s.key << ' ' << s.external << ' ' << s.at << ' ' << s.elapsed;
-                if (kind_ == Kind::PoolPublication)
+                if (kind_ == Kind::PoolPublication || kind_ == Kind::Fill)
                 {
                     out << ' ' << s.phases.size();
                     for (auto const phase : s.phases) out << ' ' << phase;

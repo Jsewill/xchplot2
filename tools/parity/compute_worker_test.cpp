@@ -334,6 +334,12 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     auto options = config(); options.broker = broker.server.endpoint(); options.listen = {"127.0.0.1", 0}; options.tls = tls;
     if (enrollment) options.listen.server_name = options.server_name = enrollment->server_name;
     options.capacity.cpu_threads = options.capacity.slots = 1;
+    pool_test::Directory farm;
+    options.local_harvester = farm.path;
+    std::filesystem::create_directory(farm.path / "config");
+    std::ofstream(farm.path / "config/config.yaml") << "self_hostname: localhost\nlogging: &logging\n  log_stdout: False\n"
+        "  log_filename: worker.log\nharvester:\n  num_threads: 1\n  plot_directories: []\n  logging: *logging\n";
+    std::ofstream(farm.path / "worker.log").close();
     WorkerService service(options); service.start();
     auto endpoint = service.endpoint();
     require(WorkerService::remote_status(endpoint, other).admission == pool::WorkerAdmission::Accepting,
@@ -342,6 +348,35 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
     payload.u16(0); payload.u16(1); payload.u32(3); payload.u64(1); payload.u64(2); payload.u64(3);
     pool::BrokerClient owner(options.broker, tls); auto session = owner.open_owner("control-inflight-codec");
+    require(!service.status().farming_pressure, "worker guessed pressure before its first local lookup");
+    auto append_lookup = [&](std::string_view seconds, unsigned count)
+    {
+        auto const epoch = std::time(nullptr); auto const local = *std::localtime(&epoch);
+        std::ofstream log(farm.path / "worker.log", std::ios::app);
+        while (count--) log << std::put_time(&local, "%Y-%m-%dT%H:%M:%S")
+            << ".000 chia.harvester.harvester: INFO     1 plots were eligible for farming challenge. Time: "
+            << seconds << " s. Total 10 plots\n";
+    };
+    auto await_offer = [&](bool pressured)
+    {
+        auto const expected = pressured ? pool::WorkerAdmission::Paused : pool::WorkerAdmission::Accepting;
+        auto const until = Clock::now() + std::chrono::seconds(5);
+        while (Clock::now() < until)
+        {
+            auto status = service.status(); auto page = owner.status();
+            if (status.farming_pressure == pressured && status.admission == expected && !page.worker_records.empty() &&
+                page.worker_records.front().admission == expected) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        throw std::runtime_error("worker failed to update its own broker offer from current harvester lookups");
+    };
+    append_lookup("6.000", 1); append_lookup("0.100", 1); await_offer(true);
+    require(WorkerService::remote_status(endpoint, other).admission == pool::WorkerAdmission::Paused,
+        "authenticated status missed the worker's temporary farming hold");
+    rejects([&] { service.generate_local(18, 2, {}, [](auto const&, auto) {}); });
+    if (enrollment) require(pool::load_worker_intent(*enrollment) == pool::WorkerIntent::Active,
+        "live farming observations overwrote saved worker intent");
+    append_lookup("0.100", 20); await_offer(false);
     pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack); task.kind = pool::Kind::Pack;
     task.k = 18; task.strength = 2; task.work_units = payload.data().size(); task.chunk_count = 1; task.max_output_bytes = 4096;
     task.resources = {1, 1, add(multiply(payload.data().size(), 20), ChunkCodec::estimate_work(18, 0, 0)), 0};

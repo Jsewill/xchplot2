@@ -98,6 +98,10 @@ struct GroupOptions : GroupComputeOptions
     uint64_t checkpoint_bytes = default_checkpoint_bytes, device = 0;
     std::string devices;
     std::vector<GroupLocalDevice> local_devices;
+    // A reviewed migration runs a single producer. Its CPU generator can
+    // inherit the union of the selected NUMA nodes within that same grant.
+    std::vector<int> producer_cpu_affinity;
+    std::vector<GroupLocalDevice> replot_gpu_devices;
     bool local_compute = false;
     std::string backend = "cpu";
     std::string tier = "auto";
@@ -116,6 +120,7 @@ struct GroupOptions : GroupComputeOptions
     uint64_t replot_proof_cpus = 0, replot_proof_solves = 1;
     bool protected_resources = false;
     std::shared_ptr<group_grow::DiskIoGovernor> disk_io;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> harvester_logs;
     uint64_t protected_gpu_bytes = 0;
     bool inventory = false;
     bool extend = false, update = false, cancel_update = false, allow_missing = false;

@@ -298,6 +298,56 @@ reported 53.42 GB of construction writes. With destination scratch disabled,
 the updated plotter took 11.59 minutes and reported 86.04 GB of writes. Each
 configuration had one uninterrupted timed run with the same plot identities.
 
+### Automatic fills on an active farm
+
+On November 24, 2026, a Linux storage host ran k=28, strength=2 fills on
+empty HDDs while its Chia harvester had 17,886 plots loaded. Two enrolled
+GPU workers supplied compute. Each group contained three members. The owner
+had a 32 GiB plotting RAM cap and chose incremental RAM construction in all
+three automatic runs. These measurements preceded the change that lets an
+independent writer try a complete encoded group when the pool has spare capacity.
+
+| Destination layout | New members | First group durable, s | Last group durable, s | Seconds per new durable member | Eligible lookup p95, s (count) |
+|---|---:|---:|---:|---:|---:|
+| One group on one HDD | 3 | 23.50 | 23.50 | 7.83 | 10.24 (2) |
+| Three successive groups on one HDD | 9 | 23.16 | 60.05 | 6.67 | 14.90 (6) |
+| One group on each of four HDDs | 12 | 42.60 | 131.74 | 10.98 | 24.28 (13) |
+
+Times run from the start of the command through publication. On one HDD,
+workers encoded complete groups for direct publication. In the four-HDD run,
+four destinations received packed members for assembly on the owner. Across
+the 12 members, the workers recorded 109.61 seconds waiting to send frames.
+Waits on different workers can overlap.
+
+For the same four destinations and plot identities, forcing incremental
+construction took 128.44 seconds with automatic worker output. With
+`--compute-output encoded`, the workers returned four complete groups.
+The first published at 21.96 seconds and the last at 73.36 seconds,
+or **6.11 seconds per durable member**. The encoded run transferred 12.15 GB
+and spent 0.93 cumulative seconds waiting to send frames. Every published
+file matched its automatic counterpart and passed full-proof verification.
+Each transfer policy had one timed run on this layout.
+
+Forced external construction took 29.37 seconds per member on the single
+group and 20.48 across four HDDs. The three-group external run on one HDD
+ended early. One attempt received a zero-entry GPU result. A later attempt
+published its first group before the broker rejected a delivery whose lease
+had been fenced.
+
+A separate two-minute farming-only window recorded a p95 of 17.75 seconds
+across 12 eligible lookups. The machines were shared and the lookup counts
+varied by run. A comparison of sustained lookup latency would require longer
+matched farming windows.
+
+### Fill startup at 1,024 directories
+
+A managed fill on one local filesystem requested two single-member groups
+in each of 1,024 empty directories. The command took 132 seconds to issue its
+first grant, including durable job setup in each directory. The controller
+spent 0.47 ms on the forecast for that grant. It accounted for all 2,048
+members, including 1,024 in later groups, and reported unknown timings for
+all 1,024 destinations. The test stopped after the first grant.
+
 ### External scratch bandwidth
 
 A 4 GiB stream through the external run writer and reader measured the
