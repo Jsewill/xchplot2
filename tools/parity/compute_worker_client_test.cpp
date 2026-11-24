@@ -1355,6 +1355,35 @@ void temporary_worker_refusal()
     auto expected = codec.encode(0, {}, 0, {&region, 1});
     pool::BrokerClient worker_control(offer.broker, tls);
     auto const instance = service.status().instance;
+    {
+        bool moved = false;
+        WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
+        config.owner_id = "terminal-grant-fence";
+        config.generation_path = [&](auto const&, auto const&, uint32_t) { return std::string(64, moved ? 'b' : 'a'); };
+        WorkerClient client(config);
+        auto const before = service.status().accepted_tasks;
+        for (bool fresh : {false, true})
+        {
+            moved = false; auto publication = client.publication_route(18, 2, {&id, 1});
+            require(bool(publication), "a registered single-slot worker did not quote its normal generation path");
+            publication->selected_fresh = fresh; publication->promoted.store(true);
+            // Both grants are genuine. Change the measured path between the quote and the authenticated data connection.
+            moved = true; bool declined = false, received = false;
+            try
+            {
+                if (fresh) client.contributions(18, 2, {&id, 1}, [&](auto, auto, auto) { received = true; },
+                    {}, {}, {}, [&](auto, auto, auto const&) { received = true; });
+                else client.generate_packed(18, 2, {&id, 1}, [&](auto const&, uint64_t) { received = true; });
+            }
+            catch (WorkerPublicationChanged const&) { declined = true; }
+            require(declined && !received && !client.stats().input_bytes && service.status().accepted_tasks == before,
+                "a changed terminal path began paid worker processing");
+        }
+        bool delivered = false;
+        client.generate(18, 2, id, [&](auto const&, uint64_t) { delivered = true; });
+        require(delivered && client.stats().completed_generation == 1 && service.status().accepted_tasks == before,
+            "discarding terminal evidence prevented the following ordinary lease from finishing");
+    }
     for (bool local : {false, true})
     {
         bool refuse = false, delayed_pause = false;

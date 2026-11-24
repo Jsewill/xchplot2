@@ -5924,9 +5924,107 @@ void farming_joint_forecasts(fs::path const& root)
     reject(options({excessive_path}), "joint assessment expanded a forecast beyond the file work bound");
 }
 
+void terminal_publications(fs::path const& directory)
+{
+    using group_grow::ConstructionCache;
+    using group_grow::PoolPublicationHistory;
+    using group_grow::TerminalPublication;
+    auto const kind = ConstructionCache::Kind::PoolPublication;
+    auto const key = stream_state::digest("paid width, concrete resources, authenticated path and physical writers");
+    auto wave = [&](unsigned age)
+    {
+        TerminalPublication w; w.key = key; w.started = 100;
+        w.peers = {{1, 100 - age}, {2, 100 - age}, {3, 100 - age}};
+        return w;
+    };
+    auto observe = [&](bool fresh, unsigned age, unsigned tail, unsigned peer_tail)
+    {
+        ConstructionCache cache(directory, kind); auto w = wave(age);
+        require(!w.publish(2, 110) && !w.publish(3, 112) && !w.publish(0, 100 + tail),
+            "incomplete terminal cohort supplied a durable publication");
+        require(w.publish(1, 100 + peer_tail), "complete terminal cohort lost its peer");
+        w.completed(cache, fresh);
+    };
+    PoolPublicationHistory controller;
+    PoolPublicationHistory::Shape shape{28, 2, 3, {}};
+    for (unsigned age : {10u, 12u}) { observe(false, age, 29, 16); observe(true, age, 18, 16); }
+    auto current = wave(11);
+    {
+        ConstructionCache cache(directory, kind); std::array<TerminalPublication::Range, 2> ranges;
+        auto const prior = current.choice(cache, &ranges);
+        require(prior && *prior && ranges[0].low == 29 && ranges[1].high == 18 &&
+            controller.final_group_encoded(shape, false, false, 1, 0, prior),
+            "earlier durable Fresh failed to improve a Packed terminal decision");
+        require(!wave(15).choice(cache), "unobserved peer phase reused terminal duration");
+        auto changed = current; changed.key = stream_state::digest("changed grant or writer");
+        require(!changed.choice(cache), "terminal timing crossed physical scope");
+        require(controller.begin(shape, {1, false, true}, 10), "Packed live publication failed to enroll");
+        controller.publish(3, 30, true);
+        require(controller.begin(shape, {1, true, true}, 31), "Fresh live publication failed to enroll");
+        controller.publish(3, 60, true);
+        require(!controller.final_group_encoded(shape, false, false, 1, 0, prior),
+            "dated evidence overrode a complete live pair");
+    }
+    for (unsigned i = 0; i < 24; ++i) observe(true, i % 2 ? 12 : 10, 18, 16);
+    { ConstructionCache cache(directory, kind);
+      require(current.choice(cache).value_or(false), "repeated winning publications evicted the other measured form"); }
+    for (unsigned age : {10u, 12u}) { observe(false, age, 29, 100); observe(true, age, 18, 100); }
+    { ConstructionCache cache(directory, kind);
+      require(!current.choice(cache), "a peer-dominated terminal finish claimed an improvement"); }
+    current.peers.clear(); current.key = stream_state::digest("subject-only");
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        {
+            ConstructionCache cache(directory, kind);
+            require(current.publish(0, 188), "missing subject-only Packed completion"); current.completed(cache, false);
+            require(current.publish(0, 200), "missing subject-only Fresh completion"); current.completed(cache, true);
+        }
+        ConstructionCache cache(directory, kind); auto const prior = current.choice(cache);
+        if (i < 3) require(!prior, "thin history displaced the incumbent inside its margin");
+        else
+        {
+            PoolPublicationHistory cold;
+            require(prior && !*prior && !cold.final_group_encoded(shape, true, true, 0, 0, prior),
+                "repeated measured Packed finishes failed to improve an ordinary Fresh decision");
+        }
+    }
+    auto const full = directory / "full"; std::array<std::string, 4> keys;
+    for (unsigned i = 0; i < keys.size(); ++i) keys[i] = stream_state::digest(std::to_string(i));
+    // The 48 worst-width records exceed the scalar cache's file bound. Every complete row carries
+    // its own four pairs of 64-bit peer phases under the terminal cache's independent bound.
+    std::array<uint64_t, 8> phases{}; phases.fill(UINT64_MAX - 10);
+    auto store = [&](unsigned first, unsigned end)
+    {
+        ConstructionCache cache(full, kind);
+        for (unsigned k = first; k < end; ++k) for (unsigned i = 0; i < 8; ++i)
+            for (bool fresh : {false, true}) cache.completed(keys[k], fresh, UINT64_MAX - i, phases);
+    };
+    store(0, 3);
+    auto const file = full / "pool-publication-v1";
+    require(fs::file_size(file) > 8192 && fs::file_size(file) < 16384, "worst-width terminal file lost its bounded rows");
+    {
+        ConstructionCache cache(full, kind);
+        for (unsigned k = 0; k < 3; ++k) for (bool fresh : {false, true})
+            require(cache.evidence(keys[k], fresh).samples == 8 && cache.phase_evidence(keys[k], fresh, 8).low_ns == phases.back(),
+                "a full terminal store lost a complete four-peer observation on reopen");
+    }
+    store(3, 4);
+    {
+        ConstructionCache cache(full, kind);
+        for (bool fresh : {false, true})
+            require(!cache.evidence(keys[0], fresh).samples && cache.evidence(keys[3], fresh).samples == 8 &&
+                cache.phase_evidence(keys[2], fresh, 8).samples == 8, "new contexts failed to replace the oldest complete observations");
+    }
+    std::ifstream input(file); std::string text((std::istreambuf_iterator<char>(input)), {}); input.close();
+    auto body = text.substr(65); body.erase(body.find_last_of(' ') + 1);
+    { std::ofstream truncated(file, std::ios::trunc); truncated << stream_state::digest(body) << '\n' << body; }
+    ConstructionCache interrupted(full, kind);
+    require(!interrupted.evidence(keys[1], true).samples, "a torn peer row supplied a partial durable cohort");
+}
 void cached_publications(fs::path const& root)
 {
     using namespace grow_controller_test;
+    terminal_publications(root / "terminal-publications");
     auto const directory = root / "publication-cache";
     Arguments args; args.max_ram = 1024; group_grow::Identity plot; plot.header.k = 18; plot.header.strength = 2;
     ExternalConfig external; external.scratch.push_back({"unused fixture path", 50});

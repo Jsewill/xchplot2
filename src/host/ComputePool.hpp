@@ -259,6 +259,13 @@ struct GenerationRoute
     uint32_t cpu_slots = 0, gpu_slots = 0;
     bool operator==(GenerationRoute const&) const = default;
 };
+struct PublicationRoute
+{
+    std::string identity, instance;
+    Endpoint endpoint;
+    Kind kind = Kind::GenerateAny;
+    Resources resources;
+};
 struct GenerationRoster
 {
     // At most one ordinary status page. Aggregate slot counts still cover
@@ -317,6 +324,7 @@ public:
     using GenerationPaths = std::vector<std::pair<std::string, std::string>>;
     bool generation_paths(OwnerSession const&, GenerationPaths const&);
     std::optional<std::pair<std::string, Kind>> finite_packed_route(OwnerSession const&, Task const&);
+    std::optional<PublicationRoute> publication_route(OwnerSession const&, Task const&);
     struct GenerationAvailability
     {
         // Common width for planning, or the largest eligible width when

@@ -46,7 +46,7 @@ constexpr char broker_restarted[] = "broker restarted; open a new owner session"
 void require(bool value, char const* message) { if (!value) throw std::runtime_error(message); }
 enum class ErrorCode : uint8_t { Invalid = 1, StaleOwner = 2, StaleDelivery = 3, StaleLease = 4 };
 enum class BeginResult : uint8_t { Stale, Running, AwaitingAdmission };
-enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute, RegisterGpuRecovery, StatusGpuRecovery, GenerationRoutesGpuRecovery, AcquireFiniteGeneration, FinitePackedRoute, GenerationPaths, DeliveredOnPath };
+enum class Operation : uint8_t { OpenOwner = 1, Acquire, Cancel, Renew, Register, Begin, Finish, Delivered, Reject, Abandon, GenerationHint, Heartbeat, Unregister, CloseOwner, Status, WorkerAdmission, RetireWorker, GenerationAvailability, GenerationRoutes, RegisterWorkerRoute, RegisterGpuRecovery, StatusGpuRecovery, GenerationRoutesGpuRecovery, AcquireFiniteGeneration, FinitePackedRoute, GenerationPaths, DeliveredOnPath, PublicationRoute };
 class UnknownOperation : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedProfiles : public std::runtime_error { using std::runtime_error::runtime_error; };
 class UnsupportedBacklog : public std::runtime_error { using std::runtime_error::runtime_error; };
@@ -206,7 +206,7 @@ struct BrokerClient::Connections
     // An older reply in flight must not disable them on the replacement.
     struct GenerationApi
     {
-        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true}, tier_profiles{true};
+        std::atomic<bool> routes{true}, backlog{true}, gpu_recovery{true}, finite{true}, paths{true}, tier_profiles{true}, publication{true};
     };
     std::atomic<std::shared_ptr<GenerationApi>> generation_api{std::make_shared<GenerationApi>()};
     explicit Connections(Endpoint route, TlsOptions value, unsigned channels) : limit(channels), creator_tls(std::move(value)), endpoint(std::move(route))
@@ -391,6 +391,23 @@ std::optional<std::pair<std::string, Kind>> BrokerClient::finite_packed_route(Ow
     auto const kind = Kind(reader.u8()); reader.finish();
     require(identifier(identity, 64) && (kind == Kind::GenerateCpu || kind == Kind::GenerateGpu), "invalid finite generation route");
     return std::pair{identity, kind};
+}
+std::optional<PublicationRoute> BrokerClient::publication_route(OwnerSession const& owner, Task const& task)
+{
+    auto const api = connections_->generation_api.load();
+    if (!api->publication.load()) return {};
+    auto writer = request(Operation::PublicationRoute); write_session(writer, owner); write_task(writer, task);
+    std::vector<uint8_t> bytes;
+    try { bytes = call(writer); }
+    catch (UnknownOperation const&) { api->publication.store(false); return {}; }
+    Reader in(bytes); PublicationRoute route; route.identity = in.string(64);
+    if (route.identity.empty()) { in.finish(); return {}; }
+    route.instance = in.string(64); route.endpoint = read_endpoint(in); route.kind = Kind(in.u8());
+    route.resources = read_resources(in); in.finish();
+    require(identifier(route.identity, 64) && identifier(route.instance, 64) && !route.endpoint.host.empty() && route.endpoint.port &&
+        (route.kind == Kind::GenerateGpu || route.kind == Kind::GenerateCpu) && route.resources.slots == 1 &&
+        route.resources.cpu_threads && route.resources.host_bytes, "invalid publication route");
+    return route;
 }
 uint32_t BrokerClient::generation_hint(OwnerSession const& owner, Task const& task, uint32_t* slots,
     GenerationAvailability* availability, std::string const& codec, std::shared_ptr<GenerationRoster const>* roster)
@@ -1941,6 +1958,39 @@ struct BrokerServer::Impl
                 paths.emplace_back(std::move(worker), identity + ':' + path);
             }
             reader.finish(); source.paths = std::move(paths); break;
+        }
+        case Operation::PublicationRoute:
+        {
+            auto session = read_session(reader); Job job; job.requested = read_task(reader); reader.finish();
+            (void)owner(identity, session); job.owner = owner_key(identity, session.owner_id);
+            auto& t = job.requested; auto const members = t.work_units;
+            require(t.kind != Kind::Pack && t.generation_output == GenerationOutput::Packed && !t.independent_members &&
+                members && members <= max_generation_batch_members, "invalid publication width");
+            uint32_t other_owner_tasks = 0; auto const room = available(job.owner, &other_owner_tasks);
+            if (other_owner_tasks) { response.string(""); break; }
+            std::optional<PublicationRoute> route;
+            uint64_t lanes = 0;
+            if (std::any_of(jobs.begin(), jobs.end(), [](auto const& job) { return job.second.state == State::Queued; }))
+            { response.string(""); break; }
+            for (auto const& [id, worker] : workers)
+            {
+                t.work_units = 1; t.generation_output = GenerationOutput::Packed;
+                auto const& capacity = worker.offer.capacity;
+                auto const single = eligible(job, id, worker, capacity);
+                if (!single) continue;
+                lanes += capacity.parallel_tasks(single->resources);
+                if (lanes > 1) break;
+                if (room.at(id) != capacity) continue;
+                t.work_units = members;
+                auto const packed = eligible(job, id, worker, capacity);
+                t.generation_output = GenerationOutput::Fresh;
+                auto const fresh = eligible(job, id, worker, capacity);
+                if (packed && fresh && packed->kind == fresh->kind && packed->resources == fresh->resources)
+                    route = PublicationRoute{id, worker.offer.instance, worker.offer.endpoint, packed->kind, packed->resources};
+            }
+            if (lanes != 1 || !route) { response.string(""); break; }
+            response.string(route->identity); response.string(route->instance); write_endpoint(response, route->endpoint);
+            response.u8(uint8_t(route->kind)); write_resources(response, route->resources); break;
         }
         case Operation::FinitePackedRoute:
         {

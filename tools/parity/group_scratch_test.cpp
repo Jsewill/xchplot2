@@ -938,10 +938,30 @@ void nvme_topology()
     require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller namespaces were accepted");
 #endif
 }
+#ifdef _WIN32
+void windows_disk_identity()
+{
+    STORAGE_DEVICE_NUMBER_EX disk{};
+    disk.Size = disk.Version = sizeof(disk);
+    disk.DeviceType = FILE_DEVICE_DISK; disk.DeviceNumber = 3;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)).empty(), "missing disk GUID established a measurement identity");
+    disk.DeviceGuid.Data1 = 1;
+    auto const original = storage_detail::disk_guid(3, disk, sizeof(disk));
+    require(original.size() == 32, "Windows disk GUID missing from measurement identity");
+    ++disk.DeviceGuid.Data1;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)) != original,
+        "Windows disk number reuse retained the previous measurement identity");
+    require(storage_detail::disk_guid(4, disk, sizeof(disk)).empty() &&
+        storage_detail::disk_guid(3, disk, sizeof(disk) - 1).empty(), "mismatched or short Windows disk identity was accepted");
+    disk.DeviceNumber = MAXDWORD;
+    require(storage_detail::disk_guid(MAXDWORD, disk, sizeof(disk)).empty(), "an MPIO path established a physical disk identity");
+}
+#endif
 int main() try
 {
     nvme_topology();
 #ifdef _WIN32
+    windows_disk_identity();
     fs::path directory;
     std::random_device random;
     for (unsigned attempt = 0; attempt < 32; ++attempt)

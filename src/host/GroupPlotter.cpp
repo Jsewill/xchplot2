@@ -989,6 +989,7 @@ struct Backend
     std::unique_ptr<group_grow::WorkerService> pool_service;
     std::shared_ptr<group_grow::WorkerClient> pool_client;
     group_grow::WorkerClientConfig pool_client_config;
+    std::optional<group_grow::ConstructionCache> terminal_cache;
     std::shared_ptr<group_grow::PoolRemoteEncoder> pool_remote;
 #ifdef GROW_TEST_CONSTRUCTION
     std::shared_ptr<group_grow::RemoteEncoder> test_remote;
@@ -1415,6 +1416,7 @@ struct Backend
             }
             return result;
         }
+        catch (group_grow::WorkerPublicationChanged const&) { throw; }
         catch (group_grow::WorkerTaskDeclined const&) {}
         catch (group_grow::pool::UnsupportedResources const&) {}
         catch (group_grow::pool::TransientTransport const&) { pool_retries.fetch_add(1); }
@@ -1474,6 +1476,7 @@ struct Backend
                 break;
             }
             catch (Interrupted const&) { throw; }
+            catch (group_grow::WorkerPublicationChanged const&) { throw; }
             catch (group_grow::WorkerAdmissionRejected const&) { throw; }
             catch (group_grow::pool::TransientTransport const&)
             { if (!retry()) break; }
@@ -3367,6 +3370,141 @@ std::string publication_cache_key(std::string const& topology, Arguments const& 
     }
     return stream_state::digest(scope.str());
 }
+bool publication_host(std::ostringstream& scope)
+{
+#ifdef __linux__
+    auto const boot = group_grow::farming_owner_detail::kernel_identity();
+    cpu_set_t cpus; CPU_ZERO(&cpus);
+    if (boot.empty() || ::sched_getaffinity(0, sizeof(cpus), &cpus)) return false;
+    auto const pid_ns = group_grow::farming_owner_detail::pid_namespace(uint64_t(::getpid()));
+    if (pid_ns.empty()) return false;
+    scope << boot << ' ' << pid_ns;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &cpus)) scope << ' ' << cpu;
+    // Affinity alone omits cgroup CPU bandwidth and I/O throttling. Use
+    // the visible v2 hierarchy when it can be resolved without guessing.
+    std::ifstream membership("/proc/self/cgroup");
+    auto cgroups = group_grow::profile_detail::read_text(membership, 4096);
+    if (!cgroups.starts_with("0::/") || cgroups.find('\n') != cgroups.size() - 1) return false;
+    fs::path const group(cgroups.substr(3, cgroups.size() - 4)), mount("/sys/fs/cgroup");
+    if (group.lexically_normal() != group || !fs::exists(mount / "cgroup.controllers")) return false;
+    auto dir = (mount / group.relative_path()).lexically_normal();
+    if (dir.filename().empty() && dir != mount) dir = dir.parent_path();
+    if (!fs::exists(dir / "cgroup.procs")) return false;
+    for (unsigned depth = 0;; ++depth)
+    {
+        if (depth > 24) return false;
+        for (auto field : {"cpu.max", "cpu.weight", "io.max"})
+        {
+            auto const setting = dir / field;
+            if (!fs::exists(setting)) { scope << " -"; continue; }
+            std::ifstream input(setting);
+            scope << ' ' << std::quoted(group_grow::profile_detail::read_text(input, 2048));
+        }
+        if (dir == mount) break;
+        dir = dir.parent_path();
+    }
+#elif defined(_WIN32)
+    auto const boot = group_grow::farming_owner_detail::process_start(4);
+    DWORD_PTR cpus = 0, machine = 0;
+    BOOL in_job = FALSE;
+    if (boot.empty() || !::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || in_job ||
+        !::GetProcessAffinityMask(::GetCurrentProcess(), &cpus, &machine)) return false;
+    scope << boot << ' ' << cpus;
+#else
+    return false;
+#endif
+    return true;
+}
+bool publication_device(std::ostringstream& scope, fs::path const& directory)
+{
+    std::vector<std::string> windows_guids;
+    auto const device = group_grow::storage_device(directory, &windows_guids);
+    if (device.filesystem.empty() || device.drives.empty() || device.drives.size() > 32) return false;
+    scope << '\n' << std::quoted(device.filesystem) << ' ' << device.rotating << ' ' << device.nonrotating;
+    for (auto const& drive : device.drives)
+    {
+        scope << ' ' << std::quoted(drive);
+#ifdef __linux__
+        if (!drive.starts_with("nvme:"))
+        {
+            if (drive.find_first_not_of("0123456789:") != drive.npos) return false;
+            std::ifstream sequence(fs::path("/sys/dev/block") / drive / "diskseq"); uint64_t id = 0;
+            if (!(sequence >> id) || !id) return false;
+            scope << ' ' << id;
+        }
+#endif
+    }
+    for (auto const& guid : windows_guids) scope << ' ' << guid;
+    return true;
+}
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+struct TerminalWave : group_grow::TerminalPublication
+{
+    std::shared_ptr<group_grow::WorkerPublication> route;
+    std::array<Range, 2> forecast{};
+    uint64_t retries = 0, failures = 0, fallback = 0;
+    unsigned workers = 0;
+    std::chrono::steady_clock::time_point pressure{};
+    static bool grant(std::ostringstream& scope, fs::path const& path, Identity const& identity, unsigned members,
+                      unsigned batch, uint64_t engine_bytes, uint64_t lease_bytes, group_grow::Config const& cfg)
+    {
+        scope << '\n' << unsigned(identity.params.get_k()) << ' ' << unsigned(identity.params.get_strength()) << ' '
+            << unsigned(identity.params.get_meta_group()) << ' ' << identity.memo.size() << ' ' << members << ' ' << batch << ' '
+            << engine_bytes << ' ' << lease_bytes << ' ' << cfg.workers << ' ' << cfg.window_bytes << ' '
+            << cfg.checkpoint_bytes << ' ' << cfg.codec_bytes;
+        return publication_device(scope, path.parent_path());
+    }
+    bool start(Backend& backend, Arguments const& args, Identity const& identity, unsigned members, uint64_t receive, std::ostringstream& scope)
+    {
+        using Cache = group_grow::ConstructionCache;
+        if (!backend.terminal_cache) backend.terminal_cache.emplace(Cache::location(Cache::Kind::PoolPublication), Cache::Kind::PoolPublication);
+        if (!backend.terminal_cache->available()) return false;
+        auto client = backend.acquire_pool_client(); std::vector<std::array<uint8_t, 32>> ids;
+        for (unsigned i = 0; i < members; ++i) ids.push_back(identity.params.get_plot_params_for_index(i).get_plot_id().data());
+        route = client->publication_route(identity.params.get_k(), identity.params.get_strength(), ids);
+        if (!route) return false;
+        if (route->loopback)
+        {
+            if (route->host.empty() || route->host != group_grow::profile_detail::host_name()) return false;
+#ifdef __linux__
+            std::error_code error; auto const ns = fs::read_symlink("/proc/self/ns/net", error);
+            if (error || ns.empty()) return false;
+            scope << ' ' << std::quoted(ns.string());
+#endif
+        }
+        auto const& r = route->route; auto const& resource = r.resources;
+        scope << '\n' << GROW_IDENTITY << ' ' << route->path << ' ' << std::quoted(route->host) << ' ' << std::quoted(route->gpu) << ' ' << unsigned(r.kind) << ' ' << resource.cpu_threads
+            << ' ' << resource.slots << ' ' << resource.host_bytes << ' ' << resource.gpu_bytes << ' ' << args.workers << ' '
+            << args.pool_writers << ' ' << args.pool_inflight << ' ' << args.max_ram << ' ' << receive << ' ' << args.cache_release
+            << ' ' << args.io_overlap << ' ' << args.generation_overlap << ' ' << (backend.generated_members != 0);
+        key = stream_state::digest(scope.str()); retries = backend.pool_retries.load(); fallback = backend.pool_local_fallbacks.load();
+        failures = client->stats().failed_tasks;
+        if (args.disk_io) { pressure = args.disk_io->pressure_deadline(); if (args.disk_io->status().pressured) return false; }
+        return true;
+    }
+    bool comparable(Backend& backend, Arguments const& args) const
+    {
+        return backend.pool_retries.load() == retries && backend.pool_local_fallbacks.load() == fallback &&
+            (!args.disk_io || (!args.disk_io->status().pressured && args.disk_io->pressure_deadline() == pressure));
+    }
+    std::optional<bool> read(Backend& backend, Arguments const& args)
+    { return args.pool_output == "auto" ? choice(*backend.terminal_cache, &forecast) : std::optional<bool>{}; }
+    bool select(group_grow::PoolPublicationHistory const& history, group_grow::PoolPublicationHistory::Shape shape,
+                bool ordinary, std::optional<bool> const& incumbent, std::optional<bool> const& prior)
+    {
+        bool selected = incumbent.value_or(ordinary);
+        if (!incumbent && prior && *prior != ordinary) selected = history.final_group_encoded(shape, ordinary, true, 0, 0, prior);
+        if (!incumbent && selected != ordinary) { route->selected_fresh = selected; route->promoted.store(true); }
+        if (controller_profile()) std::osyncstream(std::cerr) << "[grow-controller-timing] phase=terminal_publication owner="
+            << owner << " peers=" << peers.size() << " ordinary=" << (ordinary ? "fresh" : "packed")
+            << " prior=" << (prior ? (*prior ? "fresh" : "packed") : forecast[0].high ? "inconclusive" : "unknown")
+            << " selected=" << (selected ? "fresh" : "packed") << " packed_low_ns=" << forecast[0].low << " packed_high_ns=" << forecast[0].high
+            << " fresh_low_ns=" << forecast[1].low << " fresh_high_ns=" << forecast[1].high
+            << " paired_samples=" << std::min(forecast[0].samples, forecast[1].samples) << '\n';
+        return selected;
+    }
+};
+#endif
 CachedPublication comparable_publications(Backend& backend, Arguments const& args, fs::path const& path,
     group_grow::Identity const& identity, uint16_t members, unsigned ram_workers, uint16_t ram_batch,
     unsigned scratch_workers, uint16_t scratch_batch, group_grow::ExternalConfig const& scratch)
@@ -3380,72 +3518,9 @@ CachedPublication comparable_publications(Backend& backend, Arguments const& arg
             args.resume || args.replot || args.farming_detect_local || !args.fixtures.empty() || scratch.scratch.empty() || scratch.scratch.size() > 16 ||
             (args.disk_io && args.disk_io->status().pressured)) return {};
         std::ostringstream scope; scope.imbue(std::locale::classic());
-#ifdef __linux__
-        auto const boot = group_grow::farming_owner_detail::kernel_identity();
-        cpu_set_t cpus; CPU_ZERO(&cpus);
-        if (boot.empty() || ::sched_getaffinity(0, sizeof(cpus), &cpus)) return {};
-        auto const pid_ns = group_grow::farming_owner_detail::pid_namespace(uint64_t(::getpid()));
-        if (pid_ns.empty()) return {};
-        scope << boot << ' ' << pid_ns;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &cpus)) scope << ' ' << cpu;
-        // Affinity alone omits cgroup CPU bandwidth and I/O throttling. Use
-        // the visible v2 hierarchy when it can be resolved without guessing.
-        std::ifstream membership("/proc/self/cgroup");
-        auto cgroups = group_grow::profile_detail::read_text(membership, 4096);
-        if (!cgroups.starts_with("0::/") || cgroups.find('\n') != cgroups.size() - 1) return {};
-        fs::path const group(cgroups.substr(3, cgroups.size() - 4)), mount("/sys/fs/cgroup");
-        if (group.lexically_normal() != group || !fs::exists(mount / "cgroup.controllers")) return {};
-        auto dir = (mount / group.relative_path()).lexically_normal();
-        if (dir.filename().empty() && dir != mount) dir = dir.parent_path();
-        if (!fs::exists(dir / "cgroup.procs")) return {};
-        for (unsigned depth = 0;; ++depth)
-        {
-            if (depth > 24) return {};
-            for (auto field : {"cpu.max", "cpu.weight", "io.max"})
-            {
-                auto const setting = dir / field;
-                if (!fs::exists(setting)) { scope << " -"; continue; }
-                std::ifstream input(setting);
-                scope << ' ' << std::quoted(group_grow::profile_detail::read_text(input, 2048));
-            }
-            if (dir == mount) break;
-            dir = dir.parent_path();
-        }
-#elif defined(_WIN32)
-        auto const boot = group_grow::farming_owner_detail::process_start(4);
-        DWORD_PTR cpus = 0, machine = 0;
-        BOOL in_job = FALSE;
-        if (boot.empty() || !::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || in_job ||
-            !::GetProcessAffinityMask(::GetCurrentProcess(), &cpus, &machine)) return {};
-        scope << boot << ' ' << cpus;
-#else
-        return {};
-#endif
-        auto storage = [&](fs::path const& directory)
-        {
-            auto const device = group_grow::storage_device(directory);
-            if (device.filesystem.empty() || device.drives.empty() || device.drives.size() > 32) return false;
-            scope << '\n' << std::quoted(device.filesystem) << ' ' << device.rotating << ' ' << device.nonrotating;
-            for (auto const& drive : device.drives)
-            {
-                scope << ' ' << std::quoted(drive);
-#ifdef __linux__
-                if (!drive.starts_with("nvme:"))
-                {
-                    if (drive.find_first_not_of("0123456789:") != drive.npos) return false;
-                    std::ifstream sequence(fs::path("/sys/dev/block") / drive / "diskseq"); uint64_t id = 0;
-                    if (!(sequence >> id) || !id) return false;
-                    scope << ' ' << id;
-                }
-#elif defined(_WIN32)
-                // A physical disk number alone may be reused after hotplug.
-                if (!drive.starts_with("windows:nvme:")) return false;
-#endif
-            }
-            return true;
-        };
-        if (!storage(path.parent_path())) return {};
-        for (auto const& grant : scratch.scratch) if (!storage(file_io::native_path(grant.directory))) return {};
+        if (!publication_host(scope)) return {};
+        if (!publication_device(scope, path.parent_path())) return {};
+        for (auto const& grant : scratch.scratch) if (!publication_device(scope, file_io::native_path(grant.directory))) return {};
         scope << '\n' << (backend.generated_members ? "warm" : "startup");
         if (!backend.publication_cache) backend.publication_cache.emplace(group_grow::ConstructionCache::location());
         if (!backend.publication_cache->available()) return {};
@@ -5619,8 +5694,9 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         unsigned(identity.params.get_k()), unsigned(identity.params.get_strength()), maximum,
         has_compute(args) ? construction_load(args, *backend, identity, maximum, 1).supply : group_grow::GenerationSupply{}};
     std::optional<group_grow::PoolPublicationHistory::Choice> publication_choice;
-    std::chrono::steady_clock::time_point publication_start{};
-    bool comparable_publication = false;
+    std::chrono::steady_clock::time_point publication_start{}, terminal_start{};
+    std::optional<TerminalWave> terminal_wave;
+    bool terminal_attempted = false, comparable_publication = false;
 #endif
     GroupPrefetch prefetched;
     group_grow::ControllerWake consumed;
@@ -5676,21 +5752,55 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         auto const fresh_bytes = backend->mode == "pool" ?
             Backend::fresh_receive_grant(args, sum(sum(fixed, backend->retained()), prefetched.resident_bytes())) : 0;
-        bool const direct = fresh_bytes && args.io_overlap && args.generation_overlap && args.pool_output != "packed" && engine.incremental && !engine.identity().pending && !metrics.members &&
-            incoming.empty() && wanted == maximum && backend->fresh_group_slots(identity, wanted);
+        bool const whole_stream = fresh_bytes && args.io_overlap && args.generation_overlap && engine.incremental && !engine.identity().pending &&
+            !metrics.members && incoming.empty() && wanted == maximum;
+        bool const direct = whole_stream && args.pool_output != "packed" && backend->fresh_group_slots(identity, wanted);
+        std::optional<bool> incumbent, prior;
         if (direct && args.pool_output == "auto" && group_grow::storage_device(target.parent_path()).rotating)
         {
             auto& history = backend->single_publications;
             publication_choice = history.select(pool_shape, 1, 1, 1, args.pool_output);
-            if (auto incumbent = backend->finite_publication(history, pool_shape, args, remaining_job_members))
-                publication_choice = group_grow::PoolPublicationHistory::Choice{1, *incumbent, false};
-            publication_start = std::chrono::steady_clock::now();
-            comparable_publication = !publication_choice->encoded;
+            incumbent = backend->finite_publication(history, pool_shape, args, remaining_job_members);
+            if (incumbent) publication_choice = group_grow::PoolPublicationHistory::Choice{1, *incumbent, false};
+            publication_start = std::chrono::steady_clock::now(); comparable_publication = !publication_choice->encoded;
         }
-        if (direct && (!publication_choice || publication_choice->encoded))
+        if (whole_stream && !terminal_attempted && !fixture && !args.resume && !args.replot && !args.protected_resources &&
+            compact && !successor && !recovery && !scratch && prefetched.members.empty() && !metrics.recovered &&
+            (remaining_job_members ? remaining_job_members <= maximum : !prefetch_next) &&
+            (!args.disk_io || !args.disk_io->status().pressured))
+        {
+            terminal_attempted = true;
+            try
+            {
+                auto const capacity = backend->acquire_pool_client()->generation_capacity(identity.params.get_k(), identity.params.get_strength());
+                if (capacity.slots == 1 && capacity.roster && capacity.roster->complete && capacity.roster->routes.size() == 1)
+                {
+                    std::ostringstream scope; scope.imbue(std::locale::classic()); scope << "single";
+                    auto const device = group_grow::storage_device(target.parent_path()); TerminalWave wave;
+                    if ((device.rotating || device.nonrotating) && publication_host(scope) && TerminalWave::grant(scope, target, identity,
+                        maximum, batch_cap, engine_bytes, fixed, engine.config) && wave.start(*backend, args, identity, maximum, fresh_bytes, scope))
+                    {
+                        terminal_start = std::chrono::steady_clock::now(); wave.started = 1;
+                        prior = wave.read(*backend, args); terminal_wave = std::move(wave);
+                    }
+                }
+            }
+            catch (...) {}
+        }
+        bool stream = direct && (!publication_choice || publication_choice->encoded);
+        if (terminal_wave && args.pool_output == "auto" && direct)
+        {
+            bool const ordinary = stream;
+            stream = terminal_wave->select(backend->single_publications, pool_shape, ordinary, incumbent, prior);
+            if (stream != ordinary) publication_choice.reset(); // The run-local trial enrolled the other form.
+        }
+        if (stream)
         {
             uint64_t elapsed = 0;
-            auto streamed = engine.stream_fresh(*backend, identity, uint16_t(wanted), args, fresh_bytes, elapsed, nullptr, work_horizon(0, wanted));
+            std::optional<group_grow::AppendResult> streamed;
+            try { streamed = engine.stream_fresh(*backend, identity, uint16_t(wanted), args, fresh_bytes, elapsed, nullptr, work_horizon(0, wanted)); }
+            catch (group_grow::WorkerPublicationChanged const&)
+            { if (!terminal_wave) throw; terminal_wave.reset(); continue; }
             if (streamed)
             {
                 comparable_publication = !metrics.recovered;
@@ -5786,9 +5896,18 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
         {
             incoming.reserve(wanted);
             require(incoming.capacity() <= batch_cap, "member container exceeds admitted capacity");
-            metrics.generated_members += producer.fill(incoming, uint16_t(metrics.members), size_t(wanted), prefetched.resident_bytes(),
-                hash.get(), &borrowed, fixture ? "loading fixture member " : "generating " + backend->mode + " member ",
-                {}, !engine.external, work_horizon(metrics.members, wanted));
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            try
+            {
+#endif
+                metrics.generated_members += producer.fill(incoming, uint16_t(metrics.members), size_t(wanted), prefetched.resident_bytes(),
+                    hash.get(), &borrowed, fixture ? "loading fixture member " : "generating " + backend->mode + " member ",
+                    {}, !engine.external, work_horizon(metrics.members, wanted));
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            }
+            catch (group_grow::WorkerPublicationChanged const&)
+            { if (!terminal_wave) throw; terminal_wave.reset(); continue; }
+#endif
         }
         producer.admit_engine(incoming, prefetched.resident_bytes());
         std::optional<group_grow::AppendResult> appended;
@@ -6042,6 +6161,11 @@ Metrics run_group(Arguments const& args, fs::path const& target, Fixtures const*
     if (metrics.members && publication::enabled(target)) progress.published(metrics.members, newly_published ? inherited_publication : metrics.members);
     if (args.dashboard_job) args.dashboard_job->released(file_io::path_text(target), newly_published);
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    if (terminal_wave && newly_published && metrics.members == maximum && !metrics.recovered && !metrics.automatic_fallbacks &&
+        engine.incremental && engine.scratch_cleanup_complete && terminal_wave->comparable(*backend, args) &&
+        terminal_wave->route->deliveries.load() == 1 && terminal_wave->failures == backend->acquire_pool_client()->stats().failed_tasks &&
+        terminal_wave->publish(0, sum(1, group_grow::elapsed_ns(terminal_start))))
+        terminal_wave->completed(*backend->terminal_cache, terminal_wave->route->encoded.load());
     if (publication_choice && backend->single_publications.begin(pool_shape, *publication_choice, 0))
         backend->single_publications.publish(metrics.members, group_grow::elapsed_ns(publication_start), comparable_publication);
 #endif
@@ -14789,7 +14913,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         uint64_t original_member_bytes = 0;
         uint16_t prepared_members = 0, fresh_members = 0;
         uint16_t scheduled_members = 0;
-        uint64_t receipt_due = 0;
+        uint64_t receipt_due = 0, submitted_at = 0;
         uint64_t prepared_read_accounted = 0, fresh_generation_ns = 0;
         MemberLease lease;
         std::optional<group_grow::ScratchPool::IoLease> io;
@@ -14798,6 +14922,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         group_grow::Result finished;
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
         using Generated = Producer::Generated;
+        std::shared_ptr<group_grow::WorkerPublication> publication;
         std::atomic<bool> cancel_generation{false}, waiting_receiver{false};
         group_grow::NotifiedFuture<Generated> generating;
         uint64_t receiving_bytes = 0, pool_hash_bytes = 0;
@@ -14824,7 +14949,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         Metrics metrics;
         std::unique_ptr<Task> pending;
         std::future<void> ready;
-        bool fresh_declined = false, packed_declined = false;
+        bool fresh_declined = false, packed_declined = false, terminal_attempted = false;
         bool pool_encoded = true, pool_comparable = true;
         uint64_t remaining_pool_members = 0;
         group_grow::PoolPublicationHistory* pool_trial = nullptr;
@@ -15241,6 +15366,62 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         total.peak_file_bytes = std::max(total.peak_file_bytes, sum(peak, farm->replacement_peak_bytes));
     };
     size_t active = 0;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+    std::optional<TerminalWave> terminal_wave;
+    auto terminal_publication = [&](Destination& d, unsigned members, uint64_t receive) -> std::optional<bool>
+    {
+        if (terminal_wave || d.terminal_attempted || (!devices[d.owner].rotating && !devices[d.owner].nonrotating) || args.member_storage != "compact" || args.resume || args.replot ||
+            args.protected_resources || !args.fixtures.empty() || d.scratch || d.guard || !d.engine || d.engine->external ||
+            pool_prefetch.ready.valid() || !prefetched.members.empty() ||
+            d.metrics.members || d.metrics.recovered || d.fresh_declined || d.packed_declined || d.maximum != members ||
+            !writers[d.writer] || writers[d.writer]->busy() || (args.disk_io && args.disk_io->status().pressured)) return {};
+        try
+        {
+            d.terminal_attempted = true;
+            auto client = backend->acquire_pool_client();
+            auto const capacity = client->generation_capacity(d.requested.params.get_k(), d.requested.params.get_strength());
+            if (capacity.slots != 1 || !capacity.roster || !capacity.roster->complete || capacity.roster->routes.size() != 1 ||
+                !capacity.availability.admission) return {};
+            TerminalWave wave; wave.owner = d.owner; wave.workers = d.engine->config.workers;
+            std::ostringstream scope; scope.imbue(std::locale::classic());
+            auto grant = [&](Destination const& lane)
+            {
+                return TerminalWave::grant(scope, lane.path, lane.requested, lane.maximum, lane.batch_cap,
+                    lane.engine_bytes, lane.lease_bytes, lane.engine->config);
+            };
+            if (!publication_host(scope) || !grant(d)) return {};
+            // A future group or an unpriced/unsubmitted writer leaves the normal policy in force.
+            for (auto const& lane : destinations)
+            {
+                if (lane->complete) continue;
+                if (farm && farm->accepts_future(lane->owner))
+                {
+                    auto const& file = farm->lanes[lane->owner]; auto const& dir = farm->state.directories[lane->owner];
+                    bool const open_extent = farm->state.capacity_fill && (farm->all_replicas || farm->state.version >= 9) && dir.fill_stop.empty();
+                    if (!file.no_capacity && file.ordinal + 1 < args.max_groups &&
+                        sum(file.completed_members, lane->maximum) < args.max_total_members &&
+                        (open_extent || farm->file_maximum(lane->owner, file.ordinal + 1))) return {};
+                }
+                if (lane.get() == &d) continue;
+                auto const& work = lane->pending;
+                if (wave.peers.size() == wave.max_peers || lane->writer == d.writer || !lane->engine || !lane->engine->incremental ||
+                    lane->guard || lane->scratch || (!devices[lane->owner].rotating && !devices[lane->owner].nonrotating) || lane->metrics.recovered || lane->needs_resume ||
+                    lane->fresh_declined || lane->packed_declined || !work || work->work != Work::append || !work->submitted_at ||
+                    work->generating.valid() || work->contribution_input || work->prepared_input || work->scheduled_members != lane->maximum ||
+                    lane->metrics.members || !lane->ready.valid() || lane->ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready ||
+                    !writers[lane->writer] || !writers[lane->writer]->busy() || !grant(*lane)) return {};
+                if (std::any_of(wave.peers.begin(), wave.peers.end(), [&](auto const& peer)
+                    { return destinations[peer.owner]->writer == lane->writer; })) return {};
+                scope << ' ' << lane->workers << ' ' << bool(work->fresh_members);
+                wave.peers.push_back({lane->owner, work->submitted_at});
+            }
+            if (!wave.start(*backend, args, d.requested, members, receive, scope)) return {};
+            wave.started = execution_now(); auto choice = wave.read(*backend, args);
+            terminal_wave = std::move(wave); return choice;
+        }
+        catch (...) { return {}; }
+    };
+#endif
     uint32_t wait_reasons = 0;
     auto blocked = [&](ControllerWait reason) { wait_reasons |= wait_bit(reason); return false; };
     std::string farming_resource_error;
@@ -16370,7 +16551,7 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         else if (pooled_hdd) d.publication_shape.supply = supply;
         d.admission_wait = ControllerWait::count; d.admission_holder = nullptr;
         d.engine = std::move(engine); d.batch_cap = batch;
-        d.fresh_declined = d.packed_declined = false;
+        d.fresh_declined = d.packed_declined = d.terminal_attempted = false;
         d.pool_encoded = choice.encoded;
         d.remaining_pool_members = !d.scratch ? remaining_pool_members : 0;
         d.pool_trial = !prefetched_rollover && tune_pool && !farming_pressure && publications.begin(pool_shape, choice, execution_now()) ? &publications : nullptr;
@@ -16417,6 +16598,21 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
         engine.confirm_identity(); clear_progress(args); engine.release_external();
         bool const newly_published = engine.publish();
         auto const durable_at = execution_now();
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (terminal_wave)
+        {
+            auto& wave = *terminal_wave;
+            if (!newly_published || d.metrics.members != d.maximum || d.metrics.recovered || d.metrics.automatic_fallbacks ||
+                d.fresh_declined || d.packed_declined || !engine.scratch_cleanup_complete || !engine.incremental ||
+                !wave.comparable(*backend, args)) terminal_wave.reset();
+            else if (wave.publish(d.owner, durable_at))
+            {
+                if (wave.route->deliveries.load() == 1 && backend->acquire_pool_client()->stats().failed_tasks == wave.failures)
+                    wave.completed(*backend->terminal_cache, wave.route->encoded.load());
+                terminal_wave.reset();
+            }
+        }
+#endif
         if (d.metrics.members && publication::enabled(d.path))
         {
             std::optional<group_grow::DashboardJob::LaneFile> file;
@@ -16833,6 +17029,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             if (source) d.engine->attach_history(std::move(source));
         }
         d.workers = count;
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (task->work == Work::append && backend->mode == "pool" && task->scheduled_members == d.maximum && d.engine->incremental)
+        {
+            task->submitted_at = execution_now();
+            if (terminal_wave && terminal_wave->owner == d.owner && count != terminal_wave->workers) terminal_wave.reset();
+        }
+#endif
         task->original_member_bytes = resident(task->members);
         task->finish_with_members = d.engine->external && d.engine->external->can_finish_with_members();
         bool const streamed = task->contribution_input || task->prepared_input;
@@ -17377,6 +17580,9 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
     }
     while (complete < destinations.size())
     {
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+        if (terminal_wave && args.disk_io && args.disk_io->status().pressured) terminal_wave.reset();
+#endif
         if (progress_reporter.state) progress_reporter.state->waits = 0;
         auto const wake_generation = wake.generation();
         check_cancel(args);
@@ -17426,7 +17632,13 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             {
                 auto& task = *d.pending;
                 if (task.generating.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
-                auto const generated = task.generating.get();
+                Task::Generated generated;
+                try { generated = task.generating.get(); }
+                catch (group_grow::WorkerPublicationChanged const&)
+                {
+                    if (!task.publication) throw;
+                    terminal_wave.reset(); d.pending.reset(); progress = true; continue;
+                }
                 task.receipt_due = 0; task.scheduled_members = uint16_t(generated.members);
                 task.receiving_bytes = 0; task.fill_stop = generated.stop;
                 d.metrics.generated_members = sum(d.metrics.generated_members, generated.members);
@@ -17518,7 +17730,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                 if (farm && !farm->state.capacity_fill && !metadata_waiting) progress = prefetch(d) || progress;
                 continue;
             }
-            d.ready.get(); progress = true; auto& task = *d.pending; task.io.reset();
+#if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
+            try { d.ready.get(); }
+            catch (group_grow::WorkerPublicationChanged const&)
+            {
+                if (!d.pending->publication) throw;
+                if (d.engine->incremental) d.engine->incremental->fresh_write({});
+                d.engine->consumed({}); d.workers = 0; terminal_wave.reset(); d.pending.reset(); progress = true; continue;
+            }
+#else
+            d.ready.get();
+#endif
+            progress = true; auto& task = *d.pending; task.io.reset();
 #if defined(GROW_POOL_NETWORK) && GROW_POOL_NETWORK
             if (d.engine->incremental) d.engine->incremental->fresh_write({});
 #endif
@@ -18145,17 +18368,18 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
             auto const fresh_bytes = backend->mode == "pool" ?
                 Backend::fresh_receive_grant(args, sum(sum(fixed, backend->retained()), other_held)) : 0;
             if (fresh_bytes && args.io_overlap && args.generation_overlap && !d.fresh_declined && d.engine->incremental && !first && !d.needs_resume &&
-                !has_prefetched && !select_merged && wanted == d.maximum && args.pool_output != "packed")
+                !has_prefetched && !select_merged && wanted == d.maximum)
             {
-                bool const last = args.pool_output == "auto" &&
+                bool const last =
                     std::none_of(destinations.begin(), destinations.end(), [&](auto const& other)
                     {
                         return other.get() != &d && !other->complete && !other->awaiting_extent && !other->pending &&
                             !other->ready.valid() && !other->needs_finish && other->metrics.stop_reason.empty() &&
                             other->metrics.members < other->maximum;
                     });
-                bool direct = d.pool_encoded;
-                if (last)
+                auto const prior = last ? terminal_publication(d, unsigned(wanted), fresh_bytes) : std::optional<bool>{};
+                bool direct = d.pool_encoded && args.pool_output != "packed";
+                if (last && args.pool_output == "auto")
                 {
                     unsigned const batch = unsigned(wanted);
                     auto const packed = backend->pool_estimate(d.requested, GenerationOutput::Packed, 1, batch, batch);
@@ -18163,11 +18387,12 @@ int multiple_destinations(Arguments const& args, Keys const* keys, FarmingRun* f
                     group_grow::PoolPublicationHistory::Shape const shape{unsigned(d.requested.params.get_k()),
                         unsigned(d.requested.params.get_strength()), d.maximum,
                         construction_load(args, *backend, d.requested, d.maximum, 1).supply};
-                    direct = pool_publications[0].final_group_encoded(shape, direct, args.pool_writers != 0,
+                    bool const ordinary = pool_publications[0].final_group_encoded(shape, direct, args.pool_writers != 0,
                         packed.member_ns, fresh.member_ns);
-                    if (d.remaining_pool_members)
-                        if (auto incumbent = backend->finite_publication(pool_publications[0], shape, args, d.remaining_pool_members))
-                            direct = *incumbent;
+                    auto const incumbent = d.remaining_pool_members ?
+                        backend->finite_publication(pool_publications[0], shape, args, d.remaining_pool_members) : std::optional<bool>{};
+                    direct = terminal_wave ? terminal_wave->select(pool_publications[0], shape, ordinary, incumbent, prior) : incumbent.value_or(ordinary);
+                    if (terminal_wave && terminal_wave->route->promoted.load()) task.publication = terminal_wave->route;
                 }
                 if (auto slots = direct ? backend->fresh_group_slots(d.requested, wanted) : 0)
                 {

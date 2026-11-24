@@ -4055,6 +4055,8 @@ struct WorkerClient::Impl
     std::timed_mutex sequence_mutex;
     worker_detail::TaskRegistry task_states;
     mutable std::mutex planning_mutex;
+    std::weak_ptr<WorkerPublication> publication;
+    std::atomic<bool> watching_publication{false};
     std::mutex capacity_refresh_mutex, paths_mutex;
     std::string paths_session;
     pool::BrokerClient::GenerationPaths generation_paths;
@@ -4179,6 +4181,17 @@ struct WorkerClient::Impl
         ~GenerationLease() { impl.active_generation.fetch_sub(1); }
         GenerationLease(GenerationLease const&) = delete;
     };
+    std::shared_ptr<WorkerPublication> publication_for(std::span<std::array<uint8_t, 32> const> ids, bool fresh)
+    {
+        if (!watching_publication.load(std::memory_order_relaxed)) return {};
+        std::lock_guard lock(planning_mutex); auto paid = publication.lock();
+        if (!paid) { watching_publication.store(false, std::memory_order_relaxed); return {}; }
+        if (!paid->promoted.load() || paid->selected_fresh != fresh) return {};
+        if (std::equal(ids.begin(), ids.end(), paid->ids.begin(), paid->ids.end())) return paid;
+        // A reduced grant or a newly useful singleton must go back through the owner's normal format selection.
+        for (auto const& id : ids) if (std::find(paid->ids.begin(), paid->ids.end(), id) != paid->ids.end()) throw WorkerPublicationChanged();
+        return {};
+    }
     bool bind_generation_paths(pool::BrokerClient& control, pool::OwnerSession const& session)
     {
         if (!config.generation_path) return true;
@@ -4204,9 +4217,12 @@ struct WorkerClient::Impl
         }
         catch (...) { return false; } // Do not apply the previous origin if this update failed.
     }
-    void observed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection)
+    void observed(WorkerTaskObservation const& value, pool::Endpoint const& route, uint64_t selection, std::string const& path = {})
     {
-        { std::lock_guard lock(planning_mutex); planning.observed(value, route, selection); }
+        {
+            std::lock_guard lock(planning_mutex); planning.observed(value, route, selection);
+            if (auto pending = publication.lock()) pending->delivered(value, route, path);
+        }
         if (config.observe) try { config.observe(value); } catch (...) {}
     }
     void admit(WorkerTaskAdmission const& value) const
@@ -4407,7 +4423,7 @@ struct WorkerClient::Impl
                 impl.send_ns.fetch_add(generation.send_ns); impl.frame_wait_ns.fetch_add(generation.frame_wait_ns);
                 impl.receiver_ns.fetch_add(generation.receiver_ns); impl.frame_read_ns.fetch_add(generation.frame_read_ns);
             }
-            impl.observed(value, lease.endpoint, planning_selection);
+            impl.observed(value, lease.endpoint, planning_selection, path);
             if (options.observe) try { options.observe(value); } catch (...) {}
         }
     };
@@ -4524,6 +4540,7 @@ struct WorkerClient::Impl
                 cancel.check();
             }
             if (config.selected) config.selected(connection->observation());
+            if (options.publication && (!options.publication->matches(*lease) || connection->local_direct)) throw WorkerPublicationChanged();
             if (options.packed_route && !options.packed_route->matches(*lease)) throw PackedRouteChanged();
             if (options.selected && !options.selected(connection->observation())) throw WorkerTaskDeclined();
         }
@@ -4539,6 +4556,18 @@ struct WorkerClient::Impl
             { connection->connect_ns = ns; connection->ingress = connection->channel.ingress_interface(); }
             std::lock_guard lock(planning_mutex);
             data_connect_ns = data_connect_ns ? std::min(data_connect_ns, ns) : ns;
+        }
+        if (options.publication)
+        {
+            bool same_path = false;
+            try
+            {
+                auto const local = connection->channel.local_address();
+                same_path = !local.empty() && config.generation_path({lease->worker_identity, lease->worker_instance, lease->endpoint},
+                    local, connection->ingress) == options.publication->path;
+            }
+            catch (...) {}
+            if (!same_path) { connection->declined = true; throw WorkerPublicationChanged(); }
         }
         return connection;
     }
@@ -4945,6 +4974,7 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
 {
     cancel = impl_->cancellation(cancel);
     WorkerTaskOptions options; options.other_work_until = other_work_until;
+    options.publication = impl_->publication_for(ids, false);
     bool split = false;
     if (ids.size() > 1 && !impl_->config.local_only)
     {
@@ -4960,8 +4990,9 @@ bool WorkerClient::generate_packed(uint8_t k, uint8_t strength, std::span<std::a
         };
     }
     try { return impl_->generate(k, strength, ids, sink, {}, cancel, std::move(identity), {}, {}, false, false, options); }
-    catch (PackedRouteChanged const&) {}
-    catch (WorkerTaskDeclined const&) { if (!split) throw; }
+    catch (WorkerPublicationChanged const&) { throw; }
+    catch (PackedRouteChanged const&) { if (options.publication) throw WorkerPublicationChanged(); }
+    catch (WorkerTaskDeclined const&) { if (options.publication) throw WorkerPublicationChanged(); if (!split) throw; }
     // No plot ID or output was sent. Retain ordered packed delivery and the
     // original deadline across new identities for the disjoint member sets.
     if (batch_route && batch_route->paid_width)
@@ -5000,6 +5031,7 @@ void WorkerClient::contributions(uint8_t k, uint8_t strength, std::span<std::arr
         }
     }
     WorkerTaskOptions options; options.other_work_until = other_work_until; options.fresh_read_ahead = fresh_read_ahead;
+    if (manifest) options.publication = impl_->publication_for(ids, true);
     if (manifest && ids.size() > 1)
         options.selected = [&](auto const& assigned)
         { std::lock_guard lock(impl_->planning_mutex); return !impl_->planning.needs_first_member(assigned); };
@@ -5151,6 +5183,38 @@ WorkerGenerationEstimate WorkerClient::generation_estimate(uint8_t k, uint8_t st
         Clock::now(), horizon_members);
 }
 uint64_t WorkerClient::max_task_bytes() const { return impl_->config.max_task_bytes; }
+std::shared_ptr<WorkerPublication> WorkerClient::publication_route(uint8_t k, uint8_t strength,
+    std::span<std::array<uint8_t, 32> const> ids) const
+{
+    auto& impl = *impl_;
+    if (impl.config.local_only || !impl.config.generation_path || ids.empty() || ids.size() > pool::max_generation_batch_members) return {};
+    auto const capacity = generation_capacity(k, strength); auto const& a = capacity.availability.admission;
+    if (capacity.slots != 1 || capacity.batch < ids.size() || !capacity.roster || !capacity.roster->complete ||
+        capacity.roster->routes.size() != 1 || !a) return {};
+    try
+    {
+        WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(std::min(250u, impl.config.task_timeout_ms));
+        auto control = impl.broker.with_deadline(cancel.deadline); pool::OwnerSession session;
+        { auto lock = impl.sequence_lock(cancel); impl.prepare_session_locked(control, session, false); }
+        pool::Task task; task.compatibility = impl.config.compatibility; task.kind = impl.config.generation_kind;
+        task.k = k; task.strength = strength; task.work_units = ids.size(); task.resources.cpu_threads = impl.config.generation_threads;
+        auto const confirmed = control.publication_route(session, task); auto const& r = capacity.roster->routes.front();
+        if (!confirmed || confirmed->identity != r.identity || confirmed->instance != r.instance || confirmed->endpoint != r.endpoint ||
+            !pool::numeric_host(r.endpoint.host)) return {};
+        uint32_t adapter = 0; auto const local = pool::local_address(r.endpoint, &adapter);
+        // Same-host sockets have no physical ingress. A pair of identical,
+        // canonical numeric loopback addresses is still an exact local path.
+        bool const loopback = local == r.endpoint.host && (local == "127.0.0.1" || local == "::1");
+        if (local.empty() || (!adapter && !loopback)) return {};
+        auto observed = std::make_shared<WorkerPublication>(); observed->route = *confirmed;
+        observed->host = r.host; observed->gpu = r.gpu_identity; observed->loopback = loopback;
+        observed->path = impl.config.generation_path(r, local, adapter); if (observed->path.empty()) return {};
+        observed->ids.assign(ids.begin(), ids.end()); observed->k = k; observed->strength = strength;
+        { std::lock_guard lock(impl.planning_mutex); impl.publication = observed; impl.watching_publication.store(true, std::memory_order_relaxed); }
+        return observed;
+    }
+    catch (...) { return {}; } // No optional observation can delay a real lease past its normal deadline.
+}
 WorkerGenerationCapacity WorkerClient::generation_capacity(uint8_t k, uint8_t strength) const
 {
     if (impl_->config.private_generation_capacity) return impl_->config.private_generation_capacity(k, strength);
