@@ -1453,7 +1453,9 @@ void finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     };
     accepted(GenerationOutput::Fresh, 3, 900000000);
     accepted(GenerationOutput::Packed, 1, 300000000);
-    accepted(GenerationOutput::Packed, 3, 700000000);
+    // A farm can fill the fast worker with wide batches before the final
+    // singletons compete for its slot. Its singleton delivery is still fresh.
+    for (unsigned i = 0; i < 8; ++i) accepted(GenerationOutput::Packed, 3, 700000000);
     owner.close_owner(session); session = owner.open_owner("finite-job");
     entrant.register_worker(offer_b);
     auto const finite = std::chrono::steady_clock::now();
@@ -1463,7 +1465,8 @@ void finite_generation(BrokerOptions options, TlsOptions const& owner_tls, TlsOp
     next(GenerationOutput::Packed, 3); auto route = owner.finite_packed_route(session, job);
     require(route && route->first == whole->worker_identity, "an unpriced arrival broke the measured final packed batch");
     next(GenerationOutput::Packed, 1); auto first = owner.acquire(session, job, finite);
-    require(first && fast.begin(*first, first->owner_identity), "the first terminal member lost its measured route");
+    require(first && first->worker_instance == offer_a.instance && fast.begin(*first, first->owner_identity),
+        "wide deliveries evicted the measured terminal singleton route");
     next(GenerationOutput::Packed, 1);
     require(!owner.acquire(session, job, finite), "an unpriced terminal member outranked a measured imminent release");
     fast.finish(*first); auto last = owner.acquire(session, job, finite);
@@ -1528,8 +1531,9 @@ void dated_finite_generation(BrokerOptions options, TlsOptions const& owner_tls,
     };
     fast.register_worker(a);
     for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 3, cost, fast_path);
-    for (auto cost : {100000000, 300000000}) learn(fast, GenerationOutput::Packed, 3, cost, fast_path);
     for (auto cost : {70000000, 90000000}) learn(fast, GenerationOutput::Packed, 2, cost, fast_path);
+    for (unsigned i = 0; i < 4; ++i)
+        for (auto cost : {100000000, 300000000}) learn(fast, GenerationOutput::Packed, 3, cost, fast_path);
     learn(fast, GenerationOutput::Fresh, 2, 100000000, fast_path);
     for (auto cost : {100000000, 120000000}) learn(fast, GenerationOutput::Fresh, 1, cost, fast_path);
     fast.worker_admission(a.instance, WorkerAdmission::Paused); slow.register_worker(b);

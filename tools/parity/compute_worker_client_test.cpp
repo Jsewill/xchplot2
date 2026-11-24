@@ -601,6 +601,37 @@ void planning_feedback()
     auto roster = std::make_shared<pool::GenerationRoster>();
     for (auto const& worker : {fast_packed, slow_packed})
         roster->routes.push_back({worker.worker_identity, worker.worker_instance, route, {}, {}, 0, 1});
+    {
+        auto& pair = new_planner();
+        pair.capacity(18, 2, roster, 0, now);
+        auto quick = fast_packed, helper = slow_packed;
+        quick.execution_ns = 300; quick.transfer_ns = 100;
+        helper.execution_ns = 4000; helper.transfer_ns = 4000;
+        helper.generation = {4000, 4000, 4000, 0};
+        train(pair, quick, route); train(pair, helper, route);
+        auto ordinary = [&](unsigned paid)
+        {
+            WorkerPackedRoute target;
+            auto const active = pair.selected(quick, route, now);
+            auto const n = pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &target, true);
+            pair.released(quick.worker_identity, active);
+            require(n == 3 && target.route.identity == quick.worker_identity && target.paid_width == paid,
+                "the slower singleton route inherited a batch sized for the earlier release");
+        };
+        ordinary(0);
+        auto whole = quick; whole.work_units = 3; whole.execution_ns = 750;
+        observe(pair, whole, route); ordinary(3);
+        auto hybrid = std::make_shared<pool::GenerationRoster>(*roster); hybrid->routes.back().cpu_slots = 1;
+        pair.capacity(18, 2, hybrid, pair.selections(), now);
+        WorkerPackedRoute unpriced;
+        require(pair.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 3, 2, 3, 1, now, 0, &unpriced, true) == 3 &&
+            unpriced.route.identity.empty(), "a measured GPU priced the unmeasured CPU backend on the same worker");
+        pair.capacity(18, 2, roster, pair.selections(), now);
+        helper.execution_ns = 200; helper.transfer_ns = 200; observe(pair, helper, route);
+        WorkerPackedRoute open;
+        require(pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &open, true) == 3 &&
+            open.route.identity.empty(), "a competitive measured singleton was pinned behind the incumbent");
+    }
     receiving.capacity(18, 2, roster, 0, now); train(receiving, fast_packed, route);
     auto selected = receiving.selected(slow_packed, route, now);
     pool::Lease first; first.worker_identity = slow_packed.worker_identity;

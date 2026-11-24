@@ -680,10 +680,14 @@ struct BrokerServer::Impl
         std::string owner;
         GenerationOutput output;
         bool independent;
-        struct Sample { DeliveryObservation observation; uint64_t units = 0; Clock::time_point at{}; Resources resources{}; std::string origin; };
+        struct Sample { uint64_t elapsed_ns = 0, units = 0; };
         std::array<Sample, 8> samples{};
         size_t count = 0, next = 0;
         uint64_t assigned = 0;
+        // Other widths cannot replace a still-current price for this exact
+        // request. Allocate receipt storage only for widths the worker delivers.
+        struct Price { uint64_t elapsed_ns; Clock::time_point at; Resources resources; std::string origin; };
+        std::array<std::vector<Price>, max_generation_batch_members> prices;
         bool matches(Task const& task, Kind selected, std::string const& source, uint32_t threads, bool framing = true) const
         { return owner == source && kind == selected && k == task.k && strength == task.strength && cpu_threads == threads &&
             output == task.generation_output && (!framing || independent == task.independent_members); }
@@ -693,7 +697,7 @@ struct BrokerServer::Impl
             for (size_t i = 0; i < count; ++i)
                 if (!singletons || samples[i].units == 1)
                 {
-                    auto const elapsed = samples[i].observation.elapsed_ns;
+                    auto const elapsed = samples[i].elapsed_ns;
                     if (samples[i].units == units) { same += elapsed; ++exact; }
                     total += static_cast<long double>(elapsed) / samples[i].units; ++used;
                 }
@@ -717,7 +721,7 @@ struct BrokerServer::Impl
                 if (strictly_larger && sample.units == units) continue;
                 if (sample.units < width) { width = sample.units; lower = UINT64_MAX; upper = 0; observations = 0; }
                 if (sample.units != width) continue;
-                auto const ns = sample.observation.elapsed_ns;
+                auto const ns = sample.elapsed_ns;
                 lower = std::min(lower, ns); upper = std::max(upper, ns); ++observations;
             }
             long double remaining = upper - elapsed;
@@ -727,7 +731,18 @@ struct BrokerServer::Impl
             return remaining;
         }
         void add(DeliveryObservation observation, uint64_t units, Resources const& resources, std::string origin)
-        { samples[next] = {observation, units, Clock::now(), resources, std::move(origin)}; next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size()); }
+        {
+            if (kind != Kind::Pack)
+            {
+                auto& width = prices.at(size_t(units - 1));
+                Price price{observation.elapsed_ns, Clock::now(), resources, std::move(origin)};
+                if (width.size() < samples.size()) width.push_back(std::move(price));
+                else *std::min_element(width.begin(), width.end(), [](auto const& a, auto const& b)
+                    { return a.at < b.at; }) = std::move(price);
+            }
+            samples[next] = {observation.elapsed_ns, units};
+            next = (next + 1) % samples.size(); count = std::min(count + 1, samples.size());
+        }
     };
     struct Worker
     {
@@ -1009,6 +1024,7 @@ struct BrokerServer::Impl
     long double recent_cost(std::string const& identity, Worker const& worker, Task const& task, Kind kind, std::string const& owner,
                             Resources const& resources, Clock::time_point now, bool lower = false, DatedCost* dated = nullptr) const
     {
+        if (!task.work_units || task.work_units > max_generation_batch_members) return std::numeric_limits<long double>::max();
         auto const since = now - std::chrono::milliseconds(std::max(options.lease_ms, options.worker_ms));
         uint64_t result = 0;
         auto const& source = owners.at(owner);
@@ -1016,14 +1032,13 @@ struct BrokerServer::Impl
             { return item.first == identity; });
         for (auto const& history : worker.histories)
             if ((path != source.paths.end() || history.owner == owner) && history.matches(task, kind, history.owner, resources.cpu_threads))
-                for (auto const& sample : std::span(history.samples).first(history.count))
-                    if (sample.units == task.work_units && sample.resources == resources)
+                for (auto const& sample : history.prices[size_t(task.work_units - 1)])
+                    if (sample.resources == resources)
                     {
                         bool const bound = path != source.paths.end() && sample.origin == path->second;
                         if (sample.at > since && (bound || (history.owner == owner && (sample.origin.empty() || path == source.paths.end()))))
-                            result = lower && result ? std::min(result, sample.observation.elapsed_ns) :
-                                std::max(result, sample.observation.elapsed_ns);
-                        else if (bound && dated) dated->observe(sample.at, now, sample.observation.elapsed_ns);
+                            result = lower && result ? std::min(result, sample.elapsed_ns) : std::max(result, sample.elapsed_ns);
+                        else if (bound && dated) dated->observe(sample.at, now, sample.elapsed_ns);
                     }
         return result ? result : std::numeric_limits<long double>::max();
     }
