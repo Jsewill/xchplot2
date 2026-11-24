@@ -1426,7 +1426,8 @@ struct Backend
 
     group_grow::Member generate_pool(Identity const& identity, uint16_t index, Arguments const& args,
                                     std::atomic<bool> const* stop = nullptr,
-                                    std::chrono::steady_clock::time_point other_work_until = {})
+                                    std::chrono::steady_clock::time_point other_work_until = {},
+                                    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max())
     {
         auto const k = uint8_t(identity.params.get_k());
         uint64_t const bound = fragment_bound(identity.params) / sizeof(uint64_t);
@@ -1436,7 +1437,7 @@ struct Backend
         auto const plot_id = identity.params.get_plot_params_for_index(index).get_plot_id().data();
         group_grow::WorkerCancellation cancel;
         cancel.stop = stop;
-        cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        cancel.deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms));
         auto receive = [&](group_grow::PackedFragmentTile const& tile, uint64_t count)
             {
                 check_cancel(args);
@@ -2245,13 +2246,14 @@ struct Producer
             completed_bytes = sum(completed_bytes, sum(result.storage_bytes(), completed_metadata));
             completed.emplace(member, std::move(result));
         };
-        auto receive_packed = [&](size_t start, size_t n, group_grow::WorkerPackedRoute const& batch_route)
+        size_t repriced_until = 0;
+        group_grow::WorkerCancellation repriced;
+        auto receive_packed = [&](size_t start, size_t n, group_grow::WorkerPackedRoute const& batch_route,
+                                  group_grow::WorkerCancellation cancel, bool& route_changed)
         {
             std::vector<std::array<uint8_t, 32>> ids;
             for (size_t i = start; i < start + n; ++i)
                 ids.push_back(identity.params.get_plot_params_for_index(uint16_t(first + i)).get_plot_id().data());
-            group_grow::WorkerCancellation cancel;
-            cancel.stop = stopped; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
             std::vector<std::unique_ptr<group_grow::CompactMemberReceiver>> received; received.reserve(n);
             bool checked = false, complete = false;
             try
@@ -2269,8 +2271,9 @@ struct Producer
                     require(!received.empty(), "packed batch has no member prelude");
                     received.back()->append(tile);
                     progress_received(backend.progress, sum(tile.boundaries.size_bytes(), tile.words.size_bytes()));
-                }, cancel, {}, other_work_until, &batch_route);
-                complete = true;
+                }, cancel, {}, other_work_until, &batch_route, &route_changed);
+                if (route_changed) require(received.empty(), "changed packed route delivered partial output");
+                complete = !route_changed;
             }
             catch (group_grow::pool::UnsupportedResources const&) {}
             catch (group_grow::pool::TransientTransport const&) { backend.pool_retries.fetch_add(1); }
@@ -2344,26 +2347,53 @@ struct Producer
                 uint64_t const held = sum(sum(sum(other_retained, resident(values)), completed_bytes), in_flight);
                 if (pack && scheduled >= singleton_until && wanted - scheduled > 1)
                 {
-                    group_grow::WorkerPackedRoute route; unsigned singles;
-                    size_t n = client->packed_generation_width(k, strength, unsigned(wanted - scheduled), destinations,
-                        &route, &singles, other_work_until);
+                    group_grow::WorkerPackedRoute route; unsigned singles = slots;
+                    auto cancel = repriced;
+                    size_t n = 1;
+                    if (scheduled < repriced_until)
+                    {
+                        // The original signed route declined before Work. A different
+                        // width needs its own confirmed price, including the live endpoint.
+                        auto const remaining = unsigned(repriced_until - scheduled);
+                        if (auto next = client->priced_packed_route(k, strength, remaining, cancel))
+                        { route = std::move(*next); n = remaining; }
+                    }
+                    else
+                    {
+                        n = client->packed_generation_width(k, strength, unsigned(wanted - scheduled), destinations,
+                            &route, &singles, other_work_until);
+                        cancel.stop = stopped;
+                        cancel.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+                    }
                     // A packed batch owns one receiver. Its bound includes pending metadata;
                     // charge outstanding singleton grants and out-of-order members as well.
                     uint64_t const occupied = pending.empty() && completed.empty() ? sum(other_retained, resident(values)) : held;
                     uint64_t const reserved = sum(sum(fixed, backend.retained()), occupied);
                     while (n > 1 && sum(reserved, pool_receive_bytes(index, n)) > budget) --n;
                     if (route.paid_width && route.paid_width != n) n = 1;
+                    if (scheduled < repriced_until && controller_profile())
+                        std::osyncstream(std::cerr) << "[grow-controller-timing] phase=packed_route_reprice group_id="
+                            << group_tools::hex(identity.params.get_plot_group_id().span()) << " first_member=" << index
+                            << " members=" << repriced_until - scheduled << " width=" << n << '\n';
                     if (n > 1)
                     {
-                        if (receive_packed(scheduled, n, route))
+                        bool route_changed = false;
+                        if (receive_packed(scheduled, n, route, cancel, route_changed))
                         {
                             auto const bytes = pool_receive_bytes(index, n);
                             generation_peak = std::max(generation_peak, bytes); peak = std::max(peak, sum(reserved, bytes));
                             scheduled += n; made_progress = true; break;
                         }
-                        // This range has already attempted a wide lease. Reissue its IDs
-                        // individually and size the next untouched range from fresh evidence.
                         singleton_until = scheduled + n;
+                        if (route_changed)
+                        {
+                            if (controller_profile())
+                                std::osyncstream(std::cerr) << "[grow-controller-timing] phase=packed_route_decline group_id="
+                                    << group_tools::hex(identity.params.get_plot_group_id().span()) << " first_member=" << index
+                                    << " members=" << n << " width=" << route.paid_width << " priced_worker=" << route.route.identity << '\n';
+                            repriced_until = singleton_until; repriced = cancel;
+                            singleton_until = scheduled + 1;
+                        }
                     }
                     if (pending.size() >= singles) break;
                     reserved_singleton = std::move(route.reserved_singleton);
@@ -2373,8 +2403,9 @@ struct Producer
                 uint64_t const allocation = sum(next_peak(index) - backend.retained(), completed_metadata + 256);
                 generation_peak = std::max(generation_peak, next_peak(index));
                 if (args.command.empty() || args.verbose) std::osyncstream(std::cerr) << progress << index << '\n';
-                pending.push_back({scheduled, std::async(std::launch::async, [&, index, reserved_singleton = std::move(reserved_singleton)]
-                    { return backend.generate_pool(identity, index, args, &cancelled, other_work_until); }), allocation});
+                auto const deadline = scheduled < repriced_until ? repriced.deadline : std::chrono::steady_clock::time_point::max();
+                pending.push_back({scheduled, std::async(std::launch::async, [&, index, deadline, reserved_singleton = std::move(reserved_singleton)]
+                    { return backend.generate_pool(identity, index, args, &cancelled, other_work_until, deadline); }), allocation});
                 in_flight = sum(in_flight, allocation); ++scheduled; made_progress = true;
             }
             if (scheduled == wanted) accepting = false;
@@ -3479,7 +3510,11 @@ struct TerminalWave : group_grow::TerminalPublication
             << ' ' << args.io_overlap << ' ' << args.generation_overlap << ' ' << (backend.generated_members != 0);
         key = stream_state::digest(scope.str()); retries = backend.pool_retries.load(); fallback = backend.pool_local_fallbacks.load();
         failures = client->stats().failed_tasks;
-        if (args.disk_io) { pressure = args.disk_io->pressure_deadline(); if (args.disk_io->status().pressured) return false; }
+        if (args.disk_io)
+        {
+            pressure = args.disk_io->pressure_deadline(); if (args.disk_io->status().pressured) return false;
+            route->pressure_unchanged = [io=args.disk_io, before=pressure] { return io->pressure_deadline() == before; };
+        }
         return true;
     }
     bool comparable(Backend& backend, Arguments const& args) const

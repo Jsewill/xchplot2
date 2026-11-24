@@ -150,6 +150,7 @@ struct WorkerPublication
     uint8_t k = 0, strength = 0;
     std::atomic<bool> encoded{false}, promoted{false};
     bool selected_fresh = false;
+    std::function<bool()> pressure_unchanged;
     bool matches(pool::Lease const& lease) const
     {
         return lease.worker_identity == route.identity && lease.worker_instance == route.instance && lease.endpoint == route.endpoint &&
@@ -416,9 +417,12 @@ public:
     bool generate(uint8_t k, uint8_t strength, std::array<uint8_t, 32> const& plot_id,
                   WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
                   std::chrono::steady_clock::time_point other_work_until = {});
+    // A funded multi-receiver owner can reclaim the untouched range when a
+    // paid route changes before Work. Otherwise this sink stays ordered.
     bool generate_packed(uint8_t k, uint8_t strength, std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerPackedSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
-        std::chrono::steady_clock::time_point other_work_until = {}, WorkerPackedRoute const* batch_route = nullptr);
+        std::chrono::steady_clock::time_point other_work_until = {}, WorkerPackedRoute const* batch_route = nullptr,
+        bool* reprice_unstarted = nullptr);
     void contributions(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> plot_ids,
         WorkerContributionSink const&, WorkerCancellation = {}, WorkerTaskIdentity = {},
@@ -448,6 +452,9 @@ public:
     std::shared_ptr<WorkerPublication> publication_route(uint8_t k, uint8_t strength,
         std::span<std::array<uint8_t, 32> const> ids) const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
+    // Recheck a previously withdrawn batch against a complete signed price at its exact width.
+    std::optional<WorkerPackedRoute> priced_packed_route(uint8_t k, uint8_t strength, unsigned width,
+        WorkerCancellation cancel) const;
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
                                      WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr,
                                      std::chrono::steady_clock::time_point other_work_until = {}) const;

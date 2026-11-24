@@ -851,6 +851,121 @@ void late_packed_capacity()
             fenced_receipts[i].member_id_count == 1 && fenced_receipts[i].member_ids[0] == ids[i],
             "a changed packed grant lost or duplicated an ordered member");
 
+    // Only the first worker has confirmed this pair and triple on the owner's
+    // path. A second owner reserves it between pricing and the real grant.
+    admission(third, WorkerControl::Pause); admission(second, WorkerControl::Pause);
+    admission(worker, WorkerControl::Resume);
+    auto calibrated = settings;
+    calibrated.generation_path = [](auto const&, auto const&, uint32_t) { return std::string(64, 'd'); };
+    calibrated.owner_id = "tail-prices"; calibrated.selected = {}; calibrated.observe = {};
+    {
+        WorkerClient training(calibrated);
+        for (unsigned width : {3u, 3u, 2u, 2u})
+            training.generate_packed(18, 2, std::span(ids).first(width), [](auto const&, uint64_t) {});
+    }
+    for (unsigned mode : {0u, 3u, 2u, 1u})
+    {
+        bool const stop_on_decline = mode == 0, expire_on_decline = mode == 3;
+        unsigned const receivers = mode == 2 ? 2 : 1;
+        auto trial = calibrated;
+        // Each completion test starts with an unpriced alternative. The two
+        // cancelled cases leave no delivery sample on their worker.
+        auto& other = mode == 1 ? third : second;
+        if (mode == 1) admission(second, WorkerControl::Pause);
+        admission(other, WorkerControl::Resume);
+        auto competing = control.open_owner("other-tail-owner-" + std::to_string(mode));
+        pool::Task hold; hold.task_id = "competing"; hold.sequence = 1; hold.kind = pool::Kind::GenerateCpu;
+        hold.compatibility = worker_compatibility(); hold.k = 18; hold.strength = 2; hold.resources = {1,1,1,0};
+        std::optional<pool::Lease> held;
+        std::promise<void> prefix, suffix, resume;
+        auto prefix_at = prefix.get_future().share(), suffix_at = suffix.get_future().share(), release = resume.get_future().share();
+        std::atomic<unsigned> visits{0}; std::atomic<bool> stop{false};
+        trial.owner_id = "tail-reshape-" + std::to_string(mode);
+        trial.generation_path = [&](auto const& route,auto const&,uint32_t)
+        {
+            if (route.identity == fast)
+            {
+                unsigned const check = ++visits;
+                if (check == 2)
+                {
+                    admission(other, WorkerControl::Pause);
+                    held = control.acquire(competing, hold);
+                    require(held && held->worker_identity == fast, "competing owner did not acquire the priced worker");
+                    admission(other, WorkerControl::Resume);
+                }
+                // Make the release observable to the concurrently priced
+                // suffix, without letting the prefix start data transfer.
+                if (check == 3 && receivers == 2)
+                    require(prefix_at.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                        "missing prefix grant during independent suffix pricing");
+            }
+            return std::string(64, 'd');
+        };
+        std::vector<WorkerTaskObservation> grants, successes;
+        std::once_flag first_single;
+        trial.selected = [&](auto const& value)
+        {
+            { std::lock_guard lock(mutex); grants.push_back(value); }
+            if (value.work_units == 3 && stop_on_decline) { stop = true; return; }
+            if (value.work_units == 3 && expire_on_decline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            if (value.work_units == 1) std::call_once(first_single,[&]
+            {
+                auto same = control.acquire(competing,hold);
+                require(held && same && same->token == held->token, "a batch retry preempted another owner's grant");
+                control.cancel(competing,hold.task_id,hold.attempt); prefix.set_value();
+                require(release.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "prefix gate did not resume");
+            });
+            if (value.work_units == 2 && value.worker_identity == fast)
+            {
+                suffix.set_value();
+                require(release.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "suffix gate did not resume");
+            }
+        };
+        trial.observe = [&](auto const& value) { std::lock_guard lock(mutex); successes.push_back(value); };
+        Backend tails; tails.mode = "pool"; tails.cpu_scheduler = backend.cpu_scheduler; tails.pool_client_config = trial;
+        auto local_args = args; local_args.pool_inflight = receivers; local_args.command = "fill";
+        if (expire_on_decline) local_args.pool_timeout_ms = 1000;
+        Producer tail{requested,nullptr,tails,local_args,args.max_ram,uint64_t(64)<<20};
+        auto cli = tails.acquire_pool_client();
+        require(cli->generation_capacity(18,2).slots == 2, "missing eligible workers before pricing the suffix");
+        std::vector<Member> output; MemberBatchHash digest(3);
+        auto future = std::async(std::launch::async,[&] {
+            return tail.fill_pool(output,0,3,0,"",{},&stop,&digest,3,
+                std::chrono::steady_clock::now()+std::chrono::seconds(10),receivers);
+        });
+        if (stop_on_decline || expire_on_decline)
+        {
+            bool cancelled = false;
+            try { (void)future.get(); } catch (std::exception const&) { cancelled = true; }
+            auto same = control.acquire(competing, hold);
+            require(cancelled && (stop || expire_on_decline) && held && same && same->token == held->token &&
+                grants.size() == 1 && successes.empty() && output.empty(),
+                "a stopped or expired paid decline issued more Work or exposed a provisional member");
+            control.cancel(competing,hold.task_id,hold.attempt);
+            continue;
+        }
+        bool const started = prefix_at.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        bool const overlap = started && suffix_at.wait_for(receivers > 1 ? std::chrono::milliseconds(2000) :
+            std::chrono::milliseconds(0)) == std::future_status::ready;
+        auto const live = control.status({});
+        resume.set_value();
+        require(future.get() == 3 && started && grants.front().work_units == 3 && grants.front().worker_identity != fast,
+            "the ordinary producer did not lose and reshape the signed triple");
+        require(overlap == (receivers == 2) && live.granted == receivers && !live.running &&
+            cli->stats().peak_active_generation == receivers, "the packed suffix exceeded or failed to use the funded receivers");
+        require(digest.digest_for(Members(output)) == canonical_packed && !successes.empty(),
+            "repricing changed ordered canonical packed bytes");
+        if (receivers == 2)
+        {
+            auto pair = std::ranges::find_if(successes,[&](auto const& item){return item.worker_identity==fast && item.work_units==2;});
+            auto one = std::ranges::find_if(successes,[&](auto const& item){return item.worker_identity!=fast && item.work_units==1;});
+            require(successes.size() == 2 && one != successes.end() && pair != successes.end() &&
+                one->member_ids[0] == ids[0] && pair->member_ids[0] == ids[1] && pair->member_ids[1] == ids[2],
+                "actual signed retries did not cover the original prefix and priced suffix exactly once");
+        }
+    }
+
 }
 
 void owner_broker_restart()

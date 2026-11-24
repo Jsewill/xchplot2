@@ -589,8 +589,22 @@ void publication_route(BrokerOptions options, TlsOptions const& owner_tls,
     second.register_worker(offer("another-lane", 45002));
     require(!owner.publication_route(session, request), "a competing worker lane was priced as a single paid route");
     second.unregister_worker("another-lane");
-    ++hybrid.capacity_revision; hybrid.capacity.slots = 2; first.register_worker(hybrid);
-    require(!owner.publication_route(session, request), "parallel reservations were priced as a single paid route");
+    ++hybrid.capacity_revision; hybrid.capacity.slots = 2; hybrid.capacity.gpu_bytes = 2048;
+    first.register_worker(hybrid);
+    require(!owner.publication_route(session, request), "a VRAM-limited GPU hid an independent CPU lane on the same worker");
+    auto gpu = task("concurrent-gpu", 2); gpu.kind = Kind::GenerateGpu;
+    auto cpu_task = task("concurrent-cpu", 3);
+    require(owner.acquire(session, gpu) && owner.acquire(session, cpu_task), "the quoted multi-lane worker could not run CPU and GPU together");
+    owner.cancel(session, gpu.task_id, gpu.attempt); owner.cancel(session, cpu_task.task_id, cpu_task.attempt);
+    ++hybrid.capacity_revision; hybrid.capacity.host_bytes = 2048;
+    for (auto& profile : hybrid.generation_profiles) { profile.resources.host_bytes = 1400; profile.member_host_bytes = 128; }
+    first.register_worker(hybrid);
+    auto constrained = owner.publication_route(session, request);
+    require(constrained && constrained->kind == Kind::GenerateCpu && constrained->resources.host_bytes == 1656,
+        "a second nominal slot without RAM for a second task hid the only feasible publication lane");
+    ++hybrid.capacity_revision; hybrid.capacity.host_bytes = 8192; hybrid.capacity.gpu_bytes = 4096;
+    first.register_worker(hybrid);
+    require(!owner.publication_route(session, request), "parallel GPU reservations were priced as a single paid route");
 }
 void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
                          TlsOptions const& small_tls, TlsOptions const& large_tls)
