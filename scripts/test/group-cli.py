@@ -680,26 +680,30 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     second.mkdir()
     options = [first, second, "-k", 18, "--strength", 4, "--group-members", 8, "--max-groups", 1,
                "--max-total-members", 8, "--leave-free", 0, "--destination-temp", "off"]
-    forecast = json.loads(run("plan", *options, *runtime, "--capacity-bytes", "8M", "--json").stdout)
-    # This deterministic strength/meta cohort packs below the next forecast
-    # boundary. Keep the independently reserved metadata outside its tested
-    # plot-byte budget, including when a platform rounds that metadata up.
+    forecast = json.loads(run("plan", *options, *runtime, "--capacity-bytes", "16M", "--json").stdout)
+    full = next(item for item in forecast["destinations"] if item["directory"] == str(second))
+    assert full["forecast_members"] == full["group_members"] == 8, full
+    # The encoded group fits one byte below its eight-member forecast. Both
+    # directories share a filesystem and each needs its own metadata reserve.
+    plot_budget = full["group_bytes"] - 1
     for _ in range(3):
-        capacity = 10212432 + 2 * forecast["manifest_reserved_bytes"]
+        capacity = 2 * (plot_budget + forecast["manifest_reserved_bytes"])
         assessed = json.loads(run("plan", *options, *runtime, "--capacity-bytes", capacity, "--json").stdout)
         if assessed["manifest_reserved_bytes"] == forecast["manifest_reserved_bytes"]:
-            forecast = assessed
             break
         forecast = assessed
     else:
         raise AssertionError("beyond-forecast fixture metadata reservation did not settle")
-    options += ["--capacity-bytes", capacity]
-    run("fill", *options, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
+    # Execute the exact reviewed grant. A separately prepared keyed job may
+    # cross a metadata allocation boundary and start with a different forecast.
+    grant_plan = root / "initial allocation grant.plan"
+    run("plan", *options, *runtime, "--capacity-bytes", capacity, "--save-plan", grant_plan)
+    run("fill", "--from-plan", grant_plan, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
         "--quiet", point="initialized", code=86)
     original = private_record(first, "grow-farm.plan").read_bytes()
     prepared = json.loads(run("plan", "--metadata-only", "--manifest", private_record(first, "grow-farm.plan"), "--json").stdout)
     initial = next(item for item in prepared["destinations"] if item["directory"] == str(second))
-    assert 0 < initial["forecast_members"] < initial["allocation_grant_members"] <= 8, initial
+    assert initial["forecast_members"] == 7 and initial["allocation_grant_members"] == 8, initial
     offline_outputs = {path.name: digest(path) for path in [*first.glob("*.gplot"), *first.glob("*.gplot.partial")]}
     first.rename(offline)
     try:
