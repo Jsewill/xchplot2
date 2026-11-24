@@ -1,18 +1,11 @@
-# Shared CPU ownership patch and source provenance for both grow builds.
+# Shared reference headers and source provenance for both grow builds.
 # Construction and farming compatibility use their explicit saved identities;
 # legacy checkpoints and plans retain their original exact-build guards.
 include_guard(GLOBAL)
 include("${CMAKE_CURRENT_LIST_DIR}/ComputeWorker.cmake")
 
 function(pos2_grow_prepare upstream_dir output_include)
-    # Native grouped generation shares the same CPU budget as its codecs,
-    # including when no network compute targets are enabled.
     pos2_worker_prepare("${upstream_dir}" grow_dir)
-    file(STRINGS "${grow_dir}/plot/Plotter.hpp" move_marker
-        REGEX "^#define GROW_MOVE_PLOTTER_OUTPUT 1$")
-    if(NOT move_marker)
-        message(FATAL_ERROR "CPU output ownership patch was not applied; grow RAM model would be invalid")
-    endif()
     set(${output_include} "${grow_dir}" PARENT_SCOPE)
 endfunction()
 
@@ -34,7 +27,7 @@ function(pos2_grow_identity target upstream_dir)
         string(APPEND identity "upstream/${name}:${digest}\n")
     endforeach()
     set(local_sources)
-    foreach(name GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupConstructionCache.hpp GroupDashboard.hpp GroupDashboardFeed.hpp GroupHardwareTelemetry.hpp GroupFarmService.hpp GroupComputeSettings.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
+    foreach(name CpuPlotMemory.hpp CpuTables.hpp GroupPlotter.cpp GroupPlotter.hpp GroupOptions.hpp GroupConstructionCache.hpp GroupDashboard.hpp GroupDashboardFeed.hpp GroupHardwareTelemetry.hpp GroupFarmService.hpp GroupComputeSettings.hpp GroupEngine.hpp GroupCodec.hpp GroupMembers.hpp GroupPacked.hpp
                  GroupStaging.hpp GroupStorage.hpp GroupMergeState.hpp GroupMerge.hpp GroupExternal.hpp
                  GroupScratch.hpp GroupWriter.hpp GroupCheckpointPolicy.hpp GroupPolicy.hpp GroupFarming.hpp GroupFarmState.hpp
                  GroupFarmPreview.hpp GroupFarmUpdate.hpp GroupFarmProgress.hpp GroupFarmControlState.hpp GroupFarmControl.hpp GroupFarmOwner.hpp GroupFarmMembership.hpp GroupFarmMetadata.hpp GroupFarmMigration.hpp GroupFarmRetirement.hpp GroupFarmFile.hpp GroupFarmInventory.hpp GroupFarmResources.hpp GroupFarmReplotResources.hpp GroupFarmAdapters.hpp GroupFarmAdapterProcess.hpp GroupHarvesterProfile.hpp GroupCalibrationProcess.hpp

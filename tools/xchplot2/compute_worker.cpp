@@ -48,12 +48,15 @@ void help(bool all)
         "Usage: pos2_pr118_grow_worker --broker HOST:PORT --listen HOST:PORT\n"
 #endif
         "  --cpus N --host-bytes SIZE   offered CPU threads and host RAM limit\n"
+        "  --harvester local        pause new tasks during slow lookups on this worker\n"
         "  --backend cpu|gpu|auto   offered generation backend, default auto with saved setup\n"
         "  --gpu-bytes N --device N --tier NAME   GPU RAM limit in bytes, device and tier\n";
     if (all) std::cout <<
         "  --advertise HOST:PORT     address reachable by plotting hosts\n"
         "  --ca FILE --cert FILE --key FILE  mutual TLS credentials\n"
         "  --slots N                maximum active tasks, default 1\n"
+        "  --chia-root DIR          configuration of the selected local harvester\n"
+        "  --farming-deadline-ms N  lookup deadline for the selected harvester\n"
         "  --generation-threads N   CPU threads per generation task, default CPUs / slots\n"
         "  --max-frame-bytes N      maximum network message size in bytes\n"
         "  --max-task-bytes N       codec window and temporary generation-data limit in bytes\n"
@@ -74,8 +77,17 @@ int main(int argc, char** argv)
 {
     try
     {
+#ifndef XCHPLOT2_GROUP_COMMANDS
+        // The reference worker is also a standalone executable.
+        if (argc == 8 && std::string_view(argv[1]) == "compute" && std::string_view(argv[2]) == "worker" &&
+            std::string_view(argv[3]) == "--config" && std::string_view(argv[5]) == "--gpu-recovery-worker")
+            return group_grow::run_worker_gpu_child(argv[6], argv[7]);
+#endif
+        if (argc == 4 && std::string_view(argv[1]) == "--gpu-recovery-worker")
+            return group_grow::run_worker_gpu_child(argv[2], argv[3]);
         group_grow::WorkerConfig config;
-        std::filesystem::path directory;
+        std::filesystem::path directory, chia_root;
+        bool observe_farming = false;
 #ifdef XCHPLOT2_GROUP_COMMANDS
         std::filesystem::path invitation;
 #endif
@@ -111,6 +123,17 @@ int main(int argc, char** argv)
             else if (option == "--ca") config.tls.ca_file = value;
             else if (option == "--cert") config.tls.cert_file = value;
             else if (option == "--key") config.tls.key_file = value;
+            else if (option == "--harvester")
+            {
+                if (std::string_view(value) != "local") throw std::runtime_error("worker --harvester requires local");
+                observe_farming = true;
+            }
+            else if (option == "--chia-root") chia_root = std::filesystem::path(reinterpret_cast<char8_t const*>(value));
+            else if (option == "--farming-deadline-ms")
+            {
+                config.farming_deadline_ms = small(value, option);
+                if (!config.farming_deadline_ms) throw std::runtime_error("--farming-deadline-ms must be positive");
+            }
             else if (option == "--cpus") config.capacity.cpu_threads = small(value, option);
             else if (option == "--slots") config.capacity.slots = small(value, option);
             else if (option == "--host-bytes") config.capacity.host_bytes = number(value, option);
@@ -130,6 +153,9 @@ int main(int argc, char** argv)
             else throw std::runtime_error("unknown worker option: " + option);
         }
         output.validate();
+        if (observe_farming) config.local_harvester = std::move(chia_root);
+        else if (!chia_root.empty() || config.farming_deadline_ms)
+            throw std::runtime_error("--chia-root and --farming-deadline-ms require worker --harvester local");
         std::optional<group_grow::pool::PoolIdentity> identity;
 #ifdef XCHPLOT2_GROUP_COMMANDS
         if (!invitation.empty())
@@ -200,10 +226,26 @@ int main(int argc, char** argv)
             << capacity.cpu_threads << " CPU threads, " << capacity.host_bytes / (uint64_t(1) << 20)
             << " MiB host RAM, " << capacity.gpu_bytes / (uint64_t(1) << 20) << " MiB GPU RAM.\n" << std::flush;
         uint64_t healthy = UINT64_MAX;
+        std::string gpu_recovery;
+        std::optional<bool> farming_pressure;
         auto admission = group_grow::pool::WorkerAdmission::Accepting;
         while (!stopped)
         {
             auto const status = worker.status();
+            if (!output.quiet && observe_farming && (healthy == UINT64_MAX || status.farming_pressure != farming_pressure))
+            {
+                farming_pressure = status.farming_pressure;
+                std::cout << (!farming_pressure ? "Local lookup pressure is unknown without a recent eligible or slow completion.\n" :
+                    *farming_pressure ? "Slow local farming lookups are holding new worker tasks.\n" :
+                    "Local farming lookups are within the target.\n") << std::flush;
+            }
+            if (!output.quiet && gpu_recovery != status.gpu_recovery)
+            {
+                gpu_recovery = status.gpu_recovery;
+                if (gpu_recovery.empty()) std::cout << "GPU generation is available again.\n";
+                else std::cout << "GPU recovering: " << gpu_recovery << '\n';
+                std::cout << std::flush;
+            }
             if (!output.quiet && (healthy != status.healthy_brokers || admission != status.admission))
             {
                 healthy = status.healthy_brokers; admission = status.admission;

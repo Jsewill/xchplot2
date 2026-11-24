@@ -11,6 +11,7 @@
 // pos2-chip.
 
 #include "host/PlotFileWriterParallel.hpp"
+#include "host/CpuTables.hpp"
 #include "host/BoundedProofSampling.hpp"
 #include "host/BatchPlotter.hpp"
 
@@ -966,6 +967,12 @@ std::vector<uint64_t> read_plot_file_fragments(std::string const& filename)
         flat.insert(flat.end(), chunk.begin(), chunk.end());
     }
     return flat;
+}
+
+std::vector<uint64_t> native_cpu_fragments(uint8_t const* plot_id, uint8_t k, uint8_t strength,
+    unsigned threads, uint64_t ram_bytes, std::function<void()> const& check)
+{
+    return cpu::generate(PlotProofParams::create_raw(PlotId(plot_id), k, strength), threads, ram_bytes, check);
 }
 
 std::vector<uint64_t> run_cpu_plotter_to_fragments(

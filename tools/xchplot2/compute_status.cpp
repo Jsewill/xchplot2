@@ -114,6 +114,7 @@ void broker_json(BrokerSnapshot const& value)
         std::cout << ",\"producer_build\":"; string(worker.producer_build);
         std::cout << ",\"endpoint\":"; string(address(worker.endpoint));
         std::cout << ",\"admission\":"; string(pool::admission_name(worker.admission));
+        if (!worker.gpu_recovery.empty()) { std::cout << ",\"gpu_recovery\":"; string(worker.gpu_recovery); }
         std::cout << ",\"capacity\":"; resources(worker.capacity);
         std::cout << ",\"reserved\":"; resources(worker.reserved);
         std::cout << ",\"seen_ms\":" << worker.seen_ms << ",\"hardware\":"; hardware_json(worker.hardware); std::cout << '}';
@@ -153,6 +154,7 @@ void worker_json(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
     std::cout << ",\"producer_build\":"; string(value.producer_build);
     std::cout << ",\"durable_control\":" << (value.durable_control ? "true" : "false");
     std::cout << ",\"admission\":"; string(pool::admission_name(value.admission));
+    if (!value.gpu_recovery.empty()) { std::cout << ",\"gpu_recovery\":"; string(value.gpu_recovery); }
     std::cout << ",\"capacity\":"; resources(value.capacity);
     std::cout << ",\"active\":"; resources(value.active);
     std::cout << ",\"hardware\":"; hardware_json(value.hardware);
@@ -169,6 +171,8 @@ void broker_text(BrokerSnapshot const& value, bool verbose)
         << value.summary.owners << " plotting job owners; " << value.summary.queued << " queued, " << value.summary.granted
         << " assigned, " << value.summary.running << " running\n";
     if (value.truncated) std::cerr << "Listing truncated; increase --limit to inspect more rows.\n";
+    for (auto const& worker : value.workers) if (!worker.gpu_recovery.empty())
+        std::cout << "  " << address(worker.endpoint) << " GPU recovering: " << worker.gpu_recovery << '\n';
     if (!verbose) return;
     for (auto const& worker : value.workers)
         std::cout << "  Worker " << worker.identity.substr(0, 12) << ' ' << address(worker.endpoint) << ' '
@@ -197,6 +201,7 @@ void worker_text(pool::Endpoint const& endpoint, group_grow::WorkerStatus const&
             << "  Brokers: " << value.healthy_brokers << " healthy, " << value.known_brokers << '/' << value.broker_limit
             << " registered, " << value.deferred_brokers << " deferred; " << value.broker_transport_bytes << " reserved transport bytes";
     std::cout << '\n';
+    if (!value.gpu_recovery.empty()) std::cout << "  GPU recovering: " << value.gpu_recovery << '\n';
     std::cout << "  Worker control setting " << (value.durable_control ? "survives service restarts." : "lasts only for this process (explicit TLS credentials without enrollment).") << '\n';
     if (verbose) std::cout << "  Generation: " << value.compatibility << "; codec: " << value.codec_compatibility
         << "; producer: " << value.producer_build << '\n';

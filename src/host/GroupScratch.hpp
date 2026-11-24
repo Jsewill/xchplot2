@@ -80,6 +80,13 @@ public:
         }
     }
     std::shared_ptr<DiskIoGovernor> bandwidth_feedback() const { return bandwidth_; }
+    uint64_t storage_snapshot_bytes() const
+    {
+        std::lock_guard lock(mutex_);
+        uint64_t bytes = 0;
+        for (auto const& root : roots_) bytes = grow_add(bytes, group_grow::storage_snapshot_bytes(root.value.device));
+        return bytes;
+    }
     void bind_runtime(ExternalConfig& external) const
     { external.io_governor = io_governor_; external.bandwidth = bandwidth_; }
     bool offers_scratch(std::string const& filesystem) const
@@ -249,7 +256,7 @@ public:
                                         unsigned packing_inputs = 0, uint64_t read_buffer_bytes = 0,
                                         size_t parallel_roots = 1, size_t open_slots = SIZE_MAX,
                                         std::function<uint64_t(ExternalConfig&)> const& configure_stripes = {},
-                                        bool preview = false, bool spare_spindle = false)
+                                        bool preview = false, bool spare_spindle = false, long double successor_rate = 0)
     {
         std::lock_guard lock(mutex_);
         require(sealed_ && minimum && desired >= minimum && segment_bytes > 64 &&
@@ -292,13 +299,18 @@ public:
             // Keep SSD positions and their established backlog ranking. HDD
             // capacity still comes from this ledger; live feedback orders only
             // otherwise eligible physical roots, including periodic probes.
-            std::vector<size_t> rotating;
-            for (auto index : order) if (!roots_[index].value.device.nonrotating) rotating.push_back(index);
-            std::vector<long double> costs(roots_.size());
-            for (auto index : rotating) costs[index] = io_governor_->routing_cost(roots_[index].value.device);
+            std::vector<size_t> rotating, positions;
+            std::vector<std::pair<bool, long double>> costs(roots_.size());
+            for (size_t i = 0; i < order.size(); ++i)
+            {
+                auto const index = order[i]; auto const& device = roots_[index].value.device;
+                if (device.nonrotating) continue;
+                bool const pressured = io_governor_->scoped() && io_governor_->pressured(&device);
+                costs[index] = {pressured, !io_governor_->scoped() || pressured ? io_governor_->routing_cost(device) : 0.L};
+                positions.push_back(i); rotating.push_back(index);
+            }
             std::stable_sort(rotating.begin(), rotating.end(), [&](size_t a, size_t b) { return costs[a] < costs[b]; });
-            size_t next = 0;
-            for (auto& index : order) if (!roots_[index].value.device.nonrotating) index = rotating[next++];
+            for (size_t i = 0; i < positions.size(); ++i) order[positions[i]] = rotating[i];
         }
         if (spare_spindle)
         {
@@ -318,7 +330,7 @@ public:
         {
             uint64_t const extent = std::min(segment_bytes, read_buffer_bytes ? std::max(uint64_t(1), read_buffer_bytes / 8) : segment_bytes);
             size_t const width = spare_spindle ? 1 : std::min<uint64_t>(parallel_roots, std::max<uint64_t>(1, desired / extent));
-            for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots))
+            for (auto [i, quota] : rotating_shares(owner, destination, order, desired, segment_bytes, automatic, width, open_slots, successor_rate))
             {
                 auto const& root = roots_[i]; root.value.check();
                 selected.push_back(i); seen.push_back(root.filesystem);
@@ -559,9 +571,9 @@ private:
     // Reserve the spindles needed by simultaneous output writers and balance
     // the remaining drives by throughput before splitting a capacity grant.
     std::vector<std::pair<size_t, uint64_t>> rotating_shares(uint64_t owner, StorageDevice const& destination,
-        std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots) const
+        std::span<size_t const> order, uint64_t desired, uint64_t segment_bytes, bool automatic, size_t width, size_t open_slots, long double successor_rate) const
     {
-        struct Candidate { size_t root; uint64_t room; long double rate; };
+        struct Candidate { size_t root; uint64_t room; long double rate; bool lookup_pressure; };
         std::vector<Candidate> disks;
         size_t waiting = 1;
         std::vector<size_t> outputs;
@@ -592,7 +604,8 @@ private:
                 { return overlap(root.value.device, roots_[output].value.device); }) ||
                 std::any_of(disks.begin(), disks.end(), [&](Candidate const& other)
                 { return roots_[other.root].filesystem == root.filesystem || overlap(roots_[other.root].value.device, root.value.device); })) continue;
-            disks.push_back({i, grant_room(i), bandwidth_ ? bandwidth_->bandwidth(root.value.device) : 0});
+            disks.push_back({i, grant_room(i), bandwidth_ ? bandwidth_->bandwidth(root.value.device) : 0,
+                io_governor_ && io_governor_->scoped() && io_governor_->pressured(&root.value.device)});
         }
         // The output already has sequential writes of its own. Use it for
         // scratch only when the dedicated disks cannot supply the grant.
@@ -601,6 +614,9 @@ private:
             dedicated += std::min(desired - dedicated, disk.room);
         if (dedicated >= desired) std::erase_if(disks, [&](Candidate const& disk)
             { return overlap(destination, roots_[disk.root].value.device); });
+        uint64_t timely_room = 0;
+        for (auto const& disk : disks) if (!disk.lookup_pressure) timely_room += std::min(desired - timely_room, disk.room);
+        if (timely_room == desired) std::erase_if(disks, [](auto const& disk) { return disk.lookup_pressure; });
         // Give unmeasured roots an equal first trial. A slow/busy root
         // with a measured rate gets correspondingly less work.
         long double total_rate = 0; size_t measured = 0;
@@ -699,6 +715,31 @@ private:
                 { return overlap(*successor, roots_[disk.root].value.device); });
                 if (replacement != disks.end()) *end++ = *replacement;
                 selected = end - disks.begin();
+            }
+        }
+        // A qualified same-output successor can receive on different HDDs while this
+        // stripe packs. Split only this owner's share, with enough measured service
+        // and complete capacity on both sides. Unknown rates keep the ordinary grant.
+        if (successor_rate > 0 && selected > 1 && bandwidth_)
+        {
+            auto stripe = std::span(disks).first(selected);
+            long double total = 0;
+            for (auto const& disk : stripe)
+            {
+                if (overlap(destination, roots_[disk.root].value.device) ||
+                    !bandwidth_->bandwidth(roots_[disk.root].value.device)) { total = 0; break; }
+                total += disk.rate;
+            }
+            long double rate = 0;
+            uint64_t room = 0;
+            for (size_t i = 0; total && i + 1 < selected; ++i)
+            {
+                rate += disks[i].rate; room += std::min(desired - room, disks[i].room);
+                if (room < desired || rate < std::max(successor_rate, total / 2) || total - rate < successor_rate) continue;
+                uint64_t spare = 0;
+                for (auto const& disk : stripe.subspan(i + 1)) spare += std::min(desired - spare, disk.room);
+                if (spare == desired) selected = i + 1;
+                break;
             }
         }
         disks.resize(selected);

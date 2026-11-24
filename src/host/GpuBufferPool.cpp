@@ -7,6 +7,7 @@
 // CUDA host code share the same primary CUDA context).
 
 #include "host/GpuBufferPool.hpp"
+#include "host/GpuCleanup.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>   // runtime lookup of hipMemGetInfo on AMD — see device_memory_probe
@@ -312,16 +313,6 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
     // d_storage + d_pair_a have already succeeded) frees the pre-allocated
     // buffers instead of leaking ~10 GB of device VRAM and ~7 GB of host
     // pinned memory per failed pool ctor across a batch retry loop.
-    auto cleanup_partial = [&]{
-        if (d_storage)       { sycl::free(d_storage,      q); d_storage      = nullptr; }
-        if (d_pair_a)        { sycl::free(d_pair_a,       q); d_pair_a       = nullptr; }
-        if (d_pair_b)        { sycl::free(d_pair_b,       q); d_pair_b       = nullptr; }
-        if (d_sort_scratch)  { sycl::free(d_sort_scratch, q); d_sort_scratch = nullptr; }
-        if (d_counter)       { sycl::free(d_counter,      q); d_counter      = nullptr; }
-        for (int i = 0; i < kNumPinnedBuffers; ++i) {
-            if (h_pinned_t3[i]) { sycl::free(h_pinned_t3[i], q); h_pinned_t3[i] = nullptr; }
-        }
-    };
     try {
         d_storage      = sycl_alloc_device_or_throw(storage_bytes,      q, "d_storage");
         // d_pair_a is allocated lazily in ensure_pair_a(), called by
@@ -338,7 +329,7 @@ GpuBufferPool::GpuBufferPool(int k_, int strength_, bool testnet_, uint64_t max_
         // touch slot 0 so the other two 2.2 GB malloc_host calls
         // aren't paid at all.
     } catch (...) {
-        cleanup_partial();
+        release_allocations(true);
         throw;
     }
 }
@@ -357,8 +348,8 @@ void GpuBufferPool::release_pair_a()
 {
     std::lock_guard<std::mutex> lk(pair_a_mu_);
     if (!d_pair_a) return;
-    sycl::free(d_pair_a, sycl_backend::queue());
-    d_pair_a = nullptr;
+    auto* owned = std::exchange(d_pair_a, nullptr);
+    checked_gpu_free(pair_a_bytes, &GpuCleanupCharges::device, [&] { sycl::free(owned, sycl_backend::queue()); });
 }
 
 uint64_t* GpuBufferPool::ensure_pinned(int idx)
@@ -390,21 +381,24 @@ void GpuBufferPool::release_pinned(int idx)
     if (!h_pinned_t3[idx]) return;
     sycl::queue& q = sycl_backend::queue();
     q.wait_and_throw();
-    sycl::free(h_pinned_t3[idx], q);
-    h_pinned_t3[idx] = nullptr;
+    auto* owned = std::exchange(h_pinned_t3[idx], nullptr);
+    checked_gpu_free(pinned_bytes, &GpuCleanupCharges::host, [&] { sycl::free(owned, q); });
 }
 
-GpuBufferPool::~GpuBufferPool()
+GpuBufferPool::~GpuBufferPool() { release_allocations(); }
+
+void GpuBufferPool::release_allocations(bool partial) noexcept
 {
-    sycl::queue& q = sycl_backend::queue();
-    if (d_storage)       sycl::free(d_storage,      q);
-    if (d_pair_a)        sycl::free(d_pair_a,       q);
-    if (d_pair_b)        sycl::free(d_pair_b,       q);
-    if (d_sort_scratch)  sycl::free(d_sort_scratch, q);
-    if (d_counter)       sycl::free(d_counter,      q);
-    for (int i = 0; i < kNumPinnedBuffers; ++i) {
-        if (h_pinned_t3[i]) sycl::free(h_pinned_t3[i], q);
-    }
+    auto release = [&](auto*& pointer, uint64_t bytes, auto kind) {
+        if (auto* owned = std::exchange(pointer, nullptr))
+            release_gpu_memory("GPU buffer pool", bytes, kind, [&] { sycl::free(owned, sycl_backend::queue()); }, partial);
+    };
+    release(d_storage, storage_bytes, &GpuCleanupCharges::device);
+    release(d_pair_a, pair_a_bytes, &GpuCleanupCharges::device);
+    release(d_pair_b, pair_b_bytes, &GpuCleanupCharges::device);
+    release(d_sort_scratch, sort_scratch_bytes, &GpuCleanupCharges::device);
+    release(d_counter, sizeof(uint64_t), &GpuCleanupCharges::device);
+    for (auto& pointer : h_pinned_t3) release(pointer, pinned_bytes, &GpuCleanupCharges::host);
 }
 
 #ifdef XCHPLOT2_HAVE_CUB
@@ -414,6 +408,10 @@ GpuBufferPool::~GpuBufferPool()
 bool cuda_query_device_memory(int device_ordinal,
                               std::size_t& free_bytes,
                               std::size_t& total_bytes);
+#endif
+
+#ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
+std::optional<size_t> windows_hip_worker_budget(HMODULE runtime, int ordinal, size_t hip_free, size_t hip_total, size_t resident);
 #endif
 
 // AMD free-VRAM probe. Resolved at runtime rather than linked, deliberately:
@@ -667,6 +665,28 @@ bool ze_query_device_memory(int rank, size_t& free_bytes, size_t& total_bytes,
 
 } // namespace
 
+#ifdef _WIN32
+HMODULE retained_hip_runtime()
+{
+    // A cold probe can release AdaptiveCpp's last device just after enumeration.
+    // Own the runtime used for the cached entry points before that happens.
+    struct Module {
+        std::mutex mutex;
+        HMODULE handle = nullptr;
+        ~Module() { if (handle) ::FreeLibrary(handle); }
+    };
+    static Module module;
+    std::lock_guard lock(module.mutex);
+    if (!module.handle) {
+        for (auto name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
+            HMODULE handle;
+            if (::GetModuleHandleExW(0, name, &handle)) { module.handle = handle; break; }
+        }
+    }
+    return module.handle;
+}
+#endif
+
 bool hip_query_device_memory(int device_ordinal,
                              size_t& free_bytes,
                              size_t& total_bytes)
@@ -675,13 +695,10 @@ bool hip_query_device_memory(int device_ordinal,
     using SetDeviceFn  = int (*)(int);
     using GetDeviceFn  = int (*)(int*);
 
-    static void* const handle = [] () -> void* {
 #ifdef _WIN32
-        // Query the runtime AdaptiveCpp loaded, including versioned HIP SDK DLLs.
-        for (wchar_t const* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64.dll"}) {
-            if (auto handle = ::GetModuleHandleW(name)) return handle;
-        }
+    void* const handle = retained_hip_runtime();
 #else
+    static void* const handle = [] () -> void* {
         // Already in-process? A ROCm build has it loaded before we get here.
         if (void* self = dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL)) {
             if (dlsym(self, "hipMemGetInfo")) return self;
@@ -691,9 +708,9 @@ bool hip_query_device_memory(int device_ordinal,
                                    "libamdhip64.so.5"}) {
             if (void* h = dlopen(soname, RTLD_LAZY | RTLD_LOCAL)) return h;
         }
-#endif
         return nullptr;
     }();
+#endif
     if (!handle) return false;
 
     static auto const mem_get_info =
@@ -864,11 +881,19 @@ ProbeTarget probe_target_for(int device_ordinal)
             if (rt == ProbeRuntime::LevelZero)
                 t.host_unified_memory = devs[idx].get_info<sycl::info::device::host_unified_memory>();
             if (rt != ProbeRuntime::None) {
-                // Rank among devices sharing this backend — that IS the
-                // runtime's own ordinal, whereas idx counts every vendor.
                 int rank = 0;
-                for (std::size_t i = 0; i < idx; ++i)
-                    if (devs[i].get_backend() == backend) ++rank;
+                if (rt == ProbeRuntime::LevelZero) {
+                    for (std::size_t i = 0; i < idx; ++i)
+                        if (devs[i].get_backend() == backend) ++rank;
+                } else {
+                    // CUDA and HIP interop expose the native ordinal even when
+                    // AdaptiveCpp visibility filters omit other devices.
+                    rank = devs[idx].AdaptiveCpp_device_id().get_id();
+                    if (rank < 0) return {};
+#ifdef _WIN32
+                    if (rt == ProbeRuntime::Hip && !retained_hip_runtime()) return {};
+#endif
+                }
                 t.runtime = rt;
                 t.ordinal = rank;
             }
@@ -878,9 +903,9 @@ ProbeTarget probe_target_for(int device_ordinal)
         // None leaves the probe unavailable, so admission fails closed.
     }
 
+    if (t.runtime == ProbeRuntime::None) return t;
     std::lock_guard<std::mutex> lk(m);
-    cache[device_ordinal] = t;
-    return t;
+    return cache.emplace(device_ordinal, t).first->second;
 }
 
 } // namespace
@@ -977,6 +1002,29 @@ bool device_memory_probe(int device_ordinal,
     // No runtime owns this device (Level Zero / OpenCL), or the owning one
     // declined. Budget admission must fail rather than assume the total is free.
     return false;
+}
+
+std::optional<size_t> worker_gpu_headroom(int device_ordinal, size_t resident, [[maybe_unused]] bool permit_runtime_only)
+{
+    size_t free = 0, total = 0;
+    if (!device_memory_probe(device_ordinal, free, total)) return {};
+    free = std::min(free, total);
+    free += std::min(resident, total - free);
+#ifdef _WIN32
+    auto const target = probe_target_for(device_ordinal);
+    if (target.runtime == ProbeRuntime::Hip) {
+#ifdef XCHPLOT2_WINDOWS_HIP_BUDGET
+        auto const reading = windows_hip_worker_budget(retained_hip_runtime(), target.ordinal, free, total, resident);
+        if (reading) free = *reading;
+        else if (!permit_runtime_only) return {};
+#else
+        if (!permit_runtime_only) return {};
+#endif
+    }
+#endif
+    if (char const* v = std::getenv("POS2GPU_MAX_VRAM_MB"); v && v[0])
+        free = std::min(free, vram_mib_bytes(v, "POS2GPU_MAX_VRAM_MB"));
+    return free;
 }
 
 size_t vram_safety_margin()

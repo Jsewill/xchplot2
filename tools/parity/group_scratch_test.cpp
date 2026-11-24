@@ -522,6 +522,28 @@ void rotating_bandwidth(fs::path const& directory)
         "unequal HDDs failed to balance simultaneous owner bandwidth and proportional capacity");
     pool.cancel(0); pool.cancel(1);
 
+    // A measured successor must fit on a separate, sufficiently fast stripe
+    // while the original final writer still owns the shared output spindle.
+    for (auto [rate, demand, measured, split] : std::array<std::tuple<long double, uint64_t, bool, bool>, 4>{{
+        {2.L, 60 * unit, true, true}, {2.1L, 60 * unit, true, false},
+        {2.L, 210 * unit, true, false}, {2.L, 60 * unit, false, false}}})
+    {
+        ScratchPool adjacent(disks, 0);
+        auto rates = std::make_shared<DiskIoGovernor>(DiskIoGovernor::Sampler{});
+        adjacent.set_io_governor(rates);
+        if (measured) for (auto const& disk : disks) rates->observe_transfer(disk.device, unit, unit);
+        require(adjacent.try_reserve_output(0, first, unit) && adjacent.try_reserve_output(1, first, unit),
+            "adjacent output reservations did not fit");
+        adjacent.seal_recovery();
+        auto prior = adjacent.grant(0, demand, demand, unit, 2, true, 4, unit, 4, 1, {}, false, false, rate);
+        require(prior && prior->scratch.size() == (split ? 2 : 4), "successor stripe lost capacity or measured service");
+        if (!split) continue;
+        auto packing = adjacent.try_io(0);
+        auto incoming = adjacent.grant(1, demand, demand, unit, 2, true, 4, unit, 4, 1);
+        require(packing && incoming && incoming->scratch.size() == 2 && !adjacent.try_io(1) && adjacent.try_stage_io(1),
+            "disjoint successor input could not overlap packing with its target write still fenced");
+    }
+
     ScratchPool rotating_owners(disks, 0);
     require(rotating_owners.try_reserve_output(0, first, unit) && rotating_owners.try_reserve_output(1, second, unit) &&
         rotating_owners.try_reserve_output(2, first, unit), "rotating output reservations failed");
@@ -797,6 +819,45 @@ void disk_feedback(fs::path const& directory)
     require(live->routing_cost(a) < live->routing_cost(b), "a slow/contended physical drive was permanently starved");
     pool.cancel(0);
 
+    ra.device.rotating = rb.device.rotating = true;
+    std::vector<DiskIoGovernor::FarmingScope> scopes{{"first.log", {ra.device}}, {"other.log", {ra.device}}};
+    std::map<std::string, DiskIoGovernor::Counters> physical;
+    std::map<std::string, unsigned> reads;
+    auto scoped = std::make_shared<DiskIoGovernor>([&](std::string const& name)
+        { ++reads[name]; return std::optional{physical[name]}; }, 32, DiskIoGovernor::Mode::observed_farm, scopes);
+    auto const sampled = Clock::now();
+    FarmingServiceRecord late{sampled, 500000000, 1, 20, true};
+    scoped->record_farming_service(late, 1000000000, 0);
+    scoped->refresh_farming_sources(sampled);
+    ScratchPool choices({ra, rb}, 0); choices.set_io_governor(scoped);
+    require(choices.try_reserve_output(0, root(directory / "c", "target", {"target"}), unit), "scoped scratch output admission failed");
+    choices.seal_recovery();
+    scoped->poll(sampled);
+    for (size_t width : {1u, 2u})
+    {
+        auto chosen = choices.grant(0, 20 * unit, 20 * unit, unit, 2, false, 0, 0, width, 1, {}, true);
+        require(chosen && quota(*chosen) == 20 * unit && chosen->scratch.size() == 1 &&
+            chosen->scratch.front().directory == rb.directory, "new scratch did not prefer an equally eligible unpressured HDD");
+    }
+    // Both reader mappings share one physical sample. The unthrottled native
+    // write still contributes its submitted bytes exactly once.
+    constexpr uint64_t bulk = 16 * 1024 * 1024;
+    auto native = scoped->try_acquire(rb.device, bulk, sampled + milliseconds(100));
+    require(native && native->bytes() == bulk, "an unrelated HDD inherited another reader's transfer limit");
+    native->complete(bulk, 1000, sampled + milliseconds(100), DiskIoGovernor::Transfer::write);
+    physical["disk-b"].write_sectors += 2 * bulk / 512; physical["disk-b"].busy_ms = 1000;
+    scoped->poll(sampled + seconds(1));
+    auto const observed = scoped->observed_bulk_bandwidth("disk-b", sampled + seconds(1));
+    require(reads["disk-a"] == 2 && reads["disk-b"] == 2 && observed && observed->first > 0 &&
+        std::abs(observed->second / observed->first - .5L) < 1e-6L,
+        "multiple readers sampled a physical disk twice or lost an unrelated native transfer");
+    auto timely = late; timely.response_ns = 1000;
+    for (unsigned i = 0; i < 25; ++i) scoped->record_farming_service(timely, 1000000000, 0);
+    scoped->refresh_farming_sources(Clock::now());
+    auto recovered = choices.grant(0, 20 * unit, 20 * unit, unit, 2);
+    require(recovered && recovered->scratch.front().directory == ra.directory, "scratch ordering did not recover after timely lookups");
+    choices.cancel(0);
+
     DiskIoGovernor cancellable;
     auto held = cancellable.acquire(a, unit);
     std::atomic<bool> cancel{false}; std::promise<void> waiting; bool signalled = false;
@@ -916,10 +977,30 @@ void nvme_topology()
     require(storage_detail::nvme_subsystem_reply(reply).empty(), "missing controller namespaces were accepted");
 #endif
 }
+#ifdef _WIN32
+void windows_disk_identity()
+{
+    STORAGE_DEVICE_NUMBER_EX disk{};
+    disk.Size = disk.Version = sizeof(disk);
+    disk.DeviceType = FILE_DEVICE_DISK; disk.DeviceNumber = 3;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)).empty(), "missing disk GUID established a measurement identity");
+    disk.DeviceGuid.Data1 = 1;
+    auto const original = storage_detail::disk_guid(3, disk, sizeof(disk));
+    require(original.size() == 32, "Windows disk GUID missing from measurement identity");
+    ++disk.DeviceGuid.Data1;
+    require(storage_detail::disk_guid(3, disk, sizeof(disk)) != original,
+        "Windows disk number reuse retained the previous measurement identity");
+    require(storage_detail::disk_guid(4, disk, sizeof(disk)).empty() &&
+        storage_detail::disk_guid(3, disk, sizeof(disk) - 1).empty(), "mismatched or short Windows disk identity was accepted");
+    disk.DeviceNumber = MAXDWORD;
+    require(storage_detail::disk_guid(MAXDWORD, disk, sizeof(disk)).empty(), "an MPIO path established a physical disk identity");
+}
+#endif
 int main() try
 {
     nvme_topology();
 #ifdef _WIN32
+    windows_disk_identity();
     fs::path directory;
     std::random_device random;
     for (unsigned attempt = 0; attempt < 32; ++attempt)

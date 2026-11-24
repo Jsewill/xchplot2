@@ -58,7 +58,6 @@ jobs:
       linux: ${{ steps.filter.outputs.linux }}
       windows: ${{ steps.filter.outputs.windows }}
     steps:
-      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name == 'pull_request'

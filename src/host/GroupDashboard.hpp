@@ -1,4 +1,5 @@
 #pragma once
+#include "host/GroupFillForecast.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -80,6 +81,8 @@ class DashboardJob
         double last_seconds = 0;
         uint64_t last_units = 0, last_bytes = 0, worker_ns = 0, send_ns = 0, receiver_ns = 0;
         uint32_t ingress = 0;
+        uint64_t failures = 0;
+        std::string last_failure;
     };
     mutable std::mutex mutex_;
     Clock::time_point const started_;
@@ -89,6 +92,7 @@ class DashboardJob
     std::deque<DashboardFrame::Row> decisions_;
     std::vector<DashboardFrame::Row> roster_;
     std::vector<DashboardFrame::Row> admission_rows_;
+    std::map<std::string, DashboardFrame::Row> local_gpu_status_;
     std::optional<unsigned> registered_;
     std::string roster_state_;
     struct Grant
@@ -105,10 +109,100 @@ class DashboardJob
     };
     std::map<std::string, AdmissionWait> waiting_;
     uint64_t decision_count_ = 0;
-    uint64_t fresh_ = 0, inherited_ = 0, files_ = 0;
+    uint64_t fresh_ = 0, inherited_ = 0, files_ = 0, first_fresh_ = 0;
     // Saved farm output is ordered within a lane. Re-inspecting a revision or
     // extending its last file must count only the additional durable members.
     std::map<size_t, std::pair<uint64_t, uint64_t>> lane_publications_;
+    std::optional<FillCompletionForecast> fill_forecast_;
+    uint64_t forecast_start_members_ = 0;
+    Clock::time_point forecast_start_{}, schedule_at_{};
+    uint64_t scheduled_members_ = 0, scheduled_at_members_ = 0;
+    double scheduled_seconds_ = 0, schedule_bound_ = 0;
+    char const* schedule_resource_ = "unmeasured";
+    std::string schedule_missing_;
+    size_t schedule_unmeasured_ = 0;
+    bool storage_unmeasured_ = false;
+    bool fill_pool_changed_ = false;
+
+    FillCompletionForecast remaining_fill(Clock::time_point now) const
+    {
+        auto result = *fill_forecast_;
+        result.seconds.reset(); result.low.reset(); result.high.reset(); result.lower_bound.reset();
+        result.source = "unmeasured";
+        result.members = result.members.after(fresh_ - forecast_start_members_);
+        if (!fill_pool_changed_ || !result.members.expected) result.use_history();
+        if (result.members.waiting || !result.members.expected) return result;
+        if (fresh_ > forecast_start_members_)
+        {
+            auto const count = fresh_ - forecast_start_members_;
+            auto const whole = std::chrono::duration<double>(last_publication_ - forecast_start_).count() / count;
+            FillRate rate{whole, whole, 1};
+            // Average complete windows. Individual intervals can approach zero
+            // when independent HDDs publish at the same instant.
+            auto first = std::find_if(publications_.begin(), publications_.end(),
+                [&](auto const& point) { return point.second > forecast_start_members_; });
+            if (first != publications_.end() && publications_.end() - first >= 3)
+            {
+                auto middle = first + (publications_.end() - first) / 2;
+                if (middle->second < fresh_)
+                {
+                    auto const recent = std::chrono::duration<double>(last_publication_ - middle->first).count() /
+                        (fresh_ - middle->second);
+                    rate = {std::min(whole, recent), std::max(whole, recent), 2};
+                }
+            }
+            result.low.reset(); result.high.reset();
+            result.project(rate, "live-publications");
+        }
+        if (result.seconds)
+        {
+            auto const since = fresh_ > forecast_start_members_ ? last_publication_ : forecast_start_;
+            auto const age = std::chrono::duration<double>(now - since).count();
+            if (result.high) result.high = std::max(0., *result.high - age);
+            if (result.low) result.low = std::max(0., *result.low - age);
+            if (age < *result.seconds) *result.seconds -= age;
+            else
+            {
+                result.source = "awaiting-publication"; result.seconds.reset(); result.low.reset();
+                if (result.high == 0) result.high.reset();
+            }
+        }
+        bool const covers_all = scheduled_members_ == result.members.expected;
+        if (scheduled_at_members_ == fresh_ && schedule_at_ != Clock::time_point{} &&
+            (covers_all || (result.members.open && scheduled_members_ && scheduled_members_ < result.members.expected)))
+        {
+            auto const age = std::chrono::duration<double>(now - schedule_at_).count();
+            result.schedule_observed = true; result.unmeasured_lanes = schedule_unmeasured_;
+            result.scheduled_members = scheduled_members_;
+            result.shared_storage_unmeasured = storage_unmeasured_;
+            result.unmeasured_costs = schedule_missing_;
+            result.conditional_pool = false;
+            if (schedule_bound_ > age) result.lower_bound = schedule_bound_ - age;
+            if (covers_all) result.limiting_resource = schedule_resource_;
+            else
+            {
+                if (!result.unmeasured_costs.empty()) result.unmeasured_costs += ", ";
+                result.unmeasured_costs += "later groups outside the current schedule";
+            }
+            if (covers_all && scheduled_seconds_ > age)
+            {
+                result.seconds = scheduled_seconds_ - age;
+                result.source = "live-schedule";
+                if (result.low) result.low = std::min(*result.low, *result.seconds);
+                if (result.high) result.high = std::max(*result.high, *result.seconds);
+            }
+        }
+        return result;
+    }
+
+    Delivery& worker_record(std::string const& id, std::string const& instance, std::string local_device)
+    {
+        auto const at = std::find_if(deliveries_.begin(), deliveries_.end(), [&](auto const& d)
+            { return d.worker == id && d.instance == instance && d.local_device == local_device; });
+        if (at != deliveries_.end()) return *at;
+        if (deliveries_.size() == 128) deliveries_.pop_front();
+        return deliveries_.emplace_back(Delivery{id, instance, std::move(local_device)});
+    }
 
   public:
     explicit DashboardJob(Clock::time_point started = Clock::now()) : started_(started) {}
@@ -116,13 +210,51 @@ class DashboardJob
     {
         std::string id, instance, host, gpu, endpoint;
         unsigned slots;
+        bool operator==(Route const&) const = default;
     };
     struct Progress
     {
         uint64_t fresh, inherited, files;
-        double first_seconds, last_seconds;
+        double first_seconds, last_seconds, elapsed_seconds;
+        uint64_t first_fresh, delivery_routes;
     };
     using LaneFile = std::pair<size_t, uint64_t>;
+    void plan_fill(FillCompletionForecast forecast)
+    {
+        std::lock_guard lock(mutex_);
+        fill_forecast_ = std::move(forecast); forecast_start_members_ = fresh_;
+        forecast_start_ = fresh_ ? Clock::now() : started_; schedule_at_ = {}; fill_pool_changed_ = false;
+    }
+    void schedule_fill(uint64_t remaining, double seconds, double lower_bound, char const* resource,
+                       size_t unmeasured, bool storage_unmeasured, std::string missing, bool open_extent)
+    {
+        std::lock_guard lock(mutex_);
+        if (!fill_forecast_) return;
+        schedule_at_ = Clock::now(); scheduled_at_members_ = fresh_; scheduled_members_ = remaining;
+        scheduled_seconds_ = seconds; schedule_bound_ = lower_bound; schedule_resource_ = resource;
+        schedule_unmeasured_ = unmeasured; storage_unmeasured_ = storage_unmeasured;
+        schedule_missing_ = std::move(missing);
+        auto& target = fill_forecast_->members;
+        auto const published = fresh_ - forecast_start_members_;
+        if (target.open && !target.waiting && remaining && remaining <= UINT64_MAX - published)
+        {
+            auto const revised = remaining + published;
+            if ((!open_extent || revised > target.expected) && revised >= target.minimum &&
+                (!target.maximum || revised <= *target.maximum)) target.expected = revised;
+        }
+    }
+    void completed_fill()
+    {
+        std::lock_guard lock(mutex_);
+        if (!fill_forecast_) return;
+        fill_forecast_->members = {}; forecast_start_members_ = fresh_; schedule_at_ = {};
+    }
+    std::optional<FillCompletionForecast> fill_prediction() const
+    {
+        std::lock_guard lock(mutex_);
+        if (fill_forecast_) return remaining_fill(Clock::now());
+        return {};
+    }
     void published(uint64_t members, uint64_t inherited, std::optional<LaneFile> file = {})
     {
         if (!members) return;
@@ -149,7 +281,7 @@ class DashboardJob
         if (members == inherited) return;
         fresh_ += members - inherited;
         last_publication_ = Clock::now();
-        if (first_publication_ == Clock::time_point{}) first_publication_ = last_publication_;
+        if (first_publication_ == Clock::time_point{}) { first_publication_ = last_publication_; first_fresh_ = fresh_; }
         publications_.emplace_back(last_publication_, fresh_);
         if (publications_.size() > 32) publications_.pop_front();
     }
@@ -158,7 +290,9 @@ class DashboardJob
         std::lock_guard lock(mutex_);
         return {fresh_, inherited_, files_,
                 fresh_ ? std::chrono::duration<double>(first_publication_ - started_).count() : 0,
-                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0};
+                fresh_ ? std::chrono::duration<double>(last_publication_ - started_).count() : 0,
+                std::chrono::duration<double>(Clock::now() - started_).count(), first_fresh_,
+                uint64_t(std::count_if(deliveries_.begin(), deliveries_.end(), [](auto const& d) { return d.members > 0; }))};
     }
     void inherited_snapshot(uint64_t files, uint64_t members)
     {
@@ -206,26 +340,19 @@ class DashboardJob
                                         uint64_t receiver_ns, uint32_t ingress, std::string local_device = {})
     {
         std::lock_guard lock(mutex_);
-        auto at = std::find_if(deliveries_.begin(), deliveries_.end(),
-                               [&](auto const& d) { return d.worker == id && d.instance == instance && d.local_device == local_device; });
-        bool const first = at == deliveries_.end();
-        if (first)
-        {
-            if (deliveries_.size() == 128) deliveries_.pop_front();
-            deliveries_.push_back({id, instance, std::move(local_device)});
-            at = std::prev(deliveries_.end());
-        }
-        at->members += members;
-        at->bytes += bytes;
-        at->last_seconds = double(ns) / 1e9;
-        at->last_units = members;
-        at->last_bytes = bytes;
-        at->worker_ns = worker_ns;
-        at->send_ns = send_ns;
-        at->receiver_ns = receiver_ns;
-        at->ingress = ingress;
+        auto& record = worker_record(id, instance, std::move(local_device));
+        bool const first = !record.members;
+        record.members += members;
+        record.bytes += bytes;
+        record.last_seconds = double(ns) / 1e9;
+        record.last_units = members;
+        record.last_bytes = bytes;
+        record.worker_ns = worker_ns;
+        record.send_ns = send_ns;
+        record.receiver_ns = receiver_ns;
+        record.ingress = ingress;
         if (!first) return {};
-        if (!at->local_device.empty()) return "Local " + at->local_device;
+        if (!record.local_device.empty()) return "Local " + record.local_device;
         auto const route = std::find_if(previous_routes_.begin(), previous_routes_.end(),
                                         [&](auto const& r) { return r.id == id && r.instance == instance; });
         return route == previous_routes_.end() || route->host.empty() ? id : route->host;
@@ -236,6 +363,8 @@ class DashboardJob
     {
         std::lock_guard lock(mutex_);
         std::string change;
+        bool changed_supply = last_k_ && (roster_complete_ != (observed && complete) ||
+            k != last_k_ || strength != last_strength_);
         if (observed && complete && roster_complete_ && k == last_k_ && strength == last_strength_)
         {
             unsigned joined = 0, left = 0;
@@ -252,17 +381,28 @@ class DashboardJob
                 }
             for (auto const& route : previous_routes_)
                 if (!has(routes, route)) ++left;
+            changed_supply = joined || left || slots != last_slots_ || std::any_of(routes.begin(), routes.end(),
+                [&](auto const& route) { return std::find(previous_routes_.begin(), previous_routes_.end(), route) == previous_routes_.end(); });
             if (joined)
                 change = (joined == 1 ? first : std::to_string(joined) + " helpers") + " now eligible for new work";
             if (left)
                 change += (change.empty() ? "" : ". ") + std::to_string(left) +
                           (left == 1 ? " helper left the eligible pool" : " helpers left the eligible pool");
         }
+        if (fill_forecast_ && changed_supply)
+        {
+            // Preserve durable progress when a route changes or a complete
+            // observation becomes unavailable. New timings start at this boundary.
+            fill_forecast_->members = fill_forecast_->members.after(fresh_ - forecast_start_members_);
+            forecast_start_members_ = fresh_; forecast_start_ = Clock::now();
+            fill_pool_changed_ = true; schedule_at_ = {};
+        }
         if (change.empty() && registered && registered_ && *registered > *registered_)
             change = "Helper registered. Waiting for an eligible assignment.";
         registered_ = registered;
         admission_rows_ = std::move(admission);
         previous_routes_ = routes;
+        last_slots_ = slots;
         roster_complete_ = observed && complete;
         last_k_ = k;
         last_strength_ = strength;
@@ -288,6 +428,20 @@ class DashboardJob
         }
         return change;
     }
+    void failed_delivery(std::string const& id, std::string const& instance, std::string_view cause)
+    {
+        std::lock_guard lock(mutex_);
+        auto& record = worker_record(id, instance, {});
+        ++record.failures;
+        record.last_failure = cause;
+    }
+    void local_gpu_health(std::string const& device, std::string const& cause, bool waiting_for_memory)
+    {
+        std::lock_guard lock(mutex_);
+        if (!cause.empty()) local_gpu_status_[device] = {"GPU recovering", cause};
+        else if (waiting_for_memory) local_gpu_status_[device] = {"Waiting for GPU memory", {}};
+        else local_gpu_status_.erase(device);
+    }
     void decision(std::string chosen, std::string why)
     {
         std::lock_guard lock(mutex_);
@@ -304,7 +458,7 @@ class DashboardJob
         auto const elapsed = std::chrono::duration<double>(now - started_).count();
         auto const last = std::chrono::duration<double>(last_publication_ - started_).count();
         frame.summary = std::to_string(fresh_) + " new durable members   " +
-                        (fresh_ ? dashboard_number(last / fresh_) + " s/member through publication"
+                        (fresh_ ? dashboard_number(elapsed / fresh_) + " s/member since start"
                                 : "Waiting for first new publication");
         frame.add(DashboardFrame::overview,
                   std::to_string(files_) + " published files   " + std::to_string(inherited_) + " inherited members");
@@ -352,6 +506,21 @@ class DashboardJob
                           dashboard_number(std::chrono::duration<double>(now - grant.since).count(), 1) + " s. " +
                           release(grant));
         }
+        if (fill_forecast_)
+        {
+            auto const forecast = remaining_fill(now);
+            std::string detail = forecast.evidence_description();
+            std::string_view const limit = forecast.limiting_resource;
+            if (forecast.schedule_observed && forecast.scheduled_members < forecast.members.expected)
+                detail += " The current schedule covers " + std::to_string(forecast.scheduled_members) + " members.";
+            if (forecast.members.expected && limit != "unknown" && limit != "unmeasured")
+                detail += " Limited by " + std::string(limit) + ".";
+            if (forecast.conditional_pool && !fresh_) detail += " Plotting checks the current pool capacity.";
+            if (forecast.unmeasured_lanes) detail += " Destinations with unmeasured costs: " + std::to_string(forecast.unmeasured_lanes) + ".";
+            if (forecast.shared_storage_unmeasured) detail += " Shared storage bandwidth is unmeasured.";
+            if (!forecast.unmeasured_costs.empty()) detail += " Still unmeasured: " + forecast.unmeasured_costs + ".";
+            frame.add(DashboardFrame::overview, forecast.description(), std::move(detail));
+        }
         if (publications_.size() > 1)
         {
             auto const& first = publications_.front();
@@ -380,7 +549,7 @@ class DashboardJob
                                                dashboard_number(remaining * *high, 0) + " s."
                                          : ""));
             }
-            if (target > fresh_ + inherited_)
+            if (!fill_forecast_ && target > fresh_ + inherited_)
                 frame.add(DashboardFrame::overview, "Estimated remaining at recent rate  " +
                                                         dashboard_number((target - fresh_ - inherited_) * rate, 0) +
                                                         " s");
@@ -391,7 +560,13 @@ class DashboardJob
                                         : roster_state_);
         for (auto const& row : admission_rows_)
             frame.add(DashboardFrame::workers, row.value, row.detail);
+        for (auto const& [device, status] : local_gpu_status_)
+            frame.add(DashboardFrame::workers, "Local " + device + "   " + status.value, status.detail);
         auto delivered = [&](Delivery const& d, std::string const& name) {
+            if (d.failures)
+                frame.add(DashboardFrame::workers, name + "   " + std::to_string(d.failures) +
+                    (d.failures == 1 ? " failed assignment" : " failed assignments"), d.last_failure);
+            if (!d.members) return;
             if (!d.local_device.empty())
             {
                 frame.add(DashboardFrame::workers, "Local " + d.local_device + "   " + std::to_string(d.members) +
@@ -438,6 +613,7 @@ class DashboardJob
 
   private:
     std::vector<Route> previous_routes_;
+    unsigned last_slots_ = 0;
     bool roster_complete_ = false;
     uint8_t last_k_ = 0, last_strength_ = 0;
 };

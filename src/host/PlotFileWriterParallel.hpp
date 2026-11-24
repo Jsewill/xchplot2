@@ -63,6 +63,10 @@ size_t write_plot_file_parallel(
 // Idempotent; cheap after the first call.
 void warm_writer_pool();
 
+// Native CPU member construction at the raw-ID boundary.
+std::vector<uint64_t> native_cpu_fragments(uint8_t const* plot_id, uint8_t k, uint8_t strength,
+    unsigned threads, uint64_t ram_bytes, std::function<void()> const& check);
+
 // Run pos2-chip's CPU `Plotter` end-to-end and return the sorted T3
 // proof_fragment vector. Encapsulated here so other TUs don't need to
 // include plot/Plotter.hpp (and through it pos/aes/soft_aes.hpp).

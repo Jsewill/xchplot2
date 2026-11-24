@@ -5,7 +5,7 @@ name: arch-matrix
 
 on:
   pull_request:
-    paths:
+    paths: &build-paths
       - .github/workflows/arch-matrix.yml
       - CMakeLists.txt
       - cmake/**
@@ -23,22 +23,7 @@ on:
       - ci/release/adaptivecpp-level-zero-*.patch
   push:
     branches: [main]
-    paths:
-      - .github/workflows/arch-matrix.yml
-      - CMakeLists.txt
-      - cmake/**
-      - src/gpu/*.cu
-      - src/gpu/AesGpu*.cuh
-      - src/gpu/AesSBoxBP.cuh
-      - src/gpu/AesTables.inl
-      - src/gpu/PortableAttrs.hpp
-      - src/gpu/SortCubInternal.cuh
-      - contrib/pos2-plotter-output-move.patch
-      - contrib/pos2-solver-*.patch
-      - contrib/pos2-worker-thread-limit.patch
-      - contrib/cccl-arch-list.patch
-      - scripts/install-deps.sh
-      - ci/release/adaptivecpp-level-zero-*.patch
+    paths: *build-paths
   workflow_dispatch:
 
 permissions:
@@ -50,7 +35,7 @@ concurrency:
 
 jobs:
   build:
-    name: arch / sm_${{ matrix.arch }}
+    name: arch / ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
@@ -59,11 +44,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: 86
+          - name: sm_86 and sm_89
+            architectures: '86;89'
             image: nvidia/cuda:13.0.1-devel-ubuntu24.04
-          - arch: 89
-            image: nvidia/cuda:13.0.1-devel-ubuntu24.04
-          - arch: 120
+          - name: sm_120
+            architectures: '120'
             image: nvidia/cuda:12.9.1-devel-ubuntu24.04
     steps:
       - name: Bootstrap apt + sudo stub (container runs as root)
@@ -79,7 +64,6 @@ jobs:
           chmod +x /usr/local/bin/sudo
       - uses: actions/checkout@v7
       - name: Cache /opt/adaptivecpp
-        id: cache-adaptivecpp
         uses: actions/cache@v6
         with:
           path: /opt/adaptivecpp
@@ -88,16 +72,14 @@ jobs:
       - name: Run scripts/install-deps.sh (LLVM/lld + AdaptiveCpp at /opt/adaptivecpp)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          if [ "${{ steps.cache-adaptivecpp.outputs.cache-hit }}" = "true" ]; then
-            echo "[ci] AdaptiveCpp restored from cache; install-deps.sh"
-            echo "[ci] will detect it at /opt/adaptivecpp and skip the build."
-          fi
           bash scripts/install-deps.sh --gpu nvidia
-      - name: cmake configure + build CUDA TUs (arch=${{ matrix.arch }})
+      - name: Compile CUDA objects
+        env:
+          ARCHITECTURES: ${{ matrix.architectures }}
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DXCHPLOT2_BUILD_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
+            -DCMAKE_CUDA_ARCHITECTURES="$ARCHITECTURES"
           cmake --build build --parallel 2 --target pos2_gpu_cuda_obj

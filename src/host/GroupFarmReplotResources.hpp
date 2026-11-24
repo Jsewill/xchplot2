@@ -8,9 +8,7 @@
 #include "host/ComputeSession.hpp"
 #include "host/GroupStorage.hpp"
 #include <type_traits>
-#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
 #include "gpu/SyclDeviceList.hpp"
-#endif
 
 namespace group_grow::farm
 {
@@ -28,6 +26,31 @@ class ReplotResourcesUnavailable : public std::runtime_error
 public:
     using std::runtime_error::runtime_error;
 };
+template<class Matches>
+void bind_replot_gpu(pos2gpu::GroupOptions& options, std::vector<pos2gpu::GpuDeviceInfo> const& devices, Matches matches)
+{
+    auto candidate = [&](size_t id)
+    {
+        return std::find_if(options.replot_gpu_devices.begin(), options.replot_gpu_devices.end(),
+            [&](auto const& selected) { return size_t(selected.device) == id; });
+    };
+    auto allowed = [&](auto const& device)
+    {
+        return !device.physical_identity.empty() && matches(device.physical_identity) && (options.replot_gpu_devices.empty() ?
+            !options.device_set || options.device == device.id : candidate(device.id) != options.replot_gpu_devices.end());
+    };
+    auto selected = std::find_if(devices.begin(), devices.end(), [&](auto const& device) { return device.auto_dispatchable && allowed(device); });
+    if (selected == devices.end()) selected = std::find_if(devices.begin(), devices.end(), allowed);
+    if (selected == devices.end())
+    {
+        resource_detail::require(std::none_of(devices.begin(), devices.end(), [&](auto const& device)
+            { return !device.physical_identity.empty() && matches(device.physical_identity); }),
+            "the reviewed physical GPU is outside the selected devices");
+        throw ReplotResourcesUnavailable("migration is waiting for its reviewed physical GPU to become available");
+    }
+    options.device = selected->id;
+    if (auto const it = candidate(selected->id); it != options.replot_gpu_devices.end()) options.tier = it->tier;
+}
 struct ReplotLocalResources
 {
     uint64_t ram_bytes = 0, cpu_threads = 0;
@@ -376,15 +399,11 @@ inline pos2gpu::GroupOptions replot_execution_options(pos2gpu::GroupOptions cons
 {
     auto result = options; result.max_ram = request.ram_bytes; result.workers = request.cpu_threads;
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-    if (request.backend == "gpu" && !request.compute_enabled && !options.device_set)
+    auto const& gpu_identity = request.compute_enabled ? request.compute_offer_gpu_identity : request.gpu_identity;
+    if (!gpu_identity.empty())
     {
-        auto const devices = pos2gpu::list_gpu_devices();
-        auto matches = [&](auto const& device)
-        { return !device.physical_identity.empty() && request.gpu_identity == "host:" + request.host + '/' + device.physical_identity; };
-        auto selected = std::find_if(devices.begin(), devices.end(), [&](auto const& device) { return device.auto_dispatchable && matches(device); });
-        if (selected == devices.end()) selected = std::find_if(devices.begin(), devices.end(), matches);
-        if (selected == devices.end()) throw ReplotResourcesUnavailable("migration is waiting for its reviewed physical GPU to become available");
-        result.device = selected->id;
+        bind_replot_gpu(result, pos2gpu::list_gpu_devices(),
+            [&](std::string const& physical) { return gpu_identity == "host:" + request.host + '/' + physical; });
     }
 #endif
     result.pool_offer_ram = request.compute_offer_ram_bytes; result.pool_offer_cpus = request.compute_offer_cpu_threads;

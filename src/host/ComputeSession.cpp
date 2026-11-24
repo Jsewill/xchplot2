@@ -55,6 +55,10 @@ group_grow::WorkerConfig make_group_compute_offer(GroupOptions const& args, std:
     if (!args.pool_advertise.empty()) config.advertise = pool::parse_endpoint(args.pool_advertise);
     config.capacity = {uint32_t(args.pool_offer_cpus), uint32_t(args.pool_offer_slots), args.pool_offer_ram, args.pool_offer_vram};
     config.backend = args.pool_offer_backend; config.tier = args.tier; config.device = int(args.device);
+    config.cpu_affinity = args.producer_cpu_affinity;
+    config.require_cpu_affinity = args.protected_resources && !config.cpu_affinity.empty();
+    if (!config.cpu_affinity.empty())
+        config.generation_threads = unsigned(std::min<uint64_t>(config.cpu_affinity.size(), args.pool_offer_cpus));
     config.task_timeout_ms = unsigned(args.pool_timeout_ms);
     config.identity_reservation = args.compute_worker_reservation;
     // Protected migration reserves the complete executor independently of its
@@ -78,38 +82,44 @@ void prepare_group_compute(GroupOptions& args)
 {
     require(args.compute_mode == "auto" || args.compute_mode == "off", "--compute requires auto or off");
     if (args.automatic_compute) return;
-    if (!args.local_devices.empty())
+    args.local_compute = !args.local_devices.empty();
+    auto private_resources = [&]
     {
-        require(args.pool_broker.empty() && args.pool_ca.empty() && args.pool_cert.empty() && args.pool_key.empty() &&
-            args.pool_listen.empty() && args.pool_advertise.empty() && args.pool_directory.empty() && args.automatic_local_compute &&
-            !args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram && !args.pool_offer_backend_set,
-            "selected local producers cannot also use shared compute connection or offer options");
-        args.local_compute = true;
+        require(args.automatic_local_compute, "--compute-local off conflicts with selected local devices");
+        require(args.pool_listen.empty() && args.pool_advertise.empty() && !args.pool_offer_backend_set,
+            "selected local devices run for this job; remove local listener, advertise and offer-backend overrides");
         auto const workers = args.workers ? unsigned(args.workers) : std::max(1u, group_grow::profile_detail::logical_cpus());
-        args.pool_offer_cpus = std::max(1u, workers - 1);
-        // The complete executor partition includes every service baseline,
-        // retained device buffer and active task. Receiving/assembly keep the
-        // remaining quarter, with their existing per-task memory admission.
-        args.pool_offer_ram = args.max_ram / 4 * 3;
-        args.pool_offer_slots = args.local_devices.size();
-        args.pool_codec_auto = false; args.pool_codec_ram = 0;
-        return;
-    }
+        if (!args.pool_offer_cpus) args.pool_offer_cpus = std::max(1u, workers - 1);
+        if (!args.pool_offer_ram) args.pool_offer_ram = args.max_ram / 4 * 3;
+        if (!args.compute_settings.contains("--compute-offer-slots")) args.pool_offer_slots = args.local_devices.size();
+        if (args.pool_broker.empty())
+        {
+            require(!args.pool_codec_ram, "remote encoding requires a compute broker");
+            args.pool_codec_auto = false;
+        }
+    };
     if (args.compute_mode == "off")
     {
         require(args.pool_broker.empty() && args.pool_ca.empty() && args.pool_cert.empty() && args.pool_key.empty() &&
-            !args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram,
+            (args.local_compute || (!args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram)),
             "--compute off cannot be combined with connection or compute offer options");
+        if (args.local_compute) private_resources();
         return;
     }
     // Explicit credentials retain the existing direct-connection interface.
-    if (!args.pool_ca.empty() || !args.pool_cert.empty() || !args.pool_key.empty()) return;
+    if (!args.pool_ca.empty() || !args.pool_cert.empty() || !args.pool_key.empty())
+    {
+        require(!args.pool_broker.empty(), "explicit shared compute credentials require a broker");
+        if (args.local_compute) private_resources();
+        return;
+    }
     auto identity = pool::load_pool(args.pool_directory.empty() ? pool::pool_directory() :
         std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())));
     if (!identity)
     {
         require(args.pool_broker.empty(), "shared compute needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
         require(args.automatic_local_compute, "--compute-local needs saved pool membership; use compute setup on a plotting host or compute setup INVITATION on a helper");
+        if (args.local_compute) private_resources();
         return;
     }
     args.automatic_compute = true;
@@ -122,13 +132,14 @@ void prepare_group_compute(GroupOptions& args)
     require(args.max_ram > ComputeSession::memory_bytes + (32ULL << 20),
         "automatic compute needs more than 160 MiB of host RAM; increase --max-host-ram or use --compute off");
     args.max_ram -= ComputeSession::memory_bytes;
-    if (!args.automatic_local_compute)
+    if (!args.automatic_local_compute && !args.local_compute)
     {
         require(!args.pool_offer_ram && !args.pool_offer_cpus && !args.pool_offer_vram && args.pool_listen.empty() && args.pool_advertise.empty(),
             "--compute-local off cannot be combined with local compute offer options");
         return;
     }
-    if (args.pool_listen.empty() && identity->defaults.worker_port)
+    if (args.local_compute) private_resources();
+    else if (args.pool_listen.empty() && identity->defaults.worker_port)
         args.pool_listen = endpoint_text({"::", identity->defaults.worker_port});
     if (!args.pool_offer_ram) args.pool_offer_ram = std::max(args.max_ram / 2, std::min(uint64_t(256) << 20, args.max_ram / 4 * 3));
     auto limit = [](uint64_t selected, uint64_t saved) { return !selected ? saved : !saved ? selected : std::min(selected, saved); };
@@ -140,6 +151,7 @@ void prepare_group_compute(GroupOptions& args)
     if (args.pool_offer_cpu_limit) args.pool_offer_cpus = std::min(args.pool_offer_cpus, args.pool_offer_cpu_limit);
     if (!args.pool_offer_vram) args.pool_offer_vram = identity->defaults.gpu_bytes;
     args.pool_offer_vram_limit = limit(args.pool_offer_vram_limit, identity->defaults.gpu_bytes);
+    if (args.pool_offer_vram_limit) args.pool_offer_vram = std::min(args.pool_offer_vram, args.pool_offer_vram_limit);
     if (!args.pool_offer_backend_set) args.pool_offer_backend = args.backend_set ? args.backend : identity->defaults.backend;
 }
 
@@ -159,26 +171,25 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
     };
     try
     {
-        if (args.local_compute || !args.local_devices.empty())
-        {
-            result.status = "local-execution-selected";
-            result.reason = "explicit local producers are selected; status does not initialize them or consult unrelated shared enrollment";
-            result.unknowns = "current selected-device and exact task admission are not tested; saved farm progress does not prove a running local producer";
-            result.next_action = "review plan with the selected devices, then continue fill when intended; execution rechecks device and task admission";
-            return result;
-        }
-        if (args.compute_mode == "off")
+        bool const private_devices = args.local_compute || !args.local_devices.empty();
+        if (args.compute_mode == "off" && !private_devices)
         {
             result.status = "disabled"; result.reason = "shared compute is disabled for this command";
             result.next_action = "continue with local execution, or select --compute auto when shared compute is intended"; return result;
         }
         bool const explicit_tls = !args.automatic_compute &&
             (!args.pool_ca.empty() || !args.pool_cert.empty() || !args.pool_key.empty());
-        auto identity = explicit_tls ? std::optional<pool::PoolIdentity>{} : pool::load_pool(args.pool_directory.empty() ? pool::pool_directory() :
+        auto identity = explicit_tls || args.compute_mode == "off" ? std::optional<pool::PoolIdentity>{} : pool::load_pool(args.pool_directory.empty() ? pool::pool_directory() :
             std::filesystem::path(reinterpret_cast<char8_t const*>(args.pool_directory.c_str())));
         result.configured = bool(identity) || explicit_tls;
         if (!result.configured)
         {
+            if (private_devices)
+            {
+                result.status = "local-execution-selected"; result.reason = "explicit local producers are selected";
+                result.unknowns = "current selected-device and exact task admission are not tested";
+                result.next_action = "continue fill when intended; execution rechecks device and task admission"; return result;
+            }
             result.status = "not-configured"; result.reason = "no saved compute enrollment or explicit connection was selected";
             result.next_action = "continue with local execution, or use compute setup on a plotting host or compute setup INVITATION on a helper to enroll this machine"; return result;
         }
@@ -251,7 +262,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
                 pool::admission_name(worker.admission), hardware.partition.cpu_threads, hardware.partition.slots,
                 hardware.partition.host_bytes, hardware.partition.gpu_bytes, hardware.standing_host_bytes,
                 hardware.logical_cpus, hardware.total_host_bytes, hardware.available_host_bytes, hardware.total_gpu_bytes, capabilities,
-                hardware.observed_at_unix_ms});
+                hardware.observed_at_unix_ms, worker.gpu_recovery});
             bool const offers_generation = capabilities & (pool::capability(pool::Kind::GenerateCpu) | pool::capability(pool::Kind::GenerateGpu));
             bool const offers_codec = capabilities & pool::capability(pool::Kind::Pack);
             bool const generation = offers_generation && worker.compatibility == generation_contract;
@@ -334,19 +345,19 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
         }
         else if (!result.workers)
         {
-            result.status = "no-workers"; result.blocking = true;
+            result.status = "no-workers"; result.blocking = !private_devices;
             result.reason = "the authenticated brokers currently report no registered workers";
             result.next_action = "inspect compute service status on the enrolled worker machines and restore the intended worker connection";
         }
         else if (!generation_compatible || !codec_compatible)
         {
-            result.status = result.incompatible ? "incompatible-workers" : "work-capability-unavailable"; result.blocking = true;
+            result.status = result.incompatible ? "incompatible-workers" : "work-capability-unavailable"; result.blocking = !private_devices;
             result.reason = "the observed worker capabilities and contracts do not cover this build's generation and encoding work";
             result.next_action = "use compatible worker generation and codec contracts, then retry status --live; producer build differences alone do not block compatible contracts";
         }
         else if (!result.accepting_generation || !result.accepting_codec)
         {
-            result.status = "admission-closed"; result.blocking = true;
+            result.status = "admission-closed"; result.blocking = !private_devices;
             result.reason = "compatible workers were observed, but pause/drain settings leave generation or encoding tasks without an accepting worker";
             result.next_action = "use compute resume on the intended worker machine when it should accept new work; accepted tasks keep their reservations";
         }
@@ -355,6 +366,7 @@ ComputeInspection inspect_group_compute(GroupOptions const& args, std::chrono::s
             result.status = "compatible-workers-observed";
             result.reason = "authenticated observations report accepting workers with compatible generation and codec contracts";
         }
+        if (private_devices) result.unknowns += "; the job can also use its selected local devices subject to runtime admission";
     }
     catch (std::exception const& error)
     {
@@ -409,7 +421,8 @@ struct ComputeSession::Impl
         }
         else
         {
-            if (identity.defaults.discovery) discovery = std::make_shared<pool::ComputeDiscovery>(discovery_options(identity));
+            if (identity.defaults.discovery && args.automatic_local_compute)
+                discovery = std::make_shared<pool::ComputeDiscovery>(discovery_options(identity));
             if (verbose) std::cerr << "[compute] Using broker " << args.pool_broker << '\n';
         }
         if (discovery && discovery->status() != "LAN discovery active")

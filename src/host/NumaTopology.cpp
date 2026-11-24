@@ -155,7 +155,7 @@ bool pin_thread_to_cpus(std::vector<int> const& cpus)
 
     // 0 = the calling thread. NOT the process: like nice, Linux scopes affinity
     // per-thread and copies it at clone(), which is exactly what carries this
-    // down into pos2-chip's fan-out.
+    // down into the CPU generator's lanes.
     return ::sched_setaffinity(0, sizeof(set), &set) == 0;
 #endif
 }

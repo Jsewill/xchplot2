@@ -2,6 +2,7 @@
 #include "host/GroupPlotter.cpp"
 #include "host/GroupDashboardFeed.hpp"
 #include "compute_pool_fixture.hpp"
+#include "host/ComputeIdentity.hpp"
 #include "host/ComputeThreads.hpp"
 #ifdef _WIN32
 #include <process.h>
@@ -48,32 +49,180 @@ struct Directory
 std::vector<uint8_t> contents(fs::path const& path)
 { auto in = group_tools::input(path.string()); return {std::istreambuf_iterator<char>(in), {}}; }
 
-// Queue one real successor generation at the encoder boundary, after source
-// preparation has joined. Policy, measured local time, deadlines and all
-// remote validation remain the production provider's responsibility.
+// Queue one real successor after source preparation. The standalone timing
+// run uses its measured cost. CTest supplies a busy-owner cost so a faster
+// runner still exercises remote publication and canonical byte validation.
 struct PrefetchEncoder final : RemoteEncoder
 {
     std::shared_ptr<PoolRemoteEncoder> remote;
-    std::shared_ptr<CodecScheduler> scheduler;
-    std::function<void()> generation;
+    std::function<std::future<void>()> prefetch;
     std::future<void> pending;
     bool queued = false;
-    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider,
-                    std::shared_ptr<CodecScheduler> cpu, std::function<void()> work)
-        : remote(std::move(provider)), scheduler(std::move(cpu)), generation(std::move(work)) {}
+    uint64_t local_queue_ns;
+    PrefetchEncoder(std::shared_ptr<PoolRemoteEncoder> provider, std::function<std::future<void>()> start,
+        uint64_t queue_ns)
+        : remote(std::move(provider)), prefetch(std::move(start)), local_queue_ns(queue_ns) {}
     ~PrefetchEncoder() { if (pending.valid()) pending.wait(); }
     std::optional<RemoteEncodedWindow> encode(uint8_t k, std::span<ChunkInput const> chunks, bool summaries) override
     {
         auto result = remote->encode(k, chunks, summaries);
         if (!result && !queued && !chunks.empty() && !chunks.front().contributions.empty())
-        { pending = scheduler->submit(generation); queued = true; }
+        { pending = prefetch(); queued = true; }
         return result;
     }
     void observe_local(uint8_t k, std::span<ChunkInput const> chunks,
         std::span<uint64_t const> sizes, std::span<EncodedBlock const> blocks, uint64_t elapsed) override
-    { remote->observe_local(k, chunks, sizes, blocks, elapsed); }
+    { remote->observe_local(k, chunks, sizes, blocks, std::max(elapsed, local_queue_ns)); }
     void join() { if (pending.valid()) pending.get(); }
 };
+
+void failed_successor_publication(grow_controller_test::Arguments args, fs::path const& root,
+    WorkerService& original, WorkerConfig replacement)
+{
+    using namespace grow_controller_test;
+    // Withdraw the original worker if the next signed grant arrives before
+    // publication. Later foreground work must use the still-admitted worker.
+    WorkerService survivor(replacement);
+    args.target = root / "refused-successor"; fs::create_directory(args.target);
+    args.command = "fill"; args.directory_farm = true; args.construction = "incremental";
+    args.temporary.clear(); args.temporary_capacity = 0; args.destination_temp = "off";
+    args.k = 22; args.workers = 2; args.window = args.checkpoint_bytes = uint64_t(64) << 10;
+    args.max_members = args.batch = args.group_members = 1; args.max_total_members = args.max_groups = 2;
+    args.capacity = uint64_t(256) << 20; args.headroom = 0; args.farming_detect_local = false;
+    args.farming_max_eligible_groups = 16; args.pool_output = "packed"; args.pool_codec_ram = 0;
+    args.pool_owner = "failed-successor";
+    auto const destination = args.target, first = group_path(destination, 0);
+    auto const worker = original.status().identity;
+    std::atomic<unsigned> selected{0}, before_publication{0}, after_publication{0};
+    args.compute_admit_task = [&](WorkerTaskAdmission const& admission)
+    {
+        auto const attempt = ++selected;
+        if (attempt == 1) return;
+        if (fs::exists(first))
+        {
+            // A short predecessor write can finish before a speculative grant.
+            auto const expected = before_publication ? survivor.status().identity : worker;
+            require(admission.worker.identity == expected, "successor used an unexpected foreground executor");
+            ++after_publication;
+            return;
+        }
+        ++before_publication;
+        original.control(WorkerControl::Pause); survivor.start();
+        throw WorkerAdmissionRejected("declined provisional executor");
+    };
+    require(run_farming(args) == 0 && before_publication <= 1 && after_publication == 1 &&
+        selected == 2 + before_publication,
+        "successor admission lost its predecessor or skipped the surviving executor");
+    args.compute_admit_task = {}; args.generation_overlap = false;
+    args.target = root / "ordinary-successor"; fs::create_directory(args.target);
+    require(run_farming(args) == 0, "ordinary successor reference failed");
+    for (unsigned i = 0; i < 2; ++i)
+        require(contents(group_path(destination, i)) == contents(group_path(args.target, i)),
+            "a failed speculative receipt changed the canonical published prefix");
+
+    WorkerCancellation expired; expired.deadline = std::chrono::steady_clock::now();
+    require(!receive_optional_successor([&] { expired.check(); return 1; }), "optional receipt retained an expired task");
+    bool interrupted = false, invalid = false;
+    try { receive_optional_successor([]() -> size_t { throw Interrupted{}; }); }
+    catch (Interrupted const&) { interrupted = true; }
+    try { receive_optional_successor([]() -> size_t { throw std::logic_error("invalid receipt"); }); }
+    catch (std::logic_error const&) { invalid = true; }
+    require(interrupted && invalid, "optional receipt suppressed cancellation or a permanent validation failure");
+}
+
+void concurrent_writer_publication(grow_controller_test::Arguments args, fs::path const& root, WorkerConfig alternate, bool measured)
+{
+    using namespace grow_controller_test;
+    WorkerService peer(alternate); peer.start();
+    args.command = "fill"; args.directory_farm = true; args.construction = "incremental";
+    args.temporary.clear(); args.temporary_capacity = 0; args.destination_temp = "off";
+    args.pool_owner = "concurrent-whole-file"; args.pool_output = "auto"; args.pool_codec_ram = 0;
+    args.workers = args.pool_inflight = 4; args.headroom = 0; args.farming_max_eligible_groups = 16;
+    args.max_groups = 1; args.max_members = args.batch = args.group_members = args.max_total_members = 3;
+    args.capacity = uint64_t(256) << 20; args.json = true; args.quiet = true;
+    std::array<std::string, 4> drives{"disk-a", "disk-b", "disk-c", "disk-d"};
+    struct Fixture
+    {
+        std::ostringstream report;
+        std::streambuf* previous = std::cout.rdbuf(report.rdbuf());
+        ~Fixture() { fixture_rotating_drives = {}; std::cout.rdbuf(previous); }
+    } fixture;
+    fixture_rotating_drives = drives;
+    for (auto const& drive : drives)
+    {
+        auto path = root / drive; fs::create_directory(path);
+        if (drive == drives.front()) args.target = path; else args.destinations.push_back(path);
+    }
+    std::mutex receipts; std::condition_variable changed;
+    bool early_whole = false, waiting = false, overlap = false; unsigned assignments = 0;
+    std::string first_worker;
+    args.compute_admit_task = [&](WorkerTaskAdmission const& work)
+    {
+        if (work.task.kind == pool::Kind::Pack) return;
+        std::unique_lock lock(receipts);
+        ++assignments;
+        if (work.task.generation_output != pool::GenerationOutput::Fresh) return;
+        early_whole |= assignments < drives.size();
+        if (measured && first_worker.empty())
+        {
+            first_worker = work.worker.identity; waiting = true;
+            changed.wait_for(lock, std::chrono::seconds(3), [&] { return overlap; }); waiting = false;
+        }
+        else if (waiting && work.worker.identity != first_worker) { overlap = true; changed.notify_all(); }
+    };
+    if (!measured) require(run_farming(args) == 0, "four-writer automatic fill failed");
+    else
+    {
+        auto job = farming_arguments(args); Keys keys(args); auto farm = farming_run(args, &keys, job);
+        forecast_farming_fill(*farm, args);
+        auto& performance = farm->performance; auto probe_args = args; probe_args.pool_owner += "-observer";
+        Backend observer; observer.initialize(probe_args, farm->identity(keys, 0, 0), 0, false);
+        auto const offer = observer.acquire_pool_client()->generation_capacity(*args.k, *args.strength);
+        require(offer.roster && offer.roster->complete && offer.roster->routes.size() == 2, "expected two enrolled workers for measured output");
+        performance.observe_pool(offer);
+        require(performance.observed_workers && !performance.workers.empty(), "could not bind the whole-fill observations to the live workers");
+        // Seed deterministic completed times in a fixture-private cache. The
+        // controller invalidates its preference if the roster changes at dispatch.
+        using Cache = FillPerformance::Cache;
+        auto const directory = root / "history"; auto const key = performance.output_key(performance.workers);
+        { Cache cache(directory, Cache::Kind::Fill); for (unsigned i = 0; i < 2; ++i)
+            { cache.completed(key, false, 800 + i); cache.completed(key, true, 200 + i); } }
+        Cache cache(directory, Cache::Kind::Fill, Cache::Access::read_only);
+        performance.output_preference = FillPerformance::cheaper_second(cache.evidence(key, false), cache.evidence(key, true));
+        require(performance.preferred_pool_output("incremental") == true, "comparable complete fills did not favor Fresh");
+        require(multiple_destinations(args, &keys, farm.get()) == 0 && overlap,
+            "matched whole-fill evidence serialized two independently funded whole groups");
+    }
+    // Fill emits both its farming plan and its completed construction metrics.
+    std::istringstream records(fixture.report.str()); std::string metrics;
+    while (std::getline(records, metrics) && !metrics.starts_with("{\"mode\":")) {}
+    require(metrics.starts_with("{\"mode\":"), "four-writer fill did not report completion metrics");
+    auto const report = profile_detail::JsonReader(metrics).read();
+    auto integer = [&](char const* name)
+    { auto const* field = profile_detail::field(report, name); require(field, "missing four-writer fill metric"); return profile_detail::integer(*field); };
+    require(early_whole && integer("pool_fresh_groups"), "one-pass fill did not use an early whole group");
+    if (measured) require(integer("pool_fresh_groups") >= 2, "concurrent confirmed routes did not publish their whole groups");
+    else require(integer("pool_packed_members"), "other writers made no Packed progress during a cold probe");
+    require(integer("generated_members") == drives.size() * args.group_members &&
+        integer("peak_modeled_bytes") <= args.max_ram, "one-pass fill missed members or exceeded its host budget");
+    auto const state = load_farming_state(farming_metadata_path(args.target, "grow-farm.plan", false), args.max_ram);
+    require(state.directories.size() == drives.size(), "four-writer fill changed its planned destinations");
+    Keys keys(args); Config cfg; cfg.capacity_bytes = args.capacity; cfg.memory_limit_bytes = args.max_ram; cfg.workers = 1;
+    cfg.window_bytes = args.window; cfg.checkpoint_bytes = args.checkpoint_bytes; cfg.codec_bytes = uint64_t(8) << 20;
+    worker_detail::CpuLimit limit(1);
+    for (auto const& lane : state.directories)
+    {
+        auto const directory = file_io::native_path(lane.directory), actual = group_path(directory, 0);
+        auto const requested = farming_identity(keys, state, lane, 0);
+        std::vector<std::vector<uint64_t>> raw;
+        for (uint16_t i = 0; i < args.group_members; ++i)
+            raw.push_back(worker_original_reference(requested.params.get_k(), requested.params.get_strength(),
+                requested.params.get_plot_params_for_index(i).get_plot_id().data()));
+        auto const final = root / (directory.filename().string() + ".canonical");
+        Engine reference(final.string(), cfg, false, initial_identity(requested)); reference.confirm_identity();
+        require(reference.append(Members(raw)).accepted && contents(final) == contents(actual), "multi-writer fill changed canonical group bytes");
+    }
+}
 
 void accepted_remote_publication(std::optional<fs::path> retained = {})
 {
@@ -113,13 +262,28 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     WorkerService pressure(pressure_config);
     auto backend = std::make_unique<Backend>(); backend->cpu_scheduler = scheduler;
     backend->initialize(args, requested, 0, false); backend->configure_network(args);
-    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, scheduler, [&]
+    auto generate_successor = [&]
     {
         auto const id = requested.params.get_plot_params_for_index(uint16_t(args.max_members)).get_plot_id().data();
         WorkerCancellation cancel; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         pressure.generate_local(18, 2, id, [](auto const&, uint64_t) {}, cancel, pool::Kind::GenerateCpu);
         ++completed_prefetch;
-    });
+    };
+    auto encoder = std::make_shared<PrefetchEncoder>(backend->pool_remote, [&]
+    {
+        // Generation can leave a cached observation of its occupied slot.
+        // Wait for the owner to see the idle worker before timing local queue pressure.
+        auto const client = backend->acquire_pool_client();
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        for (;;)
+        {
+            auto const capacity = client->generation_capacity(18, 2);
+            if (capacity.slots && capacity.availability.codec_available) break;
+            require(std::chrono::steady_clock::now() < until, "publication worker did not become available after generation");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return scheduler->submit(generate_successor);
+    }, retained ? 0 : 1'000'000'000);
     backend->test_remote = encoder;
     std::vector<std::vector<uint64_t>> raw;
     {
@@ -143,6 +307,15 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     require(metrics.members == args.max_members && contents(args.target) == contents(canonical),
         "accepted remote codec changed complete canonical publication");
     if (retained) print_metrics(args, metrics, *backend);
+    else
+    {
+        auto replacement = pool_test::issue(certificates.path, "successor-worker", &ca);
+        offered.tls = pool_test::tls(ca, replacement); offered.tls.timeout_ms = tls.timeout_ms;
+        concurrent_writer_publication(args, directory.path, offered, false);
+        auto const measured = directory.path / "measured"; fs::create_directory(measured);
+        concurrent_writer_publication(args, measured, offered, true);
+        failed_successor_publication(args, directory.path, worker, std::move(offered));
+    }
 }
 
 void repartition_and_global_admission()
@@ -198,6 +371,11 @@ void repartition_and_global_admission()
     backend.initialize(args, requested, 0, false);
     {
         Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        auto const serial = Backend::fresh_receive_bytes(args), ahead = Backend::contribution_read_ahead_bytes(args);
+        auto const held = args.max_ram - serial;
+        require(ahead && Backend::fresh_receive_grant(args, held + 1) == 0 &&
+            Backend::fresh_receive_grant(args, held) == serial && Backend::fresh_receive_grant(args, held - ahead + 1) == serial &&
+            Backend::fresh_receive_grant(args, held - ahead) == serial + ahead, "fresh receiver lost its serial or read-ahead RAM boundary");
         uint64_t const receiving = producer.pool_receive_bytes(0, raw.size());
         uint64_t const cache = MemberBatchHash::memory_bytes(raw.size());
         producer.budget = producer.fixed + backend.retained() + receiving + cache;
@@ -296,6 +474,65 @@ void repartition_and_global_admission()
         else engine.finish();
         require(contents(paths[destination]) == contents(reference), "owner scratch repartition changed canonical publication");
     }
+    // Feed the next external group through the same asynchronous contribution
+    // receiver as fill. Its full output writer stays fenced until the predecessor releases it.
+    {
+        auto target = ScratchRoot::inspect(directory.path); target.device = {"target", {"target"}, false, true};
+        std::vector<ScratchRoot> scratch;
+        for (std::string name : {"left", "right"})
+        {
+            auto const path = directory.path / name; fs::create_directory(path);
+            auto root = ScratchRoot::inspect(path); root.device = {name, {name}, false, true};
+            scratch.push_back(std::move(root));
+        }
+        ScratchPool pool(scratch, 0);
+        require(pool.try_reserve_output(0, target, cfg.capacity_bytes) && pool.try_reserve_output(1, target, cfg.capacity_bytes),
+            "successor test could not reserve both target files");
+        pool.seal_recovery();
+        require(pool.grant(0, cfg.capacity_bytes, cfg.capacity_bytes, mib, 2).has_value(), "old writer lost its scratch");
+        auto old = pool.try_io(0);
+        auto grant = pool.grant(1, cfg.capacity_bytes, cfg.capacity_bytes, mib, 2);
+        require(old && grant && !pool.try_io(1), "same-output owners acquired two full writer leases");
+        GroupSuccessor next(directory.path / "next-contributions.gplot", requested, batch, cfg.capacity_bytes);
+        next.io = pool.try_stage_io(1); require(bool(next.io), "disjoint successor staging was unavailable");
+        next.engine = std::make_unique<Construction>(next.path.string(), cfg, false, initial, "external", grant);
+        next.engine->confirm_identity(true);
+        Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+        next.contribution_bytes = producer.contribution_bytes(cfg, batch);
+        ControllerWake wake; std::atomic<bool> cancel{true};
+        std::unique_ptr<ExternalEngine::ContributionInput> input;
+        auto stopped = receive_successor_contributions(next, args, backend, producer.fixed, 0, wake, cancel, input);
+        bool cancelled = false;
+        try { (void)stopped.get(); } catch (std::exception const&) { cancelled = true; }
+        input.reset();
+        require(cancelled && !next.engine->external->committed_member_count(), "cancelled provisional input changed the successor");
+        cancel.store(false);
+        // Hold the predecessor's real writer lease while the normal speculative
+        // receiver obtains and declines a signed grant, independent of disk speed.
+        Backend refusing; refusing.mode = "pool"; refusing.cpu_scheduler = backend.cpu_scheduler;
+        refusing.pool_client_config = backend.pool_client_config;
+        refusing.pool_client_config.owner_id += "-refused-successor";
+        bool refused = false;
+        refusing.pool_client_config.admit_task = [&](WorkerTaskAdmission const& admission)
+        {
+            refused = !admission.local_fallback && admission.worker.identity == worker.status().identity &&
+                admission.owner_id == refusing.pool_client_config.owner_id && !admission.broker_identity.empty();
+            throw WorkerAdmissionRejected("declined provisional executor");
+        };
+        auto declined = receive_successor_contributions(next, args, refusing, producer.fixed, 0, wake, cancel, input);
+        require(!declined.get().members && refused && old && next.io && !next.engine->external->committed_member_count(),
+            "declined signed successor escaped its predecessor or retained a provisional member");
+        input.reset();
+        auto receiving = receive_successor_contributions(next, args, backend, producer.fixed, 0, wake, cancel, input);
+        auto const received = receiving.get();
+        require(received.members == batch && received.peak <= args.max_ram && !next.engine->external->committed_member_count(),
+            "successor contributions did not finish privately inside the RAM bound");
+        next.io.reset(); require(!pool.try_io(1), "received successor bypassed its predecessor's publication fence");
+        old.reset(); auto writing = pool.try_io(1); require(bool(writing), "published predecessor kept the successor fenced");
+        require(next.engine->append(*input, batch, true).accepted, "ordinary handoff rejected the sealed successor");
+        input.reset(); next.engine->finish();
+        require(contents(next.path) == contents(reference), "asynchronous external successor differs from the canonical group");
+    }
     // Network receivers already own compact words; they do not pass through
     // CompactMemberBuilder, which alone populates the producer prefix cache.
     // Transfer a real prefetched group and then exercise the single-owner
@@ -339,6 +576,517 @@ void repartition_and_global_admission()
         "single-owner packed pipeline prefetch changed canonical publication");
 }
 
+void retained_terminal_grants(WorkerGenerationCapacity const& capacity)
+{
+    // No first grant with an ordinary continuation can reach the 40-unit
+    // physical bound. Permit the exact, revalidated continuation on seven
+    // writers only when the complete input roster is available.
+    std::array<unsigned, 7> packed{3, 1, 1, 2, 3, 3, 1}, write{27, 21, 29, 26, 36, 31, 37};
+    std::array<ExecutionReady, 7> ready;
+    std::array<ExecutionLane, 7> lanes;
+    std::array<TerminalGenerationBatch, 7> inputs{};
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto& work = lanes[i].work;
+        work.generation = packed[i]; work.cpu = 1; work.destination = write[i];
+        work.batches = 1; work.known = work.io_overlap = true; lanes[i].destination = i;
+        ready[i] = {i, 0, work.cpu + work.destination, true, uint16_t(packed[i]), false, work.generation};
+        inputs[i] = {i, i, 1, 0, uint16_t(packed[i]), {}, {work.generation, work.cpu, 0, work.destination},
+            ready[i].time_to_write};
+    }
+    require(capacity.slots == 1 && capacity.roster && capacity.roster->complete,
+        "the authenticated terminal fixture lost its sole worker");
+    GenerationSupply supply{capacity.slots, capacity.roster}; TerminalGenerationPlan saved;
+    require(saved.choose(ready, lanes, {}, 7, 7, 1, supply, true, 1, 100) == 4 && !saved.count,
+        "the single-grant fallback claimed an unvalidated terminal continuation");
+    require(saved.choose(ready, lanes, inputs, 7, 7, 1, supply, true, 1, 100) == 6 && saved.count == 7,
+        "the seven-writer plan did not attain the shorter durable bound");
+    saved.grant(6, inputs[6].count);
+    require(saved.next(std::span(inputs).first(6), std::span(ready).first(6), supply, 2) == 4,
+        "the second necessary grant lost its qualified writer");
+    inputs[3].writer = 99;
+    require(!saved.next(std::span(inputs).first(6), std::span(ready).first(6), supply, 2),
+        "a changed large cohort kept its old continuation");
+}
+
+void late_packed_capacity()
+{
+    using namespace grow_controller_test;
+    pool_test::Directory certificates;
+    auto ca = pool_test::issue(certificates.path, "packed-start-ca");
+    auto certificate = pool_test::issue(certificates.path, "packed-start-host", &ca);
+    auto tls = pool_test::tls(ca, certificate); tls.timeout_ms = 5000; tls.max_frame_bytes = 65536;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls;
+    RunningBroker broker(options);
+    WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
+    offered.tls = tls; offered.capacity = {1, 1, uint64_t(512) << 20, 0}; offered.generation_threads = 1;
+    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+    WorkerService worker(offered);
+    Arguments args; args.backend = "cpu"; args.pool_inflight = 2; args.pool_timeout_ms = 15000;
+    args.pool_frame_bytes = tls.max_frame_bytes; args.max_ram = uint64_t(1) << 30;
+    Backend backend; backend.mode = "pool"; backend.cpu_scheduler = std::make_shared<CodecScheduler>(2);
+    auto& config = backend.pool_client_config; config.tls = tls; config.broker = offered.broker;
+    config.owner_id = "packed-start-owner"; config.generation_kind = pool::Kind::GenerateCpu;
+    config.max_active_generation = args.pool_inflight; config.task_timeout_ms = args.pool_timeout_ms;
+    std::mutex mutex; std::vector<WorkerTaskObservation> receipts;
+    config.observe = [&](auto const& value) { std::lock_guard lock(mutex); receipts.push_back(value); };
+    std::function<void()> on_selected;
+    config.selected = [&](auto const&) { if (on_selected) on_selected(); };
+    auto client = backend.acquire_pool_client();
+    auto empty = client->generation_capacity(18, 2);
+    require(empty.roster && empty.roster->complete && !empty.slots, "packed owner did not start with an empty broker");
+    grow_controller_test::Identity requested{PlotGroupParams(PlotGroupId(std::string(64, '7')), 18, 2, 0), {}};
+    Producer producer{requested, nullptr, backend, args, args.max_ram, uint64_t(64) << 20};
+    MemberBatchHash hash(3); std::vector<Member> members;
+    auto filling = std::async(std::launch::async, [&] { return producer.fill_pool(members, 0, 3, 0, "", {}, nullptr, &hash, 2); });
+    pool::BrokerClient control(offered.broker, tls);
+    auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!control.status().queued && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(control.status().queued, "cold packed owner did not submit useful work");
+    worker.start();
+    require(filling.get() == 3 && members.size() == 3 && hash.size() == 3 && receipts.size() == 2 &&
+        hash.digest_for(Members(members)) == members_digest(18, Members(members), nullptr, [] {}),
+        "newly available packed capacity did not batch and hash the unsent pair");
+    retained_terminal_grants(client->generation_capacity(18, 2));
+    auto const canonical_packed = members_digest(18, Members(members), nullptr, [] {});
+    worker_detail::CpuLimit cpu(1);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        auto const id = requested.params.get_plot_params_for_index(uint16_t(i)).get_plot_id().data();
+        auto const receipt = std::find_if(receipts.begin(), receipts.end(), [&](auto const& value) { return value.work_units == (i ? 2 : 1); });
+        require(receipt != receipts.end() && receipt->member_id_count == receipt->work_units && receipt->member_ids[i ? i - 1 : 0] == id,
+            "packed rescheduling changed the assigned plot IDs");
+        std::vector<uint64_t> raw; auto view = members[i].view();
+        for (size_t c = 0; c < PlotGroupFile::getChunkCountForK(18); ++c)
+            for (auto value : view.region(c)) raw.push_back(value);
+        require(raw == worker_original_reference(18, 2, id), "packed rescheduling changed ordered CPU-reference output");
+    }
+    {
+        // A waiting independent receiver must fit with every extant byte grant.
+        // Holding the last foreground CPU keeps the final digest on its receiver.
+        uint64_t const held_bytes = producer.pool_receive_bytes(0, 3) + MemberBatchHash::memory_bytes(3);
+        auto const full = producer.budget;
+        producer.budget = producer.fixed + backend.retained() + 2 * held_bytes - 1;
+        require(!producer.fits_waiting_receiver(0, 3, held_bytes), "independent receiver exceeded its RAM grant");
+        ++producer.budget;
+        require(producer.fits_waiting_receiver(0, 3, held_bytes), "independent receiver lost its exact RAM grant");
+        producer.budget = full;
+        std::atomic<bool> waiting{true}; producer.waiting_receiver = &waiting;
+        {
+            CodecScheduler::Lease foreground(backend.cpu_scheduler.get(), 1);
+            auto check = std::async(std::launch::async, [&] { return producer.writer_can_hash(); });
+            require(!check.get(), "handed a digest to a writer without spare CPU");
+        }
+        // Preserve an already computed prefix while the final authenticated pair
+        // goes to the writer. A second real lease must finish before it resumes.
+        std::vector<Member> handed;
+        handed.push_back(backend.generate_pool(requested, 0, args));
+        MemberBatchHash partial_hash(3); partial_hash.append(handed.front().view(), [] {});
+        std::promise<void> selected, release;
+        auto selected_future = selected.get_future(); auto resume = release.get_future().share();
+        std::once_flag first_lease;
+        on_selected = [&] { std::call_once(first_lease, [&]
+        {
+            selected.set_value();
+            require(resume.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "handed receipt never resumed");
+        }); };
+        waiting.store(false);
+        auto pair = std::async(std::launch::async, [&] { return producer.fill_pool(handed, 0, 3, held_bytes, "", {}, nullptr, &partial_hash); });
+        require(selected_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "handed pair did not receive an authenticated grant");
+        waiting.store(true); release.set_value();
+        require(pair.get() == 2 && partial_hash.size() == 1, "receiver consumed or lost the final writer digest");
+        on_selected = {}; producer.waiting_receiver = nullptr;
+        std::promise<void> hashing, received_peer;
+        auto hashing_future = hashing.get_future(); auto peer_done = received_peer.get_future().share();
+        auto writer = std::async(std::launch::async, [&]
+        {
+            CodecScheduler::Lease cpu(backend.cpu_scheduler.get(), 1);
+            bool started = false;
+            return members_digest(18, Members(handed), &partial_hash, [&]
+            {
+                if (std::exchange(started, true)) return;
+                hashing.set_value();
+                require(peer_done.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "next receiver waited for writer hashing");
+            });
+        });
+        require(hashing_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "writer did not resume its digest");
+        grow_controller_test::Identity peer_identity{PlotGroupParams(PlotGroupId(std::string(64, '9')), 18, 2, 0), {}};
+        auto peer_member = backend.generate_pool(peer_identity, 0, args); received_peer.set_value();
+        require(peer_member.view().size() && writer.get() == hash.digest_for(Members(members)),
+            "overlapping independent receipt changed the canonical writer digest");
+    }
+    // A successor hashes only with spare owner CPU. Its complete cache or
+    // the ordinary writer fallback must bind the very same sealed members.
+    std::atomic<bool> stop{false};
+    std::future<std::unique_ptr<MemberBatchHash>> skipped;
+    {
+        CodecScheduler::Lease writer(backend.cpu_scheduler.get());
+        skipped = std::async(std::launch::async, [&] { return producer.hash_pool_successor(members, stop); });
+        require(skipped.wait_for(std::chrono::seconds(2)) == std::future_status::ready && !skipped.get(),
+            "optional successor hash queued for the last foreground CPU");
+    }
+    unsigned checks = 0; args.cancelled = [&] { return ++checks == 3; };
+    bool interrupted = false;
+    try { (void)producer.hash_pool_successor(members, stop); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted, "optional packed successor hash lost cancellation");
+    args.cancelled = {};
+    std::promise<void> started_hash, foreground_ready, release_foreground;
+    auto foreground = std::async(std::launch::async, [&]
+    {
+        require(started_hash.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "successor did not start hashing its first member");
+        CodecScheduler::Lease writer(backend.cpu_scheduler.get());
+        foreground_ready.set_value();
+        require(release_foreground.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "optional hash blocked the foreground permit");
+    });
+    bool first = true;
+    args.cancelled = [&]
+    {
+        if (std::exchange(first, false))
+        {
+            started_hash.set_value();
+            require(foreground_ready.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "writer did not receive its reserved CPU during the optional hash");
+        }
+        return false;
+    };
+    GroupPrefetch partial; partial.capacity = 3; partial.ram_rollover = true;
+    partial.hash = producer.hash_pool_successor(members, stop);
+    release_foreground.set_value(); foreground.get(); args.cancelled = {};
+    require(partial.hash && partial.hash->size() == 1, "CPU pressure discarded a completed successor digest prefix");
+    partial.members = std::move(members);
+    std::unique_ptr<MemberBatchHash> prefix;
+    partial.take(members, prefix, 3, 3);
+    size_t suffix_polls = 0, writer_polls = 0;
+    (void)members_digest(18, Members(members).subspan(1), nullptr, [&] { ++suffix_polls; });
+    require(prefix && members_digest(18, Members(members), prefix.get(), [&] { ++writer_polls; }) ==
+        hash.digest_for(Members(members)) && writer_polls == suffix_polls,
+        "writer reread the confirmed prefix or changed the canonical digest");
+    interrupted = false;
+    try { (void)members_digest(18, Members(members), prefix.get(), [] { throw Interrupted{}; }); }
+    catch (Interrupted const&) { interrupted = true; }
+    require(interrupted && prefix->digest_for(Members(members).subspan(0, 1)) == hash.digest_for(Members(members).subspan(0, 1)),
+        "cancelling suffix hashing changed the accepted digest prefix");
+    std::swap(members[0], members[1]);
+    require(members_digest(18, Members(members), prefix.get(), [] {}) ==
+        members_digest(18, Members(members), nullptr, [] {}), "writer trusted another member's digest prefix");
+    std::swap(members[0], members[1]);
+    GroupPrefetch split; split.capacity = 3; split.ram_rollover = true;
+    split.members = std::move(members); split.hash = std::move(prefix);
+    split.take(members, prefix, 1, 3);
+    require(members.size() == 1 && !prefix && !split.hash && split.first == 1 && split.members.size() == 2,
+        "short adoption exposed the original SHA state to a differently aligned batch");
+    std::vector<Member> remainder;
+    split.take(remainder, prefix, 2, 3);
+    require(!prefix && remainder.size() == 2, "remaining members inherited another range's digest");
+    for (auto& member : remainder) members.push_back(std::move(member));
+    require(bool(hash.digest_for(Members(members))), "short adoption reordered the immutable member identities");
+    for (uint16_t const cap : {4, 3, 2})
+    {
+        auto const count = std::min<size_t>(cap, members.size());
+        auto const expected = members_digest(18, Members(members).subspan(0, count), nullptr, [] {});
+        GroupPrefetch successor; successor.capacity = uint16_t(members.size()); successor.ram_rollover = true;
+        successor.hash = producer.hash_pool_successor(members, stop);
+        require(successor.hash && successor.hash->digest_for(Members(members)) == hash.digest_for(Members(members)),
+            "spare CPU failed to prepare the complete ordinary packed digest");
+        successor.members = std::move(members);
+        std::unique_ptr<MemberBatchHash> adopted;
+        successor.take(members, adopted, 3, cap);
+        require(members.size() == count && bool(adopted) == (cap == 3) &&
+            members_digest(18, Members(members), adopted.get(), [] {}) == expected,
+            "changed RAM grant reused an unadmitted cache or changed its member digest");
+    }
+    auto second_cert = pool_test::issue(certificates.path, "packed-start-second", &ca);
+    offered.tls = pool_test::tls(ca, second_cert); offered.tls.max_frame_bytes = tls.max_frame_bytes;
+    WorkerService second(offered); second.start();
+    Backend probing; probing.mode = "pool"; probing.cpu_scheduler = backend.cpu_scheduler;
+    probing.pool_client_config = config; probing.pool_client_config.owner_id = "packed-probes-owner";
+    std::promise<void> relief, release; auto resume = release.get_future().share();
+    std::string held; bool relieved = false;
+    probing.pool_client_config.selected = [&](auto const& task)
+    {
+        {
+            std::lock_guard lock(mutex);
+            if (!held.empty()) return;
+            held = task.worker_identity;
+        }
+        require(resume.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "first packed probe was never released");
+    };
+    probing.pool_client_config.observe = [&](auto const& task)
+    {
+        std::lock_guard lock(mutex);
+        if (task.worker_identity != held && !std::exchange(relieved, true)) relief.set_value();
+    };
+    auto const roster = probing.acquire_pool_client()->generation_capacity(18, 2);
+    require(roster.roster && roster.roster->complete && roster.roster->routes.size() == 2 && roster.slots == 2,
+        "second compatible packed worker was unavailable");
+    Producer competing{requested, nullptr, probing, args, args.max_ram, uint64_t(64) << 20};
+    std::vector<Member> progress;
+    auto filling_two = std::async(std::launch::async, [&]
+    { return competing.fill_pool(progress, 0, 3, 0, "", {}, nullptr, nullptr, 2); });
+    auto const concurrent = relief.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.set_value();
+    require(filling_two.get() == 3 && concurrent, "a held first probe kept another compatible worker idle");
+    // Train an exact delivery on the direct data route, then start a fresh
+    // owner and add a third, unpriced worker. Use actual owner/worker receipts.
+    auto settings = config;
+    settings.selected = {}; settings.observe = {};
+    settings.generation_path = [](auto const&, auto const&, uint32_t) { return std::string(64, 'b'); };
+    settings.owner_id = "training-batch"; settings.ephemeral_owner = true; settings.max_active_generation = 3;
+    auto admission = [&](WorkerService& service, WorkerControl operation)
+    {
+        auto const expected = service.control(operation);
+        auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;)
+        {
+            auto const status = control.status();
+            if (std::any_of(status.worker_records.begin(), status.worker_records.end(), [&](auto const& row)
+                { return row.identity == expected.identity && row.instance == expected.instance && row.admission == expected.admission; })) return;
+            require(std::chrono::steady_clock::now() < end, "signed worker admission did not reach the broker");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+    admission(second, WorkerControl::Pause);
+    std::array<std::array<uint8_t, 32>, 3> ids;
+    for (unsigned i = 0; i < ids.size(); ++i) ids[i] = requested.params.get_plot_params_for_index(i).get_plot_id().data();
+    {
+        WorkerClient training(settings);
+        for (unsigned i = 0; i < 2; ++i) training.generate_packed(18, 2, ids, [](auto const&, uint64_t) {});
+    }
+    admission(second, WorkerControl::Resume);
+    auto third_cert = pool_test::issue(certificates.path, "packed-third", &ca);
+    offered.tls = pool_test::tls(ca, third_cert); offered.tls.max_frame_bytes = tls.max_frame_bytes;
+    WorkerService third(offered); third.start();
+
+    auto const fast = worker.status().identity;
+    std::promise<WorkerTaskObservation> first_grant; auto first_future = first_grant.get_future().share();
+    std::promise<void> release_batch; auto batch_done = release_batch.get_future().share();
+    std::once_flag initial_selection;
+    std::vector<WorkerTaskObservation> delivered;
+    settings.owner_id = "independent-batches";
+    settings.selected = [&](auto const& value)
+    {
+        bool first = false;
+        std::call_once(initial_selection, [&] { first = true; first_grant.set_value(value); });
+        if (first) require(batch_done.wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+            "the independent packed batch never resumed");
+    };
+    settings.observe = [&](auto const& value) { std::lock_guard lock(mutex); delivered.push_back(value); };
+    auto fenced_settings = settings; fenced_settings.owner_id = "changed-packed-worker"; fenced_settings.selected = {};
+    std::vector<WorkerTaskObservation> fenced_receipts;
+    fenced_settings.observe = [&](auto const& value) { fenced_receipts.push_back(value); };
+    WorkerClient changed(fenced_settings);
+    WorkerPackedRoute fenced_route; unsigned fenced_limit = 0;
+    auto const fenced_capacity = changed.generation_capacity(18, 2);
+    auto const priced_width = changed.packed_generation_width(18, 2, 3, 3, &fenced_route, &fenced_limit,
+        std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    require(fenced_capacity.slots == 3 && priced_width == 3 && fenced_route.route.identity == fast,
+        "the established route was not priced before withdrawing it");
+    std::promise<void> pricing, other_sizing;
+    auto price_started = pricing.get_future(); auto other_started = other_sizing.get_future().share();
+    std::once_flag first_price;
+    std::atomic<bool> grant_before_price{false};
+    settings.generation_path = [&](auto const&, auto const&, uint32_t)
+    {
+        std::call_once(first_price, [&]
+        {
+            pricing.set_value();
+            require(other_started.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "no independent pricing peer");
+            grant_before_price = first_future.wait_for(std::chrono::milliseconds(75)) == std::future_status::ready;
+        });
+        return std::string(64, 'b');
+    };
+    Backend parallel; parallel.mode = "pool"; parallel.cpu_scheduler = backend.cpu_scheduler;
+    parallel.pool_client_config = settings;
+    auto const ready = parallel.acquire_pool_client()->generation_capacity(18, 2);
+    require(ready.roster && ready.roster->complete && ready.roster->routes.size() == 3,
+        "the third compatible worker did not join the authenticated roster");
+    auto parallel_args = args; parallel_args.pool_inflight = 3;
+    Producer established{requested, nullptr, parallel, parallel_args, args.max_ram, uint64_t(64) << 20};
+    std::vector<Member> first_members, peer_members;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto first_task = std::async(std::launch::async, [&]
+        { return established.fill_pool(first_members, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline); });
+    bool const pricing_seen = price_started.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    grow_controller_test::Identity peer_ids{PlotGroupParams(PlotGroupId(std::string(64, '8')), 18, 2, 0), {}};
+    Producer newcomer{peer_ids, nullptr, parallel, parallel_args, args.max_ram, uint64_t(64) << 20};
+    auto peer_task = std::async(std::launch::async, [&]
+        { other_sizing.set_value(); return newcomer.fill_pool(peer_members, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline); });
+    auto first_ready = first_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    auto chosen = first_ready ? first_future.get() : WorkerTaskObservation{};
+    if (!pricing_seen || grant_before_price || chosen.worker_identity != fast || chosen.work_units != 3)
+    {
+        release_batch.set_value(); first_task.get(); peer_task.get();
+        throw std::runtime_error("an independent probe preempted the established exact packed batch");
+    }
+    bool const peer_finished = peer_task.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release_batch.set_value();
+    require(first_task.get() == 3 && peer_task.get() == 3 && peer_finished &&
+        std::any_of(delivered.begin(), delivered.end(), [&](auto const& value)
+            { return value.worker_identity == third.status().identity && value.work_units == 1; }),
+        "a paid batch on the busy route suppressed a newly eligible worker's independent delivery");
+    require(members_digest(18, Members(first_members), nullptr, [] {}) == canonical_packed,
+        "the paid route changed the ordinary canonical packed digest");
+
+    // Size from the same verified price, then retire its actual worker before
+    // the request. No ID was sent under the earlier offer. Receive the three
+    // originals as ordinary grants under their original deadline.
+    settings.selected = {}; settings.owner_id = "limited-packed-owner";
+    settings.max_active_generation = 1;
+    {
+        WorkerClient serial(settings);
+        WorkerPackedRoute route; unsigned singles = 0;
+        require(serial.packed_generation_width(18, 2, 3, 3, &route, &singles, deadline) == 1,
+            "one owner receiver claimed an independent packed batch");
+    }
+    settings.max_active_generation = 3; delivered.clear();
+    // Isolate the already measured worker from the now-paid helpers using a
+    // new route fingerprint for each helper, as on an owner interface change.
+    settings.generation_path = [fast](auto const& route, auto const&, uint32_t)
+        { return std::string(64, route.identity == fast ? 'b' : 'c'); };
+    Backend constrained; constrained.mode = "pool"; constrained.cpu_scheduler = parallel.cpu_scheduler;
+    constrained.pool_client_config = settings; constrained.pool_client_config.owner_id = "constrained-paid-batch";
+    Producer constrained_producer{requested, nullptr, constrained, parallel_args, args.max_ram, uint64_t(64) << 20};
+    constrained_producer.budget = constrained_producer.fixed + constrained.retained() +
+        constrained_producer.pool_receive_bytes(0, 3) - 1;
+    std::vector<Member> limited;
+    auto count = constrained_producer.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    require(count && !delivered.empty() && delivered.front().work_units == 1 &&
+        constrained_producer.peak <= constrained_producer.budget,
+        "an unfunded exact width committed its unpriced remainder or exceeded owner RAM");
+    constrained_producer.budget = args.max_ram;
+    if (count < 3) constrained_producer.fill_pool(limited, 0, 3, 0, "", {}, nullptr, nullptr, 3, deadline);
+    require(members_digest(18, Members(limited), nullptr, [] {}) == canonical_packed,
+        "the smaller receive grant did not preserve the canonical member set");
+
+    admission(worker, WorkerControl::Pause);
+    changed.generate_packed(18, 2, ids, [](auto const&, uint64_t) {}, {}, {},
+        std::chrono::steady_clock::now() + std::chrono::seconds(10), &fenced_route);
+    require(fenced_receipts.size() == ids.size(), "withdrawing a priced worker issued unmeasured wide work elsewhere");
+    for (size_t i = 0; i < ids.size(); ++i)
+        require(fenced_receipts[i].worker_identity != fast && fenced_receipts[i].work_units == 1 &&
+            fenced_receipts[i].member_id_count == 1 && fenced_receipts[i].member_ids[0] == ids[i],
+            "a changed packed grant lost or duplicated an ordered member");
+
+    // Only the first worker has confirmed this pair and triple on the owner's
+    // path. A second owner reserves it between pricing and the real grant.
+    admission(third, WorkerControl::Pause); admission(second, WorkerControl::Pause);
+    admission(worker, WorkerControl::Resume);
+    auto calibrated = settings;
+    calibrated.generation_path = [](auto const&, auto const&, uint32_t) { return std::string(64, 'd'); };
+    calibrated.owner_id = "tail-prices"; calibrated.selected = {}; calibrated.observe = {};
+    {
+        WorkerClient training(calibrated);
+        for (unsigned width : {3u, 3u, 2u, 2u})
+            training.generate_packed(18, 2, std::span(ids).first(width), [](auto const&, uint64_t) {});
+    }
+    for (unsigned mode : {0u, 3u, 2u, 1u})
+    {
+        bool const stop_on_decline = mode == 0, expire_on_decline = mode == 3;
+        unsigned const receivers = mode == 2 ? 2 : 1;
+        auto trial = calibrated;
+        // Each completion test starts with an unpriced alternative. The two
+        // cancelled cases leave no delivery sample on their worker.
+        auto& other = mode == 1 ? third : second;
+        if (mode == 1) admission(second, WorkerControl::Pause);
+        admission(other, WorkerControl::Resume);
+        auto competing = control.open_owner("other-tail-owner-" + std::to_string(mode));
+        pool::Task hold; hold.task_id = "competing"; hold.sequence = 1; hold.kind = pool::Kind::GenerateCpu;
+        hold.compatibility = worker_compatibility(); hold.k = 18; hold.strength = 2; hold.resources = {1,1,1,0};
+        std::optional<pool::Lease> held;
+        std::promise<void> prefix, suffix, resume;
+        auto prefix_at = prefix.get_future().share(), suffix_at = suffix.get_future().share(), release = resume.get_future().share();
+        std::atomic<unsigned> visits{0}; std::atomic<bool> stop{false};
+        trial.owner_id = "tail-reshape-" + std::to_string(mode);
+        trial.generation_path = [&](auto const& route,auto const&,uint32_t)
+        {
+            if (route.identity == fast)
+            {
+                unsigned const check = ++visits;
+                if (check == 2)
+                {
+                    admission(other, WorkerControl::Pause);
+                    held = control.acquire(competing, hold);
+                    require(held && held->worker_identity == fast, "competing owner did not acquire the priced worker");
+                    admission(other, WorkerControl::Resume);
+                }
+                // Make the release observable to the concurrently priced
+                // suffix, without letting the prefix start data transfer.
+                if (check == 3 && receivers == 2)
+                    require(prefix_at.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                        "missing prefix grant during independent suffix pricing");
+            }
+            return std::string(64, 'd');
+        };
+        std::vector<WorkerTaskObservation> grants, successes;
+        std::once_flag first_single;
+        trial.selected = [&](auto const& value)
+        {
+            { std::lock_guard lock(mutex); grants.push_back(value); }
+            if (value.work_units == 3 && stop_on_decline) { stop = true; return; }
+            if (value.work_units == 3 && expire_on_decline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            if (value.work_units == 1) std::call_once(first_single,[&]
+            {
+                auto same = control.acquire(competing,hold);
+                require(held && same && same->token == held->token, "a batch retry preempted another owner's grant");
+                control.cancel(competing,hold.task_id,hold.attempt); prefix.set_value();
+                require(release.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "prefix gate did not resume");
+            });
+            if (value.work_units == 2 && value.worker_identity == fast)
+            {
+                suffix.set_value();
+                require(release.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "suffix gate did not resume");
+            }
+        };
+        trial.observe = [&](auto const& value) { std::lock_guard lock(mutex); successes.push_back(value); };
+        Backend tails; tails.mode = "pool"; tails.cpu_scheduler = backend.cpu_scheduler; tails.pool_client_config = trial;
+        auto local_args = args; local_args.pool_inflight = receivers; local_args.command = "fill";
+        if (expire_on_decline) local_args.pool_timeout_ms = 1000;
+        Producer tail{requested,nullptr,tails,local_args,args.max_ram,uint64_t(64)<<20};
+        auto cli = tails.acquire_pool_client();
+        require(cli->generation_capacity(18,2).slots == 2, "missing eligible workers before pricing the suffix");
+        std::vector<Member> output; MemberBatchHash digest(3);
+        auto future = std::async(std::launch::async,[&] {
+            return tail.fill_pool(output,0,3,0,"",{},&stop,&digest,3,
+                std::chrono::steady_clock::now()+std::chrono::seconds(10),receivers);
+        });
+        if (stop_on_decline || expire_on_decline)
+        {
+            bool cancelled = false;
+            try { (void)future.get(); } catch (std::exception const&) { cancelled = true; }
+            auto same = control.acquire(competing, hold);
+            require(cancelled && (stop || expire_on_decline) && held && same && same->token == held->token &&
+                grants.size() == 1 && successes.empty() && output.empty(),
+                "a stopped or expired paid decline issued more Work or exposed a provisional member");
+            control.cancel(competing,hold.task_id,hold.attempt);
+            continue;
+        }
+        bool const started = prefix_at.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        bool const overlap = started && suffix_at.wait_for(receivers > 1 ? std::chrono::milliseconds(2000) :
+            std::chrono::milliseconds(0)) == std::future_status::ready;
+        auto const live = control.status({});
+        resume.set_value();
+        require(future.get() == 3 && started && grants.front().work_units == 3 && grants.front().worker_identity != fast,
+            "the ordinary producer did not lose and reshape the signed triple");
+        require(overlap == (receivers == 2) && live.granted == receivers && !live.running &&
+            cli->stats().peak_active_generation == receivers, "the packed suffix exceeded or failed to use the funded receivers");
+        require(digest.digest_for(Members(output)) == canonical_packed && !successes.empty(),
+            "repricing changed ordered canonical packed bytes");
+        if (receivers == 2)
+        {
+            auto pair = std::ranges::find_if(successes,[&](auto const& item){return item.worker_identity==fast && item.work_units==2;});
+            auto one = std::ranges::find_if(successes,[&](auto const& item){return item.worker_identity!=fast && item.work_units==1;});
+            require(successes.size() == 2 && one != successes.end() && pair != successes.end() &&
+                one->member_ids[0] == ids[0] && pair->member_ids[0] == ids[1] && pair->member_ids[1] == ids[2],
+                "actual signed retries did not cover the original prefix and priced suffix exactly once");
+        }
+    }
+
+}
+
 void owner_broker_restart()
 {
     using namespace grow_controller_test;
@@ -376,17 +1124,25 @@ void owner_broker_restart()
     auto const raw_reference = directory.path / "restart-raw-reference.gplot";
     { Engine engine(raw_reference.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(Members(expected).subspan(0, 1)).accepted, "restart raw reference did not fit"); }
+    auto restart_after_retries = [&](auto& task, uint64_t before)
+    {
+        // A refused connection can take a full socket timeout. Bring the
+        // broker back after two observed retries with the task still pending.
+        auto const until = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.pool_timeout_ms);
+        while (backend.pool_retries.load() < before + 2 && std::chrono::steady_clock::now() < until &&
+            task.wait_for(std::chrono::milliseconds(10)) == std::future_status::timeout) {}
+        bool const pending = backend.pool_retries.load() >= before + 2 &&
+            task.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+        broker = std::make_unique<RunningBroker>(options);
+        return pending;
+    };
     uint64_t const raw_retries = backend.pool_retries.load();
     broker.reset();
     auto raw = std::async(std::launch::async, [&] { return backend.generate_pool(requested, 0, args); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_raw = raw.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_raw, "raw owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(raw, raw_retries), "raw owner did not stay pending across two broker retries");
     require(raw.wait_for(std::chrono::seconds(8)) == std::future_status::ready,
         "raw owner did not recover within its original task deadline");
     std::vector<Member> member; member.push_back(raw.get());
-    require(backend.pool_retries.load() > raw_retries + 1, "raw owner did not survive the old retry limit");
     auto const raw_path = directory.path / "restart-raw.gplot";
     { Engine engine(raw_path.string(), cfg, false, initial); engine.confirm_identity();
       require(engine.append(member).accepted, "restarted raw owner append did not fit"); }
@@ -406,13 +1162,10 @@ void owner_broker_restart()
         producer.defer_pool_history = true;
         return producer.fill_contributions(*input, 0, 0, producer.contribution_bytes(cfg, 2), "restart member ");
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(750));
-    bool const waiting_contribution = contribution.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-    broker = std::make_unique<RunningBroker>(options);
-    require(waiting_contribution, "contribution owner exhausted immediate retries before broker restart");
+    require(restart_after_retries(contribution, contribution_retries),
+        "contribution owner did not stay pending across two broker retries");
     require(contribution.wait_for(std::chrono::seconds(8)) == std::future_status::ready && contribution.get() == 2,
         "contribution owner did not recover its complete membership");
-    require(backend.pool_retries.load() > contribution_retries + 1, "contribution owner did not survive the old retry limit");
     require(engine.append(*input).accepted, "restarted contribution append did not fit"); input.reset(); engine.finish();
     auto const contribution_reference = directory.path / "restart-contributions-reference.gplot";
     { Engine reference(contribution_reference.string(), cfg, false, initial); reference.confirm_identity();
@@ -436,10 +1189,15 @@ void owner_broker_restart()
     require(expired.get() && bounded, "transient owner retry extended its original absolute deadline");
 }
 
-void private_local_delegation(std::optional<fs::path> retained = {})
+void private_local_delegation(std::optional<fs::path> retained = {}, bool with_helpers = false)
 {
     using namespace grow_controller_test;
     PrivateLocalSchedule model(3, 100);
+    // A previous GPU lane may already be retrying while the next lane is
+    // still being constructed. No probe may inspect this partial schedule.
+    model.devices.emplace_back();
+    require(!model.reserve_probe(1), "a recovery probe used an unpublished private schedule");
+    model.devices.clear();
     model.devices.resize(2);
     auto& fast = model.devices[0]; auto& slow = model.devices[1];
     PrivateLocalSchedule::Shape shape{18, 2, 1, pool::GenerationOutput::Packed};
@@ -465,9 +1223,19 @@ void private_local_delegation(std::optional<fs::path> retained = {})
     require(!model.choose(shape, now, 100).possible, "idle persistent GPU RAM was spent a second time");
     fast.offer.standing_host_bytes = 10; slow.offer.demand.host_bytes = 20;
     fast.offer.demand.slots = 0; fast.held = {0, 0, 0, 0};
+    fast.offer.gpu_headroom_limited = true;
     choice = model.choose(shape, now, 100);
     require(choice.device == 1 && choice.grant.cpu_threads == 3, "sole eligible slow CPU did not receive the available grant");
     require(model.choose(shape, now, 30).device == SIZE_MAX, "physical host pressure was ignored");
+    slow.offer.demand.slots = 0;
+    choice = model.choose(shape, now, 100);
+    require(choice.device == SIZE_MAX && choice.possible, "temporary GPU memory pressure ended private acquisition");
+    fast.offer.demand.host_bytes = 81;
+    require(!model.choose(shape, now, 100).possible, "waiting for GPU memory ignored the permanent shared host limit");
+    fast.offer.demand.host_bytes = 55;
+    fast.offer.gpu_headroom_limited = false;
+    require(!model.choose(shape, now, 100).possible, "permanently unsupported private shape waited for GPU memory");
+    slow.offer.demand.slots = 1;
     fast.offer.demand = {3, 1, 55, 0};
     choice = model.choose(shape, now, 100);
     require(choice.device == 0 && choice.grant.cpu_threads == 2, "one CPU service occupied every permit despite a fitting peer");
@@ -528,6 +1296,168 @@ void private_local_delegation(std::optional<fs::path> retained = {})
     auto result = run_group(args, args.target, nullptr, requested, uint16_t(ids.size()), args.capacity, 0, constructing);
     require(result.members == ids.size() && !publication::pending(args.target) && contents(args.target) == contents(cpu),
         "complete private local publication differs from the independently generated CPU-reference group");
+    if (!with_helpers) return;
+
+    // Enroll a helper after the owner has begun generating on its selected
+    // devices. Both routes use the same owner receivers and fixed identities.
+    pool_test::Directory enrollment;
+    auto owner = pool::create_pool(enrollment.path / "owner", "mixed-owner");
+    auto defaults = owner.defaults; defaults.discovery = false; defaults.interfaces = {"lo"};
+    defaults.cpus = 1; defaults.host_bytes = args.pool_offer_ram; defaults.gpu_bytes = 256ULL << 20;
+    pool::configure_pool(owner, defaults);
+    args.pool_directory = pool_test::utf8_path(owner.directory); args.pool_offer_ram = args.pool_offer_cpus = 0;
+    args.pool_offer_vram = args.pool_offer_vram_limit = 2 * defaults.gpu_bytes;
+    auto const total = args.max_ram; pos2gpu::prepare_group_compute(args);
+    require(args.automatic_compute && args.local_compute && args.pool_offer_ram == defaults.host_bytes &&
+        args.pool_offer_cpus == defaults.cpus && args.pool_offer_vram == defaults.gpu_bytes &&
+        args.max_ram + pos2gpu::ComputeSession::memory_bytes == total,
+        "mixed selection dropped enrollment or counted the automatic session and device grants twice");
+    pos2gpu::configure_group_compute(args);
+    require(args.max_ram + args.pool_codec_ram + args.pool_offer_ram + pos2gpu::ComputeSession::memory_bytes == total,
+        "mixed owner, codec, session and private device grants exceed the combined cap");
+    auto session = std::make_unique<pos2gpu::ComputeSession>(args);
+    Backend mixed; mixed.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    mixed.configure_network(args);
+    auto mixed_client = mixed.acquire_pool_client(); // The codec can create it before generation starts.
+    mixed.initialize(args, requested, 0, false);
+    bool fenced = false;
+    try { (void)WorkerService::reserve_identity(args.pool_cert); } catch (WorkerAlreadyRunning const&) { fenced = true; }
+    require(fenced, "a separate local worker could also take the selected devices' partition");
+    auto generate = [&]
+    {
+        std::optional<CompactMemberReceiver> receive;
+        mixed_client->generate(18, 2, ids.front(), [&](PackedFragmentTile const& tile, uint64_t count)
+        {
+            if (!receive) receive.emplace(18, size_t(count));
+            receive->append(tile);
+        });
+        require(bool(receive), "mixed generation produced no member");
+        auto member = receive->finish(); auto view = member.view();
+        std::vector<uint64_t> raw;
+        for (size_t chunk = 0; chunk < PlotGroupFile::getChunkCountForK(18); ++chunk)
+            for (auto value : view.region(chunk)) raw.push_back(value);
+        require(raw == reference.front(), "mixed generation changed CPU-reference bytes");
+    };
+    require(mixed_client->generation_capacity(18, 2).slots == 1 && !mixed.fresh_group_slots(requested, 1),
+        "an empty broker lost private capacity or offered a remote-only stream");
+    generate();
+    auto invitation = enrollment.path / "helper.invite"; pool::invite_pool(owner, invitation, "helper");
+    auto helper = pool::join_pool(invitation, enrollment.path / "helper");
+    WorkerConfig offered; offered.broker = pool::parse_endpoint(args.pool_broker); offered.broker.server_name = owner.server_name;
+    offered.listen = {"127.0.0.1", 0}; offered.tls = helper.tls; offered.server_name = helper.server_name;
+    offered.tls.max_frame_bytes = uint32_t(args.pool_frame_bytes);
+    offered.capacity = {1, 1, defaults.host_bytes, 0}; offered.max_task_bytes = args.window + args.pool_frame_bytes;
+    offered.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    offered.available_resources = [cap=offered.capacity](unsigned) { return cap; };
+    WorkerService remote(offered); remote.start();
+    auto wait_slots = [&](unsigned slots)
+    {
+        auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (mixed_client->generation_capacity(18, 2).slots != slots && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(mixed_client->generation_capacity(18, 2).slots == slots, "mixed capacity did not follow helper membership");
+    };
+    wait_slots(2);
+    std::future<void> peer;
+    {
+        CodecScheduler::Lease occupied(offered.cpu_scheduler.get());
+        peer = std::async(std::launch::async, generate);
+        auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!remote.status().accepted_tasks && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        require(remote.status().accepted_tasks == 1, "helper never acquired its generation grant");
+        std::async(std::launch::async, generate).get();
+    }
+    peer.get();
+    auto const stats = mixed_client->stats();
+    require(stats.completed_generation == 3 && stats.local_tasks == 2 && stats.output_bytes && !session->local_worker(),
+        "mixed generation failed to use the remote and private grants independently");
+
+    // The cold multi-writer decision needs a second physical worker grant.
+    // Live matched receipt prices precede a prior durable policy for the farm.
+    auto advertised = mixed_client->generation_capacity(18, 2, false);
+    require(!Backend::spare_fresh_worker(advertised, ids.size()), "a single worker funded both output routes");
+    using Choice = Backend::FreshChoice;
+    require(Backend::concurrent_fresh(false, true, {}, {}, {}) == Choice::probe &&
+        Backend::concurrent_fresh(false, false, {}, {}, {}) == Choice::ordinary &&
+        Backend::concurrent_fresh(true, true, {}, {}, {}) == Choice::ordinary &&
+        Backend::concurrent_fresh(false, true, 8, 3, false) == Choice::fresh &&
+        Backend::concurrent_fresh(true, false, 3, 8, true) == Choice::packed &&
+        Backend::concurrent_fresh(false, true, 0, {}, true) == Choice::fresh &&
+        Backend::concurrent_fresh(true, false, {}, 0, false) == Choice::packed, "concurrent publication ignored its live evidence or repeated a cold probe");
+    auto second_invite = enrollment.path / "second.invite"; pool::invite_pool(owner, second_invite, "second");
+    auto second = pool::join_pool(second_invite, enrollment.path / "second");
+    auto alternate = offered; alternate.tls = second.tls; alternate.tls.max_frame_bytes = offered.tls.max_frame_bytes;
+    alternate.server_name = second.server_name; alternate.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+    WorkerService alternate_service(alternate);
+    auto const fresh_path = output / "fresh.gplot", packed_path = output / "packed.gplot";
+    Engine whole(fresh_path.string(), cfg, false, initial_identity(requested));
+    Engine packed(packed_path.string(), cfg, false, initial_identity(requested));
+    whole.confirm_identity(); packed.confirm_identity();
+    auto stream = [&](Engine& engine)
+    {
+        uint64_t elapsed = 0;
+        return mixed.stream_fresh_group(engine, requested, uint16_t(ids.size()), args, Backend::fresh_receive_bytes(args), elapsed,
+            nullptr, {}, true);
+    };
+    std::future<std::optional<AppendResult>> fresh;
+    {
+        CodecScheduler::Lease occupied(offered.cpu_scheduler.get());
+        fresh = std::async(std::launch::async, [&] { return stream(whole); });
+        auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!remote.status().accepted_tasks && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(remote.status().accepted_tasks == 1, "whole-group output did not acquire a worker");
+        // An advertised full-group grant can disappear before the acquire.
+        // Decline before a manifest, then use that same destination for Packed.
+        auto refused = std::async(std::launch::async, [&] { return stream(packed); });
+        require(refused.wait_for(std::chrono::seconds(2)) == std::future_status::ready &&
+            !refused.get() && !packed.identity().pending && !packed.identity().target_members,
+            "an optional queued Fresh request held its writer or changed its destination");
+        alternate_service.start(); wait_slots(3);
+        std::async(std::launch::async, [&]
+        {
+            std::vector<Member> members;
+            Producer producer{requested, nullptr, mixed, args, args.max_ram, 0, 0};
+            require(producer.fill_pool(members, 0, ids.size(), 0, "", {}, nullptr, nullptr, 1, {}, 1) == ids.size() &&
+                packed.append(Members(members)).accepted, "a different writer could not publish Packed while Fresh was occupied");
+        }).get();
+    }
+    auto complete = fresh.get();
+    require(complete && complete->accepted && contents(fresh_path) == contents(cpu) && contents(packed_path) == contents(cpu),
+        "concurrent Fresh and Packed publication changed independently generated bytes");
+    // Wait out the advisory snapshot of the occupied lane.
+    auto const observed_until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do
+    {
+        advertised = mixed_client->generation_capacity(18, 2, false);
+        if (Backend::spare_fresh_worker(advertised, ids.size())) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    } while (std::chrono::steady_clock::now() < observed_until);
+    require(Backend::spare_fresh_worker(advertised, ids.size()) && !Backend::spare_fresh_worker(advertised, advertised.batch + 1),
+        "multi-writer probe missed spare capacity or assumed an unsupported full width");
+    advertised.availability.admission->available_slots = 1;
+    require(Backend::available_fresh_worker(advertised, ids.size()) && !Backend::spare_fresh_worker(advertised, ids.size()),
+        "a single free grant was confused with spare capacity for a cold probe");
+    advertised.availability.admission->other_owner_tasks = 1;
+    require(!Backend::available_fresh_worker(advertised, ids.size()), "an output decision took another owner's capacity");
+    alternate_service.stop();
+    auto const local_before_loss = mixed_client->stats().local_tasks;
+    remote.stop(); wait_slots(1);
+    // An earlier helper could have funded a wider batch. Release the
+    // unstarted identity so the owner can immediately split onto local work.
+    std::array<std::array<uint8_t, 32>, pool::max_generation_batch_members> wide;
+    for (uint16_t i = 0; i < wide.size(); ++i) wide[i] = requested.params.get_plot_params_for_index(i).get_plot_id().data();
+    require(mixed_client->generation_capacity(18, 2).batch < wide.size(), "fixture requires a batch wider than the private offer");
+    WorkerCancellation cancel; cancel.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool refused_width = false;
+    try { mixed_client->generate_packed(18, 2, wide, [](auto const&, auto) { throw std::runtime_error("unexpected wide output"); }, cancel); }
+    catch (pool::UnsupportedResources const&) { refused_width = true; }
+    require(refused_width, "an unstarted large batch waited for the departed helper instead of releasing its work to smaller local grants");
+    generate();
+    require(mixed_client->stats().local_tasks == local_before_loss + 1, "departure of a helper stopped private generation");
+    session.reset(); generate();
+    require(mixed_client->stats().local_tasks == local_before_loss + 2, "a broker outage stopped an admitted private device");
 }
 
 #if defined(__linux__) || defined(_WIN32)
@@ -574,6 +1504,57 @@ int run_dashboard_reader(FarmingOwnerHealth const& owner, fs::path const& marker
 #endif
 void owner_dashboard_feed()
 {
+    DashboardJob progress;
+    FillCompletionForecast forecast;
+    forecast.members.expected = 10; forecast.members.maximum = 12; forecast.members.open = true;
+    forecast.history[0] = {1, 1, 1};
+    DashboardJob overdue(std::chrono::steady_clock::now() - std::chrono::seconds(20));
+    overdue.plan_fill(forecast);
+    auto late = overdue.fill_prediction();
+    require(late && !late->seconds && std::string_view(late->source) == "awaiting-publication" && late->members.expected == 10,
+        "elapsed point estimate marked an unpublished fill complete");
+    progress.plan_fill(forecast);
+    progress.roster(18, 2, 1, true, true, true, {{"id", "process", "helper", "GPU", "endpoint", 1}});
+    progress.published(2, 1);
+    progress.schedule_fill(2, 2, 1, "physical disk", 0, false, {}, true);
+    auto partial = progress.fill_prediction();
+    require(partial && partial->members.expected == 9 && partial->scheduled_members == 2 && partial->lower_bound &&
+        std::string_view(partial->source) != "live-schedule", "open grant lost future publications or priced them as complete");
+    progress.schedule_fill(9, 9, 1, "physical disk", 0, false, {}, false);
+    require(progress.fill_prediction()->schedule_observed, "complete current schedule did not reach the forecast");
+    progress.roster(18, 2, 0, false, false, false, {});
+    auto pending = progress.fill_prediction();
+    require(pending && !pending->seconds && pending->members.expected == 9 && !pending->schedule_observed,
+        "lost worker observations retained obsolete timing or discarded durable progress");
+    progress.completed_fill();
+    require(progress.fill_prediction()->seconds == 0 && progress.fill_prediction()->members.expected == 0,
+        "a completed open fill retained a projected remainder");
+    auto gpu_status = [&](std::string const& cause, bool waiting) {
+        progress.local_gpu_health("gpu0", cause, waiting);
+        DashboardFrame frame; progress.fill(frame, false);
+        auto const& workers = frame.rows[DashboardFrame::workers];
+        auto const row = std::find_if(workers.begin(), workers.end(), [](auto const& entry)
+            { return entry.value.starts_with("Local gpu0   "); });
+        return row == workers.end() ? DashboardFrame::Row{} : *row;
+    };
+    auto waiting = gpu_status({}, true);
+    require(waiting.value == "Local gpu0   Waiting for GPU memory" && waiting.detail.empty(),
+        "private GPU memory pressure was missing from the worker view");
+    auto recovering = gpu_status("device lost", false);
+    require(recovering.value == "Local gpu0   GPU recovering" && recovering.detail == "device lost",
+        "private GPU recovery lost its driver cause after waiting for memory");
+    require(gpu_status({}, false).value.empty(), "available GPU retained its previous worker status");
+    progress.roster(18, 2, 1, true, true, true, {{"id", "process", "helper", "GPU", "endpoint", 1}});
+    progress.failed_delivery("id", "process", "insufficient memory");
+    DashboardFrame snapshot;
+    progress.fill(snapshot, true);
+    auto const& worker_rows = snapshot.rows[DashboardFrame::workers];
+    require(std::any_of(worker_rows.begin(), worker_rows.end(), [](auto const& row)
+        { return row.value.find("helper   1 failed assignment") != row.value.npos && row.detail == "insufficient memory"; }) &&
+        std::none_of(worker_rows.begin(), worker_rows.end(), [](auto const& row) { return row.value.find(" delivered") != row.value.npos; }),
+        "an unsuccessful helper did not show its failure separately from delivered work");
+    require(progress.delivery("id", "process", 1, 100, 10, 4, 2, 3, 0) == "helper",
+        "a failed assignment consumed the helper's first validated delivery announcement");
 #if defined(__linux__) || defined(_WIN32)
     std::string const job(64, 'f');
     DashboardFeed feed(job);
@@ -653,9 +1634,10 @@ try
     { private_local_delegation(fs::path(argv[2])); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--private-local") { private_local_delegation(); owner_dashboard_feed(); return 0; }
     require(argc == 1, "usage: grow_pool_owner_test [--private-local | --private-publication EMPTY_DIRECTORY | --codec-publication EMPTY_DIRECTORY]");
-    private_local_delegation();
+    private_local_delegation({}, true);
     owner_dashboard_feed();
     repartition_and_global_admission();
+    late_packed_capacity();
     owner_broker_restart();
     accepted_remote_publication();
     std::cout << "owner scratch recovery, global admission, packed prefetch, broker restart and remote publication passed\n";

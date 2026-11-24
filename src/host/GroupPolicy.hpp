@@ -2,10 +2,12 @@
 // exact memory, codec, space and recovery admission before changing any bytes.
 #pragma once
 #include "host/GroupMerge.hpp"
+#include <bit>
 #include <cmath>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <tuple>
 
 namespace group_grow
@@ -65,23 +67,25 @@ struct ConstructionSamples
 
 struct GenerationHistory
 {
-    struct Sample { uint64_t members = 0, elapsed_ns = 0; };
+    struct Sample { uint64_t members = 0, elapsed_ns = 0; uint8_t k = 0, strength = 0; };
     std::array<Sample, 8> samples{};
     size_t count = 0, next = 0;
-    void add(uint64_t members, uint64_t elapsed)
+    void add(uint64_t members, uint64_t elapsed, uint8_t k = 0, uint8_t strength = 0)
     {
         if (!members || !elapsed) return;
-        samples[next] = {members, elapsed}; next = (next + 1) % samples.size();
+        samples[next] = {members, elapsed, k, strength}; next = (next + 1) % samples.size();
         count = std::min(count + 1, samples.size());
     }
-    long double member_ns() const
+    long double member_ns(uint8_t k = 0, uint8_t strength = 0) const
     {
-        if (!count) return 0;
         std::array<long double, 8> rates{};
+        size_t matched = 0;
         for (size_t i = 0; i < count; ++i)
-            rates[i] = static_cast<long double>(samples[i].elapsed_ns) / samples[i].members;
-        std::sort(rates.begin(), rates.begin() + count);
-        return (rates[(count - 1) / 2] + rates[count / 2]) / 2;
+            if (!k || (samples[i].k == k && samples[i].strength == strength))
+                rates[matched++] = static_cast<long double>(samples[i].elapsed_ns) / samples[i].members;
+        if (!matched) return 0;
+        std::sort(rates.begin(), rates.begin() + matched);
+        return (rates[(matched - 1) / 2] + rates[matched / 2]) / 2;
     }
 };
 
@@ -94,6 +98,14 @@ struct GenerationSupply
     bool operator==(GenerationSupply const& other) const
     { return slots == other.slots && !roster.owner_before(other.roster) && !other.roster.owner_before(roster); }
 };
+
+// Current work and future files on one writer, bounded by both hard quotas.
+inline uint64_t remaining_publication_members(uint64_t member_limit, uint64_t completed, uint64_t file_limit,
+                                                 uint64_t ordinal, uint64_t file_members)
+{
+    uint64_t const members = member_limit - std::min(member_limit, completed), files = file_limit - std::min(file_limit, ordinal);
+    return file_members && files > members / file_members ? members : files * file_members;
+}
 
 // Compare complete waves of like-sized groups on rotating destinations. A wave
 // starts before the first generation request and ends after its last publication.
@@ -193,8 +205,27 @@ public:
         }
         return best;
     }
+    template<class TrialCost>
+    std::optional<bool> finite_output(Shape shape, uint64_t remaining_members, uint64_t deadline_ns,
+                                      TrialCost const& trial_cost) const
+    {
+        if (shape != shape_) return {};
+        for (auto const& result : results_) if (result.width == 1)
+        {
+            auto const packed = result.times[false].member_ns(), fresh = result.times[true].member_ns();
+            if (bool(packed) == bool(fresh)) return {};
+            // Even instantaneous future publications cannot save more than
+            // this sole writer's measured time for the remaining hard quota.
+            auto const remaining_ns = std::max(packed, fresh) * std::max<uint64_t>(shape.members, remaining_members);
+            if (remaining_ns > deadline_ns) return {};
+            // No current incumbent, unknown trial, or a measured first wave.
+            auto const cost = trial_cost(!fresh);
+            if (cost && (*cost ? *cost : deadline_ns) >= remaining_ns) return fresh != 0;
+        }
+        return {};
+    }
     bool final_group_encoded(Shape shape, bool encoded, bool fixed_width,
-                             long double packed_member_ns, long double fresh_member_ns) const
+                             long double packed_member_ns, long double fresh_member_ns, std::optional<bool> prior = {}) const
     {
         if (shape == shape_)
         {
@@ -204,9 +235,10 @@ public:
                 auto const packed = measured->times[false].member_ns(), fresh = measured->times[true].member_ns();
                 // Durable publication includes the owner's packing and syncs.
                 if (packed && fresh) return fresh <= packed;
-                if (packed && !fresh_member_ns) return false;
+                if (!prior && packed && !fresh_member_ns) return false;
             }
         }
+        if (prior) return *prior;
         // Spare workers cannot hide an output trial when generation is draining.
         if (packed_member_ns > 0) return fresh_member_ns > 0 && fresh_member_ns < packed_member_ns;
         return encoded || (!fixed_width && select(shape, 1, 1, 1, "auto", true, false).encoded);
@@ -308,6 +340,11 @@ struct ConstructionContext
     bool compact = false, io_overlap = false, release_cache = false;
     std::vector<std::string> scratch_drives;
     bool operator==(ConstructionContext const&) const = default;
+    auto execution_key() const
+    {
+        return std::tie(drives, scratch_drives, k, strength, meta_group, memo_bytes, max_ram, window,
+            checkpoint, codec, compact, io_overlap, release_cache);
+    }
 };
 struct SharedConstructionHistory
 {
@@ -346,47 +383,41 @@ struct SharedConstructionHistory
 };
 class ConstructionHistories
 {
+    struct Entry { ConstructionContext context; std::shared_ptr<SharedConstructionHistory> source; };
+    auto first(ConstructionContext const& context) const
+    {
+        return std::lower_bound(entries_.begin(), entries_.end(), context, [](Entry const& entry, auto const& key)
+            { return entry.context.execution_key() < key.execution_key(); });
+    }
 public:
     explicit ConstructionHistories(size_t limit) : limit_(limit) { entries_.reserve(limit); }
     bool empty() const { return entries_.empty(); }
     std::shared_ptr<SharedConstructionHistory> find(ConstructionContext context, bool create = true)
     {
         if (context.drives.empty()) return {};
-        for (auto const& entry : entries_) if (entry.context == context) return entry.source;
+        auto at = first(context);
+        for (; at != entries_.end() && at->context.execution_key() == context.execution_key(); ++at)
+            if (at->context.workers == context.workers) return at->source;
         if (!create) return {};
         if (entries_.size() == limit_) return {};
         auto source = std::make_shared<SharedConstructionHistory>();
-        entries_.push_back({std::move(context), source}); return source;
+        entries_.insert(at, {std::move(context), source}); return source;
     }
     std::shared_ptr<SharedConstructionHistory> reuse_external(std::shared_ptr<SharedConstructionHistory> const& source,
         ConstructionContext const& context) const
     {
         if (!source || context.drives.empty() || context.scratch_drives.empty()) return {};
-        for (auto const& entry : entries_) if (entry.source == source)
-        {
-            // External CPU occupancy records their actual phase grants. Keep
-            // every physical/plot/producer boundary while normalizing workers.
-            auto const& saved = entry.context;
-            bool const same = context.drives == saved.drives && context.scratch_drives == saved.scratch_drives &&
-                std::tie(context.k, context.strength, context.meta_group, context.memo_bytes, context.max_ram,
-                    context.window, context.checkpoint, context.codec, context.compact, context.io_overlap, context.release_cache) ==
-                std::tie(saved.k, saved.strength, saved.meta_group, saved.memo_bytes, saved.max_ram,
-                    saved.window, saved.checkpoint, saved.codec, saved.compact, saved.io_overlap, saved.release_cache);
-            return same ? source : nullptr;
-        }
+        for (auto at = first(context); at != entries_.end() && at->context.execution_key() == context.execution_key(); ++at)
+            if (at->source == source) return source;
         return {};
     }
-    std::shared_ptr<SharedConstructionHistory> execution(ConstructionContext context) const
+    std::shared_ptr<SharedConstructionHistory> execution(ConstructionContext const& context) const
     {
         if (context.drives.empty()) return {};
         // Service demands retain their observed worker grants. Only execution
         // forecasts normalize that CPU term; engine tuning still uses find().
-        for (auto const& entry : entries_)
-        {
-            context.workers = entry.context.workers;
-            if (entry.context == context) return entry.source;
-        }
-        return {};
+        auto const at = first(context);
+        return at != entries_.end() && at->context.execution_key() == context.execution_key() ? at->source : nullptr;
     }
     uint64_t memory_bytes() const
     {
@@ -402,7 +433,6 @@ public:
         return bytes;
     }
 private:
-    struct Entry { ConstructionContext context; std::shared_ptr<SharedConstructionHistory> source; };
     size_t limit_;
     std::vector<Entry> entries_;
 };
@@ -494,14 +524,30 @@ struct ConstructionRates
 // Service demands are nanoseconds inferred from completed operations in this
 // run. They are not device bandwidths: cached syscalls remain charged, and a
 // missing phase must leave the estimate unavailable rather than invent a rate.
+enum ExecutionMissing : unsigned { missing_generation = 1, missing_cpu = 2, missing_scratch = 4,
+    missing_destination = 8, missing_residual = 16 };
 struct ExecutionWork
 {
     long double generation = 0, cpu = 0, serial = 0;
     long double scratch_read = 0, scratch_write = 0, destination = 0;
     uint64_t batches = 0;
     bool known = false, io_overlap = false;
-    long double scratch_bytes = 0;
+    long double scratch_bytes = 0, destination_bytes = 0;
+    unsigned missing = 0;
+    // Repeated fresh files retain their per-publication writes and syncs.
+    void add_files(ExecutionWork const& file, uint64_t count)
+    {
+        known = batches ? known && file.known : file.known;
+        io_overlap = file.io_overlap;
+        batches += file.batches * count;
+        generation += file.generation * count; cpu += file.cpu * count; serial += file.serial * count;
+        scratch_read += file.scratch_read * count; scratch_write += file.scratch_write * count;
+        destination += file.destination * count;
+        scratch_bytes += file.scratch_bytes * count; destination_bytes += file.destination_bytes * count;
+        missing |= file.missing;
+    }
 };
+enum class ExecutionLimit { unknown, generation, codec, disk, shared_storage, committed };
 struct ExecutionEstimate
 {
     long double completion = 0, generation = 0, cpu = 0, scratch = 0, destination = 0;
@@ -514,7 +560,36 @@ struct ExecutionEstimate
     long double target_release = 0;
     unsigned route_prior_min_samples = 0;
     uint64_t route_prior_oldest_utc = 0;
+    uint64_t remaining_members = 0, rollover_members = 0;
+    uint64_t planning_ns = 0;
+    bool open_extent = false, shared_storage_unmeasured = false;
+    ExecutionLimit limit = ExecutionLimit::unknown;
+    unsigned missing = 0;
 };
+inline std::string execution_unmeasured_costs(ExecutionEstimate const& estimate)
+{
+    std::string result;
+    auto add = [&](std::string_view name) { if (!result.empty()) result += ", "; result += name; };
+    if (estimate.missing & missing_generation) add("generation and delivery");
+    if (estimate.missing & missing_cpu) add("owner codec CPU");
+    if (estimate.missing & missing_scratch) add("scratch I/O");
+    if (estimate.missing & missing_destination) add("destination I/O and sync");
+    if (estimate.missing & missing_residual) add("remaining construction phases");
+    if (estimate.shared_storage_unmeasured) add("shared storage bandwidth");
+    return result;
+}
+inline char const* execution_limiting_resource(ExecutionEstimate const& estimate)
+{
+    switch (estimate.limit)
+    {
+        case ExecutionLimit::generation: return "generation and delivery";
+        case ExecutionLimit::codec: return "owner codec CPU";
+        case ExecutionLimit::disk: return "physical disk";
+        case ExecutionLimit::shared_storage: return "shared storage bandwidth";
+        case ExecutionLimit::committed: return "committed work";
+        default: return "unknown";
+    }
+}
 struct ExecutionLane
 {
     ExecutionWork work;
@@ -526,6 +601,15 @@ struct ExecutionLane
     // A committed receipt or writer can still be outstanding at this instant.
     // Its time is relative to this forecast, on the owner's clock.
     long double ready_after = 0;
+    // The detailed successor and remaining like files may start only after
+    // this destination's predecessor publishes and returns its scratch.
+    size_t predecessor = SIZE_MAX;
+    uint64_t members = 0;
+    bool exclusive_destination = false;
+    // A staged successor can already occupy other scratch spindles while
+    // this writer still owns its terminal output.
+    std::vector<size_t> retained_scratch;
+    bool successor_active = false;
 };
 struct ExecutionReady
 {
@@ -652,6 +736,15 @@ inline bool execution_singleton_fallback(uint64_t budget, uint64_t fixed, uint64
 {
     return fixed <= budget && generation <= budget - fixed && workspace <= budget - fixed - generation;
 }
+inline bool execution_generation_precedes(ExecutionReady const& a, ExecutionReady const& b, bool timed_writes)
+{
+    if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
+    if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
+        a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
+    if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
+    if (a.known != b.known) return a.known;
+    return a.known && a.remaining > b.remaining;
+}
 inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
 {
     require(!ready.empty(), "generation order requires a ready destination");
@@ -665,18 +758,11 @@ inline size_t execution_generation_order(std::span<ExecutionReady const> ready)
     bool const timed_writes = std::all_of(ready.begin(), ready.end(), [&](auto const& item)
         { return item.members_to_pack == UINT16_MAX || item.time_to_write > 0 || (!all_tight && item.tight_capacity); });
     return std::min_element(ready.begin(), ready.end(), [&](auto const& a, auto const& b)
-    {
-        if (a.tight_capacity != b.tight_capacity) return !a.tight_capacity;
-        if (timed_writes && a.members_to_pack != UINT16_MAX && b.members_to_pack != UINT16_MAX &&
-            a.time_to_write != b.time_to_write) return a.time_to_write < b.time_to_write;
-        if (a.members_to_pack != b.members_to_pack) return a.members_to_pack < b.members_to_pack;
-        if (a.known != b.known) return a.known;
-        return a.known && a.remaining > b.remaining;
-    })->index;
+        { return execution_generation_precedes(a, b, timed_writes); })->index;
 }
 inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane const> lanes,
     size_t active, unsigned workers, unsigned granted, size_t resources, bool generation_overlap,
-    long double concurrent_scratch_bandwidth = 0, size_t target = SIZE_MAX)
+    long double concurrent_scratch_bandwidth = 0, size_t target = SIZE_MAX, long double concurrent_storage_bandwidth = 0)
 {
     ExecutionEstimate result;
     if (lanes.empty() || !active || active > lanes.size() || !workers || !granted || !resources) return result;
@@ -691,20 +777,36 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
     struct State
     {
         std::vector<Demand> scratch;
-        size_t blocks = 0, consumed = 0;
+        size_t blocks = 0, consumed = 0, owner = 0, first_child = SIZE_MAX, sibling = SIZE_MAX;
         long double consumer = 0;
-        bool admitted = false;
+        bool unmeasured = false;
     };
     std::vector<State> states(lanes.size());
     std::vector<long double> demand(resources);
+    std::vector<size_t> scratch_indices(resources, SIZE_MAX);
     size_t const max_blocks = std::max(size_t(1), size_t(4096) / lanes.size());
-    long double cpu = 0, scratch_bytes = 0;
+    long double cpu = 0, scratch_bytes = 0, destination_bytes = 0;
+    auto bound = [&](long double ns, ExecutionLimit limit)
+    {
+        if (ns > result.lower_bound) { result.lower_bound = ns; result.limit = limit; }
+    };
     for (size_t index = 0; index < lanes.size(); ++index)
     {
         auto const& lane = lanes[index]; auto& state = states[index];
         auto const& work = lane.work;
-        if (lane.destination >= resources || !(lane.ready_after >= 0)) return {};
-        if (!work.known) ++result.unmeasured;
+        if (lane.destination >= resources || !(lane.ready_after >= 0) ||
+            (lane.predecessor != SIZE_MAX && (lane.predecessor >= index || lane.committed)) ||
+            (!lane.committed && (lane.successor_active || !lane.retained_scratch.empty()))) return {};
+        if (std::any_of(lane.retained_scratch.begin(), lane.retained_scratch.end(),
+            [&](size_t resource) { return resource >= resources; })) return {};
+        result.remaining_members = grow_add(result.remaining_members, lane.members);
+        if (lane.predecessor != SIZE_MAX) result.rollover_members = grow_add(result.rollover_members, lane.members);
+        state.owner = lane.predecessor == SIZE_MAX ? index : states[lane.predecessor].owner;
+        if (lane.predecessor != SIZE_MAX)
+            state.sibling = std::exchange(states[lane.predecessor].first_child, index);
+        if (!work.known && !states[state.owner].unmeasured)
+        { states[state.owner].unmeasured = true; ++result.unmeasured; }
+        if (!work.known) result.missing |= work.missing ? work.missing : missing_residual;
         state.blocks = std::clamp<uint64_t>(work.batches, 1, max_blocks);
         long double const scratch = work.scratch_read + work.scratch_write;
         long double weights = 0;
@@ -714,54 +816,101 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
             weights += part.weight;
         }
         if (scratch && !weights) return {};
-        scratch_bytes += work.scratch_bytes;
+        scratch_bytes += work.scratch_bytes; destination_bytes += work.destination_bytes;
         demand[lane.destination] += work.destination;
         long double scratch_service = 0;
         for (auto const& part : lane.scratch)
         {
             long double const service = std::max(part.transfer_ns, scratch * (part.weight / weights));
             // Several stripes or partitions can resolve to one physical disk.
-            auto at = std::find_if(state.scratch.begin(), state.scratch.end(),
-                [&](auto const& prior) { return prior.id == part.resource; });
-            if (at == state.scratch.end()) state.scratch.push_back({part.resource, service});
-            else at->service += service;
+            auto& at = scratch_indices[part.resource];
+            if (at == SIZE_MAX) { at = state.scratch.size(); state.scratch.push_back({part.resource, service}); }
+            else state.scratch[at].service += service;
             demand[part.resource] += service; scratch_service += service;
         }
+        for (auto const& part : state.scratch) scratch_indices[part.id] = SIZE_MAX;
         result.generation += work.generation; cpu += work.cpu + work.serial;
         result.scratch += scratch_service; result.destination += work.destination;
-        result.lower_bound = std::max(result.lower_bound, lane.ready_after +
-            std::max({work.generation, work.cpu / workers + work.serial, work.destination}));
+        if (lane.ready_after) bound(lane.ready_after +
+            std::max({work.generation, work.cpu / workers + work.serial, work.destination}), ExecutionLimit::committed);
+        bound(work.cpu / workers + work.serial, ExecutionLimit::codec);
     }
     result.cpu = cpu / std::min<long double>(workers, active * static_cast<long double>(granted));
-    result.lower_bound = std::max({result.lower_bound, result.generation, result.cpu,
-        *std::max_element(demand.begin(), demand.end()),
-        concurrent_scratch_bandwidth > 0 ? scratch_bytes / concurrent_scratch_bandwidth : 0});
+    bound(result.generation, ExecutionLimit::generation); bound(result.cpu, ExecutionLimit::codec);
+    bound(*std::max_element(demand.begin(), demand.end()), ExecutionLimit::disk);
+    if (concurrent_scratch_bandwidth > 0) bound(scratch_bytes / concurrent_scratch_bandwidth, ExecutionLimit::shared_storage);
+    if (concurrent_storage_bandwidth > 0)
+        bound((scratch_bytes + destination_bytes) / concurrent_storage_bandwidth, ExecutionLimit::shared_storage);
+    if (!result.lower_bound) return result;
     enum Stage { generate, consume, publish };
     struct Event { long double at; size_t sequence, lane; Stage stage; };
     auto later = [](Event const& a, Event const& b)
     { return std::tie(a.at, a.sequence) > std::tie(b.at, b.sequence); };
     std::priority_queue<Event, std::vector<Event>, decltype(later)> events(later);
-    size_t sequence = 0, live = 0, published = 0, first = 0;
+    size_t sequence = 0, live = 0, published = 0;
     std::vector<unsigned> held(resources), targets(resources);
     std::vector<long double> disk(resources);
     std::priority_queue<long double, std::vector<long double>, std::greater<>> codecs;
     for (size_t i = 0; i < std::min(active, size_t(std::max(1u, workers / granted))); ++i) codecs.push(0);
-    long double producer = 0, writers = 0, shared_scratch = 0;
+    long double producer = 0, writers = 0, shared_scratch = 0, shared_storage = 0;
     auto admit = [&](size_t i, long double at)
     {
-        ++live; states[i].admitted = true; ++targets[lanes[i].destination];
+        live += 1 + lanes[i].successor_active; ++targets[lanes[i].destination];
         for (auto const& part : lanes[i].scratch) if (part.rotating) ++held[part.resource];
+        for (auto resource : lanes[i].retained_scratch) ++held[resource];
         events.push({std::max(at, lanes[i].ready_after), sequence++, i, generate});
+    };
+    // Retry only the writers waiting for the released resource. In a farm
+    // where many paths name one spindle a publication must not rescan every
+    // queued scratch grant. Smaller indices retain proposed dispatch order.
+    using Candidate = std::pair<size_t, size_t>;
+    std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> ready;
+    struct Waiters
+    {
+        std::priority_queue<size_t, std::vector<size_t>, std::greater<>> writers;
+        bool queued = false;
+    };
+    std::vector<Waiters> waits(2 * resources);
+    auto wake = [&](size_t key)
+    {
+        auto& wait = waits[key];
+        if (!wait.queued && !wait.writers.empty() && !(key % 2 ? targets[key / 2] : held[key / 2]))
+        { ready.emplace(wait.writers.top(), key); wait.queued = true; }
+    };
+    auto blocker = [&](ExecutionLane const& lane) -> size_t
+    {
+        if (held[lane.destination]) return 2 * lane.destination;
+        if (lane.exclusive_destination && targets[lane.destination]) return 2 * lane.destination + 1;
+        for (auto const& part : lane.scratch) if (part.rotating)
+        {
+            if (held[part.resource]) return 2 * part.resource;
+            if (targets[part.resource]) return 2 * part.resource + 1;
+        }
+        return SIZE_MAX;
     };
     auto fill = [&](long double at)
     {
-        while (first < lanes.size() && states[first].admitted) ++first;
-        for (size_t i = first; i < lanes.size() && live < active; ++i)
-            if (!states[i].admitted && !held[lanes[i].destination] && std::none_of(
-                lanes[i].scratch.begin(), lanes[i].scratch.end(),
-                [&](auto const& part) { return part.rotating && targets[part.resource]; })) admit(i, at);
+        while (live < active && !ready.empty())
+        {
+            auto const [i, key] = ready.top(); ready.pop();
+            if (key != SIZE_MAX)
+            {
+                auto& wait = waits[key]; wait.queued = false;
+                if (key % 2 ? targets[key / 2] : held[key / 2]) continue;
+                if (i != wait.writers.top()) { wake(key); continue; }
+                wait.writers.pop();
+            }
+            auto const blocked = blocker(lanes[i]);
+            if (blocked == SIZE_MAX) admit(i, at);
+            else waits[blocked].writers.push(i);
+            if (key != SIZE_MAX) wake(key);
+        }
     };
-    for (size_t i = 0; i < lanes.size(); ++i) if (lanes[i].committed) admit(i, 0);
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        if (lanes[i].committed) admit(i, 0);
+        else if (lanes[i].predecessor == SIZE_MAX) ready.emplace(i, SIZE_MAX);
+    }
     if (live > active) return {};
     fill(0);
     while (!events.empty())
@@ -770,10 +919,15 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
         auto const& lane = lanes[i]; auto const& work = lane.work; auto& state = states[i];
         if (stage == publish)
         {
-            ++published; --live; --targets[lane.destination];
+            ++published; live -= 1 + lane.successor_active; --targets[lane.destination];
             result.completion = std::max(result.completion, at);
             if (i == target) result.target_release = at;
-            for (auto const& part : lane.scratch) if (part.rotating) --held[part.resource];
+            wake(2 * lane.destination + 1);
+            for (auto const& part : lane.scratch) if (part.rotating)
+            { --held[part.resource]; wake(2 * part.resource); }
+            for (auto resource : lane.retained_scratch) { --held[resource]; wake(2 * resource); }
+            for (size_t child = state.first_child; child != SIZE_MAX; child = states[child].sibling)
+                ready.emplace(child, SIZE_MAX);
             fill(at); continue;
         }
         if (stage == generate)
@@ -815,6 +969,12 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
             auto& free = disk[lane.destination];
             free = std::max(free, written) + work.destination / state.blocks; written = free;
         }
+        if (concurrent_storage_bandwidth > 0 && work.scratch_bytes + work.destination_bytes > 0)
+        {
+            shared_storage = std::max(io_start, shared_storage) +
+                (work.scratch_bytes + work.destination_bytes) / concurrent_storage_bandwidth / state.blocks;
+            written = std::max(written, shared_storage);
+        }
         state.consumer = std::max({cpu_done, scratch_done, written});
         writers = std::max(writers, state.consumer);
         if (++state.consumed == state.blocks) events.push({state.consumer, sequence++, i, publish});
@@ -823,6 +983,236 @@ inline ExecutionEstimate pipeline_execution_estimate(std::span<ExecutionLane con
     if (published != lanes.size() || !std::isfinite(result.completion)) return {};
     result.known = !result.unmeasured && result.completion > 0;
     return result;
+}
+inline constexpr size_t terminal_forecast_lanes = std::numeric_limits<uint64_t>::digits;
+inline constexpr size_t exact_terminal_batches = 6;
+
+struct TerminalGenerationBatch
+{
+    size_t index = 0, writer = 0;
+    unsigned workers = 0;
+    uint16_t first = 0, count = 0;
+    std::array<uint8_t, 32> plot{};
+    std::array<long double, 4> service{};
+    long double time_to_write = 0;
+    bool operator==(TerminalGenerationBatch const&) const = default;
+};
+
+// A short terminal plan can survive its own pending grants. The controller
+// still checks the current receive, CPU, writer and worker availability.
+struct TerminalGenerationPlan
+{
+    std::vector<TerminalGenerationBatch> batches;
+    size_t count = 0, issued = 0;
+    GenerationSupply supply;
+    uint64_t deadline = 0;
+    void clear() { count = issued = 0; supply = {}; }
+    std::optional<size_t> choose(std::span<ExecutionReady const> ready, std::span<ExecutionLane const> lanes,
+        std::span<TerminalGenerationBatch const> inputs, size_t active, unsigned workers, unsigned grant,
+        GenerationSupply const& current, bool prefix, uint64_t now, uint64_t timeout);
+    std::optional<size_t> next(std::span<TerminalGenerationBatch const> inputs, std::span<ExecutionReady const> ready,
+        GenerationSupply const& current, uint64_t now) const
+    {
+        if (!count || now >= deadline || current != supply || inputs.size() != count - issued || ready.size() != inputs.size()) return {};
+        for (size_t i = 0; i < inputs.size(); ++i)
+            if (ready[i].tight_capacity || ready[i].deferrals >= ready.size() ||
+                std::find(inputs.begin(), inputs.end(), batches[issued + i]) == inputs.end()) return {};
+        return batches[issued].index;
+    }
+    void grant(size_t index, uint16_t members)
+    {
+        if (!count) return;
+        if (batches[issued].index != index || batches[issued].count != members) { clear(); return; }
+        if (++issued == count) clear();
+    }
+};
+
+// Price only dispatch orders the owner can issue before and after its age fence.
+// Equal completion retains ordinary priority.
+inline std::optional<size_t> execution_terminal_first(std::span<ExecutionReady const> ready,
+    std::span<ExecutionLane const> lanes, unsigned workers, unsigned grant, std::span<size_t> exact_order = {})
+{
+    if (ready.size() < 2 || ready.size() > terminal_forecast_lanes || ready.size() != lanes.size() || !workers || !grant) return {};
+    std::vector<size_t> order(lanes.size());
+    std::vector<long double> tail(lanes.size());
+    std::set<size_t> writers;
+    long double max_cpu = 0, min_generation = std::numeric_limits<long double>::max();
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        auto const& work = lanes[i].work;
+        if (!ready[i].known || !work.known || work.generation <= 0 || work.destination <= 0 || work.batches != 1 ||
+            ready[i].tight_capacity || ready[i].deferrals >= ready.size() || lanes[i].committed || lanes[i].ready_after ||
+            !lanes[i].scratch.empty() || work.scratch_read || work.scratch_write || work.scratch_bytes ||
+            !writers.insert(lanes[i].destination).second) return {};
+        auto const cpu = work.cpu / std::min(workers, grant) + work.serial;
+        tail[i] = work.io_overlap ? std::max(cpu, work.destination) : cpu + work.destination;
+        max_cpu = std::max(max_cpu, cpu); min_generation = std::min(min_generation, work.generation);
+        if (!(cpu >= 0 && std::isfinite(tail[i]) && std::isfinite(work.generation))) return {};
+    }
+    // Each mask holds equal-priority destinations in physical visiting order.
+    // Ranks only advance as grants remove work, so replaying a complete owner
+    // continuation visits at most one rank per destination for each rule.
+    auto ranks = [&](auto precedes)
+    {
+        std::array<uint64_t, terminal_forecast_lanes> groups{};
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), precedes);
+        size_t group = 0;
+        for (size_t i = 0; i < order.size(); ++i)
+        {
+            if (i && precedes(order[i - 1], order[i])) ++group;
+            groups[group] |= uint64_t(1) << order[i];
+        }
+        return groups;
+    };
+    auto const ages = ranks([&](auto a, auto b) { return ready[a].deferrals > ready[b].deferrals; });
+    auto priority = [&](bool timed)
+    { return ranks([&](auto a, auto b) { return execution_generation_precedes(ready[a], ready[b], timed); }); };
+    uint64_t untimed = 0;
+    for (size_t i = 0; i < ready.size(); ++i)
+        if (ready[i].members_to_pack != UINT16_MAX && !(ready[i].time_to_write > 0)) untimed |= uint64_t(1) << i;
+    auto const warm = priority(true), cold = untimed ? priority(false) : warm;
+    std::vector<size_t> projected(order.size());
+    auto follow = [&](std::span<size_t const> preferred, bool require_order = false)
+    {
+        uint64_t pending = UINT64_MAX >> (terminal_forecast_lanes - order.size());
+        size_t next = 0, age = 0, known = 0, unknown = 0;
+        bool retained = true;
+        auto head = [&](auto const& groups, size_t& rank)
+        {
+            while (!(groups[rank] & pending)) ++rank;
+            return groups[rank] & pending;
+        };
+        for (size_t step = 0; step < projected.size(); ++step)
+        {
+            auto group = head(ages, age);
+            bool const aged = ready[std::countr_zero(group)].deferrals + step >= order.size() - step;
+            if (aged || step >= preferred.size()) retained = false;
+            if (!retained && !aged) group = pending & untimed ? head(cold, unknown) : head(warm, known);
+            auto const later = group & (UINT64_MAX << next);
+            size_t const index = retained ? preferred[step] : size_t(std::countr_zero(later ? later : group));
+            if (require_order && preferred[step] != index) return false;
+            projected[step] = index; pending &= ~(uint64_t(1) << index);
+            next = index + 1 == ready.size() ? 0 : index + 1;
+        }
+        return true;
+    };
+    follow({});
+    order = projected;
+    auto const codecs = std::max(1u, workers / grant);
+    if (order.size() > exact_terminal_batches && (codecs >= order.size() || max_cpu <= codecs * min_generation))
+    {
+        // Every release has a free codec grant, including reuse after at
+        // least one generation interval per grant. Each writer is independent.
+        auto finish = [&](std::span<size_t const> sequence, size_t first = SIZE_MAX)
+        {
+            long double released = 0, end = 0;
+            auto append = [&](size_t i)
+            {
+                released += lanes[i].work.generation;
+                end = std::max(end, released + tail[i]);
+            };
+            if (first != SIZE_MAX) append(first);
+            for (auto i : sequence) if (i != first) append(i);
+            return end;
+        };
+        auto longest_first = order;
+        std::stable_sort(longest_first.begin(), longest_first.end(), [&](auto a, auto b) { return tail[a] > tail[b]; });
+        // Among jobs with a tail at least q, the last generation must precede
+        // that much downstream service. Descending tails attain this bound.
+        auto const lower = finish(longest_first);
+        auto best = finish(order);
+        std::optional<size_t> first;
+        for (auto i : order)
+        {
+            if (best <= lower) break;
+            if (i == order.front() || finish(longest_first, i) >= best) continue;
+            follow(std::span(&i, 1));
+            auto const candidate = finish(projected);
+            if (candidate < best) { best = candidate; first = ready[i].index; }
+        }
+        if (exact_order.size() >= order.size() && lower < best)
+        {
+            // Accept a longer plan only when the rotating owner can actually
+            // attain the physical bound. Releasing the plan early at any
+            // unchanged prefix must remain at least as good as the last one.
+            auto previous = finish(order);
+            for (size_t prefix = 1; prefix <= order.size(); ++prefix)
+            {
+                follow(std::span(longest_first).first(prefix));
+                auto const candidate = finish(projected);
+                if (candidate > previous) break;
+                if (candidate == lower)
+                {
+                    std::copy(projected.begin(), projected.end(), exact_order.begin());
+                    return ready[projected.front()].index;
+                }
+                previous = candidate;
+            }
+        }
+        return first;
+    }
+    auto const longest = std::max_element(order.begin(), order.end(), [&](auto a, auto b) { return tail[a] < tail[b]; });
+    bool const enumerate_orders = order.size() <= exact_terminal_batches;
+    if (!enumerate_orders && longest == order.begin()) return {};
+    std::vector<ExecutionLane> schedule(lanes.size());
+    auto estimate = [&]
+    {
+        for (size_t i = 0; i < projected.size(); ++i) schedule[i] = {lanes[projected[i]].work, projected[i]};
+        return pipeline_execution_estimate(schedule, schedule.size(), workers, grant, schedule.size(), true);
+    };
+    auto const ordinary = estimate();
+    if (!ordinary.known) return {};
+    if (enumerate_orders)
+    {
+        // Ranks preserve rotating priority even when two distinct batches have
+        // equal timing keys. Only physically attainable orders enter the model.
+        std::array<size_t, exact_terminal_batches> rank{};
+        for (size_t i = 0; i < order.size(); ++i) rank[order[i]] = i;
+        long double best = ordinary.completion;
+        std::optional<size_t> first;
+        while (std::next_permutation(order.begin(), order.end(), [&](auto a, auto b) { return rank[a] < rank[b]; }))
+        {
+            if (!follow(order, true)) continue;
+            auto const candidate = estimate();
+            if (!candidate.known) return {};
+            if (candidate.completion >= best) continue;
+            best = candidate.completion; first = ready[order.front()].index;
+            if (exact_order.size() >= order.size()) std::copy(order.begin(), order.end(), exact_order.begin());
+        }
+        return first;
+    }
+    follow(std::span(&*longest, 1));
+    auto const changed = estimate();
+    if (changed.known && changed.completion < ordinary.completion) return ready[*longest].index;
+    return {};
+}
+
+inline std::optional<size_t> TerminalGenerationPlan::choose(std::span<ExecutionReady const> ready,
+    std::span<ExecutionLane const> lanes, std::span<TerminalGenerationBatch const> inputs, size_t active,
+    unsigned workers, unsigned grant, GenerationSupply const& current, bool prefix, uint64_t now, uint64_t timeout)
+{
+    if (count)
+    {
+        if (prefix) if (auto saved = next(inputs, ready, current, now)) return saved;
+        clear(); return {};
+    }
+    if (ready.size() != active || active > terminal_forecast_lanes ||
+        (active <= exact_terminal_batches && inputs.size() != active)) return {};
+    std::array<size_t, terminal_forecast_lanes> order{};
+    order.front() = SIZE_MAX;
+    auto const saved = inputs.size() == active ? std::span(order).first(active) : std::span<size_t>{};
+    auto first = execution_terminal_first(ready, lanes, workers, grant, saved);
+    if (first && order.front() != SIZE_MAX)
+    {
+        long double generation = 0;
+        batches.resize(active); count = active; issued = 0; supply = current;
+        for (size_t i = 0; i < count; ++i) { batches[i] = inputs[order[i]]; generation += lanes[i].work.generation; }
+        auto duration = std::min(timeout, UINT64_MAX - now);
+        if (generation < duration) duration = uint64_t(generation);
+        deadline = now + duration;
+    }
+    return first;
 }
 
 inline ConstructionRates construction_rates(ConstructionSample const& sample)
@@ -1260,10 +1650,33 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
     result.batches = !merging && forecast.incremental_batches ? forecast.incremental_batches : forecast.batches;
     result.generation = generation; result.io_overlap = io_overlap;
     if (!result.batches) return result;
-    bool measured = generation > 0;
-    auto io = [](ConstructionCost const& work, ConstructionRates const& rates)
-    { return work.read * rates.read + work.write * rates.write + work.read_calls * rates.read_call +
-        work.write_calls * rates.write_call + work.syncs * rates.sync; };
+    if (!(generation > 0)) result.missing |= missing_generation;
+    // Engine selection also has cold tuning defaults. An execution estimate
+    // can price only observed service. In particular, a fresh write provides
+    // neither a read nor a flush rate for a future prefix rewrite.
+    auto output = [&](ConstructionCost const& work, ConstructionSamples const& samples)
+    {
+        auto transfer = [&](long double bytes, long double calls, uint64_t ConstructionSample::* volume,
+                            uint64_t ConstructionSample::* operations, uint64_t ConstructionSample::* time)
+        {
+            if (!bytes && !calls) return;
+            std::array<long double, 8> times{}; size_t count = 0;
+            for (size_t i = 0; i < samples.count; ++i)
+            {
+                auto const& s = samples.samples[i];
+                if (!s.elapsed_ns || !(s.*volume)) continue;
+                auto ns = bytes * (s.*time) / (s.*volume);
+                if (calls && operations && s.*operations) ns = (ns + calls * (s.*time) / (s.*operations)) / 2;
+                times[count++] = ns;
+            }
+            if (!count) { result.missing |= missing_destination; return; }
+            std::sort(times.begin(), times.begin() + count);
+            result.destination += (times[(count - 1) / 2] + times[count / 2]) / 2;
+        };
+        transfer(work.read, work.read_calls, &ConstructionSample::read_bytes, &ConstructionSample::read_calls, &ConstructionSample::read_ns);
+        transfer(work.write, work.write_calls, &ConstructionSample::written_bytes, &ConstructionSample::write_calls, &ConstructionSample::write_ns);
+        transfer(work.syncs, 0, &ConstructionSample::syncs, nullptr, &ConstructionSample::sync_ns);
+    };
     auto cpu = [&](ConstructionCost const& work, std::pair<long double, long double> const& rates)
     {
         result.cpu += work.codec * rates.first;
@@ -1271,9 +1684,10 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
     };
     if (!merging)
     {
-        if (history.count) result.destination = io(forecast.incremental, construction_rates(history));
+        result.destination_bytes = forecast.incremental.read + forecast.incremental.write;
+        output(forecast.incremental, history);
         auto const rates = execution_cpu_rates(history);
-        if (rates) cpu(forecast.incremental, *rates); else measured = false;
+        if (rates) cpu(forecast.incremental, *rates); else result.missing |= missing_cpu;
     }
     else
     {
@@ -1286,15 +1700,16 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
             std::max(0.0L, all.syncs - pack.syncs - place.syncs),
             std::max(0.0L, all.read_calls - pack.read_calls - place.read_calls),
             std::max(0.0L, all.write_calls - pack.write_calls - place.write_calls), all.serial_codec};
-        if (contribution_cpu) cpu(runs, *contribution_cpu); else measured = false;
-        if (packing_cpu) cpu(pack, *packing_cpu); else measured = false;
+        if (contribution_cpu) cpu(runs, *contribution_cpu); else result.missing |= missing_cpu;
+        if (packing_cpu) cpu(pack, *packing_cpu); else result.missing |= missing_cpu;
         if (external)
         {
+            result.destination_bytes = pack.write;
             auto const packed_read = execution_io_rate(packing, true, true);
             auto const written = execution_io_rate(contributions, true, false);
             auto read = execution_io_rate(contributions, true, true);
             if (!read) read = packed_read;
-            if (!read || !packed_read || !written) measured = false;
+            if (!read || !packed_read || !written) result.missing |= missing_scratch;
             result.scratch_read = runs.read * read.value_or(0) + pack.read * packed_read.value_or(0);
             result.scratch_write = runs.write * written.value_or(0);
             result.scratch_bytes = runs.read + pack.read + runs.write;
@@ -1318,19 +1733,17 @@ inline ExecutionWork construction_execution_work(ConstructionForecast const& for
                 return sample.written_bytes ? (static_cast<long double>(io.read_ns) + io.write_ns + io.sync_ns) /
                     sample.written_bytes : std::numeric_limits<long double>::infinity();
             });
-            if (!metadata || !target || !std::isfinite(*target)) measured = false;
+            if (!metadata || !target || !std::isfinite(*target)) result.missing |= missing_destination;
             result.destination = forecast.batches * metadata.value_or(0);
             if (target && std::isfinite(*target)) result.destination += pack.write * *target;
         }
         else
         {
-            if (history.contributions.count) result.destination += io(runs, construction_rates(history.contributions));
-            if (history.packing.count) result.destination += io(pack, construction_rates(history.packing));
-            if (history.layout.count) result.destination += io(place, construction_rates(history.layout));
-            else measured = false;
+            result.destination_bytes = all.read + all.write;
+            output(runs, history.contributions); output(pack, history.packing); output(place, history.layout);
         }
     }
-    result.known = measured; return result;
+    result.known = !result.missing; return result;
 }
 
 inline bool prefer_merged(ConstructionForecast const& forecast, Config const& config,

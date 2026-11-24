@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <optional>
 #include <utility>
+#include <openssl/types.h>
 
 namespace group_grow::pool
 {
@@ -48,6 +49,7 @@ void invite_pool(PoolIdentity const&, std::filesystem::path const& invitation, s
 PoolIdentity join_pool(std::filesystem::path const& invitation, std::filesystem::path const& directory, bool reuse_matching = false);
 void configure_pool(PoolIdentity const&, ComputeDefaults const&);
 void validate_compute_defaults(ComputeDefaults const&);
+bool load_bundled_tls_identity(TlsOptions const&, SSL_CTX*);
 std::vector<PoolMember> pool_members(PoolIdentity const&);
 void revoke_pool_member(PoolIdentity const&, std::string const& node);
 void export_pool_policy(PoolIdentity const&, std::filesystem::path const&);

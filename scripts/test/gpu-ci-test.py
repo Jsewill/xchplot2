@@ -146,6 +146,10 @@ with tempfile.TemporaryDirectory(prefix="xchplot2-result-check-") as directory:
     inventory.write_text('''#!/usr/bin/env python3
 import os, sys
 assert os.environ["POS2GPU_ASSERT_VRAM"] == os.environ["CI_ASSERT_VRAM"]
+if sys.argv[2:] == ["--group-pool-k18"]:
+    host = {"group-low-host": 1024**3, "shared-low-host": 2 * 1024**3}.get(os.environ["CI_FAIL"], 3 * 1024**3)
+    print(f"pool_bytes=16777217 free_bytes=4294967296 host_available_bytes={host}")
+    sys.exit(0)
 print(os.environ["CI_INVENTORY"], end="")
 sys.exit(7 if os.environ["CI_FAIL"] == "inventory" else 0)
 ''')
@@ -167,8 +171,27 @@ if kind == "batch":
     # Simulate an external memory spike; correctness must still check the plot.
     if os.environ["POS2GPU_ASSERT_VRAM"] == "1":
         sys.exit(19)
+    row = Path(sys.argv[2]).read_text().split()
+    if row[4] == "gplot-v2-grouped":
+        assert row[0] == "18" and row[9] == "2" and sys.argv[sys.argv.index("--max-host-ram") + 1] == "2G"
+        Path(row[8]).write_bytes(b"group")
+        if "--generation-overlap" in sys.argv:
+            assert os.environ["POS2GPU_MAX_VRAM_MB"] == "145"
+            auto = sys.argv[sys.argv.index("--generation-overlap") + 1] == "auto"
+            if auto and failure == "group-pin-refused":
+                print("[grow-gpu-timing] event=host-output-allocation member=0 end_ns=1 status=failed")
+            events = (("generation-borrowed", "output-borrowed") if auto and failure in ("correctness", "shared-correctness")
+                      else ("generation-tiled",))
+            for member in (1, 2):
+                for event in events:
+                    print(f"[grow-gpu-timing] event={event} member={member} end_ns=1 status=complete")
+        sys.exit(0)
     if failure == "correctness":
         assert int(os.environ["POS2GPU_MAX_VRAM_MB"]) > 0
+    if "--temp-dir" in sys.argv and Path(sys.argv[sys.argv.index("--temp-dir") + 1]).is_file():
+        if sys.argv[sys.argv.index("--max-host-ram") + 1] == "min":
+            print("unrelated failure" if failure == "spill-rejection" else "no spill file can be created")
+            sys.exit(1)
     tier = sys.argv[sys.argv.index("--tier") + 1]
     print(f"streaming tier: {tier} (")
     print("-> disk")
@@ -213,9 +236,16 @@ if kind == "verify":
              ("zero-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("missing-proofs", "tiny-proofs-proof-count", "RuntimeError", None),
              ("vector-parity", "index-meta-max-tiny-parity", "RuntimeError", None),
+             ("spill-rejection", "index-meta-max-tiny-unusable-spill", "RuntimeError", None),
              ("none", "complete", None, None),
              ("shared-quick", "complete", None, None),
-             ("correctness", "complete", None, None))
+             ("correctness", "complete", None, None),
+             ("group-always-tiled", "group-auto", "RuntimeError", None),
+             ("group-pin-refused", "complete", None, None),
+             ("group-low-host", "complete", None, None),
+             ("group-low-budget", "complete", None, None),
+             ("shared-low-host", "complete", None, None),
+             ("shared-correctness", "complete", None, None))
     for failure, stage, error_type, exit_code in cases:
         logs = root / failure
         fixture = text.replace("backend=cuda", "backend=hip" if failure == "invalid" else "backend=cuda")
@@ -225,11 +255,13 @@ if kind == "verify":
             fixture = fixture.replace("memory_kind=dedicated", "memory_kind=shared")
         suite = ("physical" if failure == "shared-physical" else
                  "vram" if failure in ("capacity", "shared-vram") else
-                 "correctness" if failure == "correctness" else "quick")
+                 "correctness" if failure in ("correctness", "shared-correctness", "shared-low-host")
+                 or failure.startswith("group-") else "quick")
         physical_args = ["--physical-vram-mib", "8192"] if suite == "physical" else []
+        host_args = ["--max-host-ram-gib", "1"] if failure == "group-low-budget" else []
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("gpu-ci.py")), str(build),
                                  "--backend", "cuda", "--suite", suite,
-                                 "--binary", str(binary), "--logs", str(logs), "--scratch", str(root), *physical_args],
+                                 "--binary", str(binary), "--logs", str(logs), "--scratch", str(root), *physical_args, *host_args],
             env=dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
                      CI_FAIL=failure, CI_INVENTORY=fixture, CI_CALLS=str(root / f"{failure}-calls.jsonl"),
                      CI_ASSERT_VRAM="1" if suite in ("vram", "physical") else "0"),
@@ -261,8 +293,16 @@ if kind == "verify":
             assert summary["reference_sha256"] == summary["vectors"][0]["reference_sha256"]
             calls = [json.loads(line) for line in (root / f"{failure}-calls.jsonl").read_text().splitlines()]
             assert sum(command[0] == "test" for command in calls) == 3
-            assert sum(command[0] == "batch" for command in calls) == 27
-            assert sum(command[0] == "verify" for command in calls) == 27
+            group_ran = failure in ("correctness", "shared-correctness", "group-pin-refused")
+            assert sum(command[0] == "batch" for command in calls) == 28 + (3 if group_ran else 0)
+            assert sum(command[0] == "verify" for command in calls) == 27 + int(group_ran)
+            if suite == "correctness":
+                group = summary["group_handoff"]
+                assert group["status"] == ("passed" if failure in ("correctness", "shared-correctness") else "skipped")
+                if group_ran:
+                    assert group["cap_mib"] == 145 and group["full_proofs_validated"] == 2
+            else:
+                assert "group_handoff" not in summary
             for vector in summary["vectors"]:
                 prefix = "" if vector["name"] == "baseline" else vector["name"] + "-"
                 labels = {prefix + tier + suffix for tier in ci["TIERS"]

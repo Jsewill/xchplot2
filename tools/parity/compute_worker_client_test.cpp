@@ -2,9 +2,11 @@
 // private ownership without adding a production cache-testing interface.
 #include "host/ComputeWorker.cpp"
 #include "host/ComputeSession.hpp"
+#include "host/GroupStorage.hpp"
 #include "host/ComputeIdentity.hpp"
 #include "host/ComputeDiscovery.hpp"
 #include "compute_pool_fixture.hpp"
+#include <deque>
 #include <iostream>
 
 using namespace group_grow;
@@ -67,6 +69,10 @@ void planning_feedback()
 {
     using Planning = worker_detail::GenerationPlanning;
     using Output = pool::GenerationOutput;
+    // Each planner carries its fixed worker histories. Keep the independent
+    // scenarios off the test thread's stack, as the client does in its Impl.
+    std::deque<Planning> planners;
+    auto new_planner = [&]() -> Planning& { return planners.emplace_back(1000); };
     auto const now = Clock::now(); pool::Endpoint route{"127.0.0.1", 49101};
     WorkerTaskObservation fast; fast.worker_identity = "local-worker"; fast.worker_instance = "first";
     fast.kind = pool::Kind::GenerateCpu; fast.k = 18; fast.strength = 2; fast.work_units = 1;
@@ -81,7 +87,7 @@ void planning_feedback()
     };
     auto train = [&](Planning& planning, WorkerTaskObservation const& value, pool::Endpoint const& endpoint)
     { for (unsigned i = 0; i < 3; ++i) observe(planning, value, endpoint); };
-    Planning planning(1000);
+    auto& planning = new_planner();
     auto missing = fast; missing.transfer_ns = 0; train(planning, missing, route);
     require(hint(planning).batch == 1 && hint(planning).concurrency == 2,
         "missing delivery phase evidence trained a generation policy");
@@ -113,7 +119,7 @@ void planning_feedback()
     require(hint(planning, 18, 2, pool::Kind::GenerateAny).batch == 1,
         "mixed-backend aggregation ignored its active worker majority");
 
-    Planning replacement(1000); train(replacement, fast, route);
+    auto& replacement = new_planner(); train(replacement, fast, route);
     auto changed = fast; changed.worker_instance = "replacement";
     observe(replacement, changed, route);
     require(hint(replacement).batch == 1, "a replacement worker inherited an old incarnation's feedback");
@@ -126,7 +132,7 @@ void planning_feedback()
     require(replacement.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, now + std::chrono::milliseconds(1001)).concurrency == 2,
         "an idle worker retained stale pressure beyond the task timeout");
 
-    Planning bounded(1000);
+    auto& bounded = new_planner();
     for (unsigned i = 0; i < 256; ++i) observe(bounded, fast, route);
     require(hint(bounded).batch == pool::max_generation_batch_members && hint(bounded).concurrency == 64,
         "generation feedback exceeded or failed to reach its bounded policy");
@@ -140,12 +146,12 @@ void planning_feedback()
     bounded.observed(older_workload, route, retired_selection, now);
     bounded.failed(older_workload, route, retired_selection, now);
     require(hint(bounded, 20).batch == 1, "late feedback resurrected a worker after bounded history eviction");
-    Planning invalid(1000); auto oversized = fast; oversized.worker_identity.assign(65, 'x');
+    auto& invalid = new_planner(); auto oversized = fast; oversized.worker_identity.assign(65, 'x');
     train(invalid, oversized, route); auto invalid_route = route; invalid_route.host.assign(254, 'x');
     train(invalid, fast, invalid_route);
     require(hint(invalid).batch == 1, "invalid protocol keys entered fixed planning storage");
 
-    Planning late(1000); auto old_selection = late.selected(fast, route, now);
+    auto& late = new_planner(); auto old_selection = late.selected(fast, route, now);
     train(late, fast, route); changed = fast; changed.worker_instance = "new-process";
     train(late, changed, route);
     for (unsigned i = 0; i < 3; ++i) late.observed(pressure, route, old_selection, now);
@@ -163,7 +169,7 @@ void planning_feedback()
     require(late.suggested(18, 2, pool::Kind::GenerateCpu, Output::Packed, expired).batch == 1,
         "a delayed completion revived a peer after its monotonic observation timeout");
 
-    Planning measured(1000);
+    auto& measured = new_planner();
     auto remote = slow; remote.generation_output = Output::Contributions; remote.worker_slots = 1;
     remote.generation = {300, 100, 80, 120};
     auto price = [&](unsigned lanes, unsigned batch = 1, Output output = Output::Contributions)
@@ -179,7 +185,7 @@ void planning_feedback()
     require(hint(measured, 18, 2, remote.kind, Output::Contributions).batch == 1,
         "a slower measured batch displaced the faster singleton");
     {
-        Planning output_modes(1000);
+        auto& output_modes = new_planner();
         auto fresh = remote; fresh.kind = pool::Kind::GenerateGpu; fresh.generation_output = Output::Fresh;
         auto estimate = [&](Output output, unsigned batch)
         { return output_modes.estimate(18, 2, fresh.kind, output, 1, batch, now); };
@@ -205,7 +211,7 @@ void planning_feedback()
     require(price(2).receivers == 2 && price(2).member_ns == 200 && price(1).member_ns == 400,
         "independent worker service did not improve the two-receiver forecast");
     {
-        Planning wave(1000);
+        auto& wave = new_planner();
         auto const kind = pool::Kind::GenerateGpu;
         auto quick = remote; quick.kind = kind; quick.work_units = 2; quick.independent_members = true;
         quick.generation = {1800, 200, 200, 0};
@@ -232,12 +238,12 @@ void planning_feedback()
             "the slow receiver changed the short scratch wave or was ignored for a longer wave");
     }
     peer.generation = remote.generation = {10, 990, 990, 10};
-    Planning shared(1000);
+    auto& shared = new_planner();
     remote.worker_slots = 8; train(shared, remote, route);
     auto const limited = shared.estimate(18, 2, remote.kind, Output::Contributions, 8, 1, now);
     require(limited.receivers == 2 && std::abs(limited.member_ns - 990) < 1e-6L,
         "multiple worker slots multiplied shared link bandwidth");
-    Planning prefetched(1000);
+    auto& prefetched = new_planner();
     remote.generation.frame_read_ns = remote.generation.frame_wait_ns;
     remote.generation.frame_wait_ns = 10;
     train(prefetched, remote, route);
@@ -249,7 +255,7 @@ void planning_feedback()
     auto const unequal = shared.estimate(18, 2, remote.kind, Output::Contributions, 2, 1, now);
     require(unequal.receivers == 2 && std::abs(unequal.member_ns - 550) < 1e-6L,
         "the individually fastest slots crowded out a faster combination on the shared link");
-    Planning mixed_link(1000);
+    auto& mixed_link = new_planner();
     auto link_heavy = peer; link_heavy.worker_slots = 2; link_heavy.generation = {100, 900, 900, 0};
     auto link_light = compute_bound; link_light.worker_identity = "light-worker";
     link_light.generation = {1200, 300, 300, 0};
@@ -260,7 +266,7 @@ void planning_feedback()
     require(partial.receivers == 2 && std::abs(partial.member_ns - 10500.L / 17) < 1e-6L,
         "the forecast did not time-share workers at the shared link limit");
     {
-        Planning adapters(1000);
+        auto& adapters = new_planner();
         auto first = link_heavy, second = link_heavy; second.worker_identity = "second-adapter-worker";
         first.ingress_interface = second.ingress_interface = 7; train(adapters, first, route); train(adapters, second, route);
         auto estimate = [&] { return adapters.estimate(18, 2, first.kind, Output::Contributions, 2, 1, now); };
@@ -283,7 +289,7 @@ void planning_feedback()
         require(std::abs(estimate().member_ns - 550) < 1e-6L, "receiver stalls were charged again as link occupancy");
     }
     {
-        Planning widths(1000); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
+        auto& widths = new_planner(); auto packed = remote; packed.generation_output = Output::Packed; packed.connect_ns = 50;
         packed.generation = {70, 30, 30, 0}; train(widths, packed, route);
         packed.work_units = 2; packed.generation = {100, 20, 20, 0}; train(widths, packed, route);
         auto price = [&](unsigned width) { return widths.estimate(18, 2, packed.kind, Output::Packed, 1, width, now); };
@@ -291,7 +297,7 @@ void planning_feedback()
             price(3).member_ns > 0 && !price(3).measured_packed_batch,
             "packed widths lost their delivery cost or treated other widths as an exact measured batch");
     }
-    Planning dual_backend(1000);
+    auto& dual_backend = new_planner();
     link_heavy.worker_slots = 1;
     auto efficient_cpu = link_heavy; efficient_cpu.generation = {1080, 120, 120, 0};
     link_heavy.kind = pool::Kind::GenerateGpu;
@@ -303,7 +309,7 @@ void planning_feedback()
         "a hybrid worker lost its low-link backend or offered the same slot twice");
     // Independently enumerate integer allocations and all time shares between
     // two allocations that straddle the link limit, for several receiver caps.
-    Planning three_workers(1000);
+    auto& three_workers = new_planner();
     std::array<unsigned, 3> const service{1000, 1000, 1500}, wire{900, 650, 300};
     for (unsigned i = 0; i < service.size(); ++i)
     {
@@ -338,7 +344,7 @@ void planning_feedback()
         require(estimate.receivers == needed && std::abs(estimate.member_ns - 1 / best) < 1e-6L,
             "worker rate or receiver count differed from the feasible allocation search");
     }
-    Planning direct(1000);
+    auto& direct = new_planner();
     auto local = compute_bound; local.local_direct = true; local.generation_output = Output::Contributions;
     local.execution_ns = 1000; local.transfer_ns = 100; local.worker_slots = 1;
     remote.worker_slots = 1; train(direct, remote, route); train(direct, local, route);
@@ -353,7 +359,7 @@ void planning_feedback()
     require(price(2).receivers == 1 && price(2).measured_slots == 1 && price(2).member_ns == 400,
         "a failed route must leave the other worker's measured service available");
 
-    Planning fleet(1000);
+    auto& fleet = new_planner();
     require(fleet.probe_contribution_route(18, 2, now), "a cold GPU route was assumed to have a delivery sample");
     auto pipeline = pair; pipeline.kind = pool::Kind::GenerateGpu; pipeline.work_units = 3;
     pipeline.independent_members = true; pipeline.generation = {750, 150, 75, 50};
@@ -362,11 +368,11 @@ void planning_feedback()
     packed.generation_output = Output::Packed; packed.work_units = 1;
     train(fleet, packed, route);
     require(fleet.probe_contribution_route(18, 2, now), "packed delivery suppressed an unmeasured contribution probe");
-    Planning legacy(1000); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
+    auto& legacy = new_planner(); auto untimed = pipeline; untimed.generation = {}; observe(legacy, untimed, route);
     require(!legacy.probe_contribution_route(18, 2, now) && !legacy.estimate(18, 2, pipeline.kind, Output::Contributions, 2, 3, now).receivers,
         "an untimed delivery kept probing or supplied an unmeasured link rate");
     train(fleet, pipeline, route);
-    Planning whole_group(1000);
+    auto& whole_group = new_planner();
     train(whole_group, pipeline, route);
     require(!whole_group.joint_contribution_members(18, 2, 2, now, 3) &&
         whole_group.joint_contribution_members(18, 2, 3, now, 3) == 3 &&
@@ -386,7 +392,7 @@ void planning_feedback()
     auto singleton = peer; singleton.kind = pipeline.kind; singleton.generation = {1350, 150, 100, 80};
     auto single = pipeline; single.independent_members = false; single.work_units = 1; single.generation = {400, 50, 25, 25};
     {
-        Planning optional(1000);
+        auto& optional = new_planner();
         auto joint_width = [&](unsigned maximum = 2) { return optional.joint_contribution_members(18, 2, maximum, now); };
         require(!joint_width(), "a cold GPU split a ready independent batch");
         observe(optional, single, route);
@@ -410,7 +416,7 @@ void planning_feedback()
         require(!optional.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)),
             "expired GPU measurements changed a fresh contribution choice");
 
-        Planning coalesced(1000);
+        auto& coalesced = new_planner();
         train(coalesced, pipeline, route);
         auto const occupied = coalesced.selected(pipeline, route, now);
         require(!coalesced.joint_contribution_members(18, 2, 2, now),
@@ -422,7 +428,7 @@ void planning_feedback()
         observe(coalesced, joint, route);
         require(!coalesced.joint_contribution_members(18, 2, 2, now),
             "an independently delivered destination continued splitting after a slower joint trial");
-        Planning mixed_routes(1000);
+        auto& mixed_routes = new_planner();
         train(mixed_routes, pipeline, route);
         auto slow_joint = joint; slow_joint.worker_identity = "joint-only";
         observe(mixed_routes, slow_joint, route);
@@ -435,7 +441,7 @@ void planning_feedback()
             "a busy pipeline must justify its wait without displacing a free encoder after an overrun");
         mixed_routes.released(pipeline.worker_identity, occupied_pipeline);
 
-        Planning assigned(1000);
+        auto& assigned = new_planner();
         train(assigned, pipeline, route);
         auto slow_single = single; slow_single.worker_identity = "slow-uplink";
         slow_single.generation = {1100, 700, 500, 300};
@@ -477,7 +483,7 @@ void planning_feedback()
         require(!assigned.repartition_contributions(slow_pair, now),
             "a measured faster joint delivery was displaced by the worker's old singleton cost");
 
-        Planning pipeline_only(1000);
+        auto& pipeline_only = new_planner();
         train(pipeline_only, pipeline, route);
         auto prior = slow_stream; prior.generation = {3600, 1800, 600, 300};
         observe(pipeline_only, prior, route);
@@ -485,7 +491,7 @@ void planning_feedback()
             !pipeline_only.joint_contribution_members(18, 2, 2, now),
             "a worker first measured in a pipeline took or repeatedly requested a slower joint trial");
 
-        Planning queued(1000);
+        auto& queued = new_planner();
         train(queued, pipeline, route);
         require(!queued.defer_queued_joint(18, 2, 2, now) && queued.joint_contribution_members(18, 2, 3, now) == 2 &&
             queued.defer_queued_joint(18, 2, 2, now) && !queued.defer_queued_joint(18, 2, 3, now),
@@ -497,7 +503,7 @@ void planning_feedback()
             !queued.defer_queued_joint(18, 2, 2, now + std::chrono::milliseconds(1001)),
             "a withdrawn calibration immediately retried or outlived its history");
 
-        Planning balanced(1000);
+        auto& balanced = new_planner();
         auto second = pipeline; second.worker_identity = "second-pipeline"; second.generation = {1200, 150, 100, 50};
         train(balanced, second, route);
         auto wide = second; wide.work_units = 8;
@@ -510,7 +516,7 @@ void planning_feedback()
             "the busy GPU's unfinished delivery was omitted from a two-way split");
         balanced.released(pipeline.worker_identity, fast_busy);
 
-        Planning abandoned(1000);
+        auto& abandoned = new_planner();
         train(abandoned, pipeline, route);
         require(abandoned.joint_contribution_members(18, 2, 2, now) == 2, "missing initial joint trial");
         auto later = now + std::chrono::milliseconds(900);
@@ -520,7 +526,7 @@ void planning_feedback()
             abandoned.joint_contribution_members(18, 2, 2, now + std::chrono::milliseconds(1001)) == 2,
             "an undelivered joint trial suppressed new calibration past its deadline");
 
-        Planning bounded(1000);
+        auto& bounded = new_planner();
         auto triple = joint; triple.work_units = 3; triple.generation = {300, 150, 50, 50};
         train(bounded, single, route); train(bounded, joint, route); train(bounded, triple, route);
         require(bounded.estimate(18, 2, pipeline.kind, Output::Contributions, 1, 2, now).member_ns == 450 &&
@@ -533,7 +539,7 @@ void planning_feedback()
     }
     for (bool singleton_first : {false, true})
     {
-        Planning mixed(1000);
+        auto& mixed = new_planner();
         if (singleton_first) observe(mixed, single, route);
         observe(mixed, pipeline, route); observe(mixed, pipeline, route);
         if (!singleton_first) observe(mixed, single, route);
@@ -568,7 +574,7 @@ void planning_feedback()
     require(width() == 1, "a late release freed the replacement route's running slot");
     fleet.released(pipeline.worker_identity, new_route);
 
-    Planning resident(1000);
+    auto& resident = new_planner();
     auto packed_width = [&] { return resident.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 2, 2, 3, 1, now); };
     auto fast_packed = single, slow_packed = singleton;
     fast_packed.generation_output = slow_packed.generation_output = Output::Packed;
@@ -590,6 +596,188 @@ void planning_feedback()
         now + std::chrono::nanoseconds(2000)) == 1, "an overdue worker committed a queued packed batch");
     resident.released(slow_packed.worker_identity, busy);
     resident.released(fast_packed.worker_identity, active);
+
+    auto& receiving = new_planner();
+    fast_packed.generation = {600, 400, 400, 0}; fast_packed.connect_ns = 0; fast_packed.worker_slots = 1;
+    auto roster = std::make_shared<pool::GenerationRoster>();
+    for (auto const& worker : {fast_packed, slow_packed})
+        roster->routes.push_back({worker.worker_identity, worker.worker_instance, route, {}, {}, 0, 1});
+    {
+        auto& pair = new_planner();
+        pair.capacity(18, 2, roster, 0, now);
+        auto quick = fast_packed, helper = slow_packed;
+        quick.execution_ns = 300; quick.transfer_ns = 100;
+        helper.execution_ns = 4000; helper.transfer_ns = 4000;
+        helper.generation = {4000, 4000, 4000, 0};
+        train(pair, quick, route); train(pair, helper, route);
+        auto ordinary = [&](unsigned paid)
+        {
+            WorkerPackedRoute target;
+            auto const active = pair.selected(quick, route, now);
+            auto const n = pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &target, true);
+            pair.released(quick.worker_identity, active);
+            require(n == 3 && target.route.identity == quick.worker_identity && target.paid_width == paid,
+                "the slower singleton route inherited a batch sized for the earlier release");
+        };
+        ordinary(0);
+        auto whole = quick; whole.work_units = 3; whole.execution_ns = 750;
+        observe(pair, whole, route); ordinary(3);
+        auto hybrid = std::make_shared<pool::GenerationRoster>(*roster); hybrid->routes.back().cpu_slots = 1;
+        pair.capacity(18, 2, hybrid, pair.selections(), now);
+        WorkerPackedRoute unpriced;
+        require(pair.dispatch_width(18, 2, pool::Kind::GenerateAny, Output::Packed, 3, 3, 2, 3, 1, now, 0, &unpriced, true) == 3 &&
+            unpriced.route.identity.empty(), "a measured GPU priced the unmeasured CPU backend on the same worker");
+        pair.capacity(18, 2, roster, pair.selections(), now);
+        helper.execution_ns = 200; helper.transfer_ns = 200; observe(pair, helper, route);
+        WorkerPackedRoute open;
+        require(pair.dispatch_width(18, 2, quick.kind, Output::Packed, 3, 3, 2, 3, 1, now, 0, &open, true) == 3 &&
+            open.route.identity.empty(), "a competitive measured singleton was pinned behind the incumbent");
+    }
+    receiving.capacity(18, 2, roster, 0, now); train(receiving, fast_packed, route);
+    auto selected = receiving.selected(slow_packed, route, now);
+    pool::Lease first; first.worker_identity = slow_packed.worker_identity;
+    first.task.kind = slow_packed.kind; first.task.k = 18; first.task.strength = 2; first.task.work_units = 1;
+    WorkerPackedRoute planned;
+    auto width_after = [&](unsigned ns, unsigned slots = 2)
+    { return receiving.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Packed, 3, 3, slots, 3, 1,
+        now + std::chrono::nanoseconds(ns), 0, &planned); };
+    require(width_after(6000) == 1, "a cold grant still connecting to its worker justified a packed batch");
+    receiving.receiving_packed(first, selected, now + std::chrono::nanoseconds(2000));
+    require(width_after(4000) == 1, "a short first transfer was assumed to outlast a measured whole batch");
+    require(width_after(6000) == 3 && planned.route.identity == fast_packed.worker_identity,
+        "a long first singleton transfer kept a measured worker on singletons");
+    pool::Lease granted; granted.task.kind = fast_packed.kind; granted.worker_identity = fast_packed.worker_identity;
+    granted.worker_instance = fast_packed.worker_instance; granted.endpoint = route;
+    require(planned.matches(granted), "the measured worker lost its sized packed batch");
+    granted.endpoint = relocated;
+    require(!planned.matches(granted), "a changed data endpoint kept a batch sized for the previous endpoint");
+    granted.endpoint = route; granted.worker_identity = slow_packed.worker_identity;
+    require(!planned.matches(granted), "a different worker received the wide batch after sizing");
+    auto in_progress = receiving.selected(fast_packed, route, now + std::chrono::nanoseconds(5900));
+    require(width_after(6000) == 3 && width_after(7000) == 1, "the measured worker's release horizon was ignored");
+    receiving.released(fast_packed.worker_identity, in_progress);
+    auto spare = std::make_shared<pool::GenerationRoster>(*roster); spare->routes.back().gpu_slots = 2;
+    receiving.capacity(18, 2, spare, receiving.selections(), now);
+    require(width_after(6000, 3) == 1, "an unmeasured worker with a second free slot was excluded from packed sizing");
+    receiving.capacity(18, 2, roster, receiving.selections(), now); receiving.released(slow_packed.worker_identity, selected);
+    require(width_after(6000) == 1, "a completed first singleton still occupied its worker");
+    selected = receiving.selected(slow_packed, route, now + std::chrono::nanoseconds(10000));
+    auto const sent = now + std::chrono::nanoseconds(15000);
+    require(width_after(20000) == 1, "an unconfirmed request reserved the measured worker's batch");
+    receiving.receiving_packed(first, selected, sent);
+    require(width_after(20000) == 3, "the validated prelude discarded service already spent on the singleton");
+    receiving.released(slow_packed.worker_identity, selected);
+    auto moved = std::make_shared<pool::GenerationRoster>(*roster); moved->routes.back().endpoint = relocated;
+    auto replaced = receiving.selected(slow_packed, relocated, now); receiving.receiving_packed(first, selected, now);
+    receiving.capacity(18, 2, moved, receiving.selections(), now);
+    require(width_after(6000) == 1, "a stale member prelude from the old route occupied its replacement");
+    receiving.released(slow_packed.worker_identity, replaced);
+
+    {
+        auto& joining = new_planner();
+        auto extra = slow_packed; extra.worker_identity = "arriving-packed-worker";
+        auto mixed = std::make_shared<pool::GenerationRoster>(*roster);
+        mixed->routes.push_back({extra.worker_identity, extra.worker_instance, route, {}, {}, 0, 1});
+        joining.capacity(18, 2, mixed, 0, now);
+        train(joining, fast_packed, route);
+        auto slower = slow_packed; slower.generation = {8000, 1000, 1000, 0};
+        train(joining, slower, route);
+        auto trial = joining.selected(extra, route, now);
+        pool::Lease probe = first; probe.worker_identity = extra.worker_identity;
+        joining.receiving_packed(probe, trial, now);
+        auto width = [&](unsigned ns)
+        { return joining.dispatch_width(18, 2, pool::Kind::GenerateGpu, Output::Packed, 3, 3, 3, 3, 1,
+            now + std::chrono::nanoseconds(ns), 0, &planned); };
+        require(width(100) == 1 && width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a second measured helper kept a fast route on singletons during another worker's long first transfer");
+        auto active_fast = joining.selected(fast_packed, route, now + std::chrono::nanoseconds(9700));
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "a wide batch stopped following the earlier measured release when an unpriced slot was occupied");
+        auto prior_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(4000));
+        auto next_slow = joining.selected(slower, route, now + std::chrono::nanoseconds(5960));
+        joining.observed(slower, route, prior_slow, now + std::chrono::nanoseconds(6000));
+        joining.released(slower.worker_identity, prior_slow);
+        require(width(10000) == 3 && planned.route.identity == fast_packed.worker_identity,
+            "an overlapped receipt on a slower measured worker broke a batch that beats its next singleton");
+        require(width(12000) == 1, "an overdue fast worker borrowed another worker's release estimate");
+        joining.released(slower.worker_identity, next_slow);
+        joining.released(fast_packed.worker_identity, active_fast);
+        auto changed = std::make_shared<pool::GenerationRoster>(*mixed); changed->routes.back().endpoint = relocated;
+        joining.capacity(18, 2, changed, joining.selections(), now);
+        require(width(10000) == 1, "a replaced worker inherited its predecessor's occupied first transfer");
+    }
+
+    {
+        auto& costs = new_planner();
+        auto routes = std::make_shared<pool::GenerationRoster>(*roster);
+        auto third = slow_packed; third.worker_identity = "wireless";
+        routes->routes.push_back({third.worker_identity, third.worker_instance, route, {}, {}, 0, 1});
+        costs.capacity(18, 2, routes, 0, now);
+        auto quick = fast_packed, medium = slow_packed, whole = quick;
+        quick.elapsed_ns = 3'500'000'000; medium.elapsed_ns = 25'000'000'000; third.elapsed_ns = 111'000'000'000;
+        whole.work_units = 3; whole.elapsed_ns = 8'000'000'000;
+        whole.generation = {}; // Older workers still deliver the measured owner receipt.
+        auto wave = [&](unsigned width, WorkerPackedRoute const& target = {}, unsigned receivers = 3)
+        { return costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, width, 3,
+            receivers, *routes, target, now); };
+        observe(costs, quick, route); observe(costs, whole, route);
+        WorkerPackedRoute target{routes->routes.front(), pool::Kind::GenerateGpu};
+        require(!wave(1) && wave(3, target) == whole.elapsed_ns && !wave(2, target),
+            "a fast worker priced unmeasured singleton peers or an unobserved split");
+        observe(costs, medium, route); observe(costs, third, route);
+        require(wave(1) == third.elapsed_ns && wave(1, {}, 1) == 3.L * third.elapsed_ns && !wave(3),
+            "a fast fleet rate concealed the slowest receipt or an unpriced whole-group route");
+        auto changed = std::make_shared<pool::GenerationRoster>(*routes); changed->routes.back().endpoint = relocated;
+        costs.capacity(18, 2, changed, costs.selections(), now);
+        require(!wave(1) && !costs.publication_trial_ns(18, 2, pool::Kind::GenerateGpu, Output::Packed, 1, 3, 3, *changed, {}, now),
+            "a replacement route inherited an earlier publication trial price");
+    }
+    auto& final_group = new_planner();
+    final_group.capacity(18, 2, roster, 0, now);
+    auto triple = fast_packed; triple.work_units = 3; triple.generation = {1200, 600, 600, 0};
+    auto alternate = slow_packed; alternate.generation = {4000, 4000, 4000, 0}; alternate.connect_ns = 0;
+    train(final_group, triple, route); train(final_group, alternate, route);
+    auto earlier = [&](Clock::time_point at, pool::Kind kind = pool::Kind::GenerateAny)
+    { return final_group.packed_before_singletons(18, 2, kind, 3, planned, at); };
+    auto running = final_group.selected(triple, route, now);
+    require(earlier(now) && planned.route.identity == triple.worker_identity,
+        "a final measured batch was split although it beats a singleton on every alternative");
+    require(!earlier(now + std::chrono::nanoseconds(2000)), "an overdue worker kept the final batch");
+    auto packed_pair = triple; packed_pair.work_units = 2; packed_pair.generation = {750, 450, 450, 0};
+    train(final_group, packed_pair, route);
+    final_group.released(triple.worker_identity, running);
+    running = final_group.selected(triple, route, now);
+    std::shared_ptr<void> assigned_singleton;
+    auto spare_fits = [&](unsigned ns) { return final_group.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2,
+        now, now + std::chrono::nanoseconds(ns), assigned_singleton); };
+    require(!spare_fits(0) && !spare_fits(7000) && spare_fits(12000) && !spare_fits(12000),
+        "packed work did not preserve the final fast batch or use the measured spare over a fitting independent horizon");
+    assigned_singleton.reset();
+    auto lost = std::make_shared<pool::GenerationRoster>(*roster); lost->routes.pop_back();
+    final_group.capacity(18, 2, lost, final_group.selections(), now);
+    require(!spare_fits(12000), "a withdrawn packed worker still supplied an idle singleton");
+    final_group.capacity(18, 2, roster, final_group.selections(), now);
+    {
+        auto& shared_link = new_planner();
+        shared_link.capacity(18, 2, roster, 0, now);
+        auto full = triple, shorter = packed_pair, helper = alternate;
+        full.generation = {1, 1800, 1800, 0}; shorter.generation = {1, 1200, 1200, 0};
+        helper.generation = {1, 8000, 8000, 0};
+        full.ingress_interface = shorter.ingress_interface = helper.ingress_interface = 7;
+        train(shared_link, full, route); train(shared_link, shorter, route); train(shared_link, helper, route);
+        shared_link.selected(full, route, now);
+        require(!shared_link.useful_packed_singleton(18, 2, pool::Kind::GenerateGpu, 3, 2, now,
+            now + std::chrono::nanoseconds(12000), assigned_singleton), "a saturated shared ingress funded another packed receiver");
+    }
+    final_group.released(triple.worker_identity, running);
+    auto dual = std::make_shared<pool::GenerationRoster>(*roster); dual->routes.back().cpu_slots = 1;
+    final_group.capacity(18, 2, dual, final_group.selections(), now);
+    require(!earlier(now) && earlier(now, pool::Kind::GenerateGpu),
+        "an unmeasured eligible backend was excluded from a final packed group");
+    final_group.capacity(18, 2, roster, final_group.selections(), now);
+    alternate.generation = {250, 250, 250, 0};
+    for (unsigned i = 0; i < 16; ++i) observe(final_group, alternate, route);
+    require(!earlier(now), "a faster singleton was excluded from a final packed group");
 }
 
 struct RunningBroker
@@ -835,6 +1023,76 @@ void network_deadlines()
         bounded_failure([&] { (void)client.encode(18, {&chunk, 1}, uint64_t(1) << 20, cancel); });
         require(peer.accepted.load(), "direct deadline test never reached the leased TLS peer");
     }
+}
+
+void failed_gpu_generation()
+{
+    pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "failed-gpu-ca");
+    auto first = pool_test::issue(directory.path, "failed-gpu", &ca), second = pool_test::issue(directory.path, "healthy-cpu", &ca);
+    auto tls = pool_test::tls(ca, first); tls.timeout_ms = 3000;
+    pool::BrokerOptions options; options.listen = {"127.0.0.1", 0}; options.tls = tls; RunningBroker broker(options);
+    pool::Listener peer({"127.0.0.1", 0}, tls); pool::BrokerClient control(broker.server.endpoint(), tls);
+    pool::WorkerOffer offer; offer.endpoint = peer.endpoint(); offer.instance = pool::random_token();
+    offer.compatibility = worker_compatibility(); offer.capabilities = pool::capability(pool::Kind::GenerateGpu);
+    offer.capacity = {1, 1, uint64_t(256) << 20, 1024};
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, offer.capacity, offer.capacity.host_bytes, 1}};
+    control.register_worker(offer);
+    WorkerConfig good; good.tls = pool_test::tls(ca, second); good.broker = broker.server.endpoint(); good.listen = {"127.0.0.1", 0};
+    good.capacity = {1, 1, uint64_t(256) << 20, 0}; good.available_resources = [cap=good.capacity](unsigned) { return cap; };
+    WorkerService healthy(good);
+    std::array<std::array<uint8_t, 32>, 1> ids{}; ids.front()[0] = 17;
+    std::vector<std::vector<uint8_t>> expected;
+    healthy.contributions_local(18, 2, ids, [&](auto, auto bytes, auto) { expected.emplace_back(bytes.begin(), bytes.end()); });
+    std::string const error = "T1 match produced 0 entries (expected ~2^18 = 262144 for k=18)";
+    auto report = [&](bool partial, bool join)
+    {
+        return std::async(std::launch::async, [&, partial, join]
+        {
+            auto channel = peer.accept(5000); require(bool(channel), "GPU fixture did not receive work");
+            auto frame = channel.receive(); pool::Reader body(frame.payload); auto lease = pool::read_lease(body);
+            require(frame.type == pool::Message::Work && control.begin(lease, channel.peer_identity()), "GPU fixture was not assigned its lease");
+            if (join)
+            {
+                healthy.start();
+                auto const until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                while (!healthy.status().healthy_brokers && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                require(healthy.status().healthy_brokers, "alternate CPU worker did not register");
+            }
+            if (partial)
+            {
+                pool::Writer chunk(tls.max_frame_bytes); chunk.u8(uint8_t(worker_detail::DataKind::Contributions));
+                chunk.u64(0); chunk.u16(1); chunk.bytes(expected.front()); channel.send(pool::Message::Data, chunk.data());
+            }
+            pool::Writer out(tls.max_frame_bytes); out.u8(uint8_t(worker_detail::WorkerError::Permanent)); out.string(error);
+            control.finish(lease); channel.send(pool::Message::Error, out.data());
+        });
+    };
+    WorkerClientConfig config; config.broker = broker.server.endpoint(); config.tls = tls; config.owner_id = "gpu-failure-owner";
+    config.generation_kind = pool::Kind::GenerateAny; config.task_timeout_ms = 5000;
+    WorkerClient client(config);
+    for (bool partial : {false, true})
+    {
+        auto gpu = report(partial, false); size_t chunks = 0; bool rejected = false;
+        try { client.contributions(18, 2, ids, [&](auto, auto, auto) { ++chunks; }); }
+        catch (WorkerGenerationFailed const& failure)
+        { rejected = std::string_view(failure.what()).find(error) != std::string_view::npos &&
+            std::string_view(failure.what()).find(offer.instance) != std::string_view::npos; }
+        gpu.get();
+        require(rejected && chunks == size_t(partial), "a sole faulty GPU lost its diagnostic or replayed a partially delivered generation");
+    }
+    auto gpu = report(false, true); size_t delivered = 0;
+    client.contributions(18, 2, ids, [&](auto ordinal, auto bytes, auto members)
+    {
+        require(ordinal == delivered && members == 1 && std::ranges::equal(bytes, expected.at(delivered)),
+            "alternate worker changed or repeated the member contribution");
+        ++delivered;
+    }, {}, WorkerTaskIdentity("fixed-gpu-failure"));
+    gpu.get();
+    auto const jobs = control.status({pool::StatusSection::Jobs});
+    require(delivered == expected.size() && std::any_of(jobs.job_records.begin(), jobs.job_records.end(), [&](auto const& job)
+        { return job.worker_instance == healthy.status().instance && job.attempt == 2; }),
+        "GPU generation did not finish on a different worker under the same task identity");
 }
 
 void independent_receivers()
@@ -1131,12 +1389,17 @@ void assigned_local_and_fencing()
     WorkerService scratch_limited(bounded); scratch_limited.start();
     config.broker = bounded.broker; config.owner_id = "batch-refusal-owner";
     config.local_service = nullptr; config.task_timeout_ms = 10000;
+    std::string failed_instance, failed_reason;
+    config.generation_failed = [&](auto const& task, std::string_view reason)
+        { failed_instance = task.worker_instance; failed_reason = reason; };
     WorkerClient refused(config);
     bool unsupported = false, emitted = false;
     try { refused.contributions(18, 2, ids, [&](auto, auto, auto) { emitted = true; }); }
     catch (pool::UnsupportedResources const&) { unsupported = true; }
     require(unsupported && !emitted,
         "refused contribution batch retried its excluded shape instead of returning before output");
+    require(failed_instance == scratch_limited.status().instance && failed_reason.find("scratch") != std::string::npos,
+        "failed generation lost its authenticated worker or resource diagnostic");
     chunks = 0;
     refused.contributions(18, 2, {&id, 1}, [&](uint64_t ordinal, auto bytes, uint16_t members)
     { require(ordinal == chunks++ && members == 1 && !bytes.empty(), "singleton split failed after a typed batch refusal"); });
@@ -1163,6 +1426,77 @@ void temporary_worker_refusal()
     auto expected = codec.encode(0, {}, 0, {&region, 1});
     pool::BrokerClient worker_control(offer.broker, tls);
     auto const instance = service.status().instance;
+    {
+        bool moved = false, pressure_at_grant = false;
+        std::shared_ptr<DiskIoGovernor> io;
+        WorkerClientConfig config; config.broker = offer.broker; config.tls = tls; config.task_timeout_ms = 3000;
+        config.owner_id = "terminal-grant-fence";
+        config.generation_path = [&](auto const&, auto const&, uint32_t) { return std::string(64, moved ? 'b' : 'a'); };
+        config.selected = [&](auto const&) { if (std::exchange(pressure_at_grant, false)) io->observe_pressure(true); };
+        WorkerClient client(config); auto const competing = worker_control.open_owner("contending-writer");
+        pool::Task blocker; blocker.compatibility = worker_compatibility(); blocker.k = 18; blocker.strength = 2;
+        blocker.kind = pool::Kind::GenerateCpu; blocker.resources.host_bytes = 1;
+        auto reserve = [&]
+        {
+            blocker.task_id = pool::random_token(); ++blocker.sequence;
+            require(bool(worker_control.acquire(competing, blocker)), "contender did not occupy the idle signed lane");
+        };
+        auto release = [&] { worker_control.cancel(competing, blocker.task_id, blocker.attempt); };
+        auto const before = service.status().accepted_tasks;
+        enum class Change { queued, pressure, path };
+        for (bool fresh : {false, true}) for (auto change : {Change::queued, Change::pressure, Change::path})
+        {
+            moved = false; auto publication = client.publication_route(18, 2, {&id, 1});
+            require(bool(publication), "a registered single-slot worker did not quote its normal generation path");
+            io = std::make_shared<DiskIoGovernor>(); auto const sampled = io->pressure_deadline();
+            publication->pressure_unchanged = [io, sampled] { return io->pressure_deadline() == sampled; };
+            publication->selected_fresh = fresh; publication->promoted.store(true);
+            std::atomic<bool> returned{false}; std::future<void> released;
+            if (change == Change::queued)
+            {
+                reserve();
+                released = std::async(std::launch::async, [&]
+                {
+                    auto const until = Clock::now() + std::chrono::seconds(2);
+                    while (!returned.load() && Clock::now() < until && !worker_control.status().queued)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    release();
+                });
+            }
+            else if (change == Change::pressure) pressure_at_grant = true;
+            else moved = true;
+            bool declined = false, received = false;
+            WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::seconds(3);
+            try
+            {
+                if (fresh) client.contributions(18, 2, {&id, 1}, [&](auto, auto, auto) { received = true; },
+                    cancel, {}, {}, [&](auto, auto, auto const&) { received = true; });
+                else client.generate_packed(18, 2, {&id, 1}, [&](auto const&, uint64_t) { received = true; }, cancel);
+            }
+            catch (WorkerPublicationChanged const&) { declined = true; }
+            returned = true; if (released.valid()) released.get();
+            require(declined && !received && !client.stats().input_bytes && service.status().accepted_tasks == before,
+                "a changed terminal queue, pressure or path failed to return to the incumbent before Work");
+        }
+        reserve();
+        auto ordinary = std::async(std::launch::async, [&]
+        {
+            bool delivered = false; client.generate(18, 2, id, [&](auto const&, uint64_t) { delivered = true; }); return delivered;
+        });
+        auto until = Clock::now() + std::chrono::seconds(2); bool waited = false;
+        while (Clock::now() < until && !(waited = worker_control.status().queued != 0))
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        release();
+        auto const delivered = ordinary.get();
+        require(waited && delivered && client.stats().completed_generation == 1,
+            "discarding terminal evidence changed the ordinary lease's queue or completion");
+        // The TLS End can reach the owner before the worker's signed release and acceptance guard finish.
+        until = Clock::now() + std::chrono::seconds(2);
+        while (Clock::now() < until && service.status().accepted_tasks != before)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(service.status().accepted_tasks == before, "completed ordinary work retained its worker acceptance");
+
+    }
     for (bool local : {false, true})
     {
         bool refuse = false, delayed_pause = false;
@@ -1217,6 +1551,36 @@ void temporary_worker_refusal()
         }
         require(client.stats().failed_tasks == 3, "temporary refusals lost their failure accounting");
     }
+    // An uploading owner can lose the direct error when the paused worker
+    // closes with unread codec data. Exercise Abandon without consuming it.
+    auto owner = worker_control.open_owner("unread-codec-refusal");
+    pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
+    payload.u16(0); payload.u16(1); payload.u32(fragments.size()); payload.words(fragments);
+    pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack);
+    task.kind = pool::Kind::Pack; task.k = 18; task.strength = 2; task.chunk_count = 1;
+    task.work_units = payload.data().size(); task.max_output_bytes = 4096;
+    task.resources = {1, 1, task.work_units * 20 + ChunkCodec::estimate_work(18, 0, 0), 0};
+    auto grant = worker_control.acquire(owner, task); require(bool(grant), "unread refusal fixture did not obtain its grant");
+    service.control(WorkerControl::Pause);
+    auto channel = pool::Channel::connect(grant->endpoint, tls, grant->worker_identity);
+    pool::Writer header(tls.max_frame_bytes); pool::write_lease(header, *grant); header.u32(3000);
+    header.u8(uint8_t(Operation::Encode)); header.u8(18); header.u8(2); header.u64(task.work_units); header.u64(task.max_output_bytes);
+    channel.send(pool::Message::Work, header.data());
+    auto const reply_by = Clock::now() + std::chrono::seconds(3);
+    while (!channel.readable() && Clock::now() < reply_by) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(channel.readable(), "paused worker did not signal its codec refusal");
+    try { channel.send(pool::Message::Data, payload.data()); } catch (pool::TransientTransport const&) {}
+    channel.close();
+    try { worker_control.abandon(*grant); } catch (pool::StaleLease const&) {}
+    service.control(WorkerControl::Resume); ++task.attempt;
+    std::optional<pool::Lease> next; auto const retry_by = Clock::now() + std::chrono::seconds(3);
+    do
+    {
+        next = worker_control.acquire(owner, task);
+        if (!next) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (!next && Clock::now() < retry_by);
+    require(next && next->worker_instance == instance, "lost codec refusal excluded the worker from the next attempt");
+    worker_control.cancel(owner, task.task_id, task.attempt);
 }
 
 void expired_cleanup()
@@ -1569,6 +1933,12 @@ void automatic_pool_growth()
         args.pool_frame_bytes = args.window = 65536; args.pool_timeout_ms = 20000;
         pos2gpu::prepare_group_compute(args); return args;
     };
+    auto offer = [](pos2gpu::GroupOptions const& args)
+    {
+        auto config = pos2gpu::make_group_compute_offer(args);
+        config.available_resources = [capacity = config.capacity](unsigned) { return capacity; };
+        return config;
+    };
     auto args = options(owner_id);
     pos2gpu::ComputeSession session(args);
     WorkerClientConfig config; config.broker = pool::parse_endpoint(args.pool_broker);
@@ -1605,7 +1975,7 @@ void automatic_pool_growth()
     auto const queued_by = Clock::now() + std::chrono::seconds(5);
     while (!control.status().queued && Clock::now() < queued_by) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     require(control.status().queued == 1, "empty broker failed to retain the pending owner's request");
-    session.offer_local(pos2gpu::make_group_compute_offer(args));
+    session.offer_local(offer(args));
     auto baseline = cold.get();
     auto original = std::async(std::launch::async, [&] { return generate(true); });
     require(receiving.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready, "original executor never began its delivery");
@@ -1613,30 +1983,54 @@ void automatic_pool_growth()
     require(initial.roster && initial.roster->complete && initial.roster->routes.size() == 1 &&
         initial.roster->routes.front().cpu_slots == 1 && !initial.roster->routes.front().gpu_slots,
         "automatic owner did not observe its original CPU executor");
+    auto wait_for_roster = [&](auto matches)
+    {
+        auto const until = Clock::now() + std::chrono::seconds(5);
+        do
+        {
+            auto value = client.generation_capacity(18, 2);
+            if (value.roster && value.roster->complete && matches(*value.roster)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (Clock::now() < until);
+        return false;
+    };
     // Enroll and start the peer after an actual lease has delivered its
     // first output. Both normal plotting sessions advertise on loopback.
     auto invitation = directory.path / "addition.invite"; pool::invite_pool(owner_id, invitation, "addition");
     auto helper_id = pool::join_pool(invitation, directory.path / "addition");
+    auto const helper_identity = pool::certificate_identity(helper_id.tls.cert_file);
     std::vector<uint64_t> remote;
+    size_t receipts_before_release;
     {
         auto helper_args = options(helper_id); pos2gpu::ComputeSession helper(helper_args);
-        helper.offer_local(pos2gpu::make_group_compute_offer(helper_args));
+        helper.offer_local(offer(helper_args));
         remote = generate(false, 2);
+        require(wait_for_roster([](auto const& roster) { return roster.routes.size() == 2; }),
+            "the owner did not report both workers while the helper was present");
+        std::lock_guard lock(mutex);
+        require(!deliveries.empty() && deliveries.front().local_direct && deliveries.front().work_units == 1,
+            "the cold member did not finish on the original worker");
+        unsigned members = 0;
+        for (auto const& received : std::span(deliveries).subspan(1))
+        {
+            require(received.worker_identity == helper_identity && !received.local_direct &&
+                received.member_id_count && received.work_units == received.member_id_count,
+                "a held original worker or another executor supplied the helper's members");
+            members += received.member_id_count;
+        }
+        require(members == 2, "the authenticated helper did not deliver both members while the original worker was held");
+        receipts_before_release = deliveries.size();
     }
     release.set_value(); auto local = original.get();
     require(!local.empty() && local == baseline && remote.size() == local.size() * 2 &&
         std::equal(local.begin(), local.end(), remote.begin()) && std::equal(local.begin(), local.end(), remote.begin() + local.size()),
         "newly enrolled executor changed the live owner's ordered member data");
-    auto const until = Clock::now() + std::chrono::seconds(5);
-    auto current = client.generation_capacity(18, 2);
-    while ((!current.roster || *current.roster != *initial.roster) && Clock::now() < until)
-    { std::this_thread::sleep_for(std::chrono::milliseconds(50)); current = client.generation_capacity(18, 2); }
-    require(current.roster && *current.roster == *initial.roster && generate(false) == local,
+    require(wait_for_roster([&](auto const& roster) { return roster == *initial.roster; }) && generate(false) == local,
         "the same plotting owner did not continue on its original worker after departure");
     std::lock_guard lock(mutex);
-    auto const helper = pool::certificate_identity(helper_id.tls.cert_file);
-    require(deliveries.size() == 5 && deliveries[1].worker_identity == helper && deliveries[2].worker_identity == helper &&
-        deliveries[1].work_units == 1 && !deliveries[1].local_direct && deliveries.back().local_direct &&
+    require(deliveries.size() == receipts_before_release + 2 &&
+        std::all_of(deliveries.begin() + receipts_before_release, deliveries.end(), [&](auto const& value)
+        { return value.worker_identity == initial.roster->routes.front().identity && value.local_direct && value.work_units == 1; }) &&
         std::find(rosters.begin(), rosters.end(), 2) != rosters.end() && rosters.back() == 1,
         "active job did not report and delegate to the late authenticated node before its departure");
 }
@@ -1786,7 +2180,7 @@ void local_only_parallel()
             auto const affinity = pos2gpu::current_thread_cpus(); bool rejected = false;
             WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::milliseconds(100);
             try { client.generate(18, 2, id, [](auto const&, auto) {}, cancel); }
-            catch (worker_detail::TaskCancelled const&) { rejected = true; }
+            catch (WorkerTaskTimeout const&) { rejected = true; }
             return rejected && pos2gpu::current_thread_cpus() == affinity;
         });
         completed = cancelled.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
@@ -1904,6 +2298,16 @@ void status_inspection()
     auto accepting = inspect(); auto after = control.status();
     require(accepting.status == "compatible-workers-observed" && accepting.accepting_generation == 1 && accepting.accepting_codec == 1 &&
         !after.owners && !after.jobs, "status inspection created owner sessions/tasks or failed to report compatible admission");
+    control.unregister_worker(offer.instance);
+    offer.admission = pool::WorkerAdmission::Accepting;
+    offer.capabilities |= pool::capability(pool::Kind::GenerateGpu);
+    offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, {1, 1, 1, 1}, 1, 1}};
+    offer.gpu_recovery = "ZE_RESULT_ERROR_DEVICE_LOST";
+    control.register_worker(offer);
+    auto recovering = inspect();
+    require(recovering.accepting_generation == 1 && recovering.accepting_codec == 1 &&
+        recovering.worker_resources.size() == 1 && recovering.worker_resources.front().gpu_recovery == offer.gpu_recovery,
+        "live status dropped the GPU recovery cause or withdrew accepting CPU work");
     args.pool_broker = "localhost:" + std::to_string(broker.server.endpoint().port);
     auto hostname = inspect();
     require(!hostname.complete && !hostname.checked && !hostname.issues.empty() && hostname.issues.front().reason.find("numeric") != std::string::npos,
@@ -1954,7 +2358,7 @@ void status_inspection()
 
 int main() try
 {
-    retry_pressure(); planning_feedback(); confirmed_generation_prior(); live_generation_routes(); network_deadlines(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); automatic_pool_growth(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
+    retry_pressure(); planning_feedback(); confirmed_generation_prior(); live_generation_routes(); network_deadlines(); failed_gpu_generation(); independent_receivers(); assigned_local_and_fencing(); temporary_worker_refusal(); expired_cleanup(); generation_admission(); protected_admission(); adaptive_resources(); session_memory_ownership(); automatic_pool_growth(); codec_window_limits(); local_only_parallel(); renewal_fence(); status_inspection();
     std::cout << "client retry ownership, bounded cache and absolute task deadlines passed\n";
     return 0;
 }

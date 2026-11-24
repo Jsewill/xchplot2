@@ -98,6 +98,22 @@ void protocol(fs::path const& root)
         "replaced root damaged either object");
 
 #ifdef _WIN32
+    auto absent = fixture(root, "absence");
+    fs::rename(source(absent), source(absent).parent_path() / "saved");
+    require(missing(absent), "missing claim directory was not recognized");
+    protect(claim(absent).parent_path());
+    require(missing(absent), "missing claim in an existing directory was not recognized");
+    write(claim(absent), "unreviewed claim");
+    HANDLE sparse = ::CreateFileW(claim(absent).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    require(sparse != INVALID_HANDLE_VALUE, "cannot open sparse claim fixture");
+    DWORD returned = 0;
+    BOOL const marked = ::DeviceIoControl(sparse, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+    ::CloseHandle(sparse);
+    require(marked, "cannot mark sparse claim fixture");
+    rejects([&] { (void)missing(absent); }, "unsupported existing claim was reported missing");
+    require(read(claim(absent)) == "unreviewed claim" && read(source(absent).parent_path() / "saved") == "reviewed source bytes",
+        "claim inspection changed an unreviewed or retained source");
+
     auto locked = fixture(root, "reader-lock");
     {
         auto reader = inventory_detail::windows_open(source(locked), false);
@@ -176,7 +192,7 @@ int main(int argc, char** argv)
     {
         std::ifstream in(file_io::native_path(argv[2]), std::ios::binary); auto inventory = read_farm_inventory(in);
 #ifdef _WIN32
-        require(::SetEnvironmentVariableW(L"XCHPLOT2_GROW_FAILPOINT", file_io::native_path(argv[3]).c_str()), "cannot inject native retirement interruption");
+        require(!::_putenv_s("XCHPLOT2_GROW_FAILPOINT", argv[3]), "cannot inject native retirement interruption");
 #else
         ::setenv("XCHPLOT2_GROW_FAILPOINT", argv[3], 1);
 #endif

@@ -211,6 +211,31 @@ void test_integrated_memory()
           "integrated: reject unavailable driver reading");
 }
 
+void test_windows_hip_worker()
+{
+    using pos2gpu::windows_hip_worker_node;
+    using pos2gpu::windows_hip_worker_headroom;
+    check(windows_hip_worker_node(0, 1) == 0, "Windows HIP: absent mask on a verified single-node adapter");
+    check(windows_hip_worker_node(2, 2) == 1, "Windows HIP: select the specified physical node");
+    check(!windows_hip_worker_node(0, 0) && !windows_hip_worker_node(0, 2) &&
+          !windows_hip_worker_node(3, 2) && !windows_hip_worker_node(4, 2),
+          "Windows HIP: reject unknown, ambiguous and out-of-range nodes");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 11 * MiB, MiB, 12 * MiB, 5 * MiB), 7 * MiB,
+             "Windows HIP: other processes consume dedicated memory");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 8 * MiB, 3 * MiB, 12 * MiB, MiB), 5 * MiB,
+             "Windows HIP: honor this process's remaining operating-system budget");
+    check_eq(windows_hip_worker_headroom(4 * MiB, 9 * MiB, MiB, 12 * MiB, MiB), 4 * MiB,
+             "Windows HIP: honor a smaller runtime allowance");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 12 * MiB, 0, 12 * MiB, 11 * MiB, 6 * MiB), MiB,
+             "Windows HIP: this process cannot reclaim another process's dedicated memory");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 12 * MiB, 2 * MiB, 12 * MiB, 11 * MiB, 6 * MiB), 3 * MiB,
+             "Windows HIP: reusable allocations cannot exceed this process's WDDM usage");
+    check_eq(windows_hip_worker_headroom(12 * MiB, 5 * MiB, 9 * MiB, 12 * MiB, 9 * MiB, 2 * MiB), 0,
+             "Windows HIP: the process remains over budget after releasing its confirmed buffers");
+    check(!windows_hip_worker_headroom(9, 3, 4, 9, 1) && !windows_hip_worker_headroom(9, 8, 4, 9, 10),
+          "Windows HIP: oversubscription leaves zero headroom");
+}
+
 } // namespace
 
 int main()
@@ -222,6 +247,7 @@ int main()
     test_tolerance_window();
     test_unknown_global_mem();
     test_integrated_memory();
+    test_windows_hip_worker();
 
     if (failures) {
         std::printf("\n%d FAILURE(S)\n", failures);

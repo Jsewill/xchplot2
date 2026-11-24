@@ -69,21 +69,22 @@ inline void async_error_handler(sycl::exception_list exns) noexcept
     }
 }
 
+inline auto queue_error_handler()
+{
+    return [scope = scoped_async_errors()](sycl::exception_list errors) noexcept {
+        ScopedAsyncErrors bind(scope);
+        async_error_handler(std::move(errors));
+    };
+}
+
 // Per-thread target device id. A worker thread sets this once at startup
 // via set_current_device_id() so that its subsequent queue() call returns
 // a queue bound to the requested device. Sentinel values:
 //   kDefaultGpuId (-1)  : sycl::gpu_selector_v (single-device default,
 //                         pre-multi-GPU zero-config path)
-//   kCpuDeviceId  (-2)  : AdaptiveCpp's OpenMP host device. NOT latent — it is
-//                         live behind XCHPLOT2_SYCL_CPU_BENCH=1, which A/Bs our
-//                         SYCL kernels on the CPU against pos2-chip's hand-tuned
-//                         CPU plotter. Production --cpu / --devices cpu plotting
-//                         bypasses this and dispatches straight to
-//                         run_one_plot_cpu() (see CpuPlotter.cpp), because
-//                         pos2-chip wins that A/B by 4.3x at k=22 on a 5950X
-//                         (0.95 s/plot vs 4.10): our kernels are GPU kernels —
-//                         written for tens of thousands of threads and coalesced
-//                         access — and they do not transpose to 32 CPU threads.
+//   kCpuDeviceId  (-2)  : AdaptiveCpp's OpenMP host device when exercising the
+//                         SYCL kernels with XCHPLOT2_SYCL_CPU_BENCH=1. Normal
+//                         CPU workers call the native C++ generator.
 //   0..N-1              : explicit GPU index from
 //                         sycl::device::get_devices(gpu)
 //
@@ -275,7 +276,7 @@ inline sycl::queue& queue()
                     " the OpenMP backend (ACPP_TARGETS must include omp), or"
                     " run with ACPP_VISIBILITY_MASK=omp.");
             }
-            q = std::make_unique<sycl::queue>(*host_dev, async_error_handler);
+            q = std::make_unique<sycl::queue>(*host_dev, queue_error_handler());
         } else if (id < 0) {
             // Default GPU: prefer an auto-dispatchable card so a zero-config run
             // skips a tiny iGPU, but never reject outright -- an iGPU-only box
@@ -288,7 +289,7 @@ inline sycl::queue& queue()
                 return (is_auto_dispatchable(d) ? 1000000 : 1) + cus;
             };
             q = std::make_unique<sycl::queue>(default_gpu_scorer,
-                                              async_error_handler);
+                                              queue_error_handler());
         } else {
             auto devices = usable_gpu_devices();
             if (id >= static_cast<int>(devices.size())) {
@@ -297,7 +298,7 @@ inline sycl::queue& queue()
                     " out of range (found " + std::to_string(devices.size()) +
                     " usable GPU device(s))");
             }
-            q = std::make_unique<sycl::queue>(devices[id], async_error_handler);
+            q = std::make_unique<sycl::queue>(devices[id], queue_error_handler());
         }
         validate_kernel_dispatch(*q);
     }

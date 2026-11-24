@@ -218,6 +218,41 @@ struct RunningBroker
 void multiple_brokers(char const* ca, char const* cert, char const* key)
 {
     pool::TlsOptions tls{ca, cert, key, 10000, 65536};
+    for (auto const [listen, simultaneous] : {std::pair{"::", false}, std::pair{"::", true}, std::pair{"0.0.0.0", false}})
+    {
+        pool::BrokerOptions options; options.listen = {listen, 0}; options.tls = tls;
+        RunningBroker home(options), later(options);
+        pool::Endpoint primary{"127.0.0.1", home.server.endpoint().port, "localhost"};
+        // A wildcard listener falls back to IPv4 when the host disables IPv6.
+        // The numeric TLS name exercises a second route on those listeners.
+        auto alternate = primary;
+        if (home.server.endpoint().host == "::") alternate.host = "::1";
+        else alternate.server_name.clear();
+        pool::Endpoint addition{"127.0.0.1", later.server.endpoint().port, "localhost"};
+        auto offered = config(); offered.broker = primary; offered.listen = {listen, 0}; offered.tls = tls; offered.max_brokers = 2;
+        offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+        std::atomic<unsigned> browse{0};
+        offered.discover_brokers = [&]
+        {
+            auto const round = ++browse;
+            if (round == 1 && !simultaneous) return std::vector<pool::Endpoint>{};
+            if (round <= 2) return std::vector<pool::Endpoint>{alternate};
+            return std::vector<pool::Endpoint>{alternate, addition};
+        };
+        WorkerService worker(offered); worker.start();
+        pool::BrokerClient original(primary, tls), alias(alternate, tls), peer(addition, tls);
+        auto const advertised = original.status().worker_records.at(0).endpoint;
+        require((advertised.host == primary.host || (simultaneous && advertised.host == alternate.host)) &&
+            alias.status().worker_records.at(0).endpoint == advertised,
+            "broker fixture did not establish its primary worker route");
+        auto const until = Clock::now() + std::chrono::seconds(3);
+        while ((browse.load() < 4 || worker.status().healthy_brokers != 2 || !peer.status().workers) && Clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto const status = worker.status();
+        require(peer.status().workers == 1 && status.known_brokers == 2 && status.healthy_brokers == 2 &&
+            original.status().worker_records.at(0).endpoint == advertised,
+            "a second address for the first broker displaced its working route or deferred a distinct broker");
+    }
     pool::BrokerOptions broker_options; broker_options.listen = {"127.0.0.1", 0}; broker_options.tls = tls;
     RunningBroker first(broker_options), second(broker_options);
     auto options = config(); options.broker = first.server.endpoint();
@@ -262,8 +297,21 @@ void multiple_brokers(char const* ca, char const* cert, char const* key)
     if (!started) { release.set_value(); held.get(); throw std::runtime_error("first broker made no progress"); }
     auto queued = std::async(std::launch::async, [&] { return collect(b); });
     bool const bounded = queued.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    WorkerGenerationCapacity busy;
+    auto const until = Clock::now() + std::chrono::seconds(3);
+    do
+    {
+        busy = a.generation_capacity(18, 2);
+        if (busy.availability.admission && !busy.availability.admission->available_slots) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (Clock::now() < until);
     release.set_value();
-    require(held.get() == expected && queued.get() == expected, "independent brokers changed worker output");
+    auto const first_result = held.get();
+    auto const idle = a.generation_capacity(18, 2);
+    require(busy.slots == 1 && busy.availability.admission && !busy.availability.admission->available_slots &&
+        !busy.availability.admission->other_owner_tasks && idle.availability.admission && idle.availability.admission->available_slots == 1,
+        "completed packed receipt retained the owner's occupied slot");
+    require(first_result == expected && queued.get() == expected, "independent brokers changed worker output");
     require(bounded, "independent brokers exceeded the worker's one shared task slot");
 
     client.local_service = nullptr; WorkerClient remote(client);
@@ -286,6 +334,12 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     auto options = config(); options.broker = broker.server.endpoint(); options.listen = {"127.0.0.1", 0}; options.tls = tls;
     if (enrollment) options.listen.server_name = options.server_name = enrollment->server_name;
     options.capacity.cpu_threads = options.capacity.slots = 1;
+    pool_test::Directory farm;
+    options.local_harvester = farm.path;
+    std::filesystem::create_directory(farm.path / "config");
+    std::ofstream(farm.path / "config/config.yaml") << "self_hostname: localhost\nlogging: &logging\n  log_stdout: False\n"
+        "  log_filename: worker.log\nharvester:\n  num_threads: 1\n  plot_directories: []\n  logging: *logging\n";
+    std::ofstream(farm.path / "worker.log").close();
     WorkerService service(options); service.start();
     auto endpoint = service.endpoint();
     require(WorkerService::remote_status(endpoint, other).admission == pool::WorkerAdmission::Accepting,
@@ -294,6 +348,35 @@ void live_controls(pool::TlsOptions tls, pool::TlsOptions const& other)
     pool::Writer payload(tls.max_frame_bytes); payload.u32(1); payload.u64(0); payload.u16(0); payload.bytes({});
     payload.u16(0); payload.u16(1); payload.u32(3); payload.u64(1); payload.u64(2); payload.u64(3);
     pool::BrokerClient owner(options.broker, tls); auto session = owner.open_owner("control-inflight-codec");
+    require(!service.status().farming_pressure, "worker guessed pressure before its first local lookup");
+    auto append_lookup = [&](std::string_view seconds, unsigned count)
+    {
+        auto const epoch = std::time(nullptr); auto const local = *std::localtime(&epoch);
+        std::ofstream log(farm.path / "worker.log", std::ios::app);
+        while (count--) log << std::put_time(&local, "%Y-%m-%dT%H:%M:%S")
+            << ".000 chia.harvester.harvester: INFO     1 plots were eligible for farming challenge. Time: "
+            << seconds << " s. Total 10 plots\n";
+    };
+    auto await_offer = [&](bool pressured)
+    {
+        auto const expected = pressured ? pool::WorkerAdmission::Paused : pool::WorkerAdmission::Accepting;
+        auto const until = Clock::now() + std::chrono::seconds(5);
+        while (Clock::now() < until)
+        {
+            auto status = service.status(); auto page = owner.status();
+            if (status.farming_pressure == pressured && status.admission == expected && !page.worker_records.empty() &&
+                page.worker_records.front().admission == expected) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        throw std::runtime_error("worker failed to update its own broker offer from current harvester lookups");
+    };
+    append_lookup("6.000", 1); append_lookup("0.100", 1); await_offer(true);
+    require(WorkerService::remote_status(endpoint, other).admission == pool::WorkerAdmission::Paused,
+        "authenticated status missed the worker's temporary farming hold");
+    rejects([&] { service.generate_local(18, 2, {}, [](auto const&, auto) {}); });
+    if (enrollment) require(pool::load_worker_intent(*enrollment) == pool::WorkerIntent::Active,
+        "live farming observations overwrote saved worker intent");
+    append_lookup("0.100", 20); await_offer(false);
     pool::Task task; task.task_id = pool::random_token(); task.compatibility = worker_compatibility(pool::Kind::Pack); task.kind = pool::Kind::Pack;
     task.k = 18; task.strength = 2; task.work_units = payload.data().size(); task.chunk_count = 1; task.max_output_bytes = 4096;
     task.resources = {1, 1, add(multiply(payload.data().size(), 20), ChunkCodec::estimate_work(18, 0, 0)), 0};
@@ -666,7 +749,7 @@ void network(char const* ca, char const* cert, char const* key)
         for (size_t i = 0; i < incoming.size(); ++i)
             require(unpack(incoming[i]->finish(checked)) == reference[i], "packed lease changed member order or content");
         auto const reference_digest = members_digest(18, Members(reference), nullptr, [] {});
-        auto collect_fresh = [&](WorkerClient& source)
+        auto collect_fresh = [&](WorkerClient& source, bool ahead = true)
         {
             size_t ordinal = 0, largest_window = 0;
             uint64_t size = 0, peak = 0, budget = 0, largest = 0;
@@ -689,6 +772,7 @@ void network(char const* ca, char const* cert, char const* key)
             auto window = [&](uint64_t first, std::span<std::span<uint8_t const> const> batch, uint16_t count)
             {
                 require(!batch.empty() && batch.size() <= fresh_group_window_chunks, "fresh group receive window exceeds admission");
+                require(caller == std::this_thread::get_id(), "fresh read-ahead changed the contribution sink thread");
                 // A shared scheduler must accept owner validation after the
                 // worker releases its codec permits, including in-process.
                 if (!largest_window) client_options.cpu_scheduler->submit([] {}).get();
@@ -700,7 +784,7 @@ void network(char const* ca, char const* cert, char const* key)
                 {
                     require(!budget && digest == reference_digest, "fresh lease changed the recovery digest");
                     budget = payload; largest = max_chunk;
-                });
+                }, false, true, {}, ahead);
             require(ordinal == PlotGroupFile::getChunkCountForK(18) && largest_window > 1 && size <= budget && peak <= largest,
                 "fresh lease lost window batching, chunks or storage bounds");
             return std::array{budget, largest, size};
@@ -710,7 +794,22 @@ void network(char const* ca, char const* cert, char const* key)
         WorkerTaskObservation observation;
         local_options.observe = [&](auto const& value) { observation = value; };
         WorkerClient local(local_options);
+        bool accepted = false, stopped = false;
+        try
+        {
+            client.contributions(18, 2, ids, [](auto, auto, auto) {}, {}, {},
+                [&](auto, auto, auto) { require(accepted, "fresh window preceded manifest"); throw WorkerTaskDeclined(); },
+                [&](auto, auto, auto const&) { accepted = true; });
+        }
+        catch (WorkerTaskDeclined const&) { stopped = true; }
+        require(accepted && stopped, "fresh read-ahead lost the sink decline");
+        auto const before_serial = client.stats().generation;
+        auto const serial_manifest = collect_fresh(client, false);
+        auto const serial = client.stats().generation;
+        require(serial.frame_wait_ns - before_serial.frame_wait_ns == serial.frame_read_ns - before_serial.frame_read_ns,
+            "one-frame fresh receive prefetched without an owner grant");
         auto const remote_manifest = collect_fresh(client);
+        require(serial_manifest == remote_manifest, "fresh read-ahead changed the serial reference");
         require(collect_fresh(local) == remote_manifest, "direct and TLS fresh leases differ in bounds or size");
         auto const completed = local.stats();
         require(completed.completed_contributions == 1 && completed.local_tasks == 1 &&
@@ -867,6 +966,17 @@ void renewal_errors()
     auto const permanent = std::make_exception_ptr(std::runtime_error("invalid content or TLS identity"));
     auto kind = [](std::exception_ptr error)
     { try { std::rethrow_exception(error); } catch (std::exception const& value) { return error_kind(value); } };
+    // An automatic worker can exit with its owner while another plot still uses it.
+    std::atomic<bool> stopped{true};
+    WorkerCancellation cancel;
+    cancel.service_stop = &stopped;
+    std::exception_ptr shutdown;
+    try { cancel.check(); } catch (pool::TransientTransport const&) { shutdown = std::current_exception(); }
+    require(shutdown && kind(shutdown) == WorkerError::Transport && kind(task_failure(shutdown, permanent)) == WorkerError::Permanent,
+        "service shutdown blocked a retry or masked a renewal failure");
+    cancel.stop = &stopped;
+    try { cancel.check(); throw std::logic_error("worker ignored task cancellation"); }
+    catch (TaskCancelled const&) {}
     require(kind(task_failure(cancelled, transport)) == WorkerError::Transport &&
         kind(task_failure(cancelled, stale)) == WorkerError::Stale &&
         kind(task_failure(cancelled, permanent)) == WorkerError::Permanent &&
@@ -922,8 +1032,24 @@ void offered_cpus()
     require(cancelled_waiter, "worker CPU queue ignored cancellation");
     CpuWork reused(offered, &shared, cancel, 2);
 }
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "compute_worker_gpu_fixture.hpp"
+#endif
 int main(int argc, char** argv)
 {
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+    if (argc == 2 && std::string_view(argv[1]) == "--shared-capacity") {
+        try { worker_gpu_test::shared_capacity(); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    if (argc == 8 && std::string_view(argv[5]) == "--gpu-recovery-worker")
+    { worker_gpu_test::child = true; return run_worker_gpu_child(argv[6], argv[7]); }
+    if (argc == 2 && (std::string_view(argv[1]) == "--gpu-recovery" || std::string_view(argv[1]) == "--gpu-recovery-network"))
+    {
+        try { worker_gpu_test::recovery(std::string_view(argv[1]) == "--gpu-recovery-network"); return 0; }
+        catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+#endif
     try { scoped_threads(); packed_word_validation(); budget(); fitted_broker_budget(); retained_budget(); chunk_headers(); renewal_errors(); offered_cpus(); generation(); if (argc == 4) network(argv[1], argv[2], argv[3]);
         else if (argc == 2 && std::string_view(argv[1]) == "--network")
         { pool_test::Directory directory; auto ca = pool_test::issue(directory.path, "worker-ca");

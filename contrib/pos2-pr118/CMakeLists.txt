@@ -63,8 +63,6 @@ if(UNIX)
     endif()
 
     # Same-file construction uses the ordinary upstream v2 codec and reader.
-    # Transfer the CPU plotter's final vector instead of retaining a duplicate
-    # through return. This leaves room for a resident batch on smaller hosts.
     pos2_grow_prepare("${POS2_PR118_DIR}" grow_include)
     add_executable(pos2_pr118_grow "${XCHPLOT2_SOURCE_DIR}/src/host/GroupPlotter.cpp"
         "${XCHPLOT2_SOURCE_DIR}/tools/xchplot2/group_options.cpp" "${XCHPLOT2_SOURCE_DIR}/tools/xchplot2/group_reference.cpp" "${POS2_PR118_DIR}/src/pos/sha/sha256.c")

@@ -129,43 +129,60 @@ void bounded_coalescing()
     // transport cost must be amortized over this worker's whole window.
     uint64_t const chunk_bytes = pool::codec_chunk_header_bytes + sizeof(uint32_t) + raw.front().size() * sizeof(uint64_t);
     uint64_t const partial = pool::codec_window_header_bytes + (tasks.size() - 1) * chunk_bytes;
+    auto scheduler = std::make_shared<CodecScheduler>(1);
+    WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;
+    client_options.owner_id = "coalescing-probe"; client_options.max_task_bytes = offered.max_task_bytes;
+    client_options.cpu_scheduler = scheduler;
+    auto client = std::make_shared<WorkerClient>(client_options);
+    PoolRemoteEncoder remote(uint64_t(64) << 20, tls.max_frame_bytes,
+        offered.max_task_bytes, [&client] { return client; }, scheduler);
+    ParallelEncoder local(k, 1, uint64_t(8) << 20, scheduler);
+    std::promise<void> submitted;
+    std::future<void> calibration;
+    std::chrono::nanoseconds local_elapsed{};
+    {
+        CodecScheduler::Lease pressure(scheduler.get());
+        calibration = std::async(std::launch::async, [&]
+        {
+            auto const begin = std::chrono::steady_clock::now();
+            submitted.set_value();
+            auto blocks = local.encode(tasks, sizes);
+            local_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin);
+            remote.observe_local(k, tasks, sizes, blocks, uint64_t(local_elapsed.count()));
+        });
+        submitted.get_future().wait();
+        require(calibration.wait_for(std::chrono::seconds(1)) != std::future_status::ready,
+            "coalescing fixture escaped shared CPU pressure");
+    }
+    calibration.get();
+    require(remote.counters.calibration_windows == 1 && client->stats().completed_codec == 1,
+        "remote codec did not calibrate the complete window in one request: " + remote.last_failure());
+
+    // The speculative probe has a 250 ms ceiling. Exercise request splitting
+    // on the same measured worker with the normal admitted-window deadline.
     for (uint64_t limit : {uint64_t(1) << 20, partial, uint64_t(16) << 10})
     {
-        auto scheduler = std::make_shared<CodecScheduler>(1);
-        WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;
-        client_options.owner_id = "coalescing-" + std::to_string(limit);
-        client_options.cpu_scheduler = scheduler; client_options.max_task_bytes = limit;
-        auto client = std::make_shared<WorkerClient>(client_options);
-        PoolRemoteEncoder remote(uint64_t(64) << 20, tls.max_frame_bytes,
-            offered.max_task_bytes, [client] { return client; }, scheduler);
-        ParallelEncoder local(k, 1, uint64_t(8) << 20, scheduler);
-        std::promise<void> submitted;
-        std::future<void> calibration;
-        {
-            CodecScheduler::Lease pressure(scheduler.get());
-            calibration = std::async(std::launch::async, [&]
-            {
-                auto const begin = std::chrono::steady_clock::now();
-                submitted.set_value();
-                auto blocks = local.encode(tasks, sizes);
-                remote.observe_local(k, tasks, sizes, blocks, uint64_t(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - begin).count()));
-            });
-            submitted.get_future().wait();
-            require(calibration.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready,
-                "coalescing fixture escaped shared CPU pressure");
-        }
-        calibration.get();
+        auto options = client_options;
+        options.owner_id = "coalescing-" + std::to_string(limit);
+        options.max_task_bytes = limit;
+        options.max_window_chunks = limit == offered.max_task_bytes ? 96 : pool::default_max_codec_chunks;
+        // Make a single-chunk tail cost more than one local chunk even on a
+        // fast loopback. Both requests together still cost less than the window.
+        if (limit == partial) options.selected = [setup = local_elapsed / int64_t(tasks.size()) * 2]
+            (WorkerTaskObservation const&) { std::this_thread::sleep_for(setup); };
+        client = std::make_shared<WorkerClient>(options);
         uint64_t const per_request = std::min<uint64_t>(client->max_window_chunks(),
             (limit - pool::codec_window_header_bytes) / chunk_bytes);
         uint64_t const requests = (tasks.size() + per_request - 1) / per_request;
-        require(remote.counters.calibration_windows == 1 && client->stats().completed_codec == requests,
-            "remote calibration did not coalesce within count and serialized byte limits");
-        auto output = remote.encode(k, tasks, true);
-        require(output && output->bytes == expected && output->sizes == sizes &&
-            client->stats().completed_codec == requests * 2 && remote.counters.accepted_windows == 1,
-            "bounded coalesced remote window changed canonical content or request count");
+        for (unsigned pass = 1; pass <= 2; ++pass)
+        {
+            auto output = remote.encode(k, tasks, true);
+            require(output && output->bytes == expected && output->sizes == sizes &&
+                client->stats().completed_codec == requests * pass,
+                "bounded coalesced remote window changed canonical content or request count at " +
+                std::to_string(limit) + " bytes (completed " + std::to_string(client->stats().completed_codec) +
+                " of " + std::to_string(requests * pass) + " requests, " + remote.last_failure() + ")");
+        }
     }
 }
 
@@ -181,6 +198,8 @@ void integration(uint8_t k)
     RunningBroker broker(broker_options);
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(256) << 20, 0}; offered.max_task_bytes = uint64_t(1) << 20;
+    // Both windows must fit at once, even when other jobs are using the CI runner.
+    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
     WorkerService service(offered); service.start();
     auto scheduler = std::make_shared<CodecScheduler>(1);
     WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;
@@ -273,7 +292,9 @@ void integration(uint8_t k)
         auto a = first_window.get(), b = second_window.get();
         { std::lock_guard lock(selection_mutex); parallel = false; }
         require(a && b && a->bytes == expected && b->bytes == expected && waiting == 2,
-            "independent remote codec windows did not run concurrently");
+            "independent remote codec windows did not run concurrently (k=" + std::to_string(k) +
+            ", selected=" + std::to_string(waiting) + ", returned=" + std::to_string(bool(a) + bool(b)) +
+            ", " + remote->last_failure() + ")");
     }
 
     unsigned initialized = 0;
@@ -340,6 +361,9 @@ void integration(uint8_t k)
             "optional codec probe waited for the generation timeout after local bytes were ready");
         ParallelEncoder fallback(k, 1, uint64_t(8) << 20, scheduler);
         auto blocks = fallback.encode(tasks, sizes);
+#if defined(_WIN32) || defined(CLOCK_THREAD_CPUTIME_ID)
+        require(fallback.cpu_time().measured, "local codec work supplied no thread CPU time");
+#endif
         for (unsigned window = 0; window < 127; ++window)
             optional->observe_local(k, tasks, sizes, blocks, 1000000);
         require(optional->counters.calibration_attempts.load() == 1 && optional->counters.failed_windows.load() == 1 &&

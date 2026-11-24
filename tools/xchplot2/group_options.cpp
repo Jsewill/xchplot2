@@ -50,6 +50,13 @@ void resolve_group_devices(pos2gpu::GroupOptions& result)
     if (result.devices.empty()) return;
     pos2gpu::BatchOptions selection;
     require(pos2gpu::parse_devices_arg(result.devices, selection), "invalid --devices selection");
+    // Backend-wide selectors also describe remote-only work on a machine
+    // with no matching local GPU, or with several NUMA nodes.
+    if (!result.automatic_local_compute && result.compute_mode != "off" && selection.device_ids.empty() && selection.cpu_node_ids.empty())
+    {
+        result.backend = selection.use_all_devices ? (selection.cpu_selected() ? "auto" : "gpu") : "cpu";
+        result.backend_set = true; return;
+    }
     // A single explicit GPU keeps the existing deferred admission: saved
     // plans and publication-only recovery need not initialize that device.
     if (!selection.use_all_devices && !selection.cpu_selected() && selection.device_ids.size() == 1)
@@ -92,7 +99,17 @@ void resolve_group_devices(pos2gpu::GroupOptions& result)
     }
     if (selection.cpu_selected())
     {
-        auto const nodes = pos2gpu::host_numa_nodes();
+        auto nodes = pos2gpu::host_numa_nodes();
+        auto const inherited = pos2gpu::current_thread_cpus();
+        if (!inherited.empty())
+        {
+            for (auto& node : nodes)
+            {
+                if (node.cpus.empty()) node.cpus = inherited;
+                else std::erase_if(node.cpus, [&](int cpu) { return !std::binary_search(inherited.begin(), inherited.end(), cpu); });
+            }
+            std::erase_if(nodes, [](auto const& node) { return node.cpus.empty(); });
+        }
         if (selection.use_all_cpu_nodes)
             for (auto const& node : nodes) devices.push_back({pos2gpu::cpu_device_id(node.node_id), "auto", node.cpus});
         else for (int id : selection.cpu_node_ids)
@@ -262,6 +279,28 @@ void reference_help()
 
 void pos2gpu::configure_group_compute(GroupOptions& result)
 {
+#ifdef XCHPLOT2_GROUP_COMMANDS
+    require(result.automatic_local_compute || (result.local_devices.empty() && result.producer_cpu_affinity.empty() &&
+        result.replot_gpu_devices.empty()), "--compute-local off conflicts with selected local devices");
+    if (!result.local_devices.empty() && (result.replot || (!result.from_plan.empty() &&
+        group_grow::farm::inventory_detail::is_replot_review(result.from_plan))))
+    {
+        // A directory resume can discover its private review after parsing.
+        // Rebuild the original combined budget before applying the reviewed
+        // single producer / authenticated local service allowance.
+        restore_group_compute_request(result);
+        for (auto& selected : result.local_devices)
+        {
+            if (is_cpu_device(selected.device))
+                result.producer_cpu_affinity.insert(result.producer_cpu_affinity.end(), selected.cpu_affinity.begin(), selected.cpu_affinity.end());
+            else result.replot_gpu_devices.push_back(std::move(selected));
+        }
+        // A fresh adaptive review starts with one of the nominated cards.
+        // Existing reviews resolve the physical identity within the full list.
+        if (!result.replot_gpu_devices.empty()) result.device = uint64_t(result.replot_gpu_devices.front().device);
+        result.local_devices.clear();
+    }
+#endif
     if (result.compute_requested) return;
     auto const& command = result.command;
     bool const farm_command = command == "fill" || command == "plan";
@@ -270,6 +309,7 @@ void pos2gpu::configure_group_compute(GroupOptions& result)
     result.compute_requested_backend = result.backend;
 #ifdef XCHPLOT2_GROUP_COMMANDS
     if (result.save_profile.empty() || !result.local_devices.empty() || result.replot) prepare_group_compute(result);
+    if (result.local_compute && !result.workers) result.workers = std::max(1u, group_grow::profile_detail::logical_cpus());
 #endif
     bool const pool_options = !result.pool_owner.empty() || !result.pool_ca.empty() || !result.pool_cert.empty() ||
         !result.pool_key.empty() || !result.pool_listen.empty() || !result.pool_advertise.empty() ||
@@ -281,7 +321,7 @@ void pos2gpu::configure_group_compute(GroupOptions& result)
 #if !defined(GROW_POOL_NETWORK) || !GROW_POOL_NETWORK
         require(false, "network compute is unavailable in this build");
 #endif
-        require(result.local_compute || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
+        require(result.pool_broker.empty() || (!result.pool_owner.empty() && result.pool_owner.size() <= 128 &&
             !result.pool_ca.empty() && !result.pool_cert.empty() && !result.pool_key.empty()),
             command.empty() ? "network compute requires a stable --pool-owner-id and mutual TLS credentials" : "network compute requires a stable --compute-owner-id and mutual TLS credentials");
         require(result.fixtures.empty(), "network compute cannot use fixture inputs");
@@ -588,6 +628,15 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
                 result.farming_profile_path = result.farming_detect_local ? fs::path{} : path(value);
                 result.farming_profile_set = true;
             }
+            else if (key == "--harvester-log")
+            {
+                require((command == "fill" || command == "plan") && !value.empty() && i + 1 < argc && *argv[i + 1],
+                    "--harvester-log requires a fill destination and a forwarded log file");
+                require(result.harvester_logs.size() < 1024, "too many harvester log bindings");
+                auto const& binding = result.harvester_logs.emplace_back(path(value), path(argv[++i]));
+                group_grow::farm::inventory_detail::bounded_text(group_grow::file_io::path_text(binding.first));
+                group_grow::farm::inventory_detail::bounded_text(group_grow::file_io::path_text(binding.second));
+            }
             else if (key == "--chia-root") { result.chia_root = path(value); result.chia_root_set = true; }
             else if (key == "--chia-executable") { result.chia_executable = path(value); result.chia_executable_set = true; }
             else if (key == "--relocate")
@@ -886,6 +935,12 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
         "sampled migration verification requires a nonzero first or periodic group count");
     require(result.farm_adapter == "chia" || result.replot || !result.from_plan.empty(),
         "native farm adapters require inventory, replot review or a saved migration plan");
+    require(result.harvester_logs.empty() || (!result.replot && !result.inventory && !result.replot_status &&
+        !result.assess_jobs && !result.metadata_only && !result.calibrate &&
+        (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
+        "--harvester-log requires an ordinary fill or fill plan");
+    std::sort(result.harvester_logs.begin(), result.harvester_logs.end());
+    result.harvester_logs.erase(std::unique(result.harvester_logs.begin(), result.harvester_logs.end()), result.harvester_logs.end());
     require(!result.farm_adapter_timeout_set || result.replot ||
         (farm_command && !result.from_plan.empty() && group_grow::farm::inventory_detail::is_replot_review(result.from_plan)),
         "--farm-adapter-timeout-ms requires inventory, replot review or a saved migration plan");
@@ -993,9 +1048,6 @@ pos2gpu::GroupOptions pos2gpu::parse_group_options(int argc, char** argv, std::s
     require(!result.meta || *result.meta <= 255, "invalid collection number");
     load_harvester_profile(result);
     resolve_group_devices(result);
-    require(result.local_devices.empty() || (!result.replot &&
-        (result.from_plan.empty() || !group_grow::farm::inventory_detail::is_replot_review(result.from_plan))),
-        "migration uses its reviewed single-producer resources; select --backend cpu or --devices gpuN for migration");
     if (result.save_profile.empty() || !result.local_devices.empty()) configure_group_compute(result);
     else { auto checked = result; configure_group_compute(checked); }
     if (result.directory_farm && !farm_command)

@@ -68,7 +68,7 @@ std::vector<GpuDeviceInfo> list_gpu_devices() { return {}; }
 std::string plot_to_file(GpuPlotOptions const& options, std::string const&)
 { last_test_options = options; return {}; }
 std::vector<std::string> worker_labels(std::vector<int> const& d) { return std::vector<std::string>(d.size(), "test"); }
-size_t batch_worker_count(BatchOptions const&, int) { return 1; }
+size_t batch_worker_count(BatchOptions const&, int, int) { return 1; }
 BatchResult run_batch(std::vector<BatchEntry> const& entries, BatchOptions const& opts)
 {
     ++batch_calls; last_options = opts; last_entries = entries;
@@ -563,7 +563,9 @@ int main(int argc, char** argv)
     assert(last_group_options.destination_temp == "off" && last_group_options.destination_temp_set);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--destination-temp", "on"}) == 0);
     assert(last_group_options.destination_temp == "on" && last_group_options.destination_temp_set);
-    put(config, "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=\"" + dir.string() + "\"\n");
+    std::ostringstream fill_config;
+    fill_config << "[fill]\nplan-only=true\nmax-host-ram=\"512M\"\ntemp-dir=" << std::quoted(dir.string()) << '\n';
+    put(config, fill_config.str());
     assert(cli({"fill", dir.string(), "--config", config.string()}) == 0);
     assert(last_group_options.destination_temp == "off" && !last_group_options.destination_temp_set &&
         last_group_options.temporary == std::vector<std::filesystem::path>{dir});
@@ -842,6 +844,16 @@ int main(int argc, char** argv)
     assert(cli({"fill", "--config", config.string(), "-D", other.string()}) != 0);
     assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only", "--no-json"}) == 0);
     assert(!last_group_options.plan_only && !last_group_options.json);
+    auto const forwarded = dir / "forwarded harvester.log", second = other / "reader.log";
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--no-plan-only",
+        "--harvester-log", dir.string(), forwarded.string(), "--harvester-log", other.string(), second.string()}) == 0);
+    assert(last_group_options.harvester_logs == (decltype(last_group_options.harvester_logs){{dir, forwarded}, {other, second}}) &&
+        !last_group_options.farming_profile);
+    assert(cli({"plan", dir.string(), "--config", config.string(), "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.harvester_logs.size() == 1);
+    assert(cli({"fill", dir.string(), "--config", config.string(), "--plan-only", "--harvester", "local",
+        "--harvester-log", dir.string(), forwarded.string()}) == 0);
+    assert(last_group_options.plan_only && last_group_options.farming_detect_local && last_group_options.harvester_logs.size() == 1);
     auto const argfile = dir / "group.args";
     put(argfile, "--group-members 3\n--max-host-ram 768M\n");
     assert(cli({"plan", dir.string(), "--config", config.string(), "@" + argfile.string()}) == 0);

@@ -23,6 +23,7 @@ struct ComputeInspection
         std::string identity, instance, host, gpu_identity, admission;
         uint64_t cpus = 0, slots = 0, host_bytes = 0, gpu_bytes = 0, standing_host_bytes = 0;
         uint64_t logical_cpus = 0, total_host_bytes = 0, available_host_bytes = 0, total_gpu_bytes = 0, capabilities = 0, observed_at_unix_ms = 0;
+        std::string gpu_recovery;
     };
     struct Broker { std::string identity, host; };
     std::string status = "not-queried", reason, next_action, unknowns, discovery = "not-queried";

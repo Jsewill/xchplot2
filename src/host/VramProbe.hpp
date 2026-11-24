@@ -1,4 +1,4 @@
-// VramProbe.hpp — validation for a Level Zero Sysman memory reading.
+// VramProbe.hpp — validation for device memory budget and usage readings.
 //
 // Header-only and free of SYCL/CUDA/Level Zero so vram_probe_test can exercise
 // it on any machine. That is the entire point: the code it guards runs only on
@@ -20,10 +20,33 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <optional>
 
 namespace pos2gpu {
+
+inline std::optional<unsigned> windows_hip_worker_node(std::uint32_t mask, unsigned node_count)
+{
+    if (!mask && node_count == 1) return 0;
+    if (!std::has_single_bit(mask)) return {};
+    auto const node = static_cast<unsigned>(std::countr_zero(mask));
+    if (node >= node_count) return {};
+    return node;
+}
+
+// Windows HIP reports allocations by the current process. A worker also has to
+// fit its WDDM process budget and the remaining dedicated memory on this adapter.
+inline std::uint64_t windows_hip_worker_headroom(std::uint64_t hip_free,
+    std::uint64_t budget, std::uint64_t process_used, std::uint64_t dedicated, std::uint64_t adapter_used, std::uint64_t resident = 0)
+{
+    // Only usage attributable to this process can be subtracted from the
+    // whole adapter. WDDM residency can be below logical USM allocations.
+    resident = std::min({resident, process_used, adapter_used});
+    process_used -= resident; adapter_used -= resident;
+    if (process_used >= budget || adapter_used >= dedicated) return 0;
+    return std::min({hip_free, budget - process_used, dedicated - adapter_used});
+}
 
 struct VramReading {
     // In the ALLOCATABLE space: what the runtime will actually hand out.
