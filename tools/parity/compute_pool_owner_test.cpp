@@ -77,9 +77,8 @@ void failed_successor_publication(grow_controller_test::Arguments args, fs::path
     WorkerService& original, WorkerConfig replacement)
 {
     using namespace grow_controller_test;
-    // The already-authenticated worker stops admitting work during the
-    // next group's speculative receipt. Every foreground retry must return
-    // through the broker after the first file has published.
+    // Withdraw the original worker if the next signed grant arrives before
+    // publication. Later foreground work must use the still-admitted worker.
     WorkerService survivor(replacement);
     args.target = root / "refused-successor"; fs::create_directory(args.target);
     args.command = "fill"; args.directory_farm = true; args.construction = "incremental";
@@ -96,17 +95,21 @@ void failed_successor_publication(grow_controller_test::Arguments args, fs::path
     {
         auto const attempt = ++selected;
         if (attempt == 1) return;
-        bool const published = fs::exists(first);
-        if (!published) ++before_publication;
-        else if (admission.worker.identity != worker) ++after_publication;
-        if (attempt == 2)
+        if (fs::exists(first))
         {
-            original.control(WorkerControl::Pause); survivor.start();
-            throw WorkerAdmissionRejected("declined provisional executor");
+            // A short predecessor write can finish before a speculative grant.
+            auto const expected = before_publication ? survivor.status().identity : worker;
+            require(admission.worker.identity == expected, "successor used an unexpected foreground executor");
+            ++after_publication;
+            return;
         }
+        ++before_publication;
+        original.control(WorkerControl::Pause); survivor.start();
+        throw WorkerAdmissionRejected("declined provisional executor");
     };
-    require(run_farming(args) == 0 && before_publication == 1 && after_publication == 1,
-        "a failed speculative receipt lost its predecessor or bypassed ordered admission on the surviving worker");
+    require(run_farming(args) == 0 && before_publication <= 1 && after_publication == 1 &&
+        selected == 2 + before_publication,
+        "successor admission lost its predecessor or skipped the surviving executor");
     args.compute_admit_task = {}; args.generation_overlap = false;
     args.target = root / "ordinary-successor"; fs::create_directory(args.target);
     require(run_farming(args) == 0, "ordinary successor reference failed");
@@ -404,6 +407,22 @@ void repartition_and_global_admission()
         input.reset();
         require(cancelled && !next.engine->external->committed_member_count(), "cancelled provisional input changed the successor");
         cancel.store(false);
+        // Hold the predecessor's real writer lease while the normal speculative
+        // receiver obtains and declines a signed grant, independent of disk speed.
+        Backend refusing; refusing.mode = "pool"; refusing.cpu_scheduler = backend.cpu_scheduler;
+        refusing.pool_client_config = backend.pool_client_config;
+        refusing.pool_client_config.owner_id += "-refused-successor";
+        bool refused = false;
+        refusing.pool_client_config.admit_task = [&](WorkerTaskAdmission const& admission)
+        {
+            refused = !admission.local_fallback && admission.worker.identity == worker.status().identity &&
+                admission.owner_id == refusing.pool_client_config.owner_id && !admission.broker_identity.empty();
+            throw WorkerAdmissionRejected("declined provisional executor");
+        };
+        auto declined = receive_successor_contributions(next, args, refusing, producer.fixed, 0, wake, cancel, input);
+        require(!declined.get().members && refused && old && next.io && !next.engine->external->committed_member_count(),
+            "declined signed successor escaped its predecessor or retained a provisional member");
+        input.reset();
         auto receiving = receive_successor_contributions(next, args, backend, producer.fixed, 0, wake, cancel, input);
         auto const received = receiving.get();
         require(received.members == batch && received.peak <= args.max_ram && !next.engine->external->committed_member_count(),
