@@ -680,13 +680,13 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     second.mkdir()
     options = [first, second, "-k", 18, "--strength", 4, "--group-members", 8, "--max-groups", 1,
                "--max-total-members", 8, "--leave-free", 0, "--destination-temp", "off"]
-    forecast = json.loads(run("plan", *options, "--capacity-bytes", "8M", "--json").stdout)
+    forecast = json.loads(run("plan", *options, *runtime, "--capacity-bytes", "8M", "--json").stdout)
     # This deterministic strength/meta cohort packs below the next forecast
     # boundary. Keep the independently reserved metadata outside its tested
     # plot-byte budget, including when a platform rounds that metadata up.
     for _ in range(3):
         capacity = 10212432 + 2 * forecast["manifest_reserved_bytes"]
-        assessed = json.loads(run("plan", *options, "--capacity-bytes", capacity, "--json").stdout)
+        assessed = json.loads(run("plan", *options, *runtime, "--capacity-bytes", capacity, "--json").stdout)
         if assessed["manifest_reserved_bytes"] == forecast["manifest_reserved_bytes"]:
             forecast = assessed
             break
@@ -694,17 +694,18 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     else:
         raise AssertionError("beyond-forecast fixture metadata reservation did not settle")
     options += ["--capacity-bytes", capacity]
-    initial = forecast["destinations"][1]
-    assert 0 < initial["members"] < 8 and initial["allocation_grant_members"] > initial["members"]
     run("fill", *options, "--seed", SEED, "-f", FARMER, "--pool-ph", POOL, *runtime,
         "--quiet", point="initialized", code=86)
     original = private_record(first, "grow-farm.plan").read_bytes()
+    prepared = json.loads(run("plan", "--metadata-only", "--manifest", private_record(first, "grow-farm.plan"), "--json").stdout)
+    initial = next(item for item in prepared["destinations"] if item["directory"] == str(second))
+    assert 0 < initial["forecast_members"] < initial["allocation_grant_members"] <= 8, initial
     offline_outputs = {path.name: digest(path) for path in [*first.glob("*.gplot"), *first.glob("*.gplot.partial")]}
     first.rename(offline)
     try:
         run("fill", "--resume", "--allow-missing", second, *runtime, "--quiet", code=4)
         completed = sum(header(path)[3] for path in second.glob("*.gplot"))
-        assert completed > initial["members"] and completed <= initial["allocation_grant_members"]
+        assert initial["forecast_members"] < completed <= initial["allocation_grant_members"], (initial, completed)
         assert private_record(second, "grow-farm.plan").read_bytes() == original
         assert private_record(offline, "grow-farm.plan").read_bytes() == original
         status = json.loads(run("status", second, "--inspect", "--json", code=2).stdout)
@@ -718,14 +719,17 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     for path in [*first.glob("*.gplot"), *second.glob("*.gplot")]:
         verify(path)
     progress_review = root / "beyond forecast saved progress.plan"
-    run("plan", second, "--save-plan", progress_review)
+    current = json.loads(run("plan", second, "--save-plan", progress_review, "--json").stdout)
     saved_progress = json.loads(run("plan", "--metadata-only", progress_review, "--json").stdout)
     assert saved_progress["recovery"]["saved_unsealed_members"] == 0
     admitted = sum(item["admitted_members"] for item in saved_progress["destinations"])
     actual = sum(header(path)[3] for destination in (first, second) for path in destination.glob("*.gplot"))
     assert admitted == actual
     saved_available = next(item for item in saved_progress["destinations"] if item["directory"] == str(second))
-    assert saved_available["count_scope"] == "layout-forecast" and saved_available["admitted_members"] > saved_available["forecast_members"]
+    current_available = next(item for item in current["destinations"] if item["directory"] == str(second))
+    assert saved_available["count_scope"] == current_available["count_scope"] == "layout-forecast"
+    assert saved_available["forecast_members"] == current_available["forecast_members"], (saved_available, current_available)
+    assert saved_available["admitted_members"] == sum(header(path)[3] for path in second.glob("*.gplot")) >= completed
 
     retired = root / "retired member returns"
     retired.mkdir()
