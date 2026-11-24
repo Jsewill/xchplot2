@@ -502,8 +502,9 @@ each extracted archive on its matching runtime. On ARM64, build the same
 Containerfile with `--build-arg BASE_IMAGE=ubuntu:26.04`; Ubuntu 26.04 supplies
 ARM64 HIP packages, and the image builds the Level Zero loader from source.
 CUDA 12.9's math declarations are adjusted for the newer glibc so the
-release retains pre-Turing code generation. The ARM64 application uses
-GCC 11 because NVCC cannot parse GCC 14's NEON header.
+release retains pre-Turing code generation. The application uses the system
+C++ compiler for C++20 support. On ARM64, NVCC uses GCC 11 for its compatible
+NEON headers.
 ARM64 includes every numeric CUDA GPU architecture reported by its compiler.
 The pinned LLVM 20 SYCL compiler uses compatible PTX targets for newer NVIDIA
 GPUs via `ci/release/adaptivecpp-cuda-llvm20.patch`. This release-only patch

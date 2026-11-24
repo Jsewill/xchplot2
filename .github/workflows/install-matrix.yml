@@ -97,6 +97,9 @@ jobs:
             container:
               - '{Containerfile,.dockerignore}'
               - 'src/gpu/**'
+              # The host side of POS2_GPU_SYCL_SRC uses the same backend compilers.
+              - 'src/host/{GpuBufferPool,GpuPipeline,HostPinnedPool,TempFile}.{cpp,hpp}'
+              - 'src/host/{GpuCleanup,HostGuard,MultiGpuShardBufferPool,PoolSizing,Spill*,Vram*}.hpp'
               - 'tools/parity/{plot_file_parity,sycl_sort_parity,sycl_bucket_offsets_parity,sycl_g_x_parity}.cpp'
       - name: Select clean installs
         id: matrix
