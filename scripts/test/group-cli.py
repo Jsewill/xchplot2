@@ -807,8 +807,9 @@ def check_farm_membership_lifecycle(run, command, verify, root):
     still_retired = next(item for item in returned["destinations"] if item["directory"] == str(member))
     assert still_retired["capacity_bytes"] == frozen_quota and still_retired["membership"] == "detached"
     for destination in added:
-        for path in destination.glob("*.gplot"):
-            verify(path)
+        path, = destination.glob("*.gplot")
+        assert header(path)[3] == 1
+        verify(path)
 
     controlled = root / "resume starts idle work"
     controlled.mkdir()

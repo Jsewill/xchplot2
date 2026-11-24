@@ -24269,13 +24269,21 @@ int run_farming(Arguments args)
         {
             if (cancelled && cancelled()) return true;
             if (noticed->load()) return true;
-            auto const now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto now_ms = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(); };
             auto next = next_check->load();
-            if (now >= next && next_check->compare_exchange_strong(next, now + 500))
+            // A slow mailbox scan must leave time for construction to run.
+            // Only one caller inspects the farm, even when a scan takes longer than the interval.
+            if (now_ms() >= next && next_check->compare_exchange_strong(next, INT64_MAX))
             {
-                if (available(*watched, bindings) != present) noticed->store(true);
-                else if (farming_runtime_bindings(*watched, bindings, discovery_scopes, cancelled) != bindings) noticed->store(true);
-                else if (boundary_pending(bindings, present)) noticed->store(true);
+                try
+                {
+                    if (available(*watched, bindings) != present ||
+                        farming_runtime_bindings(*watched, bindings, discovery_scopes, cancelled) != bindings ||
+                        boundary_pending(bindings, present)) noticed->store(true);
+                }
+                catch (...) { next_check->store(0); throw; }
+                next_check->store(now_ms() + 500);
             }
             return (cancelled && cancelled()) || noticed->load();
         };
