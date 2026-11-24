@@ -2510,13 +2510,16 @@ def check_replot(binary, root, reference=None):
     # The caller's large memory grant must survive public serialization too.
     large_root = directory / "large inventory"
     large_root.mkdir()
+    # Long names keep the plan above 16 MiB even when the filesystem omits export handles.
     for index in range(18000):
-        (large_root / f"entry-{index:05d}").touch()
+        (large_root / f"entry-{index:0128d}").touch()
     large_before = snapshot(large_root)
     large_file = directory / "large inventory.plan"
     large = run("plan", "--inventory", large_root, "-M", "16G", "--save-plan", large_file, "--json")
     large_catalog = json.loads(large.stdout)
-    assert len(large_catalog["plots"]) == 18000 and len(large_file.read_bytes()) > 16 * 1024 * 1024
+    assert len(large_catalog["plots"]) == 18000, len(large_catalog["plots"])
+    saved_bytes = large_file.stat().st_size
+    assert saved_bytes > 16 * 1024 * 1024, saved_bytes
     assert snapshot(large_root) == large_before, "large inventory serialization changed its source entries"
 
     def private_replot_farm(path):
