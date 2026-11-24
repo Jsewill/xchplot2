@@ -717,15 +717,13 @@ void native_cpu_budget()
     Backend backend; backend.mode = "cpu";
     backend.cpu_scheduler = std::make_shared<CodecScheduler>(1);
     auto const requested = identity_from(identity());
-    auto const original = worker_detail::cpu_threads();
-    std::atomic<bool> started{false}, observed{false}, escaped{false};
+    std::thread::id producer;
+    std::atomic<bool> started{false}, escaped{false}, released{false};
+    std::atomic<unsigned> generation_checks{0};
     args.cancelled = [&]
     {
-        if (worker_detail::cpu_limit)
-        {
-            observed.store(true);
-            if (worker_detail::cpu_threads() != 1) escaped.store(true);
-        }
+        if (std::this_thread::get_id() != producer) escaped.store(true);
+        if (released.load()) ++generation_checks;
         return false;
     };
     std::future<Member> generated;
@@ -733,16 +731,19 @@ void native_cpu_budget()
         CodecScheduler::Lease occupied(backend.cpu_scheduler.get());
         generated = std::async(std::launch::async, [&]
         {
+            producer = std::this_thread::get_id();
             started.store(true);
             return backend.generate(requested, 0, args, nullptr, nullptr);
         });
         while (!started.load()) std::this_thread::yield();
-        require(generated.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready && !observed.load(),
+        require(generated.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready,
             "native CPU generation escaped the shared plotting budget");
+        released.store(true);
     }
     auto output = generated.get();
-    require(output.size() && observed.load() && !escaped.load() && worker_detail::cpu_threads() == original,
-        "native CPU generation lost its scoped allowance or leaked it into the caller");
+    require(output.size() && generation_checks.load() > 1 && !escaped.load(),
+        "native CPU generation used a thread outside its one-lane grant");
+    { CodecScheduler::Lease reclaimed(backend.cpu_scheduler.get()); }
     args.cancelled = [] { return true; };
     bool interrupted = false;
     try { (void)backend.generate(requested, 0, args, nullptr, nullptr); }

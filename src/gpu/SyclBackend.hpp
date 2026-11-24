@@ -82,16 +82,9 @@ inline auto queue_error_handler()
 // a queue bound to the requested device. Sentinel values:
 //   kDefaultGpuId (-1)  : sycl::gpu_selector_v (single-device default,
 //                         pre-multi-GPU zero-config path)
-//   kCpuDeviceId  (-2)  : AdaptiveCpp's OpenMP host device. NOT latent — it is
-//                         live behind XCHPLOT2_SYCL_CPU_BENCH=1, which A/Bs our
-//                         SYCL kernels on the CPU against pos2-chip's hand-tuned
-//                         CPU plotter. Production --cpu / --devices cpu plotting
-//                         bypasses this and dispatches straight to
-//                         run_one_plot_cpu() (see CpuPlotter.cpp), because
-//                         pos2-chip wins that A/B by 4.3x at k=22 on a 5950X
-//                         (0.95 s/plot vs 4.10): our kernels are GPU kernels —
-//                         written for tens of thousands of threads and coalesced
-//                         access — and they do not transpose to 32 CPU threads.
+//   kCpuDeviceId  (-2)  : AdaptiveCpp's OpenMP host device when exercising the
+//                         SYCL kernels with XCHPLOT2_SYCL_CPU_BENCH=1. Normal
+//                         CPU workers call the native C++ generator.
 //   0..N-1              : explicit GPU index from
 //                         sycl::device::get_devices(gpu)
 //

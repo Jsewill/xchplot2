@@ -5,9 +5,10 @@
 #include "host/GroupCodec.hpp"
 #include "host/GroupWriter.hpp"
 #include "host/ComputeThreads.hpp"
+#include "host/CpuTables.hpp"
 #include "host/GroupFarmResources.hpp"
-#include "plot/Plotter.hpp"
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+#include "plot/Plotter.hpp"
 #include "gpu/SyclDeviceList.hpp"
 #include "gpu/AsyncErrorLog.hpp"
 #include "host/WorkerGpuProcess.hpp"
@@ -241,8 +242,8 @@ PlotProofParams parameters(uint8_t k, uint8_t strength, std::array<uint8_t, 32> 
 }
 uint64_t fragment_count_bound(uint8_t k, uint8_t strength)
 {
-    auto const params = parameters(k, strength);
-    return multiply(max_pairs_per_section_possible(params), params.get_num_sections());
+    (void)parameters(k, strength);
+    return pos2gpu::cpu::member_bound(k);
 }
 uint64_t boundary_bytes(uint8_t k)
 { return multiply(add(PlotGroupFile::getChunkCountForK(k), 1), sizeof(uint32_t)); }
@@ -487,6 +488,7 @@ struct OwnedChunk
     std::vector<std::vector<uint64_t>> members;
 };
 
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
 struct CancelProgress final : IProgressSink
 {
     WorkerCancellation cancel;
@@ -499,6 +501,7 @@ struct CancelProgress final : IProgressSink
             Clock::now() < cancel.deadline;
     }
 };
+#endif
 
 std::vector<OwnedChunk> read_chunks(pool::Reader& in, unsigned maximum, uint64_t max_bytes,
                                   uint32_t expected_count = 0)
@@ -610,9 +613,25 @@ uint64_t worker_service_baseline_bytes(WorkerConfig const& config)
 #endif
     return result;
 }
-uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength)
+uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength, unsigned threads)
 {
-    auto const params = parameters(k, strength);
+    (void)parameters(k, strength);
+    return pos2gpu::cpu::worker_peak(k, threads);
+}
+uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes, unsigned threads)
+{
+    using namespace worker_detail;
+    require(members && members <= pool::max_generation_batch_members, "invalid CPU worker task membership");
+    return add(add(add(worker_cpu_generation_bytes(k, strength, threads),
+        multiply(multiply(fragment_count_bound(k, strength), sizeof(uint64_t)), members - 1)),
+        multiply(boundary_bytes(k), members)), transport_bytes);
+}
+
+#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
+namespace {
+uint64_t reference_canary_bytes()
+{
+    auto const params = parameters(18, 2);
     uint64_t const section_pairs = max_pairs_per_section_possible(params);
     uint64_t const pairs = multiply(section_pairs, params.get_num_sections());
     uint64_t const element = std::max({sizeof(WorkerReferenceXsCandidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing)});
@@ -625,17 +644,7 @@ uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength)
 #endif
     return add(add(layout, multiply(pairs, sizeof(uint64_t) * copies)), 128 * mib);
 }
-uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes)
-{
-    using namespace worker_detail;
-    require(members && members <= pool::max_generation_batch_members, "invalid CPU worker task membership");
-    return add(add(add(worker_cpu_generation_bytes(k, strength),
-        multiply(multiply(fragment_count_bound(k, strength), sizeof(uint64_t)), members - 1)),
-        multiply(boundary_bytes(k), members)), transport_bytes);
-}
 
-#if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
-namespace {
 template<size_t N> void gpu_text(char (&dest)[N], std::string_view value)
 {
     require(value.size() < N && value.find(char(0)) == value.npos, "invalid GPU executor identity or tier");
@@ -1575,7 +1584,7 @@ struct WorkerService::Impl
         retained_gpu_host.store(gpu_retained.bytes); idle_generation_bytes.store(0);
     }
 #endif
-    uint64_t generation_host_bytes(uint8_t k, uint8_t strength, size_t members, bool use_gpu, uint64_t retained) const
+    uint64_t generation_host_bytes(uint8_t k, uint8_t strength, size_t members, bool use_gpu, uint64_t retained, unsigned threads) const
     {
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (use_gpu)
@@ -1589,7 +1598,7 @@ struct WorkerService::Impl
             return gpu_generation_host_bytes(*selected,k,strength,members,retained,bool(gpu_recovery.load()));
         }
 #endif
-        return worker_cpu_task_bytes(k, strength, members, config.max_task_bytes);
+        return worker_cpu_task_bytes(k, strength, members, config.max_task_bytes, threads);
     }
     std::vector<pool::GenerationProfile> profiles(pool::Resources const& capacity, uint64_t standing) const
     {
@@ -1603,7 +1612,7 @@ struct WorkerService::Impl
                 pool::GenerationProfile cpu; cpu.kind = pool::Kind::GenerateCpu; cpu.k = k; cpu.strength = strength;
                 cpu.cpu_threads = std::min(config.generation_threads, capacity.cpu_threads);
                 cpu.resources = {cpu.cpu_threads, 1,
-                    add(add(worker_cpu_generation_bytes(k, strength), boundary_bytes(k)), config.max_task_bytes), 0};
+                    add(add(worker_cpu_generation_bytes(k, strength, cpu.cpu_threads), boundary_bytes(k)), config.max_task_bytes), 0};
                 cpu.member_host_bytes = add(raw, boundary_bytes(k));
                 cpu.max_batch_members = config.max_batch_members;
                 result.push_back(cpu);
@@ -1703,11 +1712,11 @@ struct WorkerService::Impl
         // Native preflight itself can lose the device. The fresh child reports
         // its measured host requirement before allocating any generation tables.
         auto const initial_bytes = initial != gpu_profiles.end() ? child_host_bytes(initial->second,18,2) :
-            add(GpuProducer::runtime_host_allowance_bytes(), worker_cpu_generation_bytes(18,2));
+            add(GpuProducer::runtime_host_allowance_bytes(), reference_canary_bytes());
         auto const child_bytes = std::max(initial_bytes, probe_host_bytes);
         auto const raw = multiply(fragment_count_bound(18,2), sizeof(uint64_t));
         auto const peak = sample ? add(worker_gpu::mapping_size(1), GpuProducer::runtime_host_allowance_bytes()) :
-            add(worker_gpu::header_bytes, std::max(child_bytes, add(raw,worker_cpu_generation_bytes(18,2))));
+            add(worker_gpu::header_bytes, std::max(child_bytes, add(raw,reference_canary_bytes())));
         WorkerCancellation reserve = cancel;
         reserve.deadline = std::min(reserve.deadline, begin + std::chrono::milliseconds(200));
         try {
@@ -1917,7 +1926,7 @@ struct WorkerService::Impl
 #endif
         unsigned const threads = grant ? grant->cpu_threads : std::min(config.generation_threads, current_capacity().cpu_threads);
         require(threads && threads <= config.capacity.cpu_threads, "generation CPU allowance exceeds worker offer");
-        uint64_t const dynamic_peak = generation_host_bytes(k, strength, retained_members, use_gpu, prior_retained);
+        uint64_t const dynamic_peak = generation_host_bytes(k, strength, retained_members, use_gpu, prior_retained, threads);
         if (grant && dynamic_peak > grant->host_bytes)
         {
             if (use_gpu)
@@ -2259,10 +2268,8 @@ struct WorkerService::Impl
                 {
                     cancel.check();
                     CpuWork compute(offered_cpu, scheduler.get(), cancel, threads, true);
-                    worker_detail::CpuLimit limit(compute.threads());
-                    WorkerReferencePlotter::Options options{}; options.validate = false; options.verbose = false;
-                    CancelProgress progress(cancel); options.sink = &progress;
-                    owned.push_back(WorkerReferencePlotter(parameters(k, strength, id)).run(options).t3_proof_fragments);
+                    owned.push_back(pos2gpu::cpu::generate(parameters(k, strength, id), compute.threads(),
+                        worker_cpu_generation_bytes(k, strength, threads), [&] { cancel.check(); }));
                     cancel.check();
                     require(owned.back().size() <= bound, "worker CPU output exceeds admitted fragment bound");
                     members.push_back(owned.back());
@@ -2971,8 +2978,9 @@ WorkerLocalOffer WorkerService::local_generation_offer(uint8_t k, uint8_t streng
         return result;
     }
 #endif
-    result.demand = {std::min(impl_->config.generation_threads, result.capacity.cpu_threads), 1,
-        impl_->generation_host_bytes(k, strength, members, bool(impl_->offered_gpu_bytes()), result.standing_host_bytes - impl_->service_baseline),
+    const unsigned threads = std::min(impl_->config.generation_threads, result.capacity.cpu_threads);
+    result.demand = {threads, 1,
+        impl_->generation_host_bytes(k, strength, members, bool(impl_->offered_gpu_bytes()), result.standing_host_bytes - impl_->service_baseline, threads),
         impl_->offered_gpu_bytes()};
     result.member_host_bytes = add(multiply(fragment_count_bound(k, strength), sizeof(uint64_t)), boundary_bytes(k));
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
@@ -4606,7 +4614,7 @@ struct WorkerClient::Impl
         size_t const members_per_chunk = independent ? 1 : ids.size();
         uint64_t const chunks_per_group = PlotGroupFile::getChunkCountForK(k);
         uint64_t const expected_chunks = chunks_per_group * (independent ? ids.size() : 1);
-        uint64_t const host = worker_cpu_task_bytes(k, strength, members_per_chunk, config.max_task_bytes);
+        uint64_t const host = worker_cpu_task_bytes(k, strength, members_per_chunk, config.max_task_bytes, config.generation_threads);
         auto const operation = packed_sink ? Operation::Packed : manifest ? Operation::Fresh : Operation::Contributions;
         auto connection = connect(independent ? pool::Kind::GenerateGpu : config.generation_kind, k, strength, ids.size(), host,
             operation, identity, cancel, options, 0, 0, independent);

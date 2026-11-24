@@ -537,7 +537,7 @@ bool parse_hex(std::string const& s, std::array<uint8_t, 32>& out)
 // the one way a count speaks to selection, and it is what `--no-cpu` used to be.
 //
 // N is an ASK, not a promise: run_batch caps it at what host RAM actually holds
-// (12.1 GiB per worker at k=28) and says so when it does.
+// using the native table layout and reports any reduction.
 //
 // Returns false on malformed input (caller prints usage + exits 1).
 bool parse_cpu_workers_arg(std::string const& s, pos2gpu::BatchOptions& opts)

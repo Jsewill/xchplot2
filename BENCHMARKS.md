@@ -184,6 +184,45 @@ released, the same worker instance became eligible and delivered the
 member. The published file matched the reference and passed 84 full-proof
 checks. Plot construction used RAM throughout.
 
+## Native CPU plotting
+
+On November 24, 2026, four pinned E-cores on a shared Core Ultra 7 270K Plus
+published a k=28, strength-2 member through the ordinary batch writer.
+Timing starts at process launch and ends at successful exit. The two builds
+contain the same C++ member generator. Each row is one run.
+
+| Build | Peak process RAM | Seconds per published member |
+|---|---:|---:|
+| SYCL/AdaptiveCpp | 7.85 GiB | 38.47 |
+| CUDA-only | 7.84 GiB | 36.83 |
+
+The native and reference generators produced the same SHA-256 across all
+268,498,840 sorted fragments, including duplicates. Both 1,002,771,036-byte
+files matched the independent reference byte for byte and passed full-proof
+checks. A two-member k=28 group using automatic
+construction, four threads and a 12 GiB RAM budget took 80.95 seconds through
+process exit, or 40.48 seconds per member. Its file matched the independent
+two-member reference and passed 145 full-proof checks.
+
+The k=22 file also matched on Linux and Windows.
+The Windows grouped CPU path published the same k=28 file using four threads
+and RAM-only construction in 51.20 seconds on a different shared host.
+
+On a Ryzen 7 5800X with an RTX 3070, the harvester had 17,886 plots loaded.
+Twelve k=24, strength-2 members went to one separate test HDD with four
+host cores available to each batch. Elapsed time includes publication.
+
+| Devices | Whole job | Seconds per member | Members completed by CPU / GPU |
+|---|---:|---:|---:|
+| CPU | 38.51 s | 3.21 | 12 / 0 |
+| GPU | 11.05, 11.12 s | 0.92–0.93 | 0 / 12 |
+| CPU and GPU | 9.35, 9.31 s | 0.78 | 2 / 10 |
+
+Every job published the same twelve files. With the previous cold-start
+estimate the CPU stood down for all twelve members. On a shared RTX 4090
+workstation, the updated scheduler left a two-member k=24 job to the GPU.
+It finished in 0.63 seconds and both files matched.
+
 ## CPU plotting memory experiment
 
 On Linux, each variant published the same k=28, strength-2 member using
@@ -193,8 +232,8 @@ Each row is one run through process exit.
 
 | CPU generation path | Peak process RAM | Seconds per published member |
 |---|---:|---:|
-| Upstream final fragment vector copy, used by the standalone adapter | 12.13 GiB | 43.43 |
-| Move the fragment vector, as grouped and pooled workers already do | 10.13 GiB | 42.93 |
+| Upstream final fragment vector copy (former standalone path) | 12.13 GiB | 43.43 |
+| Move the fragment vector (former grouped and pooled path) | 10.13 GiB | 42.93 |
 | Move the vector and release unused table pages before export (prototype) | 8.13 GiB | 42.94 |
 | cpos v0.3.0, normal CPU plot and group writer | 7.28 GiB | 58.18 |
 

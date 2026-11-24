@@ -3,7 +3,8 @@
 #include "host/BatchPlotter.hpp"
 #include "host/Cancel.hpp"
 #include "host/GroupDashboard.hpp"
-#include "host/CpuPlotter.hpp"  // run_one_plot_cpu — pos2-chip CPU pipeline
+#include "host/CpuPlotter.hpp"
+#include "host/CpuPlotMemory.hpp"
 #include "host/GpuBufferPool.hpp"
 #include "host/VramBudget.hpp"
 #include "host/GpuPipeline.hpp"
@@ -30,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -183,9 +185,7 @@ std::uint64_t host_free_bytes_now()
 // CPU's.
 //
 // So ask again at every plot boundary. That is the one place it can be asked
-// honestly: between plots a CPU worker holds NOTHING (pos2-chip's Plotter is
-// constructed per plot, inside run_one_plot_cpu), so a worker about to start one
-// is asking "is there room for 12.1 GiB?" while holding none of it.
+// after the CPU generator and writer have released the preceding member’s buffers.
 //
 // What does NOT work is to simply probe MemAvailable and compare:
 //
@@ -194,7 +194,7 @@ std::uint64_t host_free_bytes_now()
 //     none of them has allocated yet. A probe can see an allocation; it cannot
 //     see a decision.
 //
-//   * The self-measurement. Our own workers' 12 GiB apiece IS most of what
+//   * The self-measurement. Our workers’ table allocations can account for most of what
 //     MemAvailable is missing, so a controller that re-reads it mid-run reads its
 //     own footprint as external pressure and shrinks the pool it just created.
 //
@@ -403,17 +403,8 @@ inline bool cpu_adaptive_enabled()
     return v && v[0] == '1';
 }
 
-// The tail guard (default ON; XCHPLOT2_TAIL_GUARD=0 disables). A worker about to
-// pull the next job retires instead when the workers strictly faster than it can
-// drain everything left before it would finish one more plot — so a slow worker
-// (a CPU beside a GPU, or a slow card beside a fast one) never grabs a tail job a
-// faster peer would clear sooner, and never starts at all on a batch too short to
-// help. Worker-general, and one-directional: it can only ever DECLINE work a
-// worker would finish last on, so it cannot lengthen a run, and a uniform fleet
-// (nobody strictly faster) is left untouched. Unlike XCHPLOT2_CPU_ADAPTIVE, which
-// governs how MANY CPU workers run beside a GPU, this governs whether ANY worker
-// should take the next job as the queue drains — a different question, so a
-// different switch.
+// Leave the remaining jobs to faster peers when their estimated completion
+// times justify it. The adaptive CPU governor separately controls concurrency.
 inline bool tail_guard_enabled()
 {
     char const* v = std::getenv("XCHPLOT2_TAIL_GUARD");
@@ -435,19 +426,20 @@ inline int drain_slots_env()
     return parsed;
 }
 
-// Seconds/plot the tail guard assumes for a worker that has not measured its own
-// rate yet, seeded by device class so a known-slow CPU worker can stand down on a
-// batch too short to help before it has finished even one plot. Replaced by the
-// worker's measured rate after two completions. The CPU prior is overridable (for
-// other CPUs / other k); the GPU prior only has to sit well below it, so any card
-// reads as "faster" than the CPU pre-measurement.
-inline double cpu_plot_seconds_prior()
+// Cold estimates are per member of this batch. T1 traverses four keys,
+// and T2/T3 each traverse 2^strength keys over 2^k rows.
+inline double plot_work_scale(int k, int strength)
+{
+    return std::ldexp((4.0 + 2.0 * std::ldexp(1.0, strength)) / 12.0, k - 28);
+}
+
+inline double cpu_plot_seconds_prior(double scale)
 {
     if (char const* v = std::getenv("XCHPLOT2_CPU_PLOT_SECONDS"); v && v[0]) {
-        double const d = std::atof(v);
-        if (d > 0.0) return d;
+        const double seconds = std::atof(v);
+        if (seconds > 0.0 && std::isfinite(seconds)) return seconds;
     }
-    return 45.0;  // measured 40-50 s on a desktop core group at k=28
+    return 40.0 * scale;
 }
 inline constexpr double kGpuPlotSecondsPrior = 3.0;
 
@@ -455,6 +447,7 @@ inline constexpr double kGpuPlotSecondsPrior = 3.0;
 int cpu_target_for_gpu_rate(double s_gpu_seconds);
 
 struct LiveWorker {
+    std::atomic<bool> available{true};
     std::atomic<std::size_t> written{0};
     std::atomic<std::size_t> in_flight{0};  // pulled off the queue, not retired
     std::atomic<double>      work_start{0.0};
@@ -642,26 +635,20 @@ struct BatchProgress {
     // fast); 0 in an unseeded slot, which makes the guard fall back to measured-
     // only for it. Sized with the worker count so the guard can index it freely.
     std::vector<double> worker_prior_s;
+    std::mutex rate_mutex;
+    std::condition_variable rate_changed;
 
     BatchProgress(std::size_t worker_count, std::size_t total_entries)
         : workers(worker_count), total(total_entries),
           worker_prior_s(worker_count, 0.0) {}
 };
 
-// Worker-general tail guard — see tail_guard_enabled(). Returns true (→ this
-// worker should retire from the queue rather than pull) when the workers strictly
-// faster than it can drain the `remaining` unclaimed plots before it would finish
-// one more of its own. `why`, if given, gets a one-line reason for the log.
-//
-// The rule: faster workers supply rate_faster plots/sec, so they clear `remaining`
-// in remaining / rate_faster s; retire once that is <= this worker's own per-plot
-// time, i.e. remaining <= t_self * rate_faster. Nobody strictly faster — a uniform
-// fleet, or the fastest worker itself — gives rate_faster 0 and never retires. The
-// 10% margin keeps near-equal peers from counting each other, so rate noise cannot
-// churn a balanced fleet. Rates are read lock-free: a torn read only misprices one
-// iteration of a heuristic re-asked at every pull.
-bool tail_guard_should_retire(BatchProgress const& live, int worker_id,
-                              std::size_t remaining, std::string* why)
+// Estimate whether faster peers can clear the unclaimed members within one
+// member time on this worker. Count peers with at least a 10% time advantage.
+// When the estimate depends on unmeasured peers, a positive probe_seconds
+// lets the caller wait for completions before making the decision.
+bool tail_guard_estimate(BatchProgress const& live, int worker_id, std::size_t remaining,
+                         double& probe_seconds, std::string* why)
 {
     if (remaining == 0) return false;  // queue already dry — the pull loop breaks
     if (worker_id < 0 ||
@@ -676,20 +663,27 @@ bool tail_guard_should_retire(BatchProgress const& live, int worker_id,
     double const t_self = s_per_plot(self);
     if (t_self <= 0.0) return false;  // no estimate for this worker — do not guard
 
+    double measured_rate = 0.0;
     double rate_faster = 0.0;  // plots/sec of workers meaningfully faster than self
     int    n_faster    = 0;
     std::string faster_label;  // the sole faster worker's label, when there is one
     for (std::size_t i = 0; i < live.workers.size(); ++i) {
-        if (i == self) continue;
+        if (i == self || !live.workers[i].available.load(std::memory_order_relaxed)) continue;
         double const t_i = s_per_plot(i);
         if (t_i > 0.0 && t_i < 0.9 * t_self) {
             rate_faster += 1.0 / t_i;
+            if (worker_measured_s_per_plot(live.workers[i]) > 0.0) measured_rate += 1.0 / t_i;
             if (++n_faster == 1) faster_label = live.workers[i].label;
         }
     }
     if (rate_faster <= 0.0) return false;  // nobody faster can cover the tail
 
     if (static_cast<double>(remaining) > t_self * rate_faster) return false;
+
+    // An optimistic peer estimate may park a worker before either has run.
+    // Give peers time to establish a rate while the queue can still feed both.
+    if (remaining > size_t(n_faster) && remaining > t_self * measured_rate)
+        probe_seconds = 2.0 * n_faster / rate_faster;
 
     if (why) {
         // Name the faster worker when there is one; agree the verb with the count.
@@ -705,11 +699,30 @@ bool tail_guard_should_retire(BatchProgress const& live, int worker_id,
         char buf[224];
         std::snprintf(buf, sizeof(buf),
             "standing down — %s %s the remaining %zu plot%s faster than one more "
-            "would here (~%.0f s)",
+            "would here (~%.2f s)",
             who.c_str(), verb, remaining, remaining == 1 ? "" : "s", t_self);
         *why = buf;
     }
     return true;
+}
+
+bool tail_guard_should_retire(BatchProgress& live, int worker_id, std::atomic<std::size_t> const& next,
+                              std::size_t total, std::string* why)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    for (;;) {
+        const auto claimed = std::min(total, next.load(std::memory_order_relaxed));
+        double probe = 0;
+        if (!tail_guard_estimate(live, worker_id, total - claimed, probe, why)) return false;
+        if (!probe || cancel_requested()) return true;
+        // Wake for completions, and periodically for cancellation or a skipped
+        // entry. If peers miss the predicted probe time, allow this worker to run.
+        const double left = probe - std::chrono::duration<double>(Clock::now() - start).count();
+        if (left <= 0) return false;
+        std::unique_lock lock(live.rate_mutex);
+        live.rate_changed.wait_for(lock, std::chrono::duration<double>(std::min(left, 0.1)));
+    }
 }
 
 std::string format_duration_hms(double seconds)
@@ -959,47 +972,10 @@ void emit_progress_line(std::string const& log_prefix,
     std::fflush(stderr);
 }
 
-// Drop the CALLING thread's scheduling priority — and, with it, every thread
-// that thread goes on to spawn.
-//
-// Why this exists: pos2-chip's Plotter fans out to hardware_concurrency()
-// threads with no cap and no pool (RadixSort.hpp, TableConstructorGeneric.hpp),
-// and our WriterThreadPool is also sized at hardware_concurrency(). A GPU+CPU
-// batch therefore puts ~2x core_count runnable threads on the box, and the CPU
-// plotter is the one that runs hot continuously. CFS splits the machine roughly
-// evenly during every FSE burst, the GPU worker's consumer takes twice as long,
-// its depth-1 channel backs up, and the GPU — which retires a plot 6-8x faster
-// than the CPU does — stalls waiting on it. On the tester's 12900k/RTX3080 that
-// cost 62% of the CPU worker's whole contribution: adding the CPU should have
-// taken 6.7 -> 5.74 s/plot, and only reached 6.3.
-//
-// How it works: Linux nice is a PER-THREAD attribute (POSIX says per-process;
-// NPTL disagrees), and clone() copies it into children. So nicing this one
-// worker thread also nices the entire fan-out pos2-chip spawns inside
-// run_one_plot_cpu(). We cannot cap that fan-out without patching pos2-chip —
-// but we can make all of it yield.
-//
-// Why priority rather than a thread cap: the GPU workers' demand for the host is
-// BURSTY (FSE fires once per plot completion, then nothing). A statically
-// reserved core would sit idle between bursts. Priority is work-conserving — the
-// CPU plotter still gets the whole machine whenever no GPU worker wants it, and
-// steps aside the instant one does. (Affinity is not an option either: measured,
-// glibc 2.43's hardware_concurrency() ignores the affinity mask, so taskset
-// confines the threads without reducing how many spawn.)
-//
-// ONE-WAY DOOR: an unprivileged process may RAISE its nice value but not lower
-// it again — that needs CAP_SYS_NICE or RLIMIT_NICE headroom. So this may only
-// be called on a thread we are content to leave niced for its entire life, and
-// never on a thread that will later construct something shared. That is exactly
-// why run_batch calls warm_writer_pool() from the main thread first: the CPU
-// worker now writes through the shared WriterThreadPool, and if it won the race
-// to construct it, all 32 compression threads would be born niced and every GPU
-// worker's FSE would inherit the penalty — permanently, and silently.
-//
-// Windows: SetThreadPriority affects only the calling thread and is NOT
-// inherited by threads it creates, so the fan-out would stay at normal priority
-// and nothing would change. Left unimplemented rather than faked. The CPU worker
-// still contends there; the fix on Windows is a pos2-chip thread cap.
+// Linux children inherit the worker thread's nice level. Let GPU compression
+// and submission preempt CPU generation when both are ready. The shared writer
+// pool is warmed before lowering this worker, since restoring nice would need
+// privileges. Windows child threads do not inherit this scheduling priority.
 // How many nice levels to drop the CPU worker BELOW its peers. A delta, not an
 // absolute — see nice_current_thread. 0 disables the whole mechanism.
 int cpu_worker_nice_delta()
@@ -1134,6 +1110,7 @@ std::size_t record_plot_completion(BatchResult& res,
     std::size_t const n = w.written.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1) w.first_done.store(completion_offset_s, std::memory_order_relaxed);
     w.last_done.store(completion_offset_s, std::memory_order_relaxed);
+    live.rate_changed.notify_all();
     live_retire_in_flight(w);
 
     live.bytes.fetch_add(plot_bytes, std::memory_order_relaxed);
@@ -1413,37 +1390,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
     std::string const progress_prefix =
         live.workers.size() > 1 ? std::string("[batch]") : log_prefix;
 
-    // CPU worker: bypass the GPU pool / streaming path entirely. pos2-chip's
-    // Plotter manages all internal state itself, so each plot is a
-    // synchronous run_one_plot_cpu() call.
-    //
-    // It is NOT single-threaded (this comment said so for two revisions; see
-    // CpuPlotter.hpp for the measurements). pos2-chip fans out to
-    // hardware_concurrency() with no cap and no pool, so on a GPU+CPU batch it
-    // and our WriterThreadPool — also sized at hardware_concurrency() — put
-    // ~2x core_count runnable threads on the box, and the CPU plotter is the
-    // one that runs hot continuously. CFS then splits the machine during every
-    // FSE burst, the GPU's consumer slows, its depth-1 channel backs up, and
-    // the GPU stalls. On a 12900k/RTX3080 that cost 62% of the CPU worker's
-    // theoretical contribution: adding it should have taken 6.7 -> 5.74 s/plot
-    // and only reached 6.3. The fix is to de-prioritise this worker (nice is a
-    // per-thread attribute on Linux and clone() carries it into the threads
-    // pos2-chip spawns), NOT to cap its thread count: capping is static, and
-    // the GPU's demand for the host is bursty, so a reserved core sits idle
-    // between bursts. Affinity is not a substitute — measured, glibc 2.43's
-    // hardware_concurrency() ignores the affinity mask, so taskset confines
-    // the threads without reducing how many get spawned.
-    //
-    // There can be N of these now (--cpu-workers / repeated `cpu` tokens). Each
-    // is an ordinary work-queue worker pulling off the same shared counter, and
-    // they share nothing but the queue and the writer pool — so nothing here
-    // changes for N > 1 except that the RAM cost is N x 12.14 GiB at k=28, which
-    // resolve_batch_devices gates against the host before we ever get here.
-    //
-    // XCHPLOT2_SYCL_CPU_BENCH=1 routes --cpu through the SYCL pipeline on
-    // AdaptiveCpp's CPU backend instead of pos2-chip — exposed as an env
-    // var purely for benchmarking the two CPU paths against each other,
-    // not as a supported plotting mode (pos2-chip is faster + leaner).
+    // CPU workers claim from the same queue as GPUs. Each has its own table
+    // allocation and shares the compression pool with the other workers.
+    // The SYCL host override exercises the device kernels for parity testing.
     bool const sycl_cpu_bench = [] {
         char const* v = std::getenv("XCHPLOT2_SYCL_CPU_BENCH");
         return v && v[0] == '1';
@@ -1453,34 +1402,9 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
         res.pipeline = "cpu";  // no tier to pick; see WorkerTimeline::pipeline
         if (entries.empty()) return res;
 
-        // Confine this worker to its own NUMA node — and, because Linux copies
-        // the affinity mask at clone(), the entire fan-out pos2-chip spawns
-        // inside run_one_plot_cpu() too. Same inheritance trick the nice below
-        // rides on, and it must happen here for the same reason: before the
-        // threads that need to inherit it exist.
-        //
-        // The point is memory locality, not core budgeting. This plotter is
-        // memory-latency-bound, so a worker reading a working set that lives on
-        // another socket pays the remote hop on its hottest path. It does NOT
-        // reduce the fan-out — hardware_concurrency() reports the whole host
-        // whatever the mask says (NumaTopology.hpp) — so a node-pinned worker
-        // still oversubscribes its node, and the per-node knee has to be
-        // measured rather than assumed.
-        //
-        // Gated on nodes.size() > 1, so a single-node host never pins: there is
-        // nowhere else for the memory to be, and narrowing a mask to the only
-        // node it could already use buys nothing.
-        //
-        // The guard outlives the pin for the whole slice and hands the thread's
-        // mask back on the way out — load-bearing because the single-worker fast
-        // path runs this on the CALLER's thread. See ScopedThreadAffinity.
-        //
-        // XCHPLOT2_CPU_NO_PIN=1 keeps the node-per-worker layout and the labels
-        // but skips the pin, which is the only way to A/B what locality is worth
-        // on a given box: the alternative (`--devices cpu0`) also halves the
-        // cores, so it measures two changes at once. It is a diagnostic, and it
-        // makes the cpuN labels describe an intent the run no longer honours —
-        // so it announces itself rather than skewing a benchmark silently.
+        // Pin before allocating tables or creating lanes so first-touch memory
+        // and workers stay on the selected node. Restore the caller's mask on exit.
+        // XCHPLOT2_CPU_NO_PIN disables binding for locality comparisons.
         char const* no_pin = std::getenv("XCHPLOT2_CPU_NO_PIN");
         bool const  pin_disabled = no_pin && no_pin[0] == '1';
 
@@ -1510,14 +1434,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                         "(slower on a multi-socket host, but not wrong)\n",
                         log_prefix.c_str(), want);
                 } else if (opts.verbose) {
-                    // Read the mask BACK rather than echoing what we asked for.
-                    // The label already says which node this worker was meant to
-                    // get; only the kernel can say which cpus it may actually
-                    // use, and a silent success is indistinguishable from a
-                    // no-op. Thread count cannot stand in for this: pos2-chip
-                    // sizes its fan-out from hardware_concurrency(), which
-                    // ignores the mask, so a pinned worker still spawns the
-                    // whole host's worth of threads onto this node's cpus.
+                    // Report the effective set, including any enclosing CPU affinity restriction.
                     auto const got = current_thread_cpus();
                     std::fprintf(stderr, "%s pinned to NUMA node %d (cpus %s)\n",
                                  log_prefix.c_str(), want,
@@ -1586,18 +1503,10 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                 break;  // the batch is over, or cancelled — this worker retires
             }
 
-            // Tail guard (default on): stop pulling once the faster workers will
-            // clear the queue before this CPU worker finishes one more plot — the
-            // 40-50 s CPU tail a fast GPU would otherwise wait on, and the whole of
-            // a batch too short to help. Ahead of the memory gate so a stood-down
-            // worker never sat holding RAM.
+            // Decide whether to take another member before reserving its RAM.
             if (tail_guard_enabled() && shared_idx) {
-                std::size_t const claimed =
-                    shared_idx->load(std::memory_order_relaxed);
-                std::size_t const remaining =
-                    claimed < entries.size() ? entries.size() - claimed : 0;
                 std::string why;
-                if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
+                if (tail_guard_should_retire(live, worker_id, *shared_idx, entries.size(), &why)) {
                     if (opts.verbose)
                         std::fprintf(stderr, "%s %s\n",
                                      log_prefix.c_str(), why.c_str());
@@ -1687,6 +1596,7 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
                             std::chrono::steady_clock::now() - t_start).count());
                 }
             } catch (std::exception const& ex) {
+                if (cancel_requested()) break;
                 std::fprintf(stderr,
                     "%s plot %zu FAILED: %s\n",
                     log_prefix.c_str(), i, ex.what());
@@ -2648,12 +2558,8 @@ BatchResult run_batch_slice(std::vector<BatchEntry> const& entries,
             // the fastest worker (nobody strictly faster) and for single-worker
             // runs (no shared queue). See tail_guard_should_retire.
             if (tail_guard_enabled() && shared_idx) {
-                std::size_t const claimed =
-                    shared_idx->load(std::memory_order_relaxed);
-                std::size_t const remaining =
-                    claimed < entries.size() ? entries.size() - claimed : 0;
                 std::string why;
-                if (tail_guard_should_retire(live, worker_id, remaining, &why)) {
+                if (tail_guard_should_retire(live, worker_id, *shared_idx, entries.size(), &why)) {
                     if (opts.verbose)
                         std::fprintf(stderr, "%s %s\n",
                                      log_prefix.c_str(), why.c_str());
@@ -3429,17 +3335,8 @@ BatchStrategy select_strategy(StrategyPickInputs const& inputs,
 // ---------------------------------------------------------------------------
 // The --cpu-workers RAM gate.
 //
-// N CPU workers means N concurrent pos2-chip Plotters, and they share nothing:
-// no tier shrinks them (the CPU branch of run_batch_slice returns long before
-// the tier machinery), no pool bounds them. So the only defence against asking
-// for more than the host can hold is to not start them — and getting it wrong
-// does not cost throughput, it costs the whole batch, because the OOM killer
-// takes the GPU workers' in-flight plots down with the CPU's.
-//
-// Both curves below are measured, not modelled: VmHWM out of /proc, the
-// kernel's own high-water mark, polled to process exit on a 32-thread 5950X +
-// RTX 4090. tmp/ram_model.sh reproduces them.
-// ---------------------------------------------------------------------------
+// Each concurrent CPU member needs its own bounded table layout. Reserve the
+// GPU workers' host memory and the host reserve before admitting CPU workers.
 
 namespace {
 
@@ -3529,53 +3426,9 @@ std::uint64_t cpu_budget_bytes(int k, std::size_t gpu_count)
 }
 
 
-// The auto-default CPU worker count: the knee of the throughput curve.
-//
-// pos2-chip's plotter is memory-latency-bound, so concurrent plots interleave
-// each other's stalls — but each already fans out to every core, so the gain
-// plateaus fast (k=28: N=2 +19%, N=4 +25%, flat after). Past the knee you only
-// oversubscribe, and at small k the RAM cap is no help at all (k=22 would permit
-// ~500 workers, each spawning 32 threads). So auto stops at the knee.
-//
-// Capped at half the cores so tiny hosts don't over-spawn; XCHPLOT2_CPU_AUTO_WORKERS
-// overrides for tuning.
-//
-// `node_cores` is the core count of the NODE this count is for, not the host's.
-// The knee is a property of one node's memory system — it is where extra plots
-// stop hiding each other's stalls — so a 2-socket box wants the knee twice, not
-// a knee sized by twice the cores.
-//
-// CAUTION: the ~4 was measured on a single-socket host, where a node IS the
-// machine. On a multi-socket host a node-pinned worker still spawns a
-// WHOLE-HOST-sized thread fan-out onto its node's cores (see NumaTopology.hpp),
-// so the real knee there is probably lower, and this is a starting point for
-// measurement rather than a number anyone has stood behind.
-//
-// `gpu_peer` collapses the knee to 1, because the curve above is the wrong one
-// to be standing on beside a GPU. It was measured under `--devices cpu`, so it
-// can only see what extra workers ADD (they interleave each other's memory
-// stalls: +36% at N=4). What it cannot see is what they COST, which is the GPU
-// worker's FSE consumer: that runs on the host, its work per plot is fixed by k
-// while the GPU's compute time is not, and a fast card needs it to turn a plot
-// around every couple of seconds. A CPU worker's whole-host thread fan-out
-// starves exactly that, and the peer it starves is worth ~24 of it.
-//
-// Measured 2026-07-17, RTX 4090 + 5950X at k=28:
-//
-//   workers   GPU rate      aggregate    vs GPU alone
-//   0         2.56 s/plot   2.56         —
-//   1         2.68          2.57         a wash (-0.35%)
-//   4 (knee)  4.23          4.23         2.39x SLOWER whole-run
-//
-// At the CPU-only knee of 4 the batch took 336.4 s against the 140.8 s the GPU
-// would have needed alone, and the GPU's own rate fell by 65%. One worker is a
-// wash here and still buys 74% of the CPU's own N=4 throughput, so it is the
-// risk-adjusted pick: near-free on a card this fast, and most of the prize on a
-// slow one. The two effects that make 4 wrong both ease as the GPU slows (a
-// slower card's consumer has a lower duty cycle, and the CPU's share of the
-// total rises), so a slow-GPU host may well want more than 1 — but nobody has
-// measured one. Until somebody does, 1 is the number that cannot lose badly.
-// XCHPLOT2_CPU_AUTO_WORKERS overrides for exactly that measurement.
+// The default was calibrated with the reference producer on a 5950X. Limit
+// concurrency beside a GPU because its compression and submission use host
+// cores too. Explicit worker settings remain available for other systems.
 int cpu_worker_auto_count(int node_cores, bool gpu_peer)
 {
     if (char const* v = std::getenv("XCHPLOT2_CPU_AUTO_WORKERS"); v && v[0]) {
@@ -3786,51 +3639,17 @@ int cpu_workers_that_fit(int asked, int k, std::size_t gpu_count,
 
 std::uint64_t cpu_worker_peak_bytes(int k)
 {
-    // Peak RSS of a one-plot, CPU-only process:
-    //
-    //   k=22      223 568 kB     54.58 B per 2^k entry
-    //   k=24      927 036 kB     56.58
-    //   k=26    3 226 100 kB     49.23
-    //   k=28   12 727 020 kB     48.55      (12.14 GiB)
-    //
-    // The k=28 figure reproduced 0.04% apart across two separate runs, and the
-    // spread across four concurrent workers was 0.03% — this is a tight, stable
-    // number, so there is no fudge factor on it. (The safety lives in the
-    // reserve, which is the term that is genuinely uncertain.)
-    //
-    // It is ~2^k, but not a clean power of two: the coefficient drifts DOWN as
-    // k rises, because table sizes track match counts rather than 2^k exactly.
-    // So interpolate the coefficient between anchors instead of picking one and
-    // pretending it holds everywhere.
-    //
-    // OUTSIDE the measured range, take the largest coefficient ever seen (56.58,
-    // at k=24) rather than extending the trend. The trend is downward, which
-    // means extrapolating it is exactly the way to under-estimate — and this is
-    // the number that decides whether the box survives.
-    struct Anchor { int k; double bytes_per_entry; };
-    static constexpr Anchor kAnchors[] = {
-        {22, 54.58}, {24, 56.58}, {26, 49.23}, {28, 48.55},
-    };
-    static constexpr std::size_t kN = sizeof(kAnchors) / sizeof(kAnchors[0]);
-    static constexpr double kWorstSeen = 56.58;
-
-    double coeff = kWorstSeen;
-    if (k >= kAnchors[0].k && k <= kAnchors[kN - 1].k) {
-        for (std::size_t i = 1; i < kN; ++i) {
-            if (k <= kAnchors[i].k) {
-                Anchor const& lo = kAnchors[i - 1];
-                Anchor const& hi = kAnchors[i];
-                double const t =
-                    static_cast<double>(k - lo.k) / static_cast<double>(hi.k - lo.k);
-                coeff = lo.bytes_per_entry +
-                        t * (hi.bytes_per_entry - lo.bytes_per_entry);
-                break;
-            }
-        }
+    if (k < 18 || k > 28 || k % 2) return 0;
+    // On a multi-node host a worker may be rebound to any selected node.
+    // A single-node worker keeps the enclosing process's affinity.
+    const auto affinity = current_thread_cpus();
+    unsigned threads = unsigned(affinity.size());
+    if (threads) {
+        const auto nodes = host_numa_nodes();
+        if (nodes.size() > 1)
+            for (const auto& node : nodes) threads = std::max(threads, unsigned(node.cpus.size()));
     }
-    if (k < 1 || k > 40) return 0;  // nonsense k — let the caller's guards speak
-    double const entries = static_cast<double>(std::uint64_t{1} << k);
-    return static_cast<std::uint64_t>(coeff * entries);
+    return cpu::worker_peak(unsigned(k), threads);
 }
 
 std::vector<std::string> worker_labels(std::vector<int> const& device_ids)
@@ -4338,13 +4157,11 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
         std::any_of(device_ids.begin(), device_ids.end(),
                     [](int id) { return !is_cpu_device(id); });
 
-    // Seed the tail guard's per-worker priors by device class, so a known-slow CPU
-    // worker can stand down on a batch too short to help before it has measured
-    // its own rate. Each is replaced by that worker's measured rate after 2 plots.
+    const double scale = plot_work_scale(entries.front().k, entries.front().strength);
     for (std::size_t i = 0; i < N && i < live.worker_prior_s.size(); ++i) {
         live.worker_prior_s[i] = is_cpu_device(device_ids[i])
-                                     ? cpu_plot_seconds_prior()
-                                     : kGpuPlotSecondsPrior;
+                                     ? cpu_plot_seconds_prior(scale)
+                                     : kGpuPlotSecondsPrior * scale;
     }
 
     live.cpu_gate = make_cpu_gate(N - cpu_workers_placed);  // the rest are GPUs
@@ -4387,6 +4204,8 @@ BatchResult run_batch(std::vector<BatchEntry> const& entries,
                 // cancel saves the wasted work + the partial cleanup.
                 request_cancel();
             }
+            live.workers[i].available.store(false, std::memory_order_relaxed);
+            live.rate_changed.notify_all();
         });
     }
     for (auto& t : workers) t.join();

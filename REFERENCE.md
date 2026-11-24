@@ -171,8 +171,9 @@ Grouped construction keeps its resumable output at `<name>.gplot.partial`
 until the whole group is complete, then renames it without replacing an
 occupied final path. `grow` also removes the final name while extending a file.
 A first `Ctrl-C` asks active work to stop safely; a second aborts immediately.
-The single-member engine finishes its current plot; grouped construction can
-stop at a recovery checkpoint before the file is complete.
+GPU batch workers finish their current plot. A CPU worker can stop during
+member generation and regenerate that member on resume. Grouped construction
+can stop at a recovery checkpoint before the file is complete.
 
 ### Batch manifests
 
@@ -2712,8 +2713,15 @@ do not establish support in a released farmer or network activation.
 ## Devices and CPU workers
 
 `xchplot2 devices` lists the IDs accepted by `--devices`. Without an enrolled
-compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses pos2-chip's CPU
-implementation. Combine selectors with commas:
+compute pool or grouped construction, plotting uses one GPU by default. CPU plotting is opt-in and uses xchplot2's native C++ member generator.
+A CPU worker generates and sorts the member in RAM, then hands the fragments to
+the plot writer. Its memory grant covers the table layout for its CPU allowance.
+The SYCL and CUDA-only builds use the same generator. When CPU and GPU workers
+share a batch, the scheduler starts with estimates for the selected k and
+strength. It uses observed completion times to decide whether another member
+on a slower worker will shorten the job.
+
+Combine selectors with commas:
 
 | Selector | Workers |
 |---|---|
@@ -2749,8 +2757,9 @@ retires after `XCHPLOT2_CPU_WAIT_SECS` (default 300) if memory does not return.
 `XCHPLOT2_CPU_RESERVE_MB` keeps RAM available for other work.
 
 CPU workers run at nice +10 by default and are pinned to their selected NUMA
-node. Pinning controls locality, not pos2-chip's thread count; the CPU plotter
-can still oversubscribe the node. `-v` reports the actual affinity mask:
+node. The native generator sizes its thread team from the available CPUs and
+its input size. Each worker reserves its own table memory before generation.
+The writer uses the existing shared compression pool.
 
 ```text
 [cpu1#0] pinned to NUMA node 1 (cpus 32-63)

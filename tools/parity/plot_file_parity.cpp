@@ -10,9 +10,11 @@
 
 #include "host/PlotFileWriterParallel.hpp"
 #include "host/BatchPlotter.hpp"
+#include "host/CpuPlotMemory.hpp"
 
 #include <algorithm>
 #include <array>
+#include <stdexcept>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -61,7 +63,13 @@ bool run_one(char const* label, uint32_t seed, int k, int strength, bool raw)
     entry.plot_index = raw ? 65535 : 0;
     entry.meta_group = 255;
     entry.plot_id = pos2gpu::plot_id_for_group(entry.group_id, entry.plot_index, entry.meta_group);
-    auto fragments = real_fragments(entry.plot_id, k, strength);
+    const unsigned lanes = seed % 3 + 1;
+    const auto memory = pos2gpu::cpu::Layout(k, lanes).peak_bytes();
+    auto fragments = pos2gpu::native_cpu_fragments(entry.plot_id.data(), k, strength, lanes, memory, {});
+    if (fragments != real_fragments(entry.plot_id, k, strength)) {
+        std::fprintf(stderr, "native CPU fragments differ from reference for %s seed=%u\n", label, seed);
+        return false;
+    }
 
     std::printf("[%s seed=%u k=%d strength=%d count=%zu]\n",
                 label, seed, k, strength, fragments.size());
@@ -228,6 +236,20 @@ bool file_safety(bool raw)
 int main()
 {
     bool all_ok = true;
+    auto id = derive_group_id(123);
+    const auto ram = pos2gpu::cpu::Layout(18, 2).peak_bytes();
+    try {
+        pos2gpu::native_cpu_fragments(id.data(), 18, 2, 2, ram - 1, {});
+        return 1;
+    } catch (std::length_error const&) {}
+    struct Cancelled {};
+    unsigned polls = 0;
+    try {
+        pos2gpu::native_cpu_fragments(id.data(), 18, 2, 2, ram, [&] {
+            if (++polls >= 6) throw Cancelled{};
+        });
+        return 1;
+    } catch (Cancelled const&) {}
 
     // Round-trip over varied plot ids at k=18, strength=2 — uses the real
     // CPU plotter to produce fragment streams that are guaranteed valid
@@ -244,6 +266,8 @@ int main()
         all_ok = run_one("k18s4",   seed, 18, 4, false) && all_ok;
     }
 
+    // At k=22 a section spans multiple target buckets.
+    all_ok = run_one("k22s2", 2, 22, 2, false) && all_ok;
     all_ok = run_one("raw-k18s2", 1, 18, 2, true) && all_ok;
     all_ok = file_safety(false) && all_ok;
     all_ok = file_safety(true) && all_ok;

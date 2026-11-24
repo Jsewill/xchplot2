@@ -208,7 +208,7 @@ struct WorkerIdentityReservation;
 // machine/backend selection and the owner's persisted construction identity.
 std::string worker_compatibility(pool::Kind = pool::Kind::GenerateAny);
 std::string worker_producer_build();
-uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength);
+uint64_t worker_cpu_generation_bytes(uint8_t k, uint8_t strength, unsigned threads = 0);
 
 struct WorkerConfig
 {
@@ -345,7 +345,7 @@ void default_worker_resources(WorkerConfig&);
 // inside capacity.host_bytes rather than additional to that total partition.
 // An explicitly shared scheduler must also cover the complete offered CPUs.
 uint64_t worker_service_baseline_bytes(WorkerConfig const&);
-uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes);
+uint64_t worker_cpu_task_bytes(uint8_t k, uint8_t strength, uint64_t members, uint64_t transport_bytes, unsigned threads = 0);
 // Automatic services may reduce their discovery ceiling to retain room for a
 // supported CPU generation task. Explicit limits remain constructor errors.
 void fit_worker_broker_budget(WorkerConfig&);

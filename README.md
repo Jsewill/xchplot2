@@ -1,8 +1,8 @@
 # xchplot2
 
 CPU and GPU plotter for Chia v2 proofs of space (CHIP-48). Produces ordinary
-PoS2 1.0 `.gplot` files using the pinned
-[pos2-chip](https://github.com/Chia-Network/pos2-chip) CPU reference.
+PoS2 1.0 `.gplot` files compatible with the pinned
+[pos2-chip](https://github.com/Chia-Network/pos2-chip) reference.
 
 This is the **`main` branch**, using SYCL/AdaptiveCpp with a CUB fast path
 on NVIDIA. The [`cuda-only` branch](https://github.com/Jsewill/xchplot2/tree/cuda-only)
@@ -85,7 +85,7 @@ for CPU-reference comparisons.
 | Intel | AdaptiveCpp Level Zero; see the [required settings and limitations](REFERENCE.md#troubleshooting). Use CPU plotting on integrated Intel GPUs for production. |
 | VRAM | Tiny's base k=28 floor is 1,228 MiB free after context creation, including the default 128 MiB buffer. Backend sort scratch can raise it. |
 | Host RAM | Depends on tier and worker count. Lower VRAM tiers generally use more host RAM; see [memory requirements](REFERENCE.md#memory-requirements). |
-| CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses pos2-chip's CPU plotter. |
+| CPU plotting | Opt in with `--devices cpu`, `--devices all`, or `--cpu`; uses xchplot2’s native C++ member generator. |
 | OS | Linux; WSL2 requires support from the GPU vendor. [Native Windows builds](INSTALL.md#windows) are experimental. macOS is unsupported. |
 
 See the [installation guide](INSTALL.md) for drivers, runtime versions and

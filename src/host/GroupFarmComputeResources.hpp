@@ -188,7 +188,7 @@ inline void bind_replot_compute(pos2gpu::GroupOptions& options, Profile const& p
     if (options.backend == "cpu")
     {
         cpu_minimum = worker_cpu_task_bytes(uint8_t(profile.native.k), uint8_t(profile.native.strength), 1,
-            add(options.window, options.pool_frame_bytes));
+            add(options.window, options.pool_frame_bytes), 1);
         require(std::any_of(profile.native.compute_workers.begin(), profile.native.compute_workers.end(), [&](auto const& worker)
             { return (worker.allowed_kinds & compute_generate_cpu) && worker.host_bytes - worker.standing_host_bytes >= cpu_minimum; }),
             "reviewed compute workers cannot hold one selected CPU generation task after standing residency");

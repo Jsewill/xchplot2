@@ -114,7 +114,7 @@ struct BatchResult {
 //                         kCpuWorkersAuto (-1, the default once selected) — the
 //                             throughput knee (~4 per node), then trimmed to what
 //                             host RAM holds. Beside a GPU the knee is 1 per
-//                             node instead — see "Why a knee" below.
+//                             node to leave CPU time for compression.
 //                         kCpuWorkersMax  (-2) — as many as fit in RAM, capped at
 //                             the core count (more only oversubscribes). The
 //                             "as many as make sense" escape hatch.
@@ -127,35 +127,9 @@ struct BatchResult {
 //                       ordinary work-queue workers. Set via
 //                       `--cpu-workers auto|max|N|off`.
 //
-//                       Why a knee and not "fill RAM" by default: pos2-chip's
-//                       plotter is memory-latency-bound, so concurrent plots
-//                       interleave each other's stalls — but each already fans
-//                       out to every core, so the gain plateaus fast. Aggregate
-//                       steady-state, 32-thread 5950X at k=28: 52.28 s/plot at
-//                       N=1, 43.85 at N=2 (+19%), 41.69 at N=4 (+25%), flat after
-//                       — the 3rd and 4th together buy ~5%. Past the knee you only
-//                       oversubscribe (at k=22, RAM alone would permit ~500
-//                       workers, each spawning 32 threads). So auto caps at the
-//                       knee; kCpuWorkersMax (RAM- and core-bounded) is there if
-//                       you want to push past it.
-//
-//                       Those are `--devices cpu` numbers, and beside a GPU they
-//                       are the wrong curve: they measure what extra workers ADD
-//                       and cannot see what they COST, which is the GPU worker's
-//                       host-side FSE consumer. Measured 2026-07-17 on an RTX
-//                       4090 + 5950X at k=28, the knee of 4 ran a batch 2.39x
-//                       SLOWER than the GPU alone (336.4 s vs 140.8 s for 55
-//                       plots) as the GPU's own rate fell 2.56 → 4.23 s/plot; 1
-//                       worker was a wash (2.57). So auto uses a knee of 1 per
-//                       node whenever a GPU worker is in the batch. Both effects
-//                       that make 4 wrong ease as the GPU slows, so a weak-GPU
-//                       host may want more — measure it with
-//                       XCHPLOT2_CPU_AUTO_WORKERS before assuming.
-//
-//                       It also costs a full copy of the plotter's working set
-//                       per worker (12.14 GiB at k=28), which is why
-//                       resolve_batch_devices trims the count against host RAM,
-//                       subtracting each GPU worker's host footprint first.
+//                       The default allows fewer CPU workers beside GPUs, which also
+//                       use host CPU for compression. Each live CPU member needs
+//                       its own table allocation, independently of the GPU tier.
 //   streaming_tier    — optional manual override for the streaming
 //                       pipeline tier (when the GPU pool doesn't fit).
 //                       Accepted values: "plain" (~7.24 GB floor at k=28,
@@ -392,13 +366,7 @@ BatchStrategy select_strategy(
 // have to agree on what a worker is called, or they cannot be read together.
 std::vector<std::string> worker_labels(std::vector<int> const& device_ids);
 
-// Peak resident host memory of ONE CPU worker plotting at this k.
-//
-// pos2-chip's Plotter, not ours: no streaming tier can shrink it (the CPU
-// branch of run_batch_slice returns long before the tier machinery), so this
-// is a hard, fixed cost per concurrent CPU plot and the only defence against
-// N of them is to not start them. Measured, not modelled from first
-// principles — see the anchors in the .cpp.
+// Host allocation bound, including the per-worker runtime allowance.
 std::uint64_t cpu_worker_peak_bytes(int k);
 
 // Resolve BatchOptions' device selection to the concrete id list
@@ -407,8 +375,7 @@ std::uint64_t cpu_worker_peak_bytes(int k);
 // empty → default selector).
 //
 // NOT pure: it probes host RAM and caps cpu_workers at what actually fits
-// (see cpu_worker_peak_bytes — 12.13 GiB each at k=28, and the OOM killer
-// takes the GPU workers' in-flight plots down with it). It is deterministic
+// using cpu_worker_peak_bytes. The result is deterministic
 // within a process, though, because the free-RAM probe is taken once and
 // cached: run_batch and the bench's own sizing call must agree on the worker
 // count, and re-probing would let the CPU workers' own RSS change the answer

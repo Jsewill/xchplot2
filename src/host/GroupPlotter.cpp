@@ -28,8 +28,7 @@
 #include "host/GroupFarmReplotResources.hpp"
 #include "host/GroupWriter.hpp"
 #include "host/Random.hpp"
-#include "host/ComputeThreads.hpp"
-#include "plot/Plotter.hpp"
+#include "host/CpuTables.hpp"
 #include "pos2_keygen.h"
 #include "host/GroupPlotter.hpp"
 #include "gpu/DeviceIds.hpp"
@@ -528,32 +527,13 @@ Fixtures fixtures(fs::path const& path, uint64_t budget)
     return result;
 }
 
-// Match the pinned Plotter's layout and final copy, before constructing it.
-// Plotter retains its layout through its final fragment transfer. The build's
-// producer-only move patch removes the upstream redundant vector copy; retain
-// the conservative model when building without that patch. Reserving the maximum
-// pairing count also bounds unusual identities.
-uint64_t cpu_peak(PlotGroupParams const& group)
+uint64_t cpu_peak(PlotGroupParams const& group, unsigned threads)
 {
-    auto const params = group.get_plot_params_for_index(0);
-    uint64_t const section_pairs = max_pairs_per_section_possible(params);
-    uint64_t const pairs = product(section_pairs, params.get_num_sections());
-    uint64_t const element = std::max(
-        {sizeof(WorkerReferenceXsCandidate), sizeof(T1Pairing), sizeof(T2Pairing), sizeof(T3Pairing)});
-    uint64_t const block = WorkerReferencePlotLayout::align_up(product(section_pairs, element) / 4, 64);
-    uint64_t const layout = sum(product(block, 32), 2 * mib);
-#if defined(GROW_MOVE_PLOTTER_OUTPUT) && GROW_MOVE_PLOTTER_OUTPUT
-    constexpr uint64_t copies = 1;
-#else
-    constexpr uint64_t copies = 2;
-#endif
-    return sum(sum(layout, product(pairs, sizeof(uint64_t) * copies)), 128 * mib);
+    return pos2gpu::cpu::worker_peak(group.get_k(), threads);
 }
 uint64_t fragment_bound(PlotGroupParams const& group)
 {
-    auto const params = group.get_plot_params_for_index(0);
-    return product(product(max_pairs_per_section_possible(params), params.get_num_sections()),
-                   sizeof(uint64_t));
+    return product(pos2gpu::cpu::member_bound(group.get_k()), sizeof(uint64_t));
 }
 
 struct RawPlan
@@ -1633,6 +1613,10 @@ struct Backend
         if (detailed_output(args)) std::cerr << "auto backend selected CPU: GPU producer is unavailable in this build\n";
 #endif
     }
+    unsigned cpu_threads(Arguments const& args) const
+    {
+        return cpu_scheduler ? cpu_scheduler->workers() : unsigned(args.workers);
+    }
     uint64_t generation_peak(Identity const& identity, Arguments const& args, bool borrow = false) const
     {
         if (mode == "idle") return 0;
@@ -1662,7 +1646,7 @@ struct Backend
 #endif
         // CPU generation releases its layout before compact conversion. The
         // owned raw vector and complete compact destination coexist in conversion.
-        return sum(std::max(cpu_peak(identity.params), sum(raw, compact)), fallback_retained);
+        return sum(std::max(cpu_peak(identity.params, cpu_threads(args)), sum(raw, compact)), fallback_retained);
     }
     uint64_t retained() const
     {
@@ -1731,34 +1715,12 @@ struct Backend
         (void)hash;
 #endif
         require(mode == "cpu", "member producer was not initialized");
-        // Use the same reference progress boundary as local compute workers.
-        // Upstream reports cancellation by returning partial data, so retain
-        // the stop until it has been converted to the controller exception.
-        struct CancelProgress final : IProgressSink
-        {
-            Arguments const& args;
-            bool stopped = false;
-            std::exception_ptr failure;
-            explicit CancelProgress(Arguments const& value) : args(value) {}
-            bool on_event(ProgressEvent const&) noexcept override
-            {
-                try { stopped = stopped || (args.cancelled && args.cancelled()); }
-                catch (...) { stopped = true; failure = std::current_exception(); }
-                return !stopped;
-            }
-        } progress(args);
-        unsigned const threads = cpu_scheduler ? cpu_scheduler->workers() : unsigned(args.workers);
+        unsigned const threads = cpu_threads(args);
         require(threads, "CPU producer has no plotting CPU allowance");
         group_grow::CodecScheduler::Lease compute(cpu_scheduler.get(), threads, [&] { check_cancel(args); });
-        group_grow::worker_detail::CpuLimit limit(threads);
-        WorkerReferencePlotter::Options options{};
-        options.validate = false;
-        options.verbose = false;
-        options.sink = &progress;
-        auto result = WorkerReferencePlotter(identity.params.get_plot_params_for_index(index)).run(options).t3_proof_fragments;
-        if (progress.failure) std::rethrow_exception(progress.failure);
-        if (progress.stopped) throw Interrupted{};
-        check_cancel(args);
+        const auto params = identity.params.get_plot_params_for_index(index);
+        auto result = pos2gpu::cpu::generate(params, threads, cpu_peak(identity.params, threads),
+            [&] { check_cancel(args); });
         return group_grow::Member(std::move(result));
     }
 };
@@ -2687,7 +2649,7 @@ struct Producer
 #if defined(GROW_GPU_BACKEND) && GROW_GPU_BACKEND
         if (backend.gpu) return backend.gpu->host_tiled_generation_peak_bytes();
 #endif
-        return sum(cpu_peak(identity.params), backend.fallback_retained);
+        return sum(cpu_peak(identity.params, backend.cpu_threads(args)), backend.fallback_retained);
     }
     bool fits_input(uint16_t index, uint64_t retained)
     {
@@ -12107,7 +12069,7 @@ group_grow::farm::NativeRequest replot_request(Arguments const& args, ReplotInpu
         {
             auto const offer = pos2gpu::make_group_compute_offer(effective);
             uint64_t const minimum = sum(std::max(worker.standing_host_bytes, group_grow::worker_service_baseline_bytes(offer)),
-                group_grow::worker_cpu_task_bytes(uint8_t(native.k), uint8_t(native.strength), 1, sum(effective.window, effective.pool_frame_bytes)));
+                group_grow::worker_cpu_task_bytes(uint8_t(native.k), uint8_t(native.strength), 1, sum(effective.window, effective.pool_frame_bytes), 1));
             require(minimum <= local_offer_ram_cap, "reviewed local compute partition cannot hold one generation task and its standing service");
             effective.pool_offer_ram = minimum; effective.pool_offer_cpus = 1;
         }

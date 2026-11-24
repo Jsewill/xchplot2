@@ -110,6 +110,7 @@ src/gpu/                  GPU kernels and sort backends
 src/host/
 ├── GpuPipeline           Xs → T1 → T2 → T3 orchestration
 ├── GpuBufferPool         persistent device buffers and host drain slots
+├── CpuTables / CpuPlotMemory   native CPU member generation and RAM admission
 ├── BatchPlotter          workers, memory admission, and writer queues
 ├── BatchManifest         saved identities and recovery manifests
 ├── GroupPlotter          group construction, drive scheduling and recovery
