@@ -4261,14 +4261,19 @@ def check_replot(binary, root, reference=None):
     unrelated = private_record(compute_farm, "unrelated")
     unrelated.write_text("preserve unrelated bookkeeping", encoding="utf-8")
     stopped = snapshot(compute_farm)
-    refusal = run("fill", compute_review, *keys, code=2)
-    assert "unrelated bookkeeping" in refusal.stdout + refusal.stderr and snapshot(compute_farm) == stopped
+    resume_compute = ["fill", compute_review]
+    if not durable_root:
+        # Without export handles the portable review cannot restore its scratch paths.
+        resume_compute += ["--temp-dir", external_scratch, "--destination-temp", "on"]
+    refusal = run(*resume_compute, *keys, code=2)
+    assert "unrelated bookkeeping" in refusal.stdout + refusal.stderr, refusal.stdout + refusal.stderr
+    assert snapshot(compute_farm) == stopped
     unrelated.unlink()
-    run("fill", compute_review, *keys, point="replot-journal-all-staged", code=86)
+    run(*resume_compute, *keys, point="replot-journal-all-staged", code=86)
     # Resume from the private local binding with neither the reusable profile
     # nor any compute flags, even though enrollment is outside the default path.
-    run("fill", compute_review, "--devices", cpu_node, point="replot-replacement-verified", code=86)
-    run("fill", compute_review)
+    run(*resume_compute, "--devices", cpu_node, point="replot-replacement-verified", code=86)
+    run(*resume_compute)
     compute_final = Path(reviewed_compute["batches"][0]["path"])
     assert not compute_source.exists() and header(compute_final)[3] == 2
     proof = run("verify", compute_final, "--full", "--trials", 100)

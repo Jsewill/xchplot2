@@ -87,6 +87,13 @@ struct StorageDevice
     // Both remain false for mixed media or an unknown rotation classification.
     bool nonrotating = false, rotating = false;
 };
+inline void add_destination_temporary(std::vector<std::filesystem::path>& roots, std::string_view policy,
+    std::filesystem::path const& directory, StorageDevice const& device)
+{
+    bool const enabled = policy == "on" || (!device.drives.empty() &&
+        ((policy == "ssd" && device.nonrotating) || (policy == "hdd" && device.rotating)));
+    if (enabled && std::find(roots.begin(), roots.end(), directory) == roots.end()) roots.push_back(directory);
+}
 inline uint64_t storage_snapshot_bytes(StorageDevice const& device)
 {
     uint64_t bytes = sizeof(device) + device.filesystem.size() + 1;

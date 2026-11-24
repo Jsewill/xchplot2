@@ -351,15 +351,15 @@ inline NativeRequest replot_native_request(pos2gpu::GroupOptions const& args, Pr
         require(path.is_absolute() && !directory.directory_identity.empty(), "migration destination has no absolute native identity");
         std::error_code error;
         if (!supervision.allow_missing_roots || std::filesystem::is_directory(path, error))
+        {
             require(farming_directory_identity(path) == directory.directory_identity, "migration destination native identity changed");
+            if (args.destination_temp != "off") add_destination_temporary(scratch, args.destination_temp, path, storage_device(path));
+        }
         outputs.push_back(path);
         // Both supported fixed-forecast layouts put their largest membership
         // in the first file; later files can only have equal/fewer members.
         if (directory.layout.files) result.group_members = std::max<uint64_t>(result.group_members, directory.layout.file_members(0));
     }
-    // Destination staging can consume any output resource. Its existing
-    // allocator still enforces free space; this accounts for its I/O envelope.
-    if (args.destination_temp != "off") scratch.insert(scratch.end(), outputs.begin(), outputs.end());
     auto mappings = [&](std::vector<std::filesystem::path> paths, std::vector<std::string> const& expected)
     {
         if (!supervision.allow_missing_roots) return replot_physical_storage(profile, paths, result.host);
