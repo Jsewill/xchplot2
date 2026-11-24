@@ -4,7 +4,9 @@ FROM ${BASE_IMAGE}
 ARG LLVM_VERSION=20
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The CUDA base image already contains the release toolkit.
+RUN rm -f /etc/apt/sources.list.d/cuda*.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl gnupg git ninja-build cmake python3 patchelf \
         libboost-context-dev libnuma-dev libssl-dev llvm-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev clang-${LLVM_VERSION} \
         libclang-${LLVM_VERSION}-dev libclang-cpp${LLVM_VERSION}-dev lld-${LLVM_VERSION} \
