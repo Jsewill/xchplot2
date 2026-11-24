@@ -772,14 +772,16 @@ inline void shared_capacity()
         ids[0].front() = 42;
         ids[1].front() = 43;
         size_t chunks = 0;
-        client.contributions(
-            18, 2, ids,
-            [&](uint64_t ordinal, auto bytes, uint16_t members)
+        auto consume = [&](uint64_t ordinal, std::span<uint8_t const> bytes, uint16_t members)
+        {
+            require(ordinal == chunks++ && !bytes.empty() && members == 1,
+                    "isolated independent members lost their individual contribution framing");
+        };
+        client.contributions(18, 2, ids, consume, {}, {},
+            [&](uint64_t first, std::span<std::span<uint8_t const> const> window, uint16_t members)
             {
-                require(ordinal == chunks++ && !bytes.empty() && members == 1,
-                        "isolated independent members lost their individual contribution framing");
-            },
-            {}, {}, {}, {}, true);
+                for (auto bytes : window) consume(first++, bytes, members);
+            }, {}, true);
         require(direct && chunks == 2 * PlotGroupFile::getChunkCountForK(18),
                 "embedded recovered work lost its independently signed streamed members");
     }
