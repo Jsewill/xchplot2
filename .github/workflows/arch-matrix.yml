@@ -19,7 +19,7 @@ on:
   pull_request:
     paths-ignore: &ignored-paths
       # Docs & metadata
-      - '**.md'
+      - '**/*.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
@@ -29,6 +29,9 @@ on:
       - '.github/dependabot.yml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
+      # Rust dependency changes are linked by the install and release builds.
+      - 'keygen-rs/Cargo.toml'
+      - 'keygen-rs/Cargo.lock'
       # Runtime / user-facing scripts not exercised by the arch
       # matrix (it runs cmake configure + builds pos2_gpu_cuda_obj).
       - 'scripts/test/**'
@@ -37,7 +40,9 @@ on:
       - 'scripts/install-container-deps.sh'
       # Sibling CI workflows + install-matrix-only containerfiles.
       - '.github/workflows/ci.yml'
+      - '.github/workflows/gpu*.yml'
       - '.github/workflows/lint.yml'
+      - '.github/workflows/release.yml'
       - '.github/actionlint.*'
       - '_typos.toml'
       - '.github/workflows/install-matrix.yml'

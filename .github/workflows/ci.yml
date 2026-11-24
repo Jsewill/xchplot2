@@ -2,8 +2,12 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore: &lint-paths
+    paths-ignore: &ignored-paths
+      - '.github/workflows/arch-matrix.yml'
+      - '.github/workflows/gpu*.yml'
+      - '.github/workflows/install-matrix.yml'
       - '.github/workflows/lint.yml'
+      - '.github/workflows/release.yml'
       - '.github/actionlint.*'
       - '.github/dependabot.yml'
       - '**/*.md'
@@ -12,7 +16,7 @@ on:
       - 'scripts/test/docs.py'
   push:
     branches: [cuda-only]
-    paths-ignore: *lint-paths
+    paths-ignore: *ignored-paths
 
 permissions:
   contents: read

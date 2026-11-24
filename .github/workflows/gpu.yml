@@ -4,7 +4,11 @@ on:
   push:
     branches: [cuda-only]
     paths-ignore:
+      - '.github/workflows/arch-matrix.yml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/install-matrix.yml'
       - '.github/workflows/lint.yml'
+      - '.github/workflows/release.yml'
       - '.github/actionlint.*'
       - '.github/dependabot.yml'
       - '**/*.md'

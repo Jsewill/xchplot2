@@ -216,6 +216,9 @@ whose provenance is incomplete.
 Repository lint checks workflow syntax, spelling, tracked Markdown, and links
 to local files and section headings. Dependabot groups updates to the three
 lint actions in one weekly PR per target branch when updates are available.
+Keygen dependency PRs run Rust tests, all six distro Cargo installs, and
+Linux and Windows archive checks on x86-64 and ARM64.
+
 Run the link check locally with
 
 ```bash

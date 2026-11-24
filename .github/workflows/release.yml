@@ -5,12 +5,14 @@ on:
     paths:
       - .github/workflows/release.yml
       - CMakeLists.txt
+      - LICENSE
       - cmake/**
       - ci/release/**
       - keygen-rs/**
       - src/**
       - tools/**
-      - contrib/**
+      - contrib/pos2-*.patch
+      - contrib/cccl-*.patch
       - scripts/build-release.sh
       - scripts/build-release.ps1
       - scripts/test/release.py

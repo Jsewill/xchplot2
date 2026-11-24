@@ -16,7 +16,7 @@ on:
   pull_request:
     paths-ignore: &ignored-paths
       # Docs & metadata
-      - '**.md'
+      - '**/*.md'
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
@@ -36,7 +36,9 @@ on:
       # Sibling CI workflows — editing arch-matrix or the lint
       # workflow shouldn't drag in the install matrix.
       - '.github/workflows/ci.yml'
+      - '.github/workflows/gpu*.yml'
       - '.github/workflows/lint.yml'
+      - '.github/workflows/release.yml'
       - '.github/actionlint.*'
       - '_typos.toml'
       - '.github/workflows/arch-matrix.yml'
