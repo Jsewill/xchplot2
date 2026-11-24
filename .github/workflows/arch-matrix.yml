@@ -77,6 +77,8 @@ jobs:
     steps:
       - name: Install build deps
         run: |
+          # The image supplies CUDA. Fetch the build tools from Ubuntu.
+          rm -f /etc/apt/sources.list.d/cuda*.list
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential cmake git curl ca-certificates pkg-config

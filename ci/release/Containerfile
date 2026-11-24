@@ -2,7 +2,9 @@
 FROM docker.io/nvidia/cuda:12.9.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The CUDA base image already contains the release toolkit.
+RUN rm -f /etc/apt/sources.list.d/cuda*.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git ninja-build python3-pip \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m pip install --no-cache-dir cmake==3.28.3

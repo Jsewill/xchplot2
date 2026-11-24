@@ -101,6 +101,8 @@ jobs:
     steps:
       - name: Install host tools
         run: |
+          # The image supplies CUDA. Fetch the build tools from Ubuntu.
+          rm -f /etc/apt/sources.list.d/cuda*.list
           apt-get update
           apt-get install -y --no-install-recommends \
             cmake ninja-build curl ca-certificates pkg-config \
