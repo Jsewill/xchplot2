@@ -450,6 +450,7 @@ inline void shared_capacity()
     options.tls = pool_test::tls(ca, node);
     WorkerService worker(options);
     worker.start();
+    bool const two_cpus = worker.status().capacity.cpu_threads >= 2;
     pool::BrokerClient control(options.broker, options.tls);
     auto session = control.open_owner("shared");
     auto route = [&](uint8_t k)
@@ -523,7 +524,8 @@ inline void shared_capacity()
             "released VRAM did not admit new k on the same worker");
     auto higher = worker.local_generation_offer(18, 2, 1);
     require(higher.demand.host_bytes < lower.demand.host_bytes, "upgraded tier did not reduce host demand");
-    require(route(18).first.independent_width(UINT32_MAX) > 1, "pooled tier missing independent batching");
+    require((route(18).first.independent_width(UINT32_MAX) > 1) == two_cpus,
+            "pooled independent batching did not match the available CPU lanes");
     generate(18);
     require(active_tier == "pool", "existing small producer failed to upgrade");
     auto old_setups = setups.load();
@@ -639,20 +641,24 @@ inline void shared_capacity()
             "refreshed streaming joint grant omitted its host model");
     control.cancel(session, down.task_id, down.attempt);
     auto single = request(1, true);
-    (void)grant(single, true);
+    (void)grant(single, two_cpus);
     control.cancel(session, single.task_id, single.attempt);
     auto none = request(2, true);
     (void)grant(none, false);
     control.cancel(session, none.task_id, none.attempt);
     usable_mib = 64;
-    require(eventually([&] { return route(18).first.independent_width(UINT32_MAX) > 1; }),
-            "independent shape did not recover");
+    require(eventually([&] {
+        return !route(20).second->routes.empty() && (route(18).first.independent_width(UINT32_MAX) > 1) == two_cpus;
+    }), "pooled tier and its feasible independent shapes did not recover");
     auto wide = request(2, true);
-    auto pooled = grant(wide, true);
-    require(pooled->task.resources == worker.local_generation_offer(18, 2, 1).demand,
+    auto pooled = grant(wide, two_cpus);
+    if (pooled) require(pooled->task.resources == worker.local_generation_offer(18, 2, 1).demand,
             "independent batch did not retain singleton grant");
     control.cancel(session, wide.task_id, wide.attempt);
     auto stale_task = request(1, false, true);
+    // The held singleton needs one CPU. Leave another available for the
+    // embedded CPU lease on helpers confined to two logical CPUs.
+    stale_task.resources.cpu_threads = 1;
     auto stale = grant(stale_task, true);
     usable_mib = 32;
     require(
@@ -671,6 +677,7 @@ inline void shared_capacity()
             std::this_thread::sleep_for(std::chrono::milliseconds(75));
         }
     }
+    auto finish_cpu = [&]
     {
         WorkerClientConfig local;
         local.broker = options.broker;
@@ -679,15 +686,39 @@ inline void shared_capacity()
         local.generation_kind = pool::Kind::GenerateCpu;
         local.generation_threads = 1;
         local.local_service = &worker;
-        bool delivered = false;
-        local.observe = [&](auto const& observation) { delivered = observation.local_direct; };
+        WorkerTaskObservation delivered;
+        local.observe = [&](auto const& observation) { delivered = observation; };
         WorkerClient cpu(local);
         cpu.generate(18, 2, id, [](auto const&, uint64_t) {});
-        require(delivered, "CPU fixture did not finish through the embedded worker");
-        auto page = control.status({});
-        require(!page.worker_records.empty() && page.worker_records.front().reserved == stale->task.resources,
-                "a fenced GPU capacity refresh stranded an unrelated completed CPU lease");
+        require(delivered.local_direct && delivered.kind == pool::Kind::GenerateCpu &&
+                delivered.worker_instance == stale->worker_instance && delivered.generation_resources.cpu_threads == 1,
+                "CPU fixture did not finish its signed single-CPU lease through the embedded worker");
+        auto jobs = control.status({pool::StatusSection::Jobs});
+        require(std::ranges::any_of(jobs.job_records, [&](auto const& job) {
+            return job.owner_id == local.owner_id && job.state == pool::JobState::Finished &&
+                job.worker_instance == delivered.worker_instance && job.resources == delivered.generation_resources;
+        }), "broker still holds the completed embedded CPU lease");
+    };
+    if (two_cpus) finish_cpu();
+    else
+    {
+        // One CPU is already reserved by the GPU grant. The broker must
+        // queue ordinary CPU work until that signed reservation is released.
+        auto waiting = request(1, false, true);
+        waiting.kind = pool::Kind::GenerateCpu; waiting.resources.cpu_threads = 1;
+        (void)grant(waiting, false);
+        auto jobs = control.status({pool::StatusSection::Jobs});
+        require(std::ranges::any_of(jobs.job_records, [](auto const& job) {
+            return job.kind == pool::Kind::GenerateCpu && job.state == pool::JobState::Queued &&
+                job.waiting == pool::WaitReason::CpuReserved;
+        }), "worker with one CPU did not preserve its signed CPU reservation");
+        control.cancel(session, waiting.task_id, waiting.attempt);
     }
+    auto held = control.acquire(session, stale_task);
+    require(held && held->token == stale->token, "unstarted GPU signature expired before the fence could be checked");
+    auto page = control.status({});
+    require(!page.worker_records.empty() && page.worker_records.front().reserved == stale->task.resources,
+            "fenced GPU worker retained resources beyond the held signature");
     bool declined = false;
     try
     {
@@ -698,6 +729,7 @@ inline void shared_capacity()
         declined = true;
     }
     require(declined, "worker used a lower tier that exceeded its signed host grant");
+    if (!two_cpus) finish_cpu();
     ++stale_task.attempt;
     std::optional<pool::Lease> retry;
     require(eventually(
@@ -745,15 +777,17 @@ inline void shared_capacity()
         {
             auto h = worker.local_generation_offer(18, 2, 1);
             return h.capacity.gpu_bytes == (24ull << 20) && h.demand.slots &&
-                   route(18).first.independent_width(UINT32_MAX) > 1;
+                   (route(18).first.independent_width(UINT32_MAX) > 1) == two_cpus;
         },
         "fresh streamed child lost the originally supported independent shape");
     auto const low_child = worker.local_generation_offer(18, 2, 1);
-    auto independent_child = grant(request(2, true), true);
-    require(independent_child->task.resources == low_child.demand,
-            "isolated independent contributions were charged for simultaneous members");
-    run_signed(*independent_child, 42);
+    auto child_task = request(2, true);
+    auto independent_child = grant(child_task, two_cpus);
+    if (independent_child)
     {
+        require(independent_child->task.resources == low_child.demand,
+                "isolated independent contributions were charged for simultaneous members");
+        run_signed(*independent_child, 42);
         WorkerClientConfig local;
         local.broker = options.broker;
         local.tls = options.tls;
@@ -785,6 +819,7 @@ inline void shared_capacity()
         require(direct && chunks == 2 * PlotGroupFile::getChunkCountForK(18),
                 "embedded recovered work lost its independently signed streamed members");
     }
+    else control.cancel(session, child_task.task_id, child_task.attempt);
     auto missing = worker.local_generation_offer(20, 2, 1);
     require(!missing.demand.slots && missing.gpu_headroom_limited && missing.demand.host_bytes,
             "isolated admission treated a temporarily unavailable k as permanently impossible");

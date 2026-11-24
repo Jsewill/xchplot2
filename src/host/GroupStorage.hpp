@@ -112,6 +112,8 @@ public:
     enum class Mode { protected_farm, observed_farm };
     explicit DiskIoGovernor(Sampler sampler = sample_device, size_t pending_capacity = 4096, Mode mode = Mode::protected_farm)
         : sampler_(std::move(sampler)), mode_(mode) { pending_.reserve(pending_capacity); }
+    Clock::time_point pressure_deadline() const
+    { std::lock_guard lock(mutex_); return pressure_until_; }
     static uint64_t initial_memory_bytes(size_t pending_capacity = 4096)
     { return sizeof(DiskIoGovernor) + 2 * pending_capacity * sizeof(Pending); }
     bool limits_io(Clock::time_point now = Clock::now()) const
@@ -867,6 +869,15 @@ inline std::string nvme_subsystem_name(std::span<uint8_t const> field)
     return std::string(name);
 }
 #ifdef _WIN32
+inline std::string disk_guid(DWORD number, STORAGE_DEVICE_NUMBER_EX const& id, DWORD bytes)
+{
+    if (bytes != sizeof(id) || id.Version != sizeof(id) || id.Size != sizeof(id) ||
+        id.DeviceType != FILE_DEVICE_DISK || id.DeviceNumber != number || number == MAXDWORD) return {};
+    std::array<uint8_t, sizeof(GUID)> guid;
+    std::memcpy(guid.data(), &id.DeviceGuid, guid.size());
+    if (std::all_of(guid.begin(), guid.end(), [](uint8_t byte) { return byte == 0; })) return {};
+    return group_tools::hex(guid);
+}
 inline std::string nvme_subsystem_reply(std::span<uint8_t const> encoded)
 {
     if (encoded.size() < sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) return {};
@@ -912,9 +923,11 @@ inline std::string nvme_subsystem(HANDLE disk)
 // links through the kernel's filesystem-info ioctl and sysfs interface.
 // Windows maps a volume's extents to physical disk numbers. Volume GUIDs
 // identify filesystems, never evidence that their backing disks are separate.
-inline StorageDevice storage_device(std::filesystem::path const& directory)
+// Dated measurements can also request the device GUID for each Windows disk.
+inline StorageDevice storage_device(std::filesystem::path const& directory, std::vector<std::string>* windows_disk_guids = nullptr)
 {
     namespace fs = std::filesystem;
+    if (windows_disk_guids) windows_disk_guids->clear();
     file_io::Stat info{}; require(!file_io::inspect_path(directory.c_str(), &info), "cannot inspect destination device");
     StorageDevice result{std::to_string(uint64_t(info.st_dev)), {}};
 #ifdef __linux__
@@ -1023,7 +1036,7 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
     }
     if (disks.empty()) return result;
     bool nonrotating = true, all_rotating = true;
-    std::vector<std::string> drives;
+    std::vector<std::string> drives, guids;
     for (auto number : disks)
     {
         auto device_name = L"\\\\.\\PhysicalDrive" + std::to_wstring(number);
@@ -1042,6 +1055,15 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         // having distinct disk numbers. Their unresolved topology serializes.
         if (device->BusType == BusTypeUnknown || device->BusType == BusTypeVirtual || device->BusType == BusTypeFileBackedVirtual ||
             device->BusType == BusTypeSpaces || device->BusType == BusTypeRAID || device->BusType >= BusTypeMax) return result;
+        if (windows_disk_guids)
+        {
+            STORAGE_DEVICE_NUMBER_EX id{};
+            if (!::DeviceIoControl(disk.value, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, nullptr, 0, &id, sizeof(id), &returned, nullptr))
+                return result;
+            auto guid = storage_detail::disk_guid(number, id, returned);
+            if (guid.empty()) return result;
+            guids.push_back(std::move(guid));
+        }
         if (device->BusType == BusTypeNvme)
         {
             auto subsystem = storage_detail::nvme_subsystem(disk.value);
@@ -1058,6 +1080,7 @@ inline StorageDevice storage_device(std::filesystem::path const& directory)
         drives.push_back("windows:disk:" + std::to_string(number));
     }
     result.drives = std::move(drives); result.nonrotating = nonrotating; result.rotating = all_rotating;
+    if (windows_disk_guids) *windows_disk_guids = std::move(guids);
 #endif
     return result;
 }

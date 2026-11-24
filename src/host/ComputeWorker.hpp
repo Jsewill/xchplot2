@@ -139,6 +139,35 @@ struct WorkerTaskObservation
     pool::Resources generation_resources{};
     std::optional<int> local_device; // Display selector for a private in-process executor.
 };
+// Exact validated result for a proposed single-lane whole-group publication.
+struct WorkerPublication
+{
+    pool::PublicationRoute route;
+    std::string path, host, gpu;
+    bool loopback = false;
+    std::vector<std::array<uint8_t, 32>> ids;
+    std::atomic<unsigned> deliveries{0};
+    uint8_t k = 0, strength = 0;
+    std::atomic<bool> encoded{false}, promoted{false};
+    bool selected_fresh = false;
+    bool matches(pool::Lease const& lease) const
+    {
+        return lease.worker_identity == route.identity && lease.worker_instance == route.instance && lease.endpoint == route.endpoint &&
+            lease.task.kind == route.kind && lease.task.resources == route.resources && lease.task.work_units == ids.size() &&
+            lease.task.k == k && lease.task.strength == strength;
+    }
+    void delivered(WorkerTaskObservation const& value, pool::Endpoint const& endpoint, std::string const& actual_path)
+    {
+        if (value.kind == pool::Kind::Pack) return;
+        bool const matched = !value.local_direct && !value.independent_members && value.generation.worker_ns &&
+            value.worker_identity == route.identity && value.worker_instance == route.instance && endpoint == route.endpoint &&
+            value.kind == route.kind && value.generation_resources == route.resources && actual_path == path &&
+            value.k == k && value.strength == strength && value.work_units == ids.size() && value.member_id_count == ids.size() && std::equal(ids.begin(), ids.end(), value.member_ids.begin()) &&
+            (value.generation_output == pool::GenerationOutput::Packed || value.generation_output == pool::GenerationOutput::Fresh);
+        if (matched) encoded.store(value.generation_output == pool::GenerationOutput::Fresh);
+        deliveries.fetch_add(matched ? 1 : 2);
+    }
+};
 struct WorkerGenerationPrior
 {
     uint64_t compute_low = 0, compute_high = 0, wire_low = 0, wire_high = 0;
@@ -153,6 +182,7 @@ class WorkerTaskDeclined : public std::runtime_error
 public:
     WorkerTaskDeclined() : std::runtime_error("optional compute task declined for selected worker") {}
 };
+class WorkerPublicationChanged : public WorkerTaskDeclined {};
 struct WorkerTaskOptions
 {
     std::function<bool(WorkerTaskObservation const&)> selected;
@@ -164,6 +194,7 @@ struct WorkerTaskOptions
     std::chrono::steady_clock::time_point other_work_until{};
     WorkerPackedRoute const* packed_route = nullptr;
     bool fresh_read_ahead = true;
+    std::shared_ptr<WorkerPublication> publication;
 };
 class WorkerAlreadyRunning : public std::runtime_error
 {
@@ -414,6 +445,8 @@ public:
     bool local_available() const;
     unsigned max_window_chunks() const;
     uint64_t max_task_bytes() const;
+    std::shared_ptr<WorkerPublication> publication_route(uint8_t k, uint8_t strength,
+        std::span<std::array<uint8_t, 32> const> ids) const;
     WorkerGenerationCapacity generation_capacity(uint8_t k, uint8_t strength) const;
     unsigned packed_generation_width(uint8_t k, uint8_t strength, unsigned ready, unsigned destinations,
                                      WorkerPackedRoute* batch_route = nullptr, unsigned* singleton_limit = nullptr,

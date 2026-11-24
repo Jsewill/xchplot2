@@ -558,6 +558,40 @@ void concrete_resources(BrokerOptions options, TlsOptions const& owner_tls, TlsO
     auto missing = task("unspecified", 6); missing.resources.host_bytes = 0;
     rejects([&] { (void)owner.acquire(session, missing); });
 }
+void publication_route(BrokerOptions options, TlsOptions const& owner_tls,
+                       TlsOptions const& first_tls, TlsOptions const& second_tls)
+{
+    RunningBroker running(options); auto endpoint = running.server.endpoint();
+    BrokerClient owner(endpoint, owner_tls), first(endpoint, first_tls), second(endpoint, second_tls);
+    auto const session = owner.open_owner("publication-route");
+    auto hybrid = offer("hybrid", 45001); hybrid.capacity = {2, 1, 8192, 4096};
+    hybrid.capabilities |= capability(Kind::GenerateGpu);
+    hybrid.generation_profiles = {profile(Kind::GenerateGpu), profile(Kind::GenerateCpu)};
+    for (auto& profile : hybrid.generation_profiles) { profile.max_batch_members = 3; profile.member_host_bytes = 512; }
+    first.register_worker(hybrid);
+    auto request = task("terminal"); request.kind = Kind::GenerateAny; request.work_units = 3;
+    auto const quote = owner.publication_route(session, request);
+    require(quote && quote->instance == hybrid.instance && quote->endpoint == hybrid.endpoint &&
+        quote->kind == Kind::GenerateGpu && quote->resources == Resources{1, 1, 2048, 2048},
+        "a single-slot hybrid did not quote its eligible full-width default generation shape");
+    request.generation_output = GenerationOutput::Fresh;
+    auto const lease = owner.acquire(session, request);
+    require(lease && lease->worker_identity == quote->identity && lease->task.kind == quote->kind &&
+        lease->task.resources == quote->resources, "a cold paid grant did not match its full-width publication quote");
+    request.generation_output = GenerationOutput::Packed;
+    require(!owner.publication_route(session, request), "a live signed lease was priced as idle capacity");
+    owner.cancel(session, request.task_id, request.attempt);
+    ++hybrid.capacity_revision; hybrid.generation_profiles.front().max_batch_members = 1;
+    first.register_worker(hybrid);
+    auto const cpu = owner.publication_route(session, request);
+    require(cpu && cpu->kind == Kind::GenerateCpu && cpu->resources == Resources{1, 1, 2048, 0},
+        "a full-width CPU offer was hidden by an ineligible single-member GPU tier");
+    second.register_worker(offer("another-lane", 45002));
+    require(!owner.publication_route(session, request), "a competing worker lane was priced as a single paid route");
+    second.unregister_worker("another-lane");
+    ++hybrid.capacity_revision; hybrid.capacity.slots = 2; first.register_worker(hybrid);
+    require(!owner.publication_route(session, request), "parallel reservations were priced as a single paid route");
+}
 void codec_window_limits(BrokerOptions options, TlsOptions const& owner_tls,
                          TlsOptions const& small_tls, TlsOptions const& large_tls)
 {
@@ -2286,6 +2320,7 @@ int main() try
     broker(options, a_tls, b_tls, tls(ca, wa), tls(ca, wb));
     selection(options, a_tls, tls(ca, wa), tls(ca, wb));
     concrete_resources(options, a_tls, tls(ca, wa));
+    publication_route(options, a_tls, tls(ca, wa), tls(ca, wb));
     codec_window_limits(options, a_tls, tls(ca, wa), tls(ca, wb));
     retry_eligibility(options, a_tls, tls(ca, wa), tls(ca, wb));
     queued_eligibility(options, a_tls, tls(ca, wa), tls(ca, wb));

@@ -223,7 +223,7 @@ public:
         return {};
     }
     bool final_group_encoded(Shape shape, bool encoded, bool fixed_width,
-                             long double packed_member_ns, long double fresh_member_ns) const
+                             long double packed_member_ns, long double fresh_member_ns, std::optional<bool> prior = {}) const
     {
         if (shape == shape_)
         {
@@ -233,9 +233,10 @@ public:
                 auto const packed = measured->times[false].member_ns(), fresh = measured->times[true].member_ns();
                 // Durable publication includes the owner's packing and syncs.
                 if (packed && fresh) return fresh <= packed;
-                if (packed && !fresh_member_ns) return false;
+                if (!prior && packed && !fresh_member_ns) return false;
             }
         }
+        if (prior) return *prior;
         // Spare workers cannot hide an output trial when generation is draining.
         if (packed_member_ns > 0) return fresh_member_ns > 0 && fresh_member_ns < packed_member_ns;
         return encoded || (!fixed_width && select(shape, 1, 1, 1, "auto", true, false).encoded);
