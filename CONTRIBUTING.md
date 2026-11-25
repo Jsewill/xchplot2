@@ -563,8 +563,10 @@ Both build AdaptiveCpp into LLVM using
 `ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
 and LLVM-SPIRV translator. The Windows cache key covers the host tools and
 SDK, build script, patches, PTX check, and embedded manifest. OpenSSL and
-the Rust notice generator have separate caches. Select `windows-toolchain`
-in a manual `Binary release` run on `main` to populate these caches for PRs.
+the Rust notice generator have separate caches. When their build inputs land
+on `main`, the workflow refreshes the shared Windows caches for subsequent PRs.
+After a runner image changes, select `windows-toolchain` in a manual
+`Binary release` run on `main` to refresh them.
 `scripts/build-release.ps1` collects runtime DLLs and notices, runs the
 host checks, and writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
 PRs changing only the keygen Cargo manifest, lockfile or release Rust pin

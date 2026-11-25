@@ -24,7 +24,18 @@ on:
       - scripts/test/compute-cli.py
       - scripts/test/group-pool-test.py
   push:
+    branches: [main]
     tags: ['v*', '!v*-cuda-only']
+    paths:
+      - .github/workflows/release.yml
+      - ci/release/build-adaptivecpp-windows.ps1
+      - ci/release/install-cuda-arm64.ps1
+      - ci/release/adaptivecpp-*.patch
+      - contrib/adaptivecpp-windows-*.patch
+      - ci/release/check-cuda-ptx.py
+      - tools/xchplot2/windows.manifest
+      - ci/release/build-openssl-windows.ps1
+      - ci/release/rust-toolchain
   workflow_dispatch:
     inputs:
       platform:
@@ -43,7 +54,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.platform || 'all' }}-${{ inputs.architecture || 'all' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch') }}
 
 jobs:
   changes:
@@ -58,6 +69,7 @@ jobs:
       linux: ${{ steps.filter.outputs.linux }}
       windows: ${{ steps.filter.outputs.windows }}
       full_build: ${{ steps.filter.outputs.full_build }}
+      toolchain_only: ${{ inputs.platform == 'windows-toolchain' || (github.event_name == 'push' && github.ref_type == 'branch') }}
     steps:
       - uses: dorny/paths-filter@v4
         id: filter
@@ -100,7 +112,7 @@ jobs:
   linux-sycl:
     needs: changes
     if: >-
-      (inputs.platform == '' || inputs.platform == 'all' || inputs.platform == 'linux') &&
+      needs.changes.outputs.toolchain_only != 'true' && inputs.platform != 'windows' &&
       (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
        needs.changes.outputs.linux == 'true')
     strategy:
@@ -270,8 +282,15 @@ jobs:
       - name: Install release notice generator
         if: steps.cargo-about.outputs.cache-hit != 'true'
         run: cargo install --locked --features cli cargo-about --version $env:CARGO_ABOUT_VERSION
+      - name: Check the cached Windows tools
+        if: needs.changes.outputs.toolchain_only == 'true'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          ./build/windows-toolchain/install/bin/llvm-dis.exe --version
+          ./build/windows-openssl/install/bin/openssl.exe version
+          cargo about --version
       - name: Build and package
-        if: inputs.platform != 'windows-toolchain'
+        if: needs.changes.outputs.toolchain_only != 'true'
         id: package
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -281,7 +300,7 @@ jobs:
           $env:CMAKE_BUILD_PARALLEL_LEVEL = [Math]::Min(4, [Environment]::ProcessorCount)
           ./scripts/build-release.ps1 -OpenSSLRoot build/windows-openssl/install -PackageTargetsOnly:($env:PACKAGE_TARGETS_ONLY -eq 'true')
       - name: Check the extracted runtime and Windows CPU proofs
-        if: inputs.platform != 'windows-toolchain'
+        if: needs.changes.outputs.toolchain_only != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
