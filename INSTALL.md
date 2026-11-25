@@ -42,8 +42,8 @@ a source build using the instructions below.
 Requires CUDA Toolkit **12.0+** (12.0 is the floor — `cudaGetDeviceProperties_v2`,
 the v2 ABI we link, and CUDA C++20 dialect all need 12.0; the latest benchmark used 13.3.73), **C++20** host compiler, **CMake ≥ 3.26** (3.26+ knows
 how to drive nvcc 12.5+; lower works for older nvcc), and a Rust
-toolchain from rustup `stable`. The release builds use **Rust 1.98.1**;
-older distro-packaged Rust may not support the locked dependencies.
+toolchain from rustup `stable`. Older distro-packaged Rust may not support
+the locked dependencies. Release builds use the [pinned Rust version](ci/release/rust-toolchain).
 
 ### Historical dependency sources
 
@@ -214,7 +214,7 @@ ctest --test-dir build --output-on-failure
 
 For ARM64, use Visual Studio's ARM64 C++ tools and developer prompt,
 CUDA 13.4.2, and Rust's `stable-aarch64-pc-windows-msvc` toolchain.
-The release build uses CMake 4.4 and Rust 1.98.1.
+The release build uses CMake 4.4 and the [pinned Rust version](ci/release/rust-toolchain).
 Use the same CMake commands with a GPU architecture supported by that toolkit.
 
 Change `89` to your GPU architecture from the table above. The full CTest

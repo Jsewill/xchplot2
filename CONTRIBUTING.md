@@ -216,6 +216,8 @@ whose provenance is incomplete.
 Repository lint checks workflow syntax, spelling, tracked Markdown, and links
 to local files and section headings. Dependabot groups updates to the three
 lint actions in one weekly PR per target branch when updates are available.
+Dependabot also checks the release Rust version on both branches. A change
+to that pin runs all four archive checks.
 Keygen dependency PRs run Rust tests, all six distro Cargo installs, and
 Linux and Windows archive checks on x86-64 and ARM64.
 
@@ -241,8 +243,9 @@ release notes and release attachments unless explicitly requested. Before
 publishing, review the final notes and asset list for relevance to users.
 
 The release workflow builds the standalone CMake executable in
-`ci/release/Containerfile`: Ubuntu 22.04, CUDA 12.9.1, CMake 3.28.3, and
-Rust 1.98.1. CUDA targets are explicit in `scripts/build-release.sh`; keep
+`ci/release/Containerfile` with Ubuntu 22.04, CUDA 12.9.1, and CMake 3.28.3.
+Linux and Windows use the same [release Rust version](ci/release/rust-toolchain).
+CUDA targets are explicit in `scripts/build-release.sh`; keep
 the compatibility requirements in `INSTALL.md` and the archive README in
 sync when changing them. `cargo-about` collects the Rust dependency licenses
 and fails on unresolved licenses.
@@ -263,8 +266,9 @@ For native Windows, install the [Windows build tools](INSTALL.md#windows)
 and PowerShell 7.3+, then run:
 
 ```powershell
-rustup toolchain install 1.98.1 --profile minimal
-rustup default 1.98.1
+$rustVersion = (Get-Content -Raw ci/release/rust-toolchain).Trim()
+rustup toolchain install $rustVersion --profile minimal
+rustup default $rustVersion
 cargo install --locked --features cli cargo-about --version 0.9.2
 ./scripts/build-release.ps1
 python scripts/test/release.py (Get-ChildItem build/release-windows/dist/*.zip).FullName
