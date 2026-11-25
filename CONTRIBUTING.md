@@ -262,6 +262,10 @@ The same image and script build natively on x86-64 and ARM64 (CUDA SBSA).
 ARM64 includes every numeric GPU architecture reported by its compiler.
 The release matrix runs both architectures and checks each extracted archive
 on its matching Ubuntu runtime. Manual runs can select Linux or Windows.
+For pull requests, platform-specific packaging changes run on the affected OS.
+When only the release Rust version or keygen Cargo manifests change, Windows
+builds the shipped executable and every target used by the archive checks.
+Source changes, tags and manual builds compile the full target set.
 For native Windows, install the [Windows build tools](INSTALL.md#windows)
 and PowerShell 7.3+, then run:
 

@@ -1,6 +1,6 @@
 #requires -Version 7.3
 # Build the native Windows CUDA archive with Visual Studio and CUDA.
-param([string]$BuildDir = 'build/release-windows')
+param([string]$BuildDir = 'build/release-windows', [switch]$PackageTargetsOnly)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -66,6 +66,10 @@ $jobs = if ($env:CMAKE_BUILD_PARALLEL_LEVEL) { $env:CMAKE_BUILD_PARALLEL_LEVEL }
 cmake --build $BuildDir --parallel $jobs --target $hostTests
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error `
     -R ('^(' + ($hostTests -join '|') + ')$')
-cmake --build $BuildDir --parallel $jobs
+if ($PackageTargetsOnly) {
+    cmake --build $BuildDir --parallel $jobs --target xchplot2 plot_file_parity
+} else {
+    cmake --build $BuildDir --parallel $jobs
+}
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^plot_file_parity$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

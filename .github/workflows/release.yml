@@ -30,9 +30,63 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.platform || 'all' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  changes:
+    name: Select release checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      linux: ${{ steps.filter.outputs.linux }}
+      windows: ${{ steps.filter.outputs.windows }}
+      full_build: ${{ steps.filter.outputs.full_build }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            full_build:
+              - '**'
+              - '!keygen-rs/{Cargo.toml,Cargo.lock}'
+              - '!ci/release/rust-toolchain'
+            shared:
+              - '.github/workflows/release.yml'
+              - '{CMakeLists.txt,LICENSE}'
+              - 'cmake/**'
+              - 'ci/release/{licenses.hbs,rust-toolchain}'
+              - 'keygen-rs/**'
+              - 'src/**'
+              - 'tools/**'
+              - '!tools/xchplot2/*.{rc,manifest}'
+              - 'contrib/pos2-*.patch'
+              - 'contrib/cccl-arch-list.patch'
+              - 'scripts/test/release.py'
+            linux:
+              - 'ci/release/{Containerfile,README.txt}'
+              - 'scripts/build-release.sh'
+            windows:
+              - 'ci/release/*.ps1'
+              - 'ci/release/{README.windows.txt,microsoft-runtime.txt}'
+              - 'scripts/build-release.ps1'
+              - 'scripts/test/windows.py'
+              - 'tools/xchplot2/*.{rc,manifest}'
+              - 'contrib/cccl-windows-ptx.patch'
+
   linux-cuda:
-    if: inputs.platform != 'windows'
+    needs: changes
+    if: >-
+      inputs.platform != 'windows' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.linux == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -68,9 +122,13 @@ jobs:
           if-no-files-found: error
 
   windows-cuda:
+    needs: changes
+    if: >-
+      inputs.platform != 'linux' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.shared == 'true' ||
+       needs.changes.outputs.windows == 'true')
     env:
       CARGO_ABOUT_VERSION: '0.9.2'
-    if: inputs.platform != 'linux'
     strategy:
       fail-fast: false
       matrix:
@@ -116,9 +174,10 @@ jobs:
       - name: Build and package
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          PACKAGE_TARGETS_ONLY: ${{ github.event_name == 'pull_request' && needs.changes.outputs.full_build == 'false' }}
         run: |
           $env:CMAKE_BUILD_PARALLEL_LEVEL = [Math]::Min(4, [Environment]::ProcessorCount)
-          ./scripts/build-release.ps1
+          ./scripts/build-release.ps1 -PackageTargetsOnly:($env:PACKAGE_TARGETS_ONLY -eq 'true')
       - name: Check extracted archive without toolkit libraries on PATH
         run: |
           $python = (Get-Command python.exe).Source
