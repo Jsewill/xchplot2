@@ -130,7 +130,16 @@ int main() try
     std::string pattern(reinterpret_cast<char const*>(temporary.data()), temporary.size());
     { File temp(io::temp_file(pattern.data())); require(pattern.size() == temporary.size(), "temporary creation changed its bounded template length");
       require(io::write_file(temp.fd, first.data(), first.size()) == first.size() && !io::flush(temp.fd), "private temporary file I/O failed"); }
-    require(!io::unlink_file(pattern) && !io::unlink_file(occupied) && !io::unlink_file(published), "native namespace removal failed");
+    {
+        File previous(io::open_file(occupied, io::read_only | io::no_follow));
+        require(!io::rename_file(io::native_path(pattern), occupied), "a reader blocked publication of the next revision");
+        std::array<uint8_t, 4096> value{};
+        require(io::read_at(previous.fd, value.data(), value.size(), 0) == 0, "an open reader switched to the new revision");
+        File current(io::open_file(occupied, io::read_only | io::no_follow));
+        require(io::read_at(current.fd, value.data(), value.size(), 0) == value.size() && value == first,
+            "a new reader did not see the published revision");
+    }
+    require(!io::unlink_file(occupied) && !io::unlink_file(published), "native namespace removal failed");
     require(io::inspect_link(published, &written) != 0 && errno == ENOENT, "deleted file remained in native namespace");
     std::cout << "group native identity, allocation, positioned I/O, locks and publication passed\n";
     return 0;

@@ -4302,26 +4302,26 @@ void bounded_saved_reads(fs::path const& root)
         try { operation(); } catch (std::runtime_error const&) { rejected = true; }
         require(rejected, message);
     };
+    auto const sample = root / "bounded-read";
     for (auto const& text : {std::string{}, std::string("checkpoint bytes")})
     {
-        std::istringstream in(text);
-        require(stream_state::read_exact(in, text.size()) == text, "bounded saved-state read changed its bytes");
+        stream_state::atomic_save(sample, text);
+        require(stream_state::read_exact(sample, text.size()) == text, "bounded saved-state read changed its bytes");
     }
-    std::istringstream short_input("short"), trailing_input("prefix with more bytes");
-    reject([&] { (void)stream_state::read_exact(short_input, 16); }, "bounded saved-state read accepted truncation");
-    reject([&] { (void)stream_state::read_exact(trailing_input, 6); }, "bounded saved-state read accepted growth");
-    // An input that never reaches EOF represents an appender staying ahead of
-    // a reader. Only the admitted prefix and a non-consuming probe may run.
-    struct GrowingInput : std::streambuf
+    reject([&] { (void)stream_state::read_exact(sample, 32); }, "bounded saved-state read accepted truncation");
+    reject([&] { (void)stream_state::read_exact(sample, 6); }, "bounded saved-state read accepted growth");
+#ifdef GROW_TEST_WRAP_PWRITE
+    stream_state::atomic_save(sample, std::string(32, 'x'));
+    size_t requested = 0;
+    construction_read_observer = [&](int, size_t count, off_t)
     {
-        size_t extracted = 0, probes = 0;
-        std::streamsize xsgetn(char* out, std::streamsize count) override
-        { std::fill_n(out, size_t(count), 'x'); extracted += size_t(count); return count; }
-        int_type underflow() override { ++probes; return traits_type::to_int_type('x'); }
-    } buffer;
-    std::istream growing(&buffer);
-    reject([&] { (void)stream_state::read_exact(growing, 32); }, "bounded saved-state read followed an appender");
-    require(buffer.extracted == 32 && buffer.probes == 1, "saved-state growth escaped the admitted read bound");
+        requested += count;
+        if (requested == 32) std::ofstream(sample, std::ios::binary | std::ios::app).put('x');
+    };
+    reject([&] { (void)stream_state::read_exact(sample, 32); }, "bounded saved-state read followed an appender");
+    construction_read_observer = {};
+    require(requested == 33, "saved-state growth escaped the admitted prefix and one-byte probe");
+#endif
 
     auto const work = root / "bounded-stream-state"; fs::create_directory(work);
     stream_state::State state; state.config = {1, 2, 4096, 4096, false, false}; state.raw.resize(1);
