@@ -560,8 +560,10 @@ SDK 6.4.2. ARM64 uses Visual Studio's 14.44 tools and CUDA 13.4.2, with CUDA,
 Level Zero, and OpenCL backends; AMD's Windows HIP SDK has no ARM64 runtime.
 Both build AdaptiveCpp into LLVM using
 `ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
-and LLVM-SPIRV translator. The cached install tree is invalidated when
-compiler sources or options change. `scripts/build-release.ps1` collects
+and LLVM-SPIRV translator. The Windows cache key covers the host tools and
+SDK, build script, patches, PTX check, and embedded manifest. A manual
+Windows `Binary release` run on `main` populates the cache for other PRs.
+`scripts/build-release.ps1` collects
 runtime DLLs and notices, builds all targets, runs the host checks, and
 writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
 It also requires `cargo-about` 0.9.2, native Windows Perl, and the toolchain

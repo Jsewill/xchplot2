@@ -186,12 +186,8 @@ jobs:
           }
           Remove-Item $installer, $unpacked -Recurse -Force
           "HIP_PATH=$env:ProgramFiles\AMD\ROCm\6.4" >> $env:GITHUB_ENV
-      - uses: actions/cache/restore@v6
-        id: toolchain
-        with:
-          path: build/windows-toolchain/install
-          key: ${{ matrix.arch == 'aarch64' && 'windows-arm64-acpp25.10-llvm20.1.8-msvc14.44-cuda-ze-ocl-ptx-v3' || 'windows-acpp25.10-llvm20.1.8-all-ptx-v2' }}-${{ hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch', 'contrib/adaptivecpp-*.patch') }}
       - name: Configure Visual Studio
+        id: vs
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -212,6 +208,22 @@ jobs:
               "$name=$([Environment]::GetEnvironmentVariable($name, 'Process'))" >> $env:GITHUB_ENV
           }
           clang-cl --version
+          $toolchainFiles = @((Get-Command clang-cl.exe).Source, (Get-Command nvcc.exe).Source)
+          if ($arm64) {
+              $toolchainFiles += 'ci/release/install-cuda-arm64.ps1'
+          } else {
+              $toolchainFiles += "$env:HIP_PATH/bin/hiprtc0604.dll"
+          }
+          $sdk = $env:WindowsSDKVersion.TrimEnd('\')
+          "toolchain=$env:VCToolsVersion-$sdk-$((Get-FileHash -LiteralPath $toolchainFiles).Hash -join '-')" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache/restore@v6
+        id: toolchain
+        with:
+          path: build/windows-toolchain/install
+          key: >-
+            windows-${{ matrix.arch }}-acpp-${{ steps.vs.outputs.toolchain }}-${{
+            hashFiles('ci/release/build-adaptivecpp-windows.ps1', 'ci/release/adaptivecpp-*.patch',
+                      'contrib/adaptivecpp-windows-*.patch', 'ci/release/check-cuda-ptx.py', 'tools/xchplot2/windows.manifest') }}
       - name: Build AdaptiveCpp with LLVM
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: ./ci/release/build-adaptivecpp-windows.ps1
