@@ -151,11 +151,21 @@ $hostTests = 'bench_stats_test', 'numa_topology_test', 'temp_file_test', 'spill_
     'pos2_pr118_grow_worker_test', 'pos2_pr118_grow_worker_client_test', `
     'pos2_pr118_grow_pool_codec_test', 'pos2_pr118_grow_pool_owner_test'
 cmake --build $BuildDir --parallel 2 --target $hostTests
-ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
-    -R ('^(' + ($hostTests -join '|') + ')$')
-ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 `
-    -R '^compute_(membership|worker)_network_test$'
-ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 -R '^compute_worker_gpu_(recovery|capacity)_test$'
+$hostSuites = [ordered]@{
+    host = '^(' + ($hostTests -join '|') + ')$'
+    network = '^compute_(membership|worker)_network_test$'
+    gpuWorker = '^compute_worker_gpu_(recovery|capacity)_test$'
+}
+$failedSuites = @()
+foreach ($suite in $hostSuites.GetEnumerator()) {
+    try {
+        ctest --test-dir $BuildDir --output-on-failure --no-tests=error --timeout 900 -R $suite.Value
+    } catch {
+        Write-Warning "$($suite.Key) checks failed. $_"
+        $failedSuites += $suite.Key
+    }
+}
+if ($failedSuites) { throw "Host test failures in $($failedSuites -join ', ')" }
 cmake --build $BuildDir --parallel 2
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test)$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

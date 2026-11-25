@@ -33,6 +33,29 @@ def extract_archive(archive_path, work):
     return packages[0], digest.hexdigest()
 
 
+def check_cli_suites(binary, work):
+    # Grouped plotting can take over half an hour on a hosted runner.
+    # Each harness also bounds its individual CLI operations.
+    service_options = ["--service-manager"] if os.name == "nt" else []
+    suites = [
+        ("recovery.py", [], 720),
+        ("group-cli.py", ["--automatic-compute", "--scratch", work], 60 * 60),
+        ("compute-cli.py", ["--scratch", work, *service_options], 420),
+    ]
+    failures = []
+    for script, options, timeout in suites:
+        print(f"Running {script}", flush=True)
+        try:
+            subprocess.run([sys.executable, pathlib.Path(__file__).with_name(script), binary, *options],
+                           check=True, timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            failures.append(f"{script} exited with {error.returncode}")
+        except subprocess.TimeoutExpired:
+            failures.append(f"{script} timed out after {timeout} seconds")
+    if failures:
+        raise SystemExit("\n".join(failures))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=pathlib.Path)
@@ -235,17 +258,9 @@ with os.add_dll_directory(str(directory)) if os.name == "nt" else contextlib.nul
         if os.name == "nt":
             assert (package / "licenses/microsoft-runtime.txt").stat().st_size > 0
             assert (package / "licenses/adaptivecpp-windows.txt").stat().st_size > 0
-        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("recovery.py"), binary],
-                       check=True, timeout=720)
         assert (package / "licenses/mdns.txt").stat().st_size > 0
         assert (package / ("licenses/openssl.txt" if os.name == "nt" else "licenses/libssl-dev.txt")).stat().st_size > 0
-        # Successful grouped CLI suites take over half an hour on some hosted runners.
-        # Each CLI operation still has its own timeout inside the harness.
-        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("group-cli.py"), binary,
-                        "--automatic-compute", "--scratch", work], check=True, timeout=60 * 60)
-        subprocess.run([sys.executable, pathlib.Path(__file__).with_name("compute-cli.py"), binary,
-                        "--scratch", work, *(["--service-manager"] if os.name == "nt" else [])],
-                       check=True, timeout=420)
+        check_cli_suites(binary, work)
         print("Release archive: extraction, CLI, CPU/SYCL plotting parity, and full proofs passed")
 
 
