@@ -2439,8 +2439,9 @@ the next completed job reports a member from that worker.
 Linux uses a systemd user service; logout behavior follows the system's user
 manager policy. Windows uses Task Scheduler at user login, without elevation,
 and requires that user to remain logged in. The native Windows service path
-is experimental: rapid stop/start/restart can leave the worker stopped on
-x86-64. Check `compute service status` and `compute status` after restarting.
+is experimental. A restart waits for the previous compute process to exit.
+Use `compute service status` to check the task and `compute status` to confirm
+that the worker has rejoined the pool.
 
 ### Networks and dedicated brokers
 
