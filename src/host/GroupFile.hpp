@@ -306,7 +306,11 @@ inline int flush(int fd)
     return ::FlushFileBuffers(handle(fd)) ? 0 : failed();
 }
 template <typename Path> inline int rename_file(Path const& from, Path const& to, bool replace = true)
-{ return ::MoveFileExW(native_path(from).c_str(), native_path(to).c_str(), MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0)) ? 0 : failed(); }
+{
+    try { pos2gpu::move_private_path(native_path(from), native_path(to), replace); return 0; }
+    catch (std::system_error const& error) { return failed(DWORD(error.code().value())); }
+    catch (std::exception const&) { errno = EACCES; return -1; }
+}
 template <typename Path> inline int remove_path(Path const& path, bool dir)
 {
     HANDLE file = ::CreateFileW(native_path(path).c_str(), DELETE | FILE_READ_ATTRIBUTES,

@@ -120,14 +120,30 @@ Stamp stamp(fs::path const& path)
 }
 // A preflight file size is an allocation bound, even if the file grows or is
 // replaced before it is opened. Never follow a changed input to its new EOF.
-std::string read_exact(std::istream& in, uint64_t bytes)
+std::string read_exact(fs::path const& path, uint64_t bytes)
 {
     require(bytes <= std::numeric_limits<size_t>::max() &&
-        bytes <= uint64_t(std::numeric_limits<std::streamsize>::max()), "saved state exceeds the read size limit");
+        bytes <= uint64_t(std::numeric_limits<file_io::Offset>::max()), "saved state exceeds the read size limit");
+    // Native readers share deletion on Windows so a status query can finish
+    // reading the old revision while the writer publishes its successor.
+    Descriptor file(file_io::open_file(path, file_io::read_only | file_io::close_on_exec | file_io::no_follow));
+    auto read = [&](char* output, size_t count, size_t offset)
+    {
+        file_io::Count n;
+        do { n = file_io::read_at(file.fd, output, std::min(count, file_io::max_transfer), file_io::Offset(offset)); }
+        while (n < 0 && errno == EINTR);
+        require(n >= 0, "cannot read saved state");
+        return size_t(n);
+    };
     std::string text(size_t(bytes), '\0');
-    in.read(text.data(), std::streamsize(bytes));
-    require(uint64_t(in.gcount()) == bytes && !in.bad(), "saved state was truncated while loading");
-    require(in.peek() == std::char_traits<char>::eof() && !in.bad(), "saved state grew while loading");
+    for (size_t at = 0; at < text.size();)
+    {
+        auto const n = read(text.data() + at, text.size() - at, at);
+        require(n > 0, "saved state was truncated while loading");
+        at += n;
+    }
+    char extra;
+    require(read(&extra, 1, text.size()) == 0, "saved state grew while loading");
     return text;
 }
 bool same_output(Stamp const& saved, Stamp const& current)
@@ -320,8 +336,7 @@ State load_state(fs::path const& work, Config const& config, std::string const& 
     auto const path = work / "checkpoint";
     auto const saved_stamp = stamp(path);
     require(saved_stamp.bytes < limit / 8, "checkpoint exceeds RAM budget");
-    auto file = group_tools::input(file_io::path_text(path));
-    auto body = read_exact(file, saved_stamp.bytes);
+    auto body = read_exact(path, saved_stamp.bytes);
     require(stamp(path) == saved_stamp, "checkpoint changed while loading");
     require(body.size() >= 65 && body[64] == '\n', "invalid checkpoint checksum");
     auto const hash = body.substr(0, 64);

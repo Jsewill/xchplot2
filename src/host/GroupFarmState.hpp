@@ -686,8 +686,7 @@ inline FarmingStateFile read_farming_state(std::filesystem::path const& path, ui
 {
     auto const stamp = stream_state::stamp(path);
     check_farming_state_size(stamp.bytes, memory_limit);
-    auto file = group_tools::input(file_io::path_text(path));
-    auto contents = stream_state::read_exact(file, stamp.bytes);
+    auto contents = stream_state::read_exact(path, stamp.bytes);
     require(contents.size() >= 65 && contents.back() == '\n', "invalid farming plan checksum");
     auto const digest = contents.substr(contents.size() - 65, 64);
     contents.resize(contents.size() - 65);
