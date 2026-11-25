@@ -539,8 +539,9 @@ collects CPU, CUDA, HIP, and ARM64 OpenCL runtime/JIT dependencies; the build
 script adds Level Zero, checks the GPU backends, collects license notices, and
 makes library paths relative.
 
-PR and manual runs retain workflow artifacts. Manual runs can select one
-platform and host architecture; PR and tag runs build the full matrix.
+PR and manual builds retain workflow artifacts. PRs select platforms by
+their changed inputs. Manual builds can select one platform and host
+architecture. Tag runs build both architectures on each platform.
 Only tag pushes attach archives to a draft release; manual checks against a
 tag retain their archives as workflow artifacts.
 Keep the version in `Cargo.toml`, `Cargo.lock`, and `CMakeLists.txt` identical
@@ -561,11 +562,15 @@ Level Zero, and OpenCL backends; AMD's Windows HIP SDK has no ARM64 runtime.
 Both build AdaptiveCpp into LLVM using
 `ci/release/build-adaptivecpp-windows.ps1`, including the Level Zero loader
 and LLVM-SPIRV translator. The Windows cache key covers the host tools and
-SDK, build script, patches, PTX check, and embedded manifest. A manual
-Windows `Binary release` run on `main` populates the cache for other PRs.
-`scripts/build-release.ps1` collects
-runtime DLLs and notices, builds all targets, runs the host checks, and
-writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
+SDK, build script, patches, PTX check, and embedded manifest. OpenSSL and
+the Rust notice generator have separate caches. Select `windows-toolchain`
+in a manual `Binary release` run on `main` to populate these caches for PRs.
+`scripts/build-release.ps1` collects runtime DLLs and notices, runs the
+host checks, and writes one combined `build/release-windows/dist/*-windows-ARCH-sycl.zip`.
+PRs changing only the keygen Cargo manifest, lockfile or release Rust pin
+build the archive and all its test executables. Other builds also compile the
+development targets. The extracted Windows archive runs grouped plotting and
+farm policy tests concurrently in separate temporary directories.
 It also requires `cargo-about` 0.9.2, native Windows Perl, and the toolchain
 in `ACPP_PREFIX`. `ci/release/build-openssl-windows.ps1` builds the pinned
 static OpenSSL libraries with the active Visual Studio tools; their license

@@ -1,6 +1,10 @@
 #requires -Version 7.3
 # Build a Windows SYCL archive with the LLVM-integrated AdaptiveCpp toolchain.
-param([string]$BuildDir = 'build/release-windows')
+param(
+    [string]$BuildDir = 'build/release-windows',
+    [string]$OpenSSLRoot,
+    [switch]$PackageTargetsOnly
+)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -29,8 +33,12 @@ if ($arm64) { $env:PATH = "$env:CUDA_PATH/bin/arm64;" + $env:PATH }
 $env:ACPP_VISIBILITY_MASK = 'omp'
 New-Item -ItemType Directory -Force $BuildDir | Out-Null
 $BuildDir = (Resolve-Path $BuildDir).Path
-$openssl = Join-Path $BuildDir 'openssl/install'
-& (Join-Path $PSScriptRoot '../ci/release/build-openssl-windows.ps1') -BuildDir (Join-Path $BuildDir 'openssl')
+if ($OpenSSLRoot) {
+    $openssl = (Resolve-Path $OpenSSLRoot).Path
+} else {
+    $openssl = Join-Path $BuildDir 'openssl/install'
+    & (Join-Path $PSScriptRoot '../ci/release/build-openssl-windows.ps1') -BuildDir (Join-Path $BuildDir 'openssl')
+}
 $licenses = Join-Path $BuildDir 'licenses'
 $runtime = Join-Path $BuildDir 'runtime'
 foreach ($directory in $licenses, $runtime) {
@@ -150,7 +158,8 @@ $hostTests = 'bench_stats_test', 'numa_topology_test', 'temp_file_test', 'spill_
     'pos2_pr118_grow_replot_resources_test', 'pos2_pr118_grow_farming_test', 'pos2_pr118_grow_gpu_output_test', `
     'pos2_pr118_grow_worker_test', 'pos2_pr118_grow_worker_client_test', `
     'pos2_pr118_grow_pool_codec_test', 'pos2_pr118_grow_pool_owner_test'
-cmake --build $BuildDir --parallel 2 --target $hostTests
+$jobs = if ($env:CMAKE_BUILD_PARALLEL_LEVEL) { $env:CMAKE_BUILD_PARALLEL_LEVEL } else { 2 }
+cmake --build $BuildDir --parallel $jobs --target $hostTests
 $hostSuites = [ordered]@{
     host = '^(' + ($hostTests -join '|') + ')$'
     network = '^compute_(membership|worker)_network_test$'
@@ -166,6 +175,10 @@ foreach ($suite in $hostSuites.GetEnumerator()) {
     }
 }
 if ($failedSuites) { throw "Host test failures in $($failedSuites -join ', ')" }
-cmake --build $BuildDir --parallel 2
+if ($PackageTargetsOnly) {
+    cmake --build $BuildDir --parallel $jobs --target xchplot2 hellosycl plot_file_parity sycl_twophase_budget_test
+} else {
+    cmake --build $BuildDir --parallel $jobs
+}
 ctest --test-dir $BuildDir --output-on-failure --no-tests=error -R '^(plot_file_parity|sycl_twophase_budget_test)$'
 cpack --config (Join-Path $BuildDir 'CPackConfig.cmake') -B (Join-Path $BuildDir 'dist')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise an extracted binary archive without a compiler or GPU toolkit."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import pathlib
@@ -37,21 +38,29 @@ def check_cli_suites(binary, work):
     # Grouped plotting can take over half an hour on a hosted runner.
     # Each harness also bounds its individual CLI operations.
     service_options = ["--service-manager"] if os.name == "nt" else []
-    suites = [
-        ("recovery.py", [], 720),
-        ("group-cli.py", ["--automatic-compute", "--scratch", work], 60 * 60),
-        ("compute-cli.py", ["--scratch", work, *service_options], 420),
-    ]
-    failures = []
-    for script, options, timeout in suites:
-        print(f"Running {script}", flush=True)
+    group_options = ["--automatic-compute", "--scratch", work]
+
+    def run_suite(script, options, timeout):
+        label = " ".join(map(str, (script, *options)))
+        print(f"Running {label}", flush=True)
         try:
             subprocess.run([sys.executable, pathlib.Path(__file__).with_name(script), binary, *options],
                            check=True, timeout=timeout)
         except subprocess.CalledProcessError as error:
-            failures.append(f"{script} exited with {error.returncode}")
+            return f"{label} exited with {error.returncode}"
         except subprocess.TimeoutExpired:
-            failures.append(f"{script} timed out after {timeout} seconds")
+            return f"{label} timed out after {timeout} seconds"
+
+    results = [run_suite("recovery.py", [], 720)]
+    if os.name == "nt":
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            farm = pool.submit(run_suite, "group-cli.py", ["--suite", "farm", "--scratch", work], 60 * 60)
+            results.append(run_suite("group-cli.py", ["--suite", "groups", *group_options], 60 * 60))
+            results.append(farm.result())
+    else:
+        results.append(run_suite("group-cli.py", group_options, 60 * 60))
+    results.append(run_suite("compute-cli.py", ["--scratch", work, *service_options], 420))
+    failures = [error for error in results if error]
     if failures:
         raise SystemExit("\n".join(failures))
 

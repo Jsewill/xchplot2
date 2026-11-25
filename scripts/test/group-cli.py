@@ -1341,7 +1341,15 @@ def check_empty_capacity_probe(run, root, keys, construction):
     print("PASS capacity-stop recovery, occupied target refusal and retirement of the withdrawn probe", flush=True)
 
 
-def check(binary, root, reference=None):
+def check_farm(run, command, verify, root):
+    check_farm_guided_plans(run, command, verify, root)
+    check_farm_membership_lifecycle(run, command, verify, root)
+    check_farm_v8_retirement(run, command, verify, root)
+    check_farm_updates(run, command, verify, root)
+    check_farm_returning_drives(run, command, verify, root)
+
+
+def check(binary, root, reference=None, suite="all"):
     counter = 0
 
     def command(*args):
@@ -1367,6 +1375,10 @@ def check(binary, root, reference=None):
         result = run("verify", path, "--full", "--trials", 100)
         found = re.search(r"(\d+) full proofs validated", (result.stdout + result.stderr).lower())
         assert found and int(found[1]) > 0, result
+
+    if suite == "farm":
+        check_farm(run, command, verify, root)
+        return
 
     keys = ["-f", FARMER, "--pool-ph", POOL]
     construction = ["-d", "cpu", "-M", "512M", "-j", 2,
@@ -2466,11 +2478,8 @@ def check(binary, root, reference=None):
             assert (snapshot(left), snapshot(right)) == conflict, "conflicting private/top-level records changed the job"
             private_record(left, "grow-farm.plan").unlink()
     print("PASS staged-job recovery and unfinished partial recovery preserve the saved extent", flush=True)
-    check_farm_guided_plans(run, command, verify, root)
-    check_farm_membership_lifecycle(run, command, verify, root)
-    check_farm_v8_retirement(run, command, verify, root)
-    check_farm_updates(run, command, verify, root)
-    check_farm_returning_drives(run, command, verify, root)
+    if suite == "all":
+        check_farm(run, command, verify, root)
 
 
 def check_replot(binary, root, reference=None):
@@ -4775,7 +4784,11 @@ def main():
     parser.add_argument("--compute", action="store_true", help="also test authenticated loopback compute sharing (needs openssl)")
     parser.add_argument("--automatic-compute", action="store_true", help="test saved enrollment and automatic LAN compute over loopback")
     parser.add_argument("--scratch", type=Path, default=Path.cwd(), help="existing directory on real disk")
+    parser.add_argument("--suite", choices=("all", "groups", "farm"), default="all",
+                        help="run grouped plotting or the independent farm policy and recovery cases")
     args = parser.parse_args()
+    if args.suite == "farm" and (args.compute or args.automatic_compute or args.reference):
+        parser.error("--compute, --automatic-compute and --reference apply to the group suite")
     allocated_console = False
     if os.name == "nt":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -4787,8 +4800,15 @@ def main():
             os.environ["XDG_CONFIG_HOME"] = str(Path(work) / "empty-compute-settings")
             os.environ["XDG_STATE_HOME"] = str(Path(work) / "migration-state")
             os.environ["XDG_CACHE_HOME"] = str(Path(work) / "performance-cache")
-            check_dashboard(args.binary.resolve(), Path(work))
-            check(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)
+            if os.name == "nt":
+                local_data = Path(work) / "local-app-data"
+                local_data.mkdir()
+                os.environ["LOCALAPPDATA"] = str(local_data)
+            if args.suite != "farm":
+                check_dashboard(args.binary.resolve(), Path(work))
+            check(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None, args.suite)
+            if args.suite == "farm":
+                return
             if sys.platform == "linux":
                 check_replot(args.binary.resolve(), Path(work), args.reference.resolve() if args.reference else None)
             if args.compute:
