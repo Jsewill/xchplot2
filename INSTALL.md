@@ -362,7 +362,7 @@ Toolchain prerequisites for the NVIDIA build:
   link, plus C++20 CUDA dialect, both require 12.0).
 - **CMake ≥ 3.26** for nvcc 12.5+ (Debian 12's stock 3.25 doesn't know
   the dialect flags; install Kitware's repo).
-- **Rust via rustup `stable`**. Release builds use Rust 1.98.1.
+- **Rust via rustup `stable`**. Release builds use the [pinned Rust version](ci/release/rust-toolchain).
   Older distro-packaged Rust may not support the locked dependencies.
 
 ### NVIDIA dependency sources
@@ -483,8 +483,8 @@ byte for byte and passed full-proof verification. See the
 
 Install Visual Studio 2022's C++ build tools and Windows SDK, LLVM/Clang
 20.1.8, CUDA Toolkit 12.9.1, HIP SDK 6.4.2 (Core and Runtime Compiler),
-CMake 3.24+, Ninja, Git, Python 3.11+, and Rust
-1.98.1 for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
+CMake 3.24+, Ninja, Git, Python 3.11+, and the [release Rust version](ci/release/rust-toolchain)
+for `x86_64-pc-windows-msvc`. Use PowerShell 7.3+ with the VS 2022
 developer environment loaded, plus native Windows Perl such as Strawberry
 Perl for OpenSSL.
 Build the pinned LLVM-integrated AdaptiveCpp toolchain, then the application:

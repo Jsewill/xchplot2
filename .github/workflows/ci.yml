@@ -2,8 +2,10 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore: &lint-paths
+    paths-ignore: &ignored-paths
       - '.github/workflows/lint.yml'
+      - '.github/workflows/release.yml'
+      - 'ci/release/**'
       - '.github/actionlint.*'
       - '.github/dependabot.yml'
       - '**/*.md'
@@ -12,7 +14,7 @@ on:
       - 'scripts/test/docs.py'
   push:
     branches: [main]
-    paths-ignore: *lint-paths
+    paths-ignore: *ignored-paths
   workflow_dispatch:
 
 permissions:

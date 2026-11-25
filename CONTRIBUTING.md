@@ -156,7 +156,9 @@ Keep each workflow focused on its own checks:
 Repository lint checks every PR and `main` push, including deletions and
 renames that could break local links. Dependabot groups its spelling,
 Markdown, and workflow linter updates in one weekly PR per target branch
-when updates are available. Build workflows select jobs by their inputs.
+when updates are available. Dependabot also checks the release Rust version
+on both branches. A change to that pin runs all four archive checks.
+Build workflows select jobs by their inputs.
 Release PRs select Linux and Windows builds separately. Manual dispatch runs
 all checks for the selected workflow, subject to its platform, architecture
 or suite inputs. Scheduled installation checks and tag release builds run
@@ -490,7 +492,8 @@ publishing, review the final notes and asset list for relevance to users.
 The release workflow builds Linux archives and experimental Windows ZIPs
 for x86-64 and ARM64 through the standalone CMake executable and CPack.
 The x86-64 Linux image pins Ubuntu 24.04, AdaptiveCpp
-25.10, Rust 1.98.1, CUDA 12.9.1, ROCm 7.1.1, and LLVM 20, with Level Zero.
+25.10, CUDA 12.9.1, ROCm 7.1.1, and LLVM 20, with Level Zero.
+Linux and Windows use the same [release Rust version](ci/release/rust-toolchain).
 ROCm 7.1.1 provides the LLVM 20 runtime compiler needed by the shared generic
 build; the former AMD-only archive used ROCm 6.2 with LLVM 18.
 Keep `INSTALL.md` and the archive README in sync with these pins.

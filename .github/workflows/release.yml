@@ -77,7 +77,7 @@ jobs:
               - 'contrib/pos2-*.patch'
               - 'contrib/cccl-arch-list.patch'
               - 'ci/release/adaptivecpp-*.patch'
-              - 'ci/release/{adaptivecpp-third-party.txt,llvm-third-party.txt,licenses.hbs,check-cuda-ptx.py}'
+              - 'ci/release/{adaptivecpp-third-party.txt,llvm-third-party.txt,licenses.hbs,check-cuda-ptx.py,rust-toolchain}'
               - 'scripts/test/{recovery,release,group-cli,compute-cli,group-pool-test}.py'
             linux:
               - 'ci/release/{Containerfile,README.txt}'
@@ -231,8 +231,9 @@ jobs:
       - name: Install release Rust tooling
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          $rustVersion = (Get-Content -Raw ci/release/rust-toolchain).Trim()
+          rustup toolchain install $rustVersion --profile minimal
+          rustup default $rustVersion
           cargo install --locked --features cli cargo-about --version 0.9.2
       - name: Build and package
         id: package
