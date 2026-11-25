@@ -1,19 +1,12 @@
 version: 2
 
-# Dependabot bumps deps via PR. Two ecosystems:
-#   - cargo: the keygen-rs subcrate's BLS / sha2 / address-codec stack.
-#     The build.rs at repo root only references env state and has no
-#     runtime crate deps, so it doesn't need its own entry.
-#   - github-actions: action versions in .github/workflows/.
-# Version updates cover both main and cuda-only.
-# Weekly cadence keeps PR volume low; bump to daily if security
-# advisories pile up.
+# Version updates cover both maintained branches. Cargo registry dependencies
+# live in keygen-rs, which CMake builds separately from the root crate.
 updates:
   - package-ecosystem: cargo
     directory: /keygen-rs
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
     # The protocol test API uses chia-bls public-key types.
     groups:
       chia:
@@ -25,7 +18,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
     groups:
       linters:
         patterns:
@@ -38,7 +30,6 @@ updates:
     target-branch: cuda-only
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
     # The protocol test API uses chia-bls public-key types.
     groups:
       chia:
@@ -51,7 +42,6 @@ updates:
     target-branch: cuda-only
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
     groups:
       linters:
         patterns:
