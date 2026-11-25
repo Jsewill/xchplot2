@@ -62,11 +62,18 @@ def check(binary, root, service_manager=False):
         try:
             run("authority", "service", "install")
             node = status("authority")["node_id"]
-            until(lambda: any(w["node_id"] == node for w in status("owner")["workers"]))
+
+            def worker_instance(previous=None):
+                return next((w["instance"] for w in status("owner")["workers"]
+                             if w["node_id"] == node and w["instance"] != previous), None)
+
+            instance = until(worker_instance)
+            run("authority", "service", "start")
+            assert until(worker_instance) == instance
             for _ in range(3):
                 for action in ("status", "stop", "start", "restart"):
                     run("authority", "service", action)
-                until(lambda: any(w["node_id"] == node for w in status("owner")["workers"]))
+                instance = until(lambda: worker_instance(instance))
         except Exception:
             try:
                 result = run("authority", "service", "status")
@@ -244,6 +251,15 @@ def check(binary, root, service_manager=False):
             print("PASS Windows task XML, Unicode executable/membership arguments and user context", flush=True)
             if service_manager:
                 managed_service()
+                broker.stop()
+                try:
+                    run("authority", "service", "install", "--role", "broker")
+                    until(lambda: status("owner")["brokers"])
+                    run("authority", "service", "restart", "--role", "broker")
+                    assert until(lambda: status("owner")["brokers"])[0]["authenticated"]
+                finally:
+                    run("authority", "service", "remove", "--role", "broker")
+                print("PASS native broker service restart and authenticated reconnect", flush=True)
             return
 
         # Exercise real publication/removal and exact manager argv without changing

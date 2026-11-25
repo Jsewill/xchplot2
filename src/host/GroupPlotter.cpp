@@ -24051,7 +24051,14 @@ int run_farming(Arguments args)
             if (args.cancel_update || unfinished)
             {
                 mailbox = std::make_unique<FarmingUpdateMailbox>(*job.saved, job.legacy_metadata, true, args.max_ram, job.directories);
-                if (!mailbox->locked()) return attached();
+                if (!mailbox->locked())
+                {
+                    if (held_locks.empty() || mailbox->terminal()) return attached();
+                    // Another requester can hold the mailbox while this
+                    // coordinator still owns the destinations.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
                 if (args.cancel_update)
                 {
                     job.check(); bool const changed = mailbox->cancel();
@@ -24369,10 +24376,14 @@ int run_farming(Arguments args)
                     completed_members = sum(completed_members, directory.extents.at(size_t(file)));
             }
         auto finished_performance = std::move(farm->performance);
+        // Keep a connected coordinator in charge while a queued update is
+        // published or refused. Reuse locks only for the same complete set of lanes.
+        if (!missing && farm->bound_directories == bindings) held_locks = std::move(farm->locks);
         args.compute_session.reset(); farm.reset();
         auto current_bindings = farming_runtime_bindings(*watched, bindings, discovery_scopes, cancelled);
         check_cancel(args);
         auto now = available(*watched, current_bindings);
+        if (current_bindings != bindings || now != present) held_locks.clear();
         interrupted = interrupted || current_bindings != bindings;
         // Construction resources are released before observing a changed
         // policy head. The ordinary reload validates its lineage and locks;
@@ -24436,10 +24447,9 @@ int run_farming(Arguments args)
             // retry a real model limit without completed-member progress.
             resume(*watched, manifest, current_bindings);
             job = farming_reload_arguments(args, *watched, current_bindings);
-            try { held_locks = farming_writer_locks(job); }
+            try { if (held_locks.empty()) held_locks = farming_writer_locks(job); }
             catch (DirectoryBusy const&) { return attached(); }
-            // A coordinator that acquired the job while these locks were
-            // released may have left a successor to recover first.
+            // A newly recovered set of lanes may have a successor to settle first.
             if (job.pending) continue;
             grant_refresh_pending = false;
             grant_refresh_members = completed_members;

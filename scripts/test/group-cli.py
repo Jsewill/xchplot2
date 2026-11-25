@@ -1131,7 +1131,7 @@ def check_farm_updates(run, command, verify, root):
                                                "--group-members", 8, "--max-groups", 2, "--max-total-members", 11,
                                                "--capacity-bytes", "128M", "--headroom-bytes", 0,
                                                "--farming-max-eligible-groups", 4, "--seed", SEED,
-                                               "-f", FARMER, "--pool-ph", POOL, "--quiet"),
+                                               "-f", FARMER, "--pool-ph", POOL, "--json"),
                                        stdout=output, stderr=subprocess.STDOUT)
             try:
                 stopped = False
@@ -1159,9 +1159,8 @@ def check_farm_updates(run, command, verify, root):
                               "--max-groups", 3, "--max-total-members", 11 if refused_update else 14,
                               "--capacity-bytes", 1 if refused_update else "128M", *runtime, "--json",
                               code=(0, 2) if refused_update else 0)
-                # The original writer can release its boundary while the
-                # requester is acquiring it, letting either process apply or
-                # refuse the request. Both must preserve the original work.
+                # An update can be queued or settled before the requester returns.
+                # The active fill must finish under the resulting policy.
                 if request.returncode:
                     assert "completed plots, active reservations and recovery metadata" in request.stderr
                 else:
@@ -1175,8 +1174,18 @@ def check_farm_updates(run, command, verify, root):
                     receipts = {record["id"]: record for record in waiting["updates"]}
                     assert receipts[first_request]["status"] == "superseded" and receipts[second_request["request_id"]]["status"] == "accepted"
                 if stopped:
-                    process.send_signal(signal.SIGCONT)
-                    stopped = False
+                    # Retain the request lock while the writer reaches its next
+                    # checkpoint. A temporary mailbox owner must not end the fill.
+                    with private_record(live, "grow-farm.update.lock").open("rb") as mailbox:
+                        fcntl.flock(mailbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        process.send_signal(signal.SIGCONT)
+                        stopped = False
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        else:
+                            raise AssertionError("fill exited while the update mailbox was locked")
                 assert process.wait(timeout=180) == 0, live_log.read_text(encoding="utf-8")
             finally:
                 if stopped and process.poll() is None:
@@ -1193,9 +1202,8 @@ def check_farm_updates(run, command, verify, root):
         assert any(record["status"] == ("refused" if refused_update else "applied") for record in status["updates"])
         if refused_update:
             assert status["update_reason"]
-        else:
-            verify(paths[0])
-            verify(paths[-1])
+        verify(paths[0])
+        verify(paths[-1])
     print("PASS resizing, future parameter cohorts, live updates, refusal/cancellation, read-only status and revision recovery", flush=True)
 
 

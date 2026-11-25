@@ -519,8 +519,7 @@ at runtime; the packaged application avoids that dependency.
 Use an ACL-capable filesystem (NTFS/ReFS) for ordinary plots, manifests and
 spill. Grouped construction and recovery require local NTFS; sparse,
 compressed, encrypted and network-backed group storage is rejected. The
-Windows group and background-service ports remain experimental. The x86-64
-Task Scheduler worker can stop after rapid service restarts. See the
+Windows group and background-service ports remain experimental. See the
 [shared-compute reference](REFERENCE.md#shared-compute) for enrollment,
 services and firewall requirements.
 The first Ctrl-C or Ctrl-Break asks active work to stop safely; a second aborts.

@@ -5,6 +5,7 @@
 #include <taskschd.h>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <thread>
 
 namespace
@@ -89,24 +90,74 @@ void check_task(IRegisteredTask* task, std::wstring const& marker)
     require(description.value && std::wstring_view(description.value, SysStringLen(description.value)) == marker,
         "refusing to modify a task not generated for this compute identity");
 }
+using ProcessHandle = std::unique_ptr<void, decltype(&::CloseHandle)>;
+ProcessHandle running_action(IRegisteredTask* task)
+{
+    ProcessHandle process(nullptr, ::CloseHandle);
+    Com<IRunningTaskCollection> instances;
+    checked(task->GetInstances(0, instances.out()), "inspect running compute task instances");
+    LONG count = 0; checked(instances->get_Count(&count), "count running compute task instances");
+    if (!count) return process;
+    // The generated task has one Exec action and ignores additional instances.
+    VARIANT first{}; first.vt = VT_I4; first.lVal = 1;
+    Com<IRunningTask> running; DWORD pid = 0; Bstr action;
+    if (FAILED(instances->get_Item(first, running.out())) || !running.value || FAILED(running->get_EnginePID(&pid)) || !pid ||
+        FAILED(running->get_CurrentAction(&action.value)) || !::SysStringLen(action.value)) return process;
+    process.reset(::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!process) return process;
+    // Some tasks run in a shared scheduler engine. Only wait on the executable
+    // that Task Scheduler identifies as this instance's current action.
+    std::wstring image(32768, L'\0'); DWORD length = DWORD(image.size());
+    if (!::QueryFullProcessImageNameW(process.get(), 0, image.data(), &length) ||
+        ::CompareStringOrdinal(image.data(), int(length), action.value, int(::SysStringLen(action.value)), TRUE) != CSTR_EQUAL)
+        process.reset();
+    return process;
+}
 void stop(IRegisteredTask* task)
 {
     TASK_STATE state{}; checked(task->get_State(&state), "inspect task state");
     if (state != TASK_STATE_RUNNING && state != TASK_STATE_QUEUED) return;
+    auto const process = running_action(task);
     checked(task->Stop(0), "stop compute task");
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
     do
     {
         checked(task->get_State(&state), "wait for compute task shutdown");
-        if (state != TASK_STATE_RUNNING && state != TASK_STATE_QUEUED) return;
+        // The task can report ready while its previous process still owns the worker identity.
+        auto const exit = process ? ::WaitForSingleObject(process.get(), 0) : WAIT_OBJECT_0;
+        if (exit == WAIT_FAILED) checked(HRESULT_FROM_WIN32(::GetLastError()), "wait for compute action exit");
+        if (exit == WAIT_OBJECT_0 && state != TASK_STATE_RUNNING && state != TASK_STATE_QUEUED) return;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } while (std::chrono::steady_clock::now() < deadline);
     throw std::runtime_error("compute task has not stopped within 45 seconds");
 }
 void start(IRegisteredTask* task)
 {
+    TASK_STATE state{}; checked(task->get_State(&state), "inspect compute task state");
+    if (state == TASK_STATE_RUNNING) return;
     VARIANT empty{}; Com<IRunningTask> running;
     checked(task->Run(empty, running.out()), "start compute task for the logged-in user");
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+    do
+    {
+        auto const result = running.value ? running->get_State(&state) : SCHED_E_TASK_NOT_RUNNING;
+        if (result == SCHED_E_TASK_NOT_RUNNING)
+        {
+            // IgnoreNew can discard this instance when another start won the race.
+            checked(task->get_State(&state), "inspect compute task startup");
+            require(state == TASK_STATE_RUNNING, "Task Scheduler did not start the compute task");
+            return;
+        }
+        checked(result, "wait for compute task startup");
+        if (state == TASK_STATE_RUNNING)
+        {
+            Bstr action; checked(running->get_CurrentAction(&action.value), "inspect running compute action");
+            if (::SysStringLen(action.value)) return;
+        }
+        require(state != TASK_STATE_READY && state != TASK_STATE_DISABLED, "compute task stopped before starting its action");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("compute task has not started its action within 45 seconds");
 }
 } // namespace
 
