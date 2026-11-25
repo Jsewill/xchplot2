@@ -188,7 +188,7 @@ target_include_directories(pos2_pr118_group PRIVATE
     "${POS2_PR118_DIR}/src" "${keygen_dir}/include")
 target_link_libraries(pos2_pr118_group PRIVATE "${keygen_lib}" fse Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
-    target_link_libraries(pos2_pr118_group PRIVATE ws2_32 userenv bcrypt ntdll advapi32)
+    target_link_libraries(pos2_pr118_group PRIVATE ws2_32 userenv bcrypt ntdll advapi32 dbghelp synchronization)
 elseif(UNIX)
     target_link_libraries(pos2_pr118_group PRIVATE m)
 endif()
