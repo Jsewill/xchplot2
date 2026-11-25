@@ -373,12 +373,14 @@ void repartition_and_global_admission()
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(512) << 20, 0};
     offered.generation_threads = 1; offered.max_batch_members = 4; offered.max_task_bytes = single_work;
+    // The fixture controls CPU contention through the scheduler below.
+    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
     offered.cpu_scheduler = std::make_shared<CodecScheduler>(offered.capacity.cpu_threads);
     WorkerService worker(offered); worker.start();
     Arguments args; args.backend = "cpu"; args.workers = 2; args.pool_inflight = 1;
     args.max_ram = uint64_t(1) << 30; args.window = uint64_t(1) << 20;
-    // Both writers share one slot. A refused batch and its singleton retries share
-    // the original task deadline, so use the normal owner budget for this byte-parity test.
+    // Allow a refused batch and its singleton retries to share one slot with the other writer.
+    args.pool_timeout_ms = 60000;
     args.pool_frame_bytes = tls.max_frame_bytes; args.pool_socket_timeout_ms = tls.timeout_ms;
     args.pool_broker = "127.0.0.1:" + std::to_string(offered.broker.port);
     args.pool_owner = "owner-repartition"; args.pool_ca = tls.ca_file; args.pool_cert = tls.cert_file; args.pool_key = tls.key_file;
