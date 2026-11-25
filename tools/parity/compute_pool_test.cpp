@@ -196,12 +196,17 @@ void transport(TlsOptions server_tls, TlsOptions const& client_tls, TlsOptions c
         for (unsigned attempt = 0; attempt < 64; ++attempt) broken.send(Message::Data, message.data());
         (void)broken.receive();
     });
-    auto reject_peer = [&](TlsOptions const& client, std::string pin)
-    {
-        auto peer = std::async(std::launch::async, [&] { try { auto incoming = listener.accept(1000); if (incoming) (void)incoming.receive(); } catch (...) {} });
-        permanent_rejects([&] { auto denied = Channel::connect(listener.endpoint(), client, pin); denied.send(Message::Data, {}); (void)denied.receive(); }); peer.get();
-    };
-    reject_peer(client_tls, std::string(64, '0')); reject_peer(rogue_tls, {});
+    // Check the permanent error at the peer that verifies the credential.
+    // Its counterpart may receive a TLS alert or simply see the connection close.
+    auto wrong_pin = std::async(std::launch::async, [&] { rejects([&] { (void)listener.accept(1000); }); });
+    permanent_rejects([&] { (void)Channel::connect(listener.endpoint(), client_tls, std::string(64, '0')); },
+        "network worker certificate differs from its lease");
+    wrong_pin.get();
+    auto untrusted_client = std::async(std::launch::async, [&] {
+        permanent_rejects([&] { (void)listener.accept(1000); }, "network certificate verification failed");
+    });
+    rejects([&] { (void)Channel::connect(listener.endpoint(), rogue_tls); });
+    untrusted_client.get();
     auto corrupt = [&](std::vector<uint8_t> data, bool send = true, bool transient = false)
     {
         auto peer = std::async(std::launch::async, [&]

@@ -2535,6 +2535,10 @@ struct WorkerService::Impl
             auto active = broker->with_deadline(cancel.deadline);
             begin_assigned(accepted, *broker, *lease, channel.peer_identity(), cancel);
             begun = true;
+            // The Work frame carries all generation inputs. Its owner can be waiting for
+            // a reply while this worker queues for a slot or its first CPU permit.
+            // Encode enables keepalives after reading its separate upload below.
+            keepalive_enabled = lease->task.kind != pool::Kind::Pack;
             Renewal renewal(active, *lease, cancelled, renewal_failure, [&]
             {
                 std::lock_guard lock(output_mutex);
@@ -2558,7 +2562,6 @@ struct WorkerService::Impl
                 // The request is fully decoded. Its reserved frame can now hold
                 // the previous contribution while the encoder fills the next one.
                 std::vector<uint8_t>().swap(frame.payload);
-                { std::lock_guard lock(output_mutex); keepalive_enabled = true; }
                 bool const use_gpu = lease->task.kind == pool::Kind::GenerateGpu || (lease->task.kind == pool::Kind::GenerateAny && offered_gpu_bytes());
                 if (use_gpu && !offered_gpu_bytes())
                 {
