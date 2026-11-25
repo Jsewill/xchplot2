@@ -506,7 +506,7 @@ add_dependencies(pos2_keygen pos2_keygen_build)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(pos2_keygen INTERFACE pthread dl m)
 elseif(WIN32)
-    target_link_libraries(pos2_keygen INTERFACE ws2_32 userenv bcrypt ntdll advapi32)
+    target_link_libraries(pos2_keygen INTERFACE ws2_32 userenv bcrypt ntdll advapi32 dbghelp synchronization)
 endif()
 
 # xchplot2_cli: the CLI dispatch logic as a static library, with the
