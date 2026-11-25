@@ -108,6 +108,7 @@ void bounded_coalescing()
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {1, 1, uint64_t(256) << 20, 0};
     offered.max_task_bytes = uint64_t(1) << 20;
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService service(offered); service.start();
     constexpr uint8_t k = 18;
     uint64_t const range = uint64_t(1) << (k + PlotGroupFile::PROOFS_PER_CHUNK_BITS);
@@ -199,7 +200,7 @@ void integration(uint8_t k)
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(256) << 20, 0}; offered.max_task_bytes = uint64_t(1) << 20;
     // Both windows must fit at once, even when other jobs are using the CI runner.
-    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService service(offered); service.start();
     auto scheduler = std::make_shared<CodecScheduler>(1);
     WorkerClientConfig client_options; client_options.broker = offered.broker; client_options.tls = tls;

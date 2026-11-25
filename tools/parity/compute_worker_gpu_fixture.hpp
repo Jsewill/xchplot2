@@ -235,7 +235,7 @@ inline void recovery(bool network)
     auto options = config(); options.backend = "gpu"; options.capacity.cpu_threads = 4;
     options.capacity.slots = 3; options.capacity.host_bytes = 4ull<<30; options.device = 0;
     default_worker_resources(options);
-    options.available_resources = [capacity = options.capacity](unsigned) { return capacity; };
+    options.available_resources = pool_test::fixed_resources(options.capacity);
     std::unique_ptr<RunningBroker> broker;
     std::optional<pool::BrokerClient> control;
     pool::OwnerSession session;
@@ -438,7 +438,7 @@ inline void shared_capacity()
     options.capacity.cpu_threads = 4;
     options.generation_threads = 2;
     default_worker_resources(options);
-    options.available_resources = [capacity = options.capacity](unsigned) { return capacity; };
+    options.available_resources = pool_test::fixed_resources(options.capacity);
     pool::BrokerOptions settings;
     settings.listen = {"127.0.0.1", 0};
     settings.tls = pool_test::tls(ca, owner);
@@ -846,7 +846,7 @@ inline void shared_capacity()
     capped.backend = "gpu";
     capped.capacity.gpu_bytes = 40ull << 20;
     capped.tier = "pool";
-    capped.available_resources = [capacity = capped.capacity](unsigned) { return capacity; };
+    capped.available_resources = pool_test::fixed_resources(capped.capacity);
     WorkerService explicit_worker(capped);
     require(!explicit_worker.local_generation_offer(18, 2, 1).demand.slots,
             "explicit cap treated exhausted memory as unknown");

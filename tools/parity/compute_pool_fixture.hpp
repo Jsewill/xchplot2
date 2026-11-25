@@ -1,6 +1,6 @@
-// Local ephemeral CA/certificates for standalone network-compute tests.
+// Shared fixtures for standalone network-compute tests.
 #pragma once
-#include "host/ComputeNetwork.hpp"
+#include "host/ComputePool.hpp"
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -17,6 +17,8 @@ namespace pool_test
 {
 using group_grow::pool::TlsOptions;
 namespace fs = std::filesystem;
+inline auto fixed_resources(group_grow::pool::Resources capacity)
+{ return [capacity](uint32_t) { return capacity; }; }
 inline std::string utf8_path(fs::path const& path)
 { auto const value = path.u8string(); return {reinterpret_cast<char const*>(value.data()), value.size()}; }
 inline void require(bool value, char const* message)

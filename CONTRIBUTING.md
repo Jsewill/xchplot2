@@ -221,6 +221,8 @@ pause/drain/resume, renewal, revocation and background service commands.
 Linux service checks use an isolated test manager. Native Windows archive
 checks run the same suites on NTFS, including a temporary Task Scheduler task
 with `--service-manager`; the harness removes that task before returning.
+After building the binaries, the install and archive checks run each selected
+CLI suite and report their failures together.
 The same flag exercises a temporary systemd user service on Linux when a
 user manager is available.
 Discovery checks use loopback multicast and do not qualify a physical LAN.

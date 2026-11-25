@@ -78,6 +78,7 @@ WorkerConfig config()
 {
     WorkerConfig options; options.capacity.cpu_threads = 2; options.capacity.slots = 2;
     options.capacity.host_bytes = uint64_t(2) << 30; options.generation_threads = 1;
+    options.available_resources = pool_test::fixed_resources(options.capacity);
     options.tls.max_frame_bytes = 4096;
     return options;
 }
@@ -230,7 +231,6 @@ void multiple_brokers(char const* ca, char const* cert, char const* key)
         else alternate.server_name.clear();
         pool::Endpoint addition{"127.0.0.1", later.server.endpoint().port, "localhost"};
         auto offered = config(); offered.broker = primary; offered.listen = {listen, 0}; offered.tls = tls; offered.max_brokers = 2;
-        offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
         std::atomic<unsigned> browse{0};
         offered.discover_brokers = [&]
         {

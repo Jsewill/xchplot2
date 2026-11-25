@@ -1038,7 +1038,7 @@ void failed_gpu_generation()
     offer.generation_profiles = {{pool::Kind::GenerateGpu, 18, 2, 1, offer.capacity, offer.capacity.host_bytes, 1}};
     control.register_worker(offer);
     WorkerConfig good; good.tls = pool_test::tls(ca, second); good.broker = broker.server.endpoint(); good.listen = {"127.0.0.1", 0};
-    good.capacity = {1, 1, uint64_t(256) << 20, 0}; good.available_resources = [cap=good.capacity](unsigned) { return cap; };
+    good.capacity = {1, 1, uint64_t(256) << 20, 0}; good.available_resources = pool_test::fixed_resources(good.capacity);
     WorkerService healthy(good);
     std::array<std::array<uint8_t, 32>, 1> ids{}; ids.front()[0] = 17;
     std::vector<std::vector<uint8_t>> expected;
@@ -1247,7 +1247,7 @@ void assigned_local_and_fencing()
     auto data_tls = tls; data_tls.max_frame_bytes = 4096;
     WorkerConfig offer; offer.broker = broker.server.endpoint(); offer.listen = {"127.0.0.1", 0}; offer.tls = data_tls;
     offer.capacity = {2, 4, uint64_t(2) << 30, 0}; offer.generation_threads = 1;
-    offer.available_resources = [capacity = offer.capacity](unsigned) { return capacity; };
+    offer.available_resources = pool_test::fixed_resources(offer.capacity);
     WorkerService service(offer); service.start();
     WorkerClientConfig config; config.broker = offer.broker; config.tls = data_tls;
     config.owner_id = "direct-local-owner"; config.local_service = &service;
@@ -1417,7 +1417,7 @@ void temporary_worker_refusal()
     RunningBroker broker(options);
     WorkerConfig offer; offer.broker = broker.server.endpoint(); offer.listen = {"127.0.0.1", 0}; offer.tls = tls;
     offer.capacity = {1, 1, uint64_t(512) << 20, 0};
-    offer.available_resources = [](uint32_t) { return pool::Resources{1, 1, uint64_t(2) << 30, 0}; };
+    offer.available_resources = pool_test::fixed_resources({1, 1, uint64_t(2) << 30, 0});
     WorkerService service(offer); service.start();
     std::array<uint8_t, 32> id{};
     std::array<uint64_t, 3> fragments{1, 2, 3}; std::span<uint64_t const> region(fragments);
@@ -1657,6 +1657,7 @@ void expired_cleanup()
         RunningBroker broker(options());
         WorkerConfig worker; worker.broker = broker.server.endpoint(); worker.listen = {"127.0.0.1", 0}; worker.tls = tls;
         worker.capacity = {1, 1, uint64_t(2) << 30, 0}; worker.cpu_scheduler = std::make_shared<CodecScheduler>(1);
+        worker.available_resources = pool_test::fixed_resources(worker.capacity);
         WorkerService service(worker); service.start();
         WorkerClientConfig config; config.broker = worker.broker; config.tls = tls;
         config.owner_id = "running-cleanup-owner"; WorkerClient client(config);
@@ -1723,6 +1724,7 @@ void generation_admission()
     config.owner_id = "generation-admission-owner"; config.max_active_generation = 1;
     config.cpu_scheduler = std::make_shared<CodecScheduler>(1);
     WorkerConfig local; local.capacity = {1, 1, uint64_t(2) << 30, 0}; local.cpu_scheduler = config.cpu_scheduler;
+    local.available_resources = pool_test::fixed_resources(local.capacity);
     WorkerService service(local); config.local_service = &service;
     WorkerClient client(config); std::array<uint8_t, 32> id{};
     WorkerCancellation cancel; cancel.deadline = Clock::now() + std::chrono::seconds(2);
@@ -1760,6 +1762,7 @@ void protected_admission()
     auto data_tls = tls; data_tls.max_frame_bytes = 4096;
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0}; offered.tls = data_tls;
     offered.capacity = {1, 2, uint64_t(2) << 30, 0}; offered.generation_threads = 1;
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     bool startup_checked = false;
     offered.admit_start = [&](WorkerConfig const& actual)
     { startup_checked = true; require(actual.capacity == offered.capacity && worker_service_baseline_bytes(actual) < actual.capacity.host_bytes,
@@ -1936,7 +1939,7 @@ void automatic_pool_growth()
     auto offer = [](pos2gpu::GroupOptions const& args)
     {
         auto config = pos2gpu::make_group_compute_offer(args);
-        config.available_resources = [capacity = config.capacity](unsigned) { return capacity; };
+        config.available_resources = pool_test::fixed_resources(config.capacity);
         return config;
     };
     auto args = options(owner_id);
@@ -2046,6 +2049,7 @@ void codec_window_limits()
     auto data_tls = tls; data_tls.max_frame_bytes = 4096;
     WorkerConfig worker; worker.broker = broker.server.endpoint(); worker.listen = {"127.0.0.1", 0}; worker.tls = data_tls;
     worker.capacity = {1, 1, uint64_t(128) << 20, 0}; worker.max_window_chunks = 2; worker.max_task_bytes = 4096;
+    worker.available_resources = pool_test::fixed_resources(worker.capacity);
     WorkerService service(worker); service.start();
     bool selected = false;
     WorkerClientConfig config; config.broker = worker.broker; config.tls = data_tls; config.owner_id = "codec-limits-owner";
@@ -2091,6 +2095,7 @@ void local_only_parallel()
     auto scheduler = std::make_shared<CodecScheduler>(1);
     WorkerConfig offer; offer.capacity = {1, 1, uint64_t(256) << 20, 0}; offer.generation_threads = 1;
     offer.max_task_bytes = uint64_t(1) << 20; offer.tls.max_frame_bytes = 4096; offer.cpu_scheduler = scheduler;
+    offer.available_resources = pool_test::fixed_resources(offer.capacity);
     auto const original_affinity = pos2gpu::current_thread_cpus();
     if (!original_affinity.empty()) offer.cpu_affinity = {original_affinity.front()};
     std::array<std::shared_ptr<WorkerService>, 2> services{
@@ -2207,6 +2212,7 @@ void renewal_fence()
     RunningBroker broker(options);
     WorkerConfig worker; worker.broker = broker.server.endpoint(); worker.listen = {"127.0.0.1", 0}; worker.tls = tls;
     worker.tls.timeout_ms = 1500; worker.capacity = {1, 1, uint64_t(512) << 20, 0};
+    worker.available_resources = pool_test::fixed_resources(worker.capacity);
     worker.cpu_scheduler = std::make_shared<CodecScheduler>(1);
     WorkerService service(worker); service.start();
     pool::BrokerClient controller(worker.broker, tls);
@@ -2329,6 +2335,7 @@ void status_inspection()
         worker.tls.listen_interfaces = {"lo"};
         worker.tls.membership_directory = pool_test::utf8_path(member.directory);
         worker.capacity = {1, 1, uint64_t(512) << 20, 0};
+        worker.available_resources = pool_test::fixed_resources(worker.capacity);
         WorkerService service(worker); service.start();
         pool::DiscoveryOptions announcement; announcement.pool_id = member.pool_id; announcement.node_id = member.node_id;
         announcement.name = member.name; announcement.server_name = member.server_name;

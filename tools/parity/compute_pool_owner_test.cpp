@@ -253,6 +253,7 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {1, 1, uint64_t(512) << 20, 0}; offered.generation_threads = 1;
     offered.max_task_bytes = (uint64_t(1) << 20) + tls.max_frame_bytes;
+    if (!retained) offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService worker(offered); worker.start();
     Arguments args; args.backend = "cpu"; args.workers = 1; args.pool_inflight = 2;
     args.max_ram = uint64_t(1) << 30; args.capacity = uint64_t(64) << 20;
@@ -268,7 +269,8 @@ void accepted_remote_publication(std::optional<fs::path> retained = {})
     args.pool_codec_ram = uint64_t(64) << 20;
     Keys keys(args); auto const requested = keys.derive(0);
     auto scheduler = std::make_shared<CodecScheduler>(1);
-    WorkerConfig pressure_config; pressure_config.capacity = {1, 1, uint64_t(512) << 20, 0};
+    WorkerConfig pressure_config; pressure_config.capacity = offered.capacity;
+    pressure_config.available_resources = offered.available_resources;
     pressure_config.generation_threads = 1; pressure_config.cpu_scheduler = scheduler;
     pressure_config.tls.max_frame_bytes = tls.max_frame_bytes; pressure_config.max_task_bytes = offered.max_task_bytes;
     unsigned completed_prefetch = 0;
@@ -373,12 +375,14 @@ void repartition_and_global_admission()
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(512) << 20, 0};
     offered.generation_threads = 1; offered.max_batch_members = 4; offered.max_task_bytes = single_work;
+    // The fixture controls CPU contention through the scheduler below.
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     offered.cpu_scheduler = std::make_shared<CodecScheduler>(offered.capacity.cpu_threads);
     WorkerService worker(offered); worker.start();
     Arguments args; args.backend = "cpu"; args.workers = 2; args.pool_inflight = 1;
     args.max_ram = uint64_t(1) << 30; args.window = uint64_t(1) << 20;
-    // Both writers share one slot. A refused batch and its singleton retries share
-    // the original task deadline, so use the normal owner budget for this byte-parity test.
+    // Allow a refused batch and its singleton retries to share one slot with the other writer.
+    args.pool_timeout_ms = 60000;
     args.pool_frame_bytes = tls.max_frame_bytes; args.pool_socket_timeout_ms = tls.timeout_ms;
     args.pool_broker = "127.0.0.1:" + std::to_string(offered.broker.port);
     args.pool_owner = "owner-repartition"; args.pool_ca = tls.ca_file; args.pool_cert = tls.cert_file; args.pool_key = tls.key_file;
@@ -635,7 +639,7 @@ void late_packed_capacity()
     RunningBroker broker(options);
     WorkerConfig offered; offered.broker = broker.server.endpoint(); offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {1, 1, uint64_t(512) << 20, 0}; offered.generation_threads = 1;
-    offered.available_resources = [capacity = offered.capacity](unsigned) { return capacity; };
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService worker(offered);
     Arguments args; args.backend = "cpu"; args.pool_inflight = 2; args.pool_timeout_ms = 15000;
     args.pool_frame_bytes = tls.max_frame_bytes; args.max_ram = uint64_t(1) << 30;
@@ -1117,6 +1121,7 @@ void owner_broker_restart()
     options.listen = broker->server.endpoint();
     WorkerConfig offered; offered.broker = options.listen; offered.listen = {"127.0.0.1", 0};
     offered.tls = tls; offered.capacity = {2, 2, uint64_t(512) << 20, 0}; offered.generation_threads = 1;
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService worker(offered); worker.start();
     grow_controller_test::Identity requested{PlotGroupParams(PlotGroupId(std::string(64, '6')), 18, 2, 0), {}};
     Arguments args; args.backend = "cpu"; args.workers = 2; args.pool_inflight = 2;
@@ -1363,7 +1368,7 @@ void private_local_delegation(std::optional<fs::path> retained = {}, bool with_h
     offered.tls.max_frame_bytes = uint32_t(args.pool_frame_bytes);
     offered.capacity = {1, 1, defaults.host_bytes, 0}; offered.max_task_bytes = args.window + args.pool_frame_bytes;
     offered.cpu_scheduler = std::make_shared<CodecScheduler>(1);
-    offered.available_resources = [cap=offered.capacity](unsigned) { return cap; };
+    offered.available_resources = pool_test::fixed_resources(offered.capacity);
     WorkerService remote(offered); remote.start();
     auto wait_slots = [&](unsigned slots)
     {

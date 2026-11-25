@@ -53,17 +53,22 @@ cmake -S . -B build-native-install/cmake -G Ninja \
 cmake --build build-native-install/cmake --parallel "$CARGO_BUILD_JOBS" \
     --target xchplot2 plot_file_parity sycl_twophase_budget_test solver_filter_parity
 "$cmake_binary" --help
+failed=()
 ctest --test-dir build-native-install/cmake \
     --output-on-failure --no-tests=error \
-    -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$'
+    -R '^(plot_file_parity|sycl_twophase_budget_test|solver_filter_parity)$' || failed+=("CMake parity tests")
 
 for binary in "$cargo_binary" "$cmake_binary"; do
     echo "Testing plot recovery and proofs with $binary"
-    python3 scripts/test/recovery.py "$binary"
+    python3 scripts/test/recovery.py "$binary" || failed+=("recovery.py with $binary")
     if [[ $binary == "$full_binary" ]]; then
         echo "Testing grouped plotting and automatic compute with $binary"
-        python3 scripts/test/group-cli.py "$binary" --automatic-compute
+        python3 scripts/test/group-cli.py "$binary" --automatic-compute || failed+=("group-cli.py with $binary")
         echo "Testing compute management with $binary"
-        python3 scripts/test/compute-cli.py "$binary"
+        python3 scripts/test/compute-cli.py "$binary" || failed+=("compute-cli.py with $binary")
     fi
 done
+if (( ${#failed[@]} )); then
+    printf 'Failed %s\n' "${failed[@]}" >&2
+    exit 1
+fi
