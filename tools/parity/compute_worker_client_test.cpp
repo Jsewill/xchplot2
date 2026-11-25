@@ -2229,15 +2229,11 @@ void renewal_fence()
         pool::Writer request(tls.max_frame_bytes); pool::write_lease(request, *lease); request.u32(10000);
         request.u8(uint8_t(Operation::Packed)); request.u8(18); request.u8(2); request.u16(1);
         std::array<uint8_t, 32> id{}; request.bytes(id); channel.send(pool::Message::Work, request.data());
-        bool running = false; auto const until = Clock::now() + std::chrono::seconds(3);
-        do
-        {
-            try { controller.renew(*lease); running = true; }
-            catch (pool::StaleLease const&) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
-        } while (!running && Clock::now() < until);
-        require(running, "renewal fixture never entered Running state");
-        owner = controller.open_owner(owner.owner_id);
         auto frame = channel.receive();
+        require(frame.type == pool::Message::Reply && frame.payload.empty(),
+            "generation waiting for its first CPU permit did not keep the data connection alive");
+        owner = controller.open_owner(owner.owner_id);
+        do { frame = channel.receive(); } while (frame.type == pool::Message::Reply && frame.payload.empty());
         require(frame.type == pool::Message::Error, "fenced renewal did not return a typed worker failure");
         bool stale = false;
         try { throw_worker_error(frame.payload); } catch (pool::StaleLease const&) { stale = true; }
